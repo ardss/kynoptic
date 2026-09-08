@@ -14,12 +14,15 @@
 //!   ghost     — 清扫幽灵 session
 //!   autostart — 开关开机自启动
 //!   migrate   — 从旧 Python db 导入（已迁移到 scripts/migrate_legacy_db.py）
+//!   now       — 当前机器状态（compact 表格 / --json）
+//!   query     — 时间范围事件查询 (--from/--to/--bucket/--limit/--json)
+//!   mcp       — 启动 MCP server（stdio，Claude Desktop: command "kynoptic" args ["mcp"]）
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use chrono::{Duration, Utc};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::json;
 
 use kynoptic_core::analyzer;
@@ -54,6 +57,10 @@ Subcommands:
   ghost                                       Close ghost sessions
   autostart [enable|disable|status]            Toggle auto-start
   migrate   [--legacy PATH] [--target PATH]   Migrate from legacy db
+  now       [--json]                          Current machine status (compact)
+  query     [--from T] [--to T] [--bucket B] [--limit N] [--json]
+                                              Event query in time range
+  mcp                                         Run MCP server over stdio
 ";
 
 fn resolve_db() -> PathBuf {
@@ -513,6 +520,255 @@ fn cmd_migrate(_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// === now ===
+
+/// `kynoptic now`：当前机器状态一行式视图（与 MCP get_current_status 同数据面）。
+fn cmd_now(args: &[String]) -> Result<()> {
+    let as_json = args.iter().any(|a| a == "--json");
+    let conn = open_db(&resolve_db())?;
+    let status = kynoptic_mcp::state::current_status(&conn, None).map_err(Error::InvalidData)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    let obj = status
+        .as_object()
+        .ok_or_else(|| Error::InvalidData("状态非对象".into()))?;
+    println!("=== Kynoptic now ({}) ===", queries::today_local_str());
+    for (k, v) in obj {
+        println!("{k:<16} {v}");
+    }
+    Ok(())
+}
+
+// === query ===
+
+/// 解析 `--from`/`--to` 时间边界。支持：
+/// - `today` / `yesterday`（本地日界）
+/// - `YYYY-MM-DD`（本地日的起点；作为上界时为次日零点，即闭开区间语义）
+/// - RFC3339 / `YYYY-MM-DDTHH:MM`（原样使用，非 RFC3339 时补 `:00+00:00`）
+fn parse_when(s: &str, is_upper_bound: bool) -> Result<String> {
+    let shift = if is_upper_bound { 1 } else { 0 };
+    match s {
+        "today" => {
+            let (start, end) = queries::today_range();
+            Ok(if is_upper_bound { end } else { start })
+        }
+        "yesterday" => {
+            let d = queries::date_offset_str(-1 + shift);
+            queries::local_day_range(&d)
+                .map(|(start, _)| start)
+                .ok_or_else(|| Error::InvalidData(format!("无法解析时间: {s}")))
+        }
+        _ => {
+            if let Some((start, end)) = queries::local_day_range(s) {
+                // 纯日期：下界取日始，上界取次日零点（[from, to) 闭开区间）
+                return Ok(if is_upper_bound { end } else { start });
+            }
+            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                return Ok(s.to_string());
+            }
+            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+                    return Ok(format!("{}+00:00", dt.format("%Y-%m-%dT%H:%M:%S")));
+                }
+            }
+            Err(Error::InvalidData(format!(
+                "无法解析时间: {s}（支持 today/yesterday/YYYY-MM-DD/RFC3339）"
+            )))
+        }
+    }
+}
+
+/// bucket 过滤：接受 bucket id（`activity/keys`、`app/window`、`system/*`…）
+/// 或裸 event_type（`keyboard`…）。v0.1 events 表仍是 legacy 布局（见 CODE_NOTES §2），
+/// bucket 的第二段（监控器名）暂不参与过滤。
+fn parse_bucket(s: &str) -> Result<String> {
+    const KNOWN: &[&str] = &[
+        "keyboard",
+        "mouse",
+        "window",
+        "system",
+        "clipboard",
+        "network",
+        "session",
+        "device",
+        "location",
+    ];
+    // bucket id → event_type 的映射（v0.1 实际记录的采集类别）。
+    // 先查完整 id（activity 段下 keys/mouse 分属两类），再退回第一段。
+    const EXACT: &[(&str, &str)] = &[("activity/keys", "keyboard"), ("activity/mouse", "mouse")];
+    const HEADS: &[(&str, &str)] = &[
+        ("app", "window"),
+        ("system", "system"),
+        ("network", "network"),
+        ("session", "session"),
+        ("device", "device"),
+    ];
+    if let Some((_, etype)) = EXACT.iter().find(|(b, _)| *b == s) {
+        return Ok(etype.to_string());
+    }
+    let head = s.split('/').next().unwrap_or(s);
+    if KNOWN.contains(&head) {
+        return Ok(head.to_string());
+    }
+    if let Some((_, etype)) = HEADS.iter().find(|(b, _)| *b == head) {
+        return Ok(etype.to_string());
+    }
+    Err(Error::InvalidData(format!(
+        "未知 bucket: {s}（允许: activity/keys, activity/mouse, app/window, system/*, network/*, session/*, device/* 或裸 event_type）"
+    )))
+}
+
+struct QueryArgs {
+    from: Option<String>,
+    to: Option<String>,
+    bucket: Option<String>,
+    limit: usize,
+    json: bool,
+}
+
+fn parse_query_args(args: &[String]) -> Result<QueryArgs> {
+    let mut q = QueryArgs {
+        from: None,
+        to: None,
+        bucket: None,
+        limit: 50,
+        json: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" => {
+                i += 1;
+                q.from = args.get(i).cloned();
+            }
+            "--to" => {
+                i += 1;
+                q.to = args.get(i).cloned();
+            }
+            "--bucket" => {
+                i += 1;
+                q.bucket = args.get(i).cloned();
+            }
+            "--limit" => {
+                i += 1;
+                q.limit = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50)
+                    .clamp(1, 1000);
+            }
+            "--json" => q.json = true,
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（支持 --from/--to/--bucket/--limit/--json）"
+                )))
+            }
+        }
+        i += 1;
+    }
+    Ok(q)
+}
+
+/// `kynoptic query --from yesterday --bucket keyboard --limit 20 --json`
+fn cmd_query(args: &[String]) -> Result<()> {
+    let q = parse_query_args(args)?;
+    let from = match &q.from {
+        Some(s) if !s.is_empty() => parse_when(s, false)?,
+        _ => parse_when("today", false)?,
+    };
+    let to = match &q.to {
+        Some(s) if !s.is_empty() => Some(parse_when(s, true)?),
+        _ => None,
+    };
+    let bucket = q
+        .bucket
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(parse_bucket)
+        .transpose()?;
+
+    let conn = open_db(&resolve_db())?;
+    let sql = match (&bucket, &to) {
+        (Some(_), Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type = ?3 ORDER BY timestamp DESC LIMIT ?4",
+        (Some(_), None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 AND event_type = ?3 ORDER BY timestamp DESC LIMIT ?4",
+        (None, Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp DESC LIMIT ?4",
+        (None, None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 ORDER BY timestamp DESC LIMIT ?4",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let map_row =
+        |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String, String, String, String)> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        };
+    let rows: Vec<(String, String, String, String, String)> = match (&bucket, &to) {
+        (Some(b), Some(t)) => stmt
+            .query_map(params![from, t, b, q.limit as i64], map_row)?
+            .flatten()
+            .collect(),
+        (Some(b), None) => stmt
+            .query_map(params![from, b, q.limit as i64], map_row)?
+            .flatten()
+            .collect(),
+        (None, Some(t)) => stmt
+            .query_map(params![from, t, q.limit as i64], map_row)?
+            .flatten()
+            .collect(),
+        (None, None) => stmt
+            .query_map(params![from, q.limit as i64], map_row)?
+            .flatten()
+            .collect(),
+    };
+
+    if q.json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|(ts, t, a, app, title)| {
+                json!({
+                    "timestamp": ts, "event_type": t, "event_action": a,
+                    "app_name": app, "window_title": title,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        println!(
+            "=== {} events (from {}, limit {}) ===",
+            rows.len(),
+            from,
+            q.limit
+        );
+        println!(
+            "{:<25} {:<9} {:<12} {:<16} title",
+            "timestamp", "type", "action", "app"
+        );
+        for (ts, t, a, app, title) in &rows {
+            println!(
+                "{ts:<25} {t:<9} {a:<12} {:<16} {}",
+                truncate_col(app, 16),
+                truncate_col(title, 40)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn truncate_col(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
+// === mcp ===
+
+/// `kynoptic mcp`：启动 MCP server（stdio JSON-RPC，阻塞到 stdin 关闭）。
+fn cmd_mcp() -> Result<()> {
+    kynoptic_mcp::serve_stdio();
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
@@ -525,6 +781,9 @@ fn main() -> ExitCode {
         "ghost" => cmd_ghost(),
         "autostart" => cmd_autostart(&args[1..]),
         "migrate" => cmd_migrate(&args[1..]),
+        "now" => cmd_now(&args[1..]),
+        "query" => cmd_query(&args[1..]),
+        "mcp" => cmd_mcp(),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE);
             Ok(())
@@ -539,5 +798,105 @@ fn main() -> ExitCode {
             eprintln!("✗ {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === parse_when ===
+
+    #[test]
+    fn parse_when_pure_date_respects_upper_bound() {
+        let lower = parse_when("2026-09-09", false).unwrap();
+        let upper = parse_when("2026-09-09", true).unwrap();
+        assert!(
+            lower < upper,
+            "同一天的上界应为其次日零点: {lower} < {upper}"
+        );
+        // 上界恰为下界 + 1 天
+        let lu = chrono::DateTime::parse_from_rfc3339(&lower).unwrap();
+        let uu = chrono::DateTime::parse_from_rfc3339(&upper).unwrap();
+        assert_eq!((uu - lu).num_hours(), 24);
+    }
+
+    #[test]
+    fn parse_when_yesterday_shifts_with_bound() {
+        let lower = parse_when("yesterday", false).unwrap();
+        let upper = parse_when("yesterday", true).unwrap();
+        assert!(lower < upper);
+        // --to yesterday = 今日起点
+        let (today_start, _) = queries::today_range();
+        assert_eq!(upper, today_start);
+    }
+
+    #[test]
+    fn parse_when_rfc3339_passthrough_and_naive_datetime() {
+        let t = parse_when("2026-09-09T12:30:00+08:00", false).unwrap();
+        assert_eq!(t, "2026-09-09T12:30:00+08:00");
+        let naive = parse_when("2026-09-09T12:30", false).unwrap();
+        assert_eq!(naive, "2026-09-09T12:30:00+00:00");
+        let naive_s = parse_when("2026-09-09T12:30:45", true).unwrap();
+        assert_eq!(naive_s, "2026-09-09T12:30:45+00:00");
+    }
+
+    #[test]
+    fn parse_when_rejects_garbage() {
+        assert!(parse_when("not-a-time", false).is_err());
+        assert!(parse_when("", false).is_err());
+    }
+
+    // === parse_bucket ===
+
+    #[test]
+    fn parse_bucket_maps_bucket_ids_to_event_types() {
+        assert_eq!(parse_bucket("activity/keys").unwrap(), "keyboard");
+        assert_eq!(parse_bucket("activity/mouse").unwrap(), "mouse");
+        assert_eq!(parse_bucket("app/window").unwrap(), "window");
+        assert_eq!(parse_bucket("system/anything").unwrap(), "system");
+        assert_eq!(parse_bucket("keyboard").unwrap(), "keyboard");
+    }
+
+    #[test]
+    fn parse_bucket_rejects_unknown() {
+        assert!(parse_bucket("pet/mood").is_err());
+        assert!(parse_bucket("").is_err());
+    }
+
+    // === parse_query_args ===
+
+    #[test]
+    fn query_args_defaults_and_clamping() {
+        let q = parse_query_args(&[]).unwrap();
+        assert!(!q.json);
+        assert_eq!(q.limit, 50);
+        assert!(q.from.is_none() && q.to.is_none() && q.bucket.is_none());
+
+        let a: Vec<String> = ["--limit", "9999", "--json", "--bucket", "keyboard"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let q = parse_query_args(&a).unwrap();
+        assert_eq!(q.limit, 1000, "limit 钳到 1000");
+        assert!(q.json);
+        assert_eq!(q.bucket.as_deref(), Some("keyboard"));
+    }
+
+    #[test]
+    fn query_args_rejects_unknown_flag() {
+        let a: Vec<String> = vec!["--gpu".to_string()];
+        assert!(parse_query_args(&a).is_err());
+    }
+
+    // === 输出整形 ===
+
+    #[test]
+    fn truncate_col_caps_long_text() {
+        assert_eq!(truncate_col("short", 16), "short");
+        let long = "x".repeat(100);
+        let t = truncate_col(&long, 16);
+        assert_eq!(t.chars().count(), 16);
+        assert!(t.ends_with('…'));
     }
 }

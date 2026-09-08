@@ -4,12 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "命令行工具:统计/导出/报告/分析/数据库维护"
 
+# 两个 bin 名同源 main.rs：`kynoptic`（网站 MCP 配置示例的 command）
+# 与 `kynoptic-ctl`（历史文档中的名字）。行为完全一致。
 [[bin]]
 name = "kynoptic"
 path = "src/main.rs"
 
+[[bin]]
+name = "kynoptic-ctl"
+path = "src/main.rs"
+
 [dependencies]
 kynoptic-core = { path = "../core" }
+kynoptic-mcp = { path = "../mcp" }
 chrono = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1"
