@@ -1,0 +1,37 @@
+{
+  "categories": {
+    "game": [
+      "steam", "epicgames", "league", "valorant", "csgo",
+      "dota", "genshin", "javaw", "yszhuce"
+    ],
+    "development": [
+      "code", "devenv", "idea", "vim", "nvim", "git", "docker",
+      "node", "python", "cargo", "rustc", "g++", "gcc", "make",
+      "cmake", "windowsterminal", "powershell", "cmd"
+    ],
+    "browser": ["chrome", "firefox", "msedge", "opera", "brave"],
+    "communication": [
+      "wechat", "dingtalk", "slack", "discord", "telegram", "qq", "tim", "feishu"
+    ],
+    "media": ["vlc", "spotify", "potplayer", "mpc", "foobar2000", "netease"],
+    "design": [
+      "photoshop", "illustrator", "figma", "indesign",
+      "premiere", "aftereffects", "blender"
+    ],
+    "writing": [
+      "winword", "wps", "notion", "obsidian", "typora", "onenote", "excel", "powerpnt"
+    ],
+    "terminal": ["windowsterminal", "powershell", "cmd", "bash", "wsl"]
+  },
+  "diary_activities": {
+    "code": "写代码",
+    "devenv": "写代码",
+    "chrome": "浏览网页",
+    "msedge": "浏览网页",
+    "firefox": "浏览网页",
+    "wechat": "聊天",
+    "dingtalk": "聊天",
+    "feishu": "聊天",
+    "explorer": "管理文件"
+  }
+}
