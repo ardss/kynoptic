@@ -7,7 +7,11 @@ pub const CHANNEL_CAPACITY: usize = 20_000;
 
 // === 写入线程 ===
 pub const WRITE_BATCH_SIZE: usize = 300;
-pub const WRITE_FLUSH_INTERVAL_SECS: u64 = 5;
+/// 小批 flush 间隔。perf-idle 2026-09 实测每次事务提交因 events 表 + 4~5 个
+/// 索引要写 ~6 个 4KB WAL 页（≈38KB/提交），间隔过短时磁盘写入被提交开销
+/// 主导：5s → 10 分钟窗口 WAL 增长 1.9MB；30s 在事件新鲜度（最大延迟 30s）
+/// 与磁盘足迹之间取平衡（用户可见默认值变更，见 BENCHMARKS.md）。
+pub const WRITE_FLUSH_INTERVAL_SECS: u64 = 30;
 
 // === 后台线程间隔 ===
 pub const MAINTENANCE_INTERVAL_SECS: u64 = 24 * 3600;
