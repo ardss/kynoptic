@@ -1,0 +1,15 @@
+[package]
+name = "kynoptic-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server stub —— 工具面注册与参数校验（见 mcp-tool-spec-v1）"
+
+[dependencies]
+kynoptic-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "1"
