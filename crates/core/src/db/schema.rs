@@ -21,6 +21,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_bucket_model",
         include_str!("migrations/0002_bucket_model.sql"),
     ),
+    (
+        "0003_perf_indexes",
+        include_str!("migrations/0003_perf_indexes.sql"),
+    ),
 ];
 
 /// 0001 的内容单独导出：供 CLI 等外部工具对裸库做幂等初始化。

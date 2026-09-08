@@ -24,7 +24,7 @@ pub const DB_FILENAME: &str = "kynoptic.db";
 /// 读连接池耗尽时最多等待的周期数（每周期 5s）。
 /// 超过则降级为新建临时连接，避免调用方无限阻塞。
 pub const READER_POOL_MAX_WAITS: u32 = 3;
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段

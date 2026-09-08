@@ -419,13 +419,22 @@ pub fn top_app_window_in_range(
 ///
 /// 供 [`crate::anomaly`] 的深夜活动检测——此前该业务模块手写
 /// `COUNT(*) WHERE CAST(substr(timestamp,12,2)) >= ?`。
+///
+/// 性能注（perf-query 1M 事件库 2026-09 实测）：日期过滤必须用
+/// `timestamp >= ?1 AND timestamp < ?2` 的可走索引（idx_events_timestamp）
+/// 区间谓词；`substr(timestamp,1,10)=?` 对整列求值无法走索引，1M 行时每次
+/// 调用退化为全表扫描（~300ms+），get_anomalies(7d) 会累计到秒级。
 pub fn late_night_key_count(conn: &Connection, date: &str, hour_threshold: i64) -> i64 {
+    let (start, end) = match super::local_day_range(date) {
+        Some(r) => r,
+        None => (date.to_string(), format!("{date}\u{7f}")),
+    };
     conn.query_row(
         "SELECT COUNT(*) FROM events \
-         WHERE substr(timestamp, 1, 10) = ?1 \
-           AND CAST(substr(timestamp, 12, 2) AS INTEGER) >= ?2 \
+         WHERE timestamp >= ?1 AND timestamp < ?2 \
+           AND CAST(substr(timestamp, 12, 2) AS INTEGER) >= ?3 \
            AND event_type = 'keyboard' AND event_action = 'press'",
-        params![date, hour_threshold],
+        params![start, end, hour_threshold],
         |r| r.get::<_, i64>(0),
     )
     .unwrap_or(0)
@@ -448,19 +457,24 @@ pub fn daily_agg_avg_apm_before(conn: &Connection, date: &str) -> f64 {
 /// 返回 (minute, count)，供 [`crate::anomaly`] 的 APM 突增检测消费。
 pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(String, i64)> {
     let mut out = Vec::new();
+    // 可走索引的日期区间谓词（见 late_night_key_count 性能注）
+    let (start, end) = match super::local_day_range(date) {
+        Some(r) => r,
+        None => (date.to_string(), format!("{date}\u{7f}")),
+    };
     let Ok(mut stmt) = conn.prepare(
         "SELECT substr(timestamp, 1, 16), COUNT(*) AS n \
          FROM events \
-         WHERE substr(timestamp, 1, 10) = ?1 \
+         WHERE timestamp >= ?1 AND timestamp < ?2 \
            AND event_type IN ('keyboard', 'mouse') \
          GROUP BY 1 \
-         HAVING n >= ?2 \
+         HAVING n >= ?3 \
          ORDER BY n DESC \
          LIMIT 5",
     ) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map(params![date, min_count], |r| {
+    let Ok(rows) = stmt.query_map(params![start, end, min_count], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) else {
         return out;
@@ -476,19 +490,24 @@ pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(
 /// 供 [`crate::anomaly`] 的新应用突增检测消费。
 pub fn top_apps_by_event_types(conn: &Connection, date: &str, limit: i64) -> Vec<(String, i64)> {
     let mut out = Vec::new();
+    // 可走索引的日期区间谓词（见 late_night_key_count 性能注）
+    let (start, end) = match super::local_day_range(date) {
+        Some(r) => r,
+        None => (date.to_string(), format!("{date}\u{7f}")),
+    };
     let Ok(mut stmt) = conn.prepare(
         "SELECT IFNULL(app_name, '(unknown)') AS app, COUNT(*) AS n \
          FROM events \
-         WHERE substr(timestamp, 1, 10) = ?1 \
+         WHERE timestamp >= ?1 AND timestamp < ?2 \
            AND app_name IS NOT NULL \
            AND event_type IN ('keyboard', 'mouse', 'window') \
          GROUP BY app \
          ORDER BY n DESC \
-         LIMIT ?2",
+         LIMIT ?3",
     ) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map(params![date, limit], |r| {
+    let Ok(rows) = stmt.query_map(params![start, end, limit], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) else {
         return out;
