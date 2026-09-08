@@ -149,6 +149,27 @@ fn writer_loop_inner(
                     return Some(n);
                 }
             }
+        } else {
+            // batch 非空但未到 flush 时机：阻塞等待剩余时间（或新事件），
+            // 而不是回到 try_recv 空转。旧实现在此直接继续外层循环 →
+            // 只要 batch 里有任何待 flush 事件，writer 线程就以 ~100% 单核
+            // 空转直到 flush_interval 到期（perf-idle 基准 2026-09 实测的
+            // 空载 CPU 根因）。
+            let until_flush = flush_interval
+                .saturating_sub(now.duration_since(last_flush))
+                .min(Duration::from_millis(500));
+            match rx.recv_timeout(until_flush) {
+                Ok(event) => batch.push(event),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let n = batch.len();
+                    if n > 0 {
+                        db.insert_events(&batch);
+                        total_written.fetch_add(n, Ordering::Relaxed);
+                    }
+                    return Some(n);
+                }
+            }
         }
     }
 }
