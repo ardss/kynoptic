@@ -154,11 +154,11 @@
 <header class="hero">
   <div class="wrap">
     <div class="badge">● <span class="l en">Open source · Windows 10/11 · v0.1 in development</span><span class="l zh">开源 · Windows 10/11 · v0.1 开发中</span></div>
-    <h1><span class="l en">Give your AI a memory of <span class="quiet">what your PC has been doing.</span></span><span class="l zh">给你的 AI 装上眼睛，<span class="quiet">看见你的电脑在干什么。</span></span></h1>
-    <p class="sub"><span class="l en">Kynoptic quietly records which apps you use, how active you are, and what your hardware is doing — into one local file that Claude, Cursor, or any MCP AI can query. No screenshots. No cloud. Nothing leaves your device.</span><span class="l zh">Kynoptic 在后台安静地记录：你用了哪些软件、多活跃、硬件状态如何——全部存进一个本地文件，Claude、Cursor 或任何支持 MCP 的 AI 都能直接查询。不截屏、不上云、数据不离机。</span></p>
+    <h1><span class="l en">What did you do on this computer <span class="quiet">yesterday afternoon?</span></span><span class="l zh">昨天下午，你在这台电脑上干了什么？<span class="quiet">现在这句话可以直接问 AI。</span></span></h1>
+    <p class="sub"><span class="l en">Kynoptic records which apps you use and what your machine was doing into one local file that Claude, Cursor, or any MCP AI can search. So next time you can't remember where you saw or did something — just ask.</span><span class="l zh">Kynoptic 在后台记下你用过哪些软件、机器当时在干什么，存成一个 AI 能查的本地文件。下次想不起某个东西在哪看过、哪天做过，直接问就行。</span></p>
     <div class="ctas">
       <a class="btn btn-primary" href="#waitlist"><span class="l en">Get launch updates</span><span class="l zh">上线时通知我</span></a>
-      <a class="btn btn-ghost" href="https://github.com/ardss/kynoptic"><span class="l en">★ Star on GitHub</span><span class="l zh">★ 去 GitHub 点个 Star</span></a>
+      <a class="btn btn-ghost" href="https://github.com/ardss/kynoptic"><span class="l en">Star on GitHub</span><span class="l zh">去 GitHub 点个 Star</span></a>
     </div>
     <div class="demo">
       <div class="bar"><i></i><i></i><i></i><span class="t">Claude Desktop — MCP</span></div>
@@ -168,7 +168,7 @@
 <span class="a"><span class="l en">14:02–15:10  VS Code — repo "kynoptic", 3 files, deep-focus session</span><span class="l zh">14:02–15:10  VS Code —— kynoptic 仓库，3 个文件，深度专注</span></span>
 <span class="a"><span class="l en">15:10–15:26  Chrome · 23 tabs — MDN, GitHub issues</span><span class="l zh">15:10–15:26  Chrome · 23 个标签页 —— MDN、GitHub issues</span></span>
 <span class="a"><span class="l en">15:26–15:58  Steam + game session — GPU 82%, 71°C, fan up</span><span class="l zh">15:26–15:58  Steam + 游戏 —— GPU 82%、71°C、风扇提速</span></span>
-<span class="dim"><span class="l en">source: local SQLite · 214 KB · never uploaded</span><span class="l zh">来源：本地 SQLite · 214 KB · 从未上传</span></span></pre>
+<span class="dim"><span class="l en">source: local SQLite file, 214 KB</span><span class="l zh">来源：本地 SQLite 文件，214 KB</span></span></pre>
     </div>
   </div>
 </header>
@@ -181,22 +181,22 @@
     <p class="sub"><span class="l en">Your AI assistant already knows everything on the internet. Kynoptic gives it the one thing it's missing: what actually happened on your machine.</span><span class="l zh">AI 助手知道整个互联网，却不知道你的电脑上发生过什么。Kynoptic 补上的正是这块空白。</span></p>
     <div class="grid3">
       <div class="case">
-        <div class="icon">🧠</div>
-        <h3 class="l en">"What was that app called?"</h3><h3 class="l zh">"那个软件叫什么来着？"</h3>
-        <p class="l en">You remember using it Tuesday afternoon — not the name. Your AI can now look it up instead of guessing.</p><p class="l zh">记得周二下午用过，就是想不起名字。现在 AI 可以直接查记录回答你，而不是瞎猜。</p>
+        <div class="icon">01</div>
+        <h3 class="l en">"Where did I see that?"</h3><h3 class="l zh">"那个东西在哪看到的？"</h3>
+        <p class="l en">Someone linked a library last week — Slack, Discord, or HN? You don't have to guess where to search. Your AI looks through your machine's history and tells you.</p><p class="l zh">上周有人发过一个库的链接——Slack、Discord 还是 HN 来着？不用再猜该去哪搜，AI 直接翻这台机器的历史告诉你。</p>
+        <div class="ask"><span class="l en">"Find the page where someone mentioned a golang library last week"</span><span class="l zh">"找一下上周有人提到某个 golang 库的那个页面"</span></div>
+      </div>
+      <div class="case">
+        <div class="icon">02</div>
+        <h3 class="l en">"That app I used on Tuesday?"</h3><h3 class="l zh">"周二用过的那个软件叫什么？"</h3>
+        <p class="l en">You remember using it Tuesday afternoon — just not the name. Your AI can look it up instead of guessing.</p><p class="l zh">记得周二下午用过，就是想不起名字。AI 直接查记录回答你，而不是瞎猜。</p>
         <div class="ask"><span class="l en">"Find the app I used Tuesday afternoon to edit PDFs"</span><span class="l zh">"帮我找周二下午用过的那个 PDF 编辑软件"</span></div>
       </div>
       <div class="case">
-        <div class="icon">🔥</div>
-        <h3 class="l en">"Why did it crash?"</h3><h3 class="l zh">"刚才为什么卡了？"</h3>
-        <p class="l en">Game stuttered at 9 pm? Check what the GPU, thermal, and active apps were doing at that exact minute.</p><p class="l zh">晚上 9 点游戏掉帧？查一下那一分钟 GPU 温度、负载和前台应用，原因一目了然。</p>
+        <div class="icon">03</div>
+        <h3 class="l en">"Why did it stutter at 9 pm?"</h3><h3 class="l zh">"晚上 9 点为什么卡？"</h3>
+        <p class="l en">Check what the GPU, thermals, and foreground apps were doing at that exact minute — then the weekly summary writes itself.</p><p class="l zh">查一下那一分钟 GPU 温度、负载和前台应用在干什么；每周的时间总结也能顺手生成。</p>
         <div class="ask"><span class="l en">"What was my GPU temperature doing at 21:00 yesterday?"</span><span class="l zh">"昨天 21:00 前后 GPU 温度怎么变化的？"</span></div>
-      </div>
-      <div class="case">
-        <div class="icon">⏱️</div>
-        <h3 class="l en">"Where did my time go?"</h3><h3 class="l zh">"我的时间花哪了？"</h3>
-        <p class="l en">Daily and weekly activity summaries generated from your own data — no manual timers, no cloud tracking service.</p><p class="l zh">基于你自己的本地数据生成每天/每周的活动总结——不用手动打卡，也不经过任何云服务。</p>
-        <div class="ask"><span class="l en">"Summarize my screen focus time this week"</span><span class="l zh">"总结一下我本周的专注时间"</span></div>
       </div>
     </div>
   </div>
@@ -229,7 +229,7 @@
 <span class="kw">$</span> <span class="fn">kynoptic</span> query --from yesterday \
     --metric gpu --join window
 
-<span class="cm"># <span class="l en">your data, plain SQL</span><span class="l zh">数据是你自己的，直接 SQL</span></span>
+<span class="cm"># <span class="l en">or query the history as plain SQL</span><span class="l zh">也可以直接用 SQL 查历史</span></span>
 <span class="kw">$</span> <span class="fn">sqlite3</span> kynoptic.db <span class="str">"SELECT * FROM events"</span></pre>
       </div>
     </div>
@@ -240,13 +240,8 @@
 <section class="privacy" id="privacy">
   <div class="wrap">
     <div class="kicker"><span class="l en">Privacy</span><span class="l zh">隐私</span></div>
-    <h2><span class="l en">It watches activity, never content.</span><span class="l zh">记录活动，不碰内容。</span></h2>
-    <p class="sub"><span class="l en">Kynoptic knows <em>what kind</em> of thing happened — never what your screen showed. By design, there is nothing sensitive to leak.</span><span class="l zh">Kynoptic 只记录"发生了哪类活动"，永远不记录屏幕上显示了什么。从设计上就不存在可泄露的敏感画面。</span></p>
-    <div class="p-cards">
-      <div class="p-card"><h3 class="l en">No keylogging</h3><h3 class="l zh">不记录按键内容</h3><p class="l en">Only aggregate counts of input events are stored. Password fields are excluded at the hook level — not even a count.</p><p class="l zh">只存输入事件的聚合计数；密码框在系统钩子层就被排除——连计数都没有。</p></div>
-      <div class="p-card"><h3 class="l en">No screenshots</h3><h3 class="l zh">没有截屏</h3><p class="l en">No pixels, no frames, no OCR. Nothing to replay, nothing to leak.</p><p class="l zh">不抓像素、不录帧、不做 OCR。没有可回放的东西，也就没有可泄露的东西。</p></div>
-      <div class="p-card"><h3 class="l en">Local only</h3><h3 class="l zh">纯本地</h3><p class="l en">One SQLite file on your disk. No servers, no telemetry, no upload code path — verifiable in the open source.</p><p class="l zh">一切都在你磁盘上的一个 SQLite 文件里。没有服务器、没有遥测、没有上传代码路径——源码公开可审计。</p></div>
-    </div>
+    <h2><span class="l en">One paragraph, because it's simple.</span><span class="l zh">一段话讲完，因为它本来就简单。</span></h2>
+    <p class="sub"><span class="l en">Kynoptic records events, not content: which app was in front, for how long, plus machine metrics. No screenshots, no keystroke contents, no OCR — so there is nothing on disk to replay or leak. Everything lands in one SQLite file, there is no upload code path, and the source is open. When you ask your AI a question, the answer is computed on your machine; no third-party LLM is involved unless you plug in your own API key.</span><span class="l zh">Kynoptic 记录的是事件，不是内容：哪个应用在前台、多久、加上机器指标。没有截屏、没有按键内容、没有 OCR——磁盘上不存在可以回放或泄露的东西。一切都在一个 SQLite 文件里，代码里没有上传路径，源码公开。你向 AI 提问时，答案在你的机器上算出来；除非你自己填入 API key，否则没有任何第三方大模型参与。</span></p>
   </div>
 </section>
 
