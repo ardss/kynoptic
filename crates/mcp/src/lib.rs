@@ -1,10 +1,14 @@
-//! kynoptic-mcp —— MCP server 工具面（v0.1 stub）
+//! kynoptic-mcp —— MCP server（stdio JSON-RPC 2.0）
 //!
-//! 依据《mcp-tool-spec-v1》定义工具面：多语义小工具、列表类工具必带 `limit`
-//! （默认 20，上限 100）。本 crate 目前只实现工具注册表与参数校验的纯逻辑部分，
-//! 传输层（stdio/协议编解码）后置。
+//! 依据《mcp-tool-spec-v1》实现五工具：多语义小工具、列表类工具必带 `limit`
+//! （默认 20，上限 100）。协议层见 [`server`]，数据面见 [`state`]。
 
 use serde::{Deserialize, Serialize};
+
+pub mod server;
+pub mod state;
+
+pub use server::{serve_stdio, McpServer};
 
 /// 规范中的 MCP 工具（不含 Resource）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
