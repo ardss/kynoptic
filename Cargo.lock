@@ -408,6 +408,7 @@ dependencies = [
  "csv",
  "env_logger",
  "kynoptic-core",
+ "kynoptic-mcp",
  "log",
  "rusqlite",
  "serde_json",
@@ -435,7 +436,10 @@ dependencies = [
 name = "kynoptic-mcp"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "kynoptic-core",
+ "log",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

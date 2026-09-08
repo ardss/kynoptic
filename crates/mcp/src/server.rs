@@ -38,10 +38,8 @@ impl McpServer {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
 
-        if id.is_none() {
-            // 通知：initialized 等一律静默吸收（MCP 无推送语义，v0.1 不发通知）
-            return None;
-        }
+        // 通知（无 id）：initialized 等一律静默吸收（MCP 无推送语义，v0.1 不发通知）
+        id.as_ref()?;
 
         let result = match method {
             "initialize" => Ok(self.initialize(&params)),
@@ -149,7 +147,10 @@ impl McpServer {
                     .get("signal")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "缺少 signal 参数".to_string())?;
-                let timeout = args.get("timeout_sec").and_then(|v| v.as_u64()).unwrap_or(300);
+                let timeout = args
+                    .get("timeout_sec")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(300);
                 state::wait_for(&conn, signal, timeout)
             }
             other => Err(format!(
@@ -175,9 +176,7 @@ fn tool_text(v: &Value, is_error: bool) -> Value {
 
 /// tools/list 的工具定义（name + description + inputSchema）。
 fn tool_definitions() -> Vec<Value> {
-    let limit_schema = |desc: &str| {
-        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": desc })
-    };
+    let limit_schema = |desc: &str| json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": desc });
     vec![
         json!({
             "name": "get_current_status",
@@ -277,11 +276,7 @@ pub fn serve_stdio() {
     log::info!("kynoptic-mcp 启动，db={db_path}");
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    serve(
-        stdin.lock(),
-        &mut stdout.lock(),
-        &McpServer::new(db_path),
-    );
+    serve(stdin.lock(), &mut stdout.lock(), &McpServer::new(db_path));
 }
 
 #[cfg(test)]
@@ -331,7 +326,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["get_current_status", "get_summary", "get_timeline", "get_anomalies", "wait_for"]
+            [
+                "get_current_status",
+                "get_summary",
+                "get_timeline",
+                "get_anomalies",
+                "wait_for"
+            ]
         );
         for t in resp["result"]["tools"].as_array().unwrap() {
             assert!(t["inputSchema"].is_object(), "每个工具需带 inputSchema");

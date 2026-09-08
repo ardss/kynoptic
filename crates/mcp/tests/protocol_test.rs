@@ -24,7 +24,12 @@ fn seeded_db() -> PathBuf {
     let mut events: Vec<Event> = Vec::new();
     let now = Utc::now().to_rfc3339();
 
-    let push = |e: &mut Vec<Event>, ts: &str, t: EventType, a: EventAction, app: Option<&str>, data: Value| {
+    let push = |e: &mut Vec<Event>,
+                ts: &str,
+                t: EventType,
+                a: EventAction,
+                app: Option<&str>,
+                data: Value| {
         let mut ev = Event::new(a, t);
         ev.timestamp = ts.to_string();
         ev.app_name = app.map(String::from);
@@ -32,10 +37,38 @@ fn seeded_db() -> PathBuf {
         ev.event_data = Some(data);
         e.push(ev);
     };
-    push(&mut events, &now, EventType::Keyboard, EventAction::Press, None, json!({}));
-    push(&mut events, &now, EventType::Keyboard, EventAction::Press, None, json!({}));
-    push(&mut events, &now, EventType::Mouse, EventAction::Click, None, json!({}));
-    push(&mut events, &now, EventType::Window, EventAction::Switch, Some("vscode"), json!({}));
+    push(
+        &mut events,
+        &now,
+        EventType::Keyboard,
+        EventAction::Press,
+        None,
+        json!({}),
+    );
+    push(
+        &mut events,
+        &now,
+        EventType::Keyboard,
+        EventAction::Press,
+        None,
+        json!({}),
+    );
+    push(
+        &mut events,
+        &now,
+        EventType::Mouse,
+        EventAction::Click,
+        None,
+        json!({}),
+    );
+    push(
+        &mut events,
+        &now,
+        EventType::Window,
+        EventAction::Switch,
+        Some("vscode"),
+        json!({}),
+    );
     push(
         &mut events,
         &now,
@@ -75,7 +108,9 @@ fn roundtrip(db_path: &str, requests: &[Value]) -> Vec<Value> {
 }
 
 fn text_payload(resp: &Value) -> Value {
-    let text = resp["result"]["content"][0]["text"].as_str().expect("text content");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
     serde_json::from_str(text).expect("payload 应为 JSON")
 }
 
@@ -96,7 +131,10 @@ fn full_initialize_list_call_roundtrip() {
     );
     // 通知不回包：6 条请求（1 条通知）→ 5 条响应
     assert_eq!(responses.len(), 5);
-    assert_eq!(responses[0]["result"]["protocolVersion"], json!("2024-11-05"));
+    assert_eq!(
+        responses[0]["result"]["protocolVersion"],
+        json!("2024-11-05")
+    );
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 5);
 

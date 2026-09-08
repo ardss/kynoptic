@@ -691,10 +691,10 @@ fn cmd_query(args: &[String]) -> Result<()> {
 
     let conn = open_db(&resolve_db())?;
     let sql = match (&bucket, &to) {
-        (Some(_), Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type = ?3 ORDER BY timestamp DESC LIMIT ?4",
-        (Some(_), None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 AND event_type = ?3 ORDER BY timestamp DESC LIMIT ?4",
-        (None, Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp DESC LIMIT ?4",
-        (None, None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ?1 ORDER BY timestamp DESC LIMIT ?4",
+        (Some(_), Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ? AND timestamp < ? AND event_type = ? ORDER BY timestamp DESC LIMIT ?",
+        (Some(_), None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ? AND event_type = ? ORDER BY timestamp DESC LIMIT ?",
+        (None, Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp DESC LIMIT ?",
+        (None, None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?",
     };
     let mut stmt = conn.prepare(sql)?;
     let map_row =

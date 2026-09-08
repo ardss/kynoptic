@@ -54,10 +54,7 @@ pub fn current_status(conn: &Connection, groups: Option<&[String]>) -> Result<Va
         Some(g) if !g.is_empty() => {
             for s in g {
                 if !GROUPS.contains(&s.as_str()) {
-                    return Err(format!(
-                        "未知分组: {s}（允许: {}）",
-                        GROUPS.join("/")
-                    ));
+                    return Err(format!("未知分组: {s}（允许: {}）", GROUPS.join("/")));
                 }
             }
             g.to_vec()
@@ -72,7 +69,10 @@ pub fn current_status(conn: &Connection, groups: Option<&[String]>) -> Result<Va
             "system" => {
                 out.insert("cpu_pct".into(), f_or_null(state_cpu(conn, &state)));
                 out.insert("mem_pct".into(), f_or_null(state_mem(conn, &state)));
-                out.insert("max_temp_c".into(), state.get("max_temp_c").cloned().unwrap_or(Value::Null));
+                out.insert(
+                    "max_temp_c".into(),
+                    state.get("max_temp_c").cloned().unwrap_or(Value::Null),
+                );
                 out.insert("apm_5min".into(), f_or_null(Some(apm_last_5min(conn))));
             }
             "activity" => {
@@ -113,9 +113,7 @@ fn read_current_state(conn: &Connection) -> std::collections::HashMap<String, Va
     let Ok(mut stmt) = conn.prepare("SELECT key, value FROM current_state") else {
         return map;
     };
-    if let Ok(rows) = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    }) {
+    if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
         for (k, v) in rows.flatten() {
             // value 列存 TEXT，优先解析为 JSON 标量，失败则原样字符串
             let val = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
@@ -144,10 +142,7 @@ fn state_mem(conn: &Connection, state: &std::collections::HashMap<String, Value>
         .as_f64()
 }
 
-fn battery_pct(
-    conn: &Connection,
-    state: &std::collections::HashMap<String, Value>,
-) -> Option<f64> {
+fn battery_pct(conn: &Connection, state: &std::collections::HashMap<String, Value>) -> Option<f64> {
     if let Some(v) = state.get("battery_pct").and_then(|v| v.as_f64()) {
         return Some(v);
     }
@@ -208,16 +203,13 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn latest_event_data(
-    conn: &Connection,
-    etype: EventType,
-    action: EventAction,
-) -> Option<Value> {
+fn latest_event_data(conn: &Connection, etype: EventType, action: EventAction) -> Option<Value> {
     queries::latest_event_data(conn, etype, action)
 }
 
 fn f_or_null(v: Option<f64>) -> Value {
-    v.map(|f| json!((f * 100.0).round() / 100.0)).unwrap_or(Value::Null)
+    v.map(|f| json!((f * 100.0).round() / 100.0))
+        .unwrap_or(Value::Null)
 }
 
 fn s_or_null(v: Option<String>) -> Value {
@@ -388,7 +380,7 @@ pub fn timeline(
             .or_else(|| to_t.map(|t| t.to_rfc3339()))
             .unwrap_or_else(|| ts.clone());
         let end = if end <= *ts { ts.clone() } else { end }; // 防御：时间戳倒挂
-        // hour 粒度：与上一段同应用且同一本地小时 → 合并
+                                                             // hour 粒度：与上一段同应用且同一本地小时 → 合并
         if granularity == "hour" {
             if let Some(last) = segs.last_mut() {
                 if last.0 == *app && local_hour_bucket(&last.1) == local_hour_bucket(ts) {
@@ -461,7 +453,7 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
     Ok(match signal {
         "late_night" => {
             let hour = Local::now().hour();
-            hour >= kynoptic_core::constants::LATE_NIGHT_HOUR_START as u32
+            hour >= kynoptic_core::constants::LATE_NIGHT_HOUR_START
         }
         "low_battery" => {
             let Some(d) = latest_event_data(conn, EventType::System, EventAction::BatteryStatus)
@@ -477,7 +469,8 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
             };
             d.pointer("/memory/used_percent")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) >= 90.0
+                .unwrap_or(0.0)
+                >= 90.0
         }
         "thermal_hot" => {
             // v0.1 无温度监控器（R8 裁剪），数据面恒缺 → 永不触发
@@ -502,11 +495,8 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
         }
         "network_down" => {
             // 有系统心跳但 15 分钟内无网络快照 → 视为网络不可用
-            let hb = queries::latest_event_ts_by_action(
-                conn,
-                EventType::System,
-                EventAction::Heartbeat,
-            );
+            let hb =
+                queries::latest_event_ts_by_action(conn, EventType::System, EventAction::Heartbeat);
             let net = queries::latest_event_ts_by_action(
                 conn,
                 EventType::Network,
@@ -561,7 +551,14 @@ mod tests {
         conn
     }
 
-    fn insert(conn: &Connection, ts: &str, t: &str, a: &str, app: Option<&str>, data: Option<Value>) {
+    fn insert(
+        conn: &Connection,
+        ts: &str,
+        t: &str,
+        a: &str,
+        app: Option<&str>,
+        data: Option<Value>,
+    ) {
         conn.execute(
             "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,?2,?3,?4,?5,?6,NULL)",
             params![ts, t, a, data.map(|v| v.to_string()), app, app],
@@ -653,8 +650,22 @@ mod tests {
     #[test]
     fn timeline_segments_and_clamp() {
         let conn = mem_conn();
-        insert(&conn, "2026-09-09T01:00:00+00:00", "window", "switch", Some("a"), None);
-        insert(&conn, "2026-09-09T01:10:00+00:00", "window", "switch", Some("b"), None);
+        insert(
+            &conn,
+            "2026-09-09T01:00:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T01:10:00+00:00",
+            "window",
+            "switch",
+            Some("b"),
+            None,
+        );
         let (v, trunc) = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
@@ -684,9 +695,30 @@ mod tests {
     #[test]
     fn timeline_hour_merges_same_app() {
         let conn = mem_conn();
-        insert(&conn, "2026-09-09T01:00:00+00:00", "window", "switch", Some("a"), None);
-        insert(&conn, "2026-09-09T01:20:00+00:00", "window", "switch", Some("a"), None);
-        insert(&conn, "2026-09-09T02:00:00+00:00", "window", "switch", Some("a"), None);
+        insert(
+            &conn,
+            "2026-09-09T01:00:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T01:20:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T02:00:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
         let (v, _) = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
@@ -702,7 +734,14 @@ mod tests {
     #[test]
     fn timeline_rejects_bad_granularity() {
         let conn = mem_conn();
-        assert!(timeline(&conn, "2026-09-09T00:00:00+00:00", "2026-09-09T01:00:00+00:00", "day", 20).is_err());
+        assert!(timeline(
+            &conn,
+            "2026-09-09T00:00:00+00:00",
+            "2026-09-09T01:00:00+00:00",
+            "day",
+            20
+        )
+        .is_err());
     }
 
     #[test]
@@ -722,7 +761,7 @@ mod tests {
             if *s == "late_night" {
                 continue;
             }
-            assert_eq!(check_signal(&conn, s).unwrap(), false, "{s}");
+            assert!(!check_signal(&conn, s).unwrap(), "{s}");
         }
     }
 
