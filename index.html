@@ -375,23 +375,21 @@ function toggleLang(){
   setLang(window.__kynlang === 'zh' ? 'en' : 'zh', true);
 }
 
-/* Waitlist: set FORMSPREE_ID after registering at formspree.io (free);
-   until then the form falls back to a mailto draft. */
-var FORMSPREE_ID = '';
+/* Waitlist via FormSubmit.co (no account; first submission sends an
+   activation email to the inbox below — click it once to go live). */
+var WL_EMAIL = 'kynoptic@outlook.com';
 function submitWL(e){
   e.preventDefault();
   var email = document.getElementById('wlemail').value.trim();
   var ok = document.getElementById('wlok');
   var done = function(){ ok.style.display = 'block'; document.getElementById('wlform').style.display = 'none'; };
-  if (FORMSPREE_ID) {
-    fetch('https://formspree.io/f/' + FORMSPREE_ID, {
-      method: 'POST', headers: {'Accept':'application/json','Content-Type':'application/json'},
-      body: JSON.stringify({email: email})
-    }).then(done).catch(done);
-  } else {
-    location.href = 'mailto:kynoptic@outlook.com?subject=' + encodeURIComponent('[Kynoptic waitlist] ' + email);
+  fetch('https://formsubmit.co/ajax/' + WL_EMAIL, {
+    method: 'POST', headers: {'Accept':'application/json','Content-Type':'application/json'},
+    body: JSON.stringify({email: email, _subject: '[Kynoptic waitlist] new signup'})
+  }).then(done).catch(function(){
+    location.href = 'mailto:' + WL_EMAIL + '?subject=' + encodeURIComponent('[Kynoptic waitlist] ' + email);
     done();
-  }
+  });
   return false;
 }
 </script>
