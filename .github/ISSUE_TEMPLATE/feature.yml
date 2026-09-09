@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest an idea for Kynoptic.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What question about your own machine can you not answer today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      description: Kynoptic is local-first. Features that send data off the machine, or that record input content rather than counts, are out of scope.
+      options:
+        - label: This feature works fully locally and respects the input-counts-only boundary
+          required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

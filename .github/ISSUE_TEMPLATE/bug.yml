@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a problem with Kynoptic on Windows.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Please include the details below.
+        Do not paste recorded event data, window titles, or file paths
+        from your own machine unless they are required to reproduce.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `kynoptic now`, or the commit hash if built from source.
+      placeholder: v0.1.x / abc1234
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 26100
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Expected vs actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. kynoptic collect
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Collector / monitors
+        - CLI (query/now/stats)
+        - Dashboard
+        - MCP server
+        - Tray
+        - Storage / migrations
+        - Build / other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      render: text

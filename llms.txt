@@ -1,0 +1,64 @@
+# Kynoptic
+
+> A local-first activity awareness layer for Windows. Kynoptic records
+> which applications you use, when your machine is busy, and what
+> changes on your system - entirely on your machine - and answers
+> questions about it later through a CLI, a local dashboard, or MCP.
+
+## What it is
+
+- 40 system monitors (foreground window/app switches, keyboard/mouse
+  activity counts, idle time, battery, network, devices, processes,
+  audio, brightness, Wi-Fi, and more). 14 are enabled by default
+  (pure Win32 APIs, zero subprocesses); 26 more are opt-in.
+- Raw events are stored untouched in SQLite. Aggregate tables are
+  derived read caches only; the raw layer is append-only and is never
+  truncated or cleaned up automatically.
+- Status: v0.1, active development. Language: Rust. License:
+  Apache-2.0.
+
+## Privacy boundary
+
+- No account, no telemetry, no analytics, no network calls. Data never
+  leaves the machine by default.
+- Keyboard and mouse are stored as per-minute counts only - never key
+  contents. Per-key detail is opt-in via settings.
+- The dashboard and MCP server bind to 127.0.0.1 only.
+
+## Architecture (three crates, plus a tray shell)
+
+- `crates/core` - collectors, event pipeline, SQLite storage
+  (numbered migrations), queries, monitor registry
+  (`crates/core/src/registry.rs` is the single source of truth for
+  what is enabled by default).
+- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary: `now`,
+  `query`, `stats`, `collect`, `dashboard`, `probe`, and the MCP
+  launcher. Includes a local-only read-only web dashboard.
+- `crates/mcp` - MCP server over stdio JSON-RPC 2.0.
+- `crates/tray` - pure Win32 tray shell hosting the collector and
+  dashboard in one process.
+
+## MCP tools (five)
+
+`get_current_status`, `get_summary`, `get_timeline`, `get_anomalies`,
+`wait_for` - all read locally collected data; nothing is uploaded.
+
+## Key documents
+
+- [BENCHMARKS.md](BENCHMARKS.md) - reproducible performance numbers
+  (idle CPU, memory, startup, storage per event, query p95 on a
+  1M-event database); the fact-check source for any overhead claims.
+- [APP.md](APP.md) - extended workspace docs, including the 40-monitor
+  table with sensitivity labels.
+- [CODE_NOTES.md](CODE_NOTES.md) - design and carve-out decisions.
+- [CHANGELOG.md](CHANGELOG.md) / [SECURITY.md](SECURITY.md) /
+  [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Build and test
+
+Requirements: Windows 10/11, stable Rust toolchain (MSVC target).
+
+```bash
+cargo build --workspace
+cargo test --workspace
+```
