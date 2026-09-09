@@ -14,6 +14,10 @@
 | RAM | 32 GB |
 | 构建 | `cargo build --release`（opt-level=3, lto=true, strip=true） |
 
+> 注（2026-09-09 monitors 恢复）：上游 26 个被裁监控器已恢复进仓库但**全部默认
+> 关闭**，默认启用集合精确等于 v0.1 的 14 个（见 CODE_NOTES.md §9），因此本文件
+> 所有数字的前提（默认监控集 + 零子进程）不变，无需重测。
+
 ## 复现命令
 
 ```bash

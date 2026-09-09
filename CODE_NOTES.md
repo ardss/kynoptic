@@ -11,8 +11,10 @@
   改为原生 `GetProcessTimes` 差分（两次采样间 kernel+user 时间增量 / 墙钟增量），
   保留上游 EMA（α=0.3）平滑口径。`ps.rs` 已删除。
 - **device.rs**：磁盘 I/O 速率原为 WMI `PerfDisk_PhysicalDisk`，无轻量原生等价 API
-  （PDH/IOCTL 复杂度高）。v0.1 暂返回 `None`（`DeviceSnapshot.disk_io` 为 Option 且
-  skip_serializing_if，自动省略）；`parse_disk_io` 纯函数与测试保留，待 v0.2 原生方案。
+  （PDH/IOCTL 复杂度高）。v0.1 曾暂返回 `None`。恢复后（见 §9）上游完整实现
+  （`collect_disk_io` + WMI 脚本）已回归，但因 PS 子进程约束由
+  `DeviceMonitor.enable_disk_io`（默认 `false`）门控——默认行为不变（disk_io 省略），
+  显式开启后才采集，待原生方案落地后转默认。
 
 ## 2. Schema 迁移 vs DDL 草案的偏差
 
@@ -66,8 +68,11 @@ MCP（crates/mcp）与 CLI 的 `now`/`query` 已是可用实现（stdio JSON-RPC
 - **wait_for**：spec 要求"语义层规则引擎订阅，不轮询数据库"——v0.1 无规则引擎，
   实现为 2s 间隔查库轮询（timeout_sec 默认 300、上限 1800、下限 1 保留）。
   信号覆盖：late_night / low_battery / memory_pressure / marathon_session /
-  network_down 可判定；thermal_hot / disk_almost_full 因 v0.1 无温度/磁盘监控器
-  （R8 裁剪）恒不触发（永远 timeout 而非报错）。
+  network_down 可判定。thermal_hot / disk_almost_full 原标注"恒不触发"——恢复
+  监控器后已接通：`thermal_hot` 读 `system/thermal_snapshot.max_temp_celsius ≥ 80`
+  （thermal 监控器默认关闭，启用后数据面才存在）；`disk_almost_full` 读
+  `device/device_snapshot.disks[].used_percent ≥ 90`（device 默认启用，立即可用）。
+  两者在数据缺失时仍是不触发（timeout 而非报错），语义不变。
 - **Resource（`kynoptic://events/{bucket}`）与 subscriptions/listen**：按 spec 属
   可选项，v0.1 未实现（tools/list 只含五工具）。
 - **敏感 bucket consent_token**：v0.1 采集器不写 clipboard 等敏感桶，工具面无需
@@ -122,3 +127,50 @@ crates/cli 同时产出 `kynoptic` 与 `kynoptic-ctl` 两个 bin（同一 main.r
 - 语义微差（记录在案）：缓存路径的分钟/小时桶按**本地时区**（与"今日"定义
   同源）；events 现算回退路径沿用 UTC substr 切桶。深夜检测在非 UTC 时区的
   回退路径上可能少计（旧有行为），缓存路径为本地口径。
+
+## 9. monitors：恢复上游 26 个裁剪监控器，默认全关（2026-09-09）
+
+**用户决策**："已经写了的代码不应该裁；敏感的默认关就行。"上游 40 个监控器
+全部回到 `crates/core/src/monitors/`，v0.1 的 14-monitor 裁剪撤回为
+**默认开关分层**：
+
+- 单一事实源：`crates/core/src/registry.rs`（`MONITOR_REGISTRY`，40 项，含
+  default_enabled / sensitivity（R8 ①低②中③高）/ dep（native|powershell））。
+- 默认启用集合**精确等于 v0.1 的 14 个**（`registry::default_enabled_ids`，
+  测试 `default_enabled_is_exactly_the_v01_fourteen` 锁死）——BENCHMARKS.md
+  全部空载数字的前提不受影响。
+- 恢复的 26 个全部默认关闭：R8 ② 级 12 个（中敏感，含纯原生的 browser/
+  clipboard/file_activity/media/screen_capture/usb_device/bluetooth，与
+  PS 依赖的 display/external_display/audio_input/audio_output/ime），
+  R8 ③ 级 14 个（高敏感或主题外，全部 PS 依赖：location/notification/
+  calendar/dns/security/firewall/uac/windows_update/driver/vpn/print/
+  stylus/thermal/gpu）。
+- **PS 子进程约束不变**：任何默认启用的监控器不 spawn 子进程。PS 依赖型
+  （`monitors/ps.rs` 随之恢复）代码原样恢复、默认关闭，文件头统一标注
+  "PS 子进程实现（powershell spawn），待原生 API 重写"。
+- device.rs 的磁盘 I/O 速率为 PS 依赖但 device 在默认 14 内：以
+  `DeviceMonitor::enable_disk_io`（默认 false）门控上游实现（见 §1）。
+- 配置模板：`crates/core/config/monitors.json`（严格 JSON，readme + 40 项），
+  测试 `config_template_matches_registry` 保证与注册表逐项一致。
+- `registry::create_monitors_for(&HashSet<String>)` 是按启用集构建监控器的
+  工厂；collector 默认路径走 `default_enabled_ids()`。运行时按需启用某个
+  默认关闭的监控器 = 把它的 id 放进启用集（CLI 参数面后置）。
+- MCP `wait_for` 的 thermal_hot / disk_almost_full 已接通真实数据面（§5）。
+
+### 恢复清单（26，全部默认关闭）
+
+| 监控器 | 依赖 | 级别 | | 监控器 | 依赖 | 级别 |
+|---|---|---|---|---|---|---|
+| browser | 原生 | ② | | location | PS | ③ |
+| clipboard | 原生 | ② | | notification | PS | ③ |
+| file_activity | 原生 | ② | | calendar | PS | ③ |
+| media | 原生 | ② | | dns | PS | ③ |
+| screen_capture | 原生 | ② | | security | PS | ③ |
+| usb_device | 原生 | ② | | firewall | PS | ③ |
+| bluetooth | 原生 | ② | | uac | PS | ③ |
+| display | PS | ② | | windows_update | PS | ③ |
+| external_display | PS | ② | | driver | PS | ③ |
+| audio_input | PS | ② | | vpn | PS | ③ |
+| audio_output | PS | ② | | print | PS | ③ |
+| ime | PS | ② | | stylus | PS | ③ |
+| thermal | PS | ③ | | gpu | PS | ③ |

@@ -6,11 +6,44 @@ Kynoptic 的本机感知层（采集器 + CLI + MCP 工具面）Rust workspace�
 
 | Crate | 说明 |
 |-------|------|
-| `crates/core` (`kynoptic-core`) | 采集核心：14 个 v0.1 监控器（纯 windows-sys、零 PowerShell 子进程）、事件通道/写入线程、SQLite 存储层（编号 SQL 迁移）、查询/分析 |
+| `crates/core` (`kynoptic-core`) | 采集核心：40 个监控器（14 个默认启用：纯 windows-sys、零 PowerShell 子进程；26 个恢复自上游、默认关闭）、事件通道/写入线程、SQLite 存储层（编号 SQL 迁移）、查询/分析 |
 | `crates/cli` (`kynoptic-cli`) | 命令行工具：统计/导出/报告/分析/数据库维护/实时状态/事件查询/MCP 启动（bin 名 `kynoptic` 与别名 `kynoptic-ctl`） |
 | `crates/mcp` (`kynoptic-mcp`) | MCP server（stdio JSON-RPC 2.0）：`get_current_status` / `get_summary` / `get_timeline` / `get_anomalies` / `wait_for` |
 
-v0.1 监控器（14 个）：`system` `window` `keyboard_hook` `mouse_hook` `idle` `session` `battery` `network` `device` `process` `audio` `brightness` `wifi` `power_plan`（见 `crates/core/src/monitors/`）。
+监控器全集 40 个（注册表：`crates/core/src/registry.rs`；配置模板：`crates/core/config/monitors.json`）。**默认启用 14 个**（纯 windows-sys、零子进程，与 v0.1 相同）：`system` `window` `keyboard_hook` `mouse_hook` `idle` `session` `battery` `network` `device` `process` `audio` `brightness` `wifi` `power_plan`。
+
+恢复自上游、**默认关闭**的 26 个：
+
+| 监控器 | 敏感度 | 依赖 | 采集内容 |
+|--------|--------|------|---------|
+| `browser` | 中 | 原生 | 浏览器标签页标题 |
+| `clipboard` | 中 | 原生 | 剪贴板文本哈希 |
+| `file_activity` | 中 | 原生 | 文件系统活动 |
+| `media` | 中 | 原生 | 媒体设备使用 |
+| `screen_capture` | 中 | 原生 | 截屏/录屏检测 |
+| `usb_device` | 中 | 原生 | USB 设备插拔 |
+| `bluetooth` | 中 | 原生 | 蓝牙设备 |
+| `display` | 中 | PS* | 显示器配置变化 |
+| `external_display` | 中 | PS* | 外接显示器插拔 |
+| `audio_input` | 中 | PS* | 音频输入设备插拔 |
+| `audio_output` | 中 | PS* | 音频输出设备插拔 |
+| `ime` | 中 | PS* | 输入法切换 |
+| `location` | 高 | PS* | 位置快照（IP 粗定位） |
+| `notification` | 高 | PS* | Windows 通知中心 |
+| `calendar` | 高 | PS* | 日历事件（Outlook） |
+| `dns` | 高 | PS* | DNS 查询记录 |
+| `security` | 高 | PS* | 安全事件日志 |
+| `firewall` | 高 | PS* | 防火墙事件日志 |
+| `uac` | 高 | PS* | UAC 提权事件 |
+| `windows_update` | 高 | PS* | 系统更新状态 |
+| `driver` | 高 | PS* | 驱动变化 |
+| `vpn` | 高 | PS* | VPN 状态 |
+| `print` | 高 | PS* | 打印任务 |
+| `stylus` | 高 | PS* | 触控笔设备 |
+| `thermal` | 高 | PS* | 温度传感器 |
+| `gpu` | 高 | PS* | GPU 状态快照 |
+
+\* PS = 每次采集 spawn 一个 PowerShell 子进程，默认一律关闭，代码标注"PS 子进程，待原生重写"。另外 `device`（默认启用）的磁盘 I/O 速率子功能同为 PS 依赖，默认关闭、仅显式开启后采集（容量/内存字段不受影响）。
 
 ## 构建
 
