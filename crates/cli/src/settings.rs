@@ -24,6 +24,14 @@ pub struct AppSettings {
     /// dashboard 监听端口（仅记录，dashboard 启动参数仍可覆盖）。
     #[serde(default = "default_dashboard_port")]
     pub dashboard_port: u16,
+    /// 输入采集边界：true（默认）= 只存每分钟计数，不存按键内容（隐私红线）；
+    /// false = 逐键明细（opt-in，知情用户显式开启）。
+    #[serde(default = "default_input_counts_only")]
+    pub input_counts_only: bool,
+}
+
+fn default_input_counts_only() -> bool {
+    true
 }
 
 fn default_enabled_monitors() -> Vec<String> {
@@ -43,6 +51,7 @@ impl Default for AppSettings {
             enabled_monitors: default_enabled_monitors(),
             autostart: false,
             dashboard_port: DEFAULT_DASHBOARD_PORT,
+            input_counts_only: true,
         }
     }
 }

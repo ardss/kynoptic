@@ -41,17 +41,21 @@ fn rand_jitter() -> f64 {
 
 /// 输入事件（键盘/鼠标 Hook）的存储粒度。
 ///
-/// **默认 [`InputGranularity::Raw`]：逐事件原样落库（原始数据神圣，不做折叠）**。
-/// [`InputGranularity::Minute`] 为 opt-in 的磁盘优化：输入折叠为每分钟每桶一行
-/// `input_agg` 计数型事件（见 [`crate::input_agg`]），计数语义（APM/活跃分钟/
-/// daily_agg）保持，但按键明细与鼠标坐标不再存储。
+/// **默认 [`InputGranularity::Minute`]（计数制）**：输入折叠为每分钟每桶一行
+/// `input_agg` 计数型事件（见 [`crate::input_agg`]）。这是隐私边界设计而非
+/// 数据裁剪——SOP 阶段四监控类项目硬标准："键盘类数据只存计数不存内容，
+/// 这是与 spyware 划清界限的核心证据"。计数语义（APM/活跃分钟/daily_agg）
+/// 完整保留。
+///
+/// [`InputGranularity::Raw`] 为 opt-in：逐事件原样落库（含按键明细与鼠标
+/// 坐标），供明确知情、需要明细的用户在设置中显式开启。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputGranularity {
-    /// 逐事件原样落库（默认；行为与 v0.1 一致）
+    /// 每分钟每桶一行计数型事件（默认；隐私边界：只存计数不存内容）
     #[default]
-    Raw,
-    /// 每分钟每桶一行计数型事件（opt-in 磁盘优化）
     Minute,
+    /// 逐事件原样落库（opt-in：含按键明细与鼠标坐标）
+    Raw,
 }
 
 /// 采集器运行设置（代码内默认值；默认值调整属产品决策，见 CODE_NOTES.md §8）。

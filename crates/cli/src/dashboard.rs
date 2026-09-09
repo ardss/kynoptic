@@ -209,6 +209,7 @@ fn settings_payload(s: &AppSettings) -> Value {
     json!({
         "enabled_monitors": s.enabled_monitors,
         "autostart": s.autostart,
+        "input_counts_only": s.input_counts_only,
         "dashboard_port": s.dashboard_port,
         "monitors": monitors,
     })
@@ -234,6 +235,9 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
             return Err(format!("未知监控器 id: {bad}"));
         }
         next.enabled_monitors = ids;
+    }
+    if let Some(v) = req.get("input_counts_only") {
+        next.input_counts_only = v.as_bool().ok_or("input_counts_only 应为布尔值")?;
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;

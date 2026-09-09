@@ -873,11 +873,16 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         "kynoptic collect: {} monitors, db = {db_path}. Ctrl+C to stop.",
         enabled.len()
     );
-    let mut c = collector::start_collection_custom(
-        &enabled,
-        collector::CollectorSettings::default(),
-        &db_path,
-    );
+    let input_counts_only = crate::settings::load(std::path::Path::new(&db_path)).input_counts_only;
+    let csettings = collector::CollectorSettings {
+        input_granularity: if input_counts_only {
+            collector::InputGranularity::Minute
+        } else {
+            collector::InputGranularity::Raw
+        },
+        ..collector::CollectorSettings::default()
+    };
+    let mut c = collector::start_collection_custom(&enabled, csettings, &db_path);
 
     // Ctrl+C → 优雅关停，保证缓冲事件 flush、session 正常关闭
     let shutdown = c.shutdown_flag().clone();

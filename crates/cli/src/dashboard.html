@@ -109,6 +109,11 @@
     <input type="checkbox" id="set-autostart">
     <label for="set-autostart">start kynoptic collect at login</label>
   </div>
+  <div>
+    <h2>settings — input privacy</h2>
+    <input type="checkbox" id="set-counts" checked>
+    <label for="set-counts">store keyboard/mouse as per-minute counts only (recommended; per-key detail off)</label>
+  </div>
   <div class="muted">Takes effect after reboot (applied by the system on next login).</div>
 </section>
 <section>
@@ -201,6 +206,7 @@ async function loadSettings() {
   document.getElementById("mon-optin").innerHTML =
     s.monitors.filter(m => !m.default_enabled).map(row).join("");
   document.getElementById("set-autostart").checked = s.autostart;
+  document.getElementById("set-counts").checked = s.input_counts_only;
   settingsMsg("", true);
 }
 async function saveSettings() {
@@ -211,7 +217,8 @@ async function saveSettings() {
       .filter(x => x.checked).map(x => x.dataset.id);
     const body = {
       enabled_monitors: enabled_monitors,
-      autostart: document.getElementById("set-autostart").checked
+      autostart: document.getElementById("set-autostart").checked,
+      input_counts_only: document.getElementById("set-counts").checked
     };
     const r = await fetch("/api/settings", {
       method: "POST",
