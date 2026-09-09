@@ -2,6 +2,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
+![Kynoptic dashboard demo](demo.gif)
+
 A local-first activity awareness layer for Windows. Kynoptic records which
 applications you use, when your machine is busy, what changes on your system —
 and lets you (or your AI assistant) ask questions about it later. Everything
