@@ -117,7 +117,7 @@ impl Monitor for BrowserMonitor {
 /// 使用 QueryFullProcessImageNameW 直接获取完整路径（O(1)），
 /// 替代原先对整个进程列表做 CreateToolhelp32Snapshot 线性扫描（O(所有进程)）。
 /// 输出为纯文件名（如 "chrome.exe"），与原实现一致。
-fn get_process_name(pid: u32) -> String {
+pub(crate) fn get_process_name(pid: u32) -> String {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };

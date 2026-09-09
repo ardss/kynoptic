@@ -51,17 +51,19 @@ impl Monitor for WindowMonitor {
             let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
             let title = String::from_utf16_lossy(&buf[..len as usize]);
 
-            // 获取进程 ID
+            // 获取进程 ID 与进程名（app_name 铁律：不得留空）
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
+            let proc_name = super::browser::get_process_name(pid);
 
             let event = Event::new(EventAction::Switch, EventType::Window)
                 .data(json!({
                     "hwnd": hwnd as u64,
                     "title": title,
                     "pid": pid,
+                    "proc": proc_name,
                 }))
-                .app("", &title);
+                .app(&proc_name, &title);
 
             let _ = tx.try_send(event);
         }
