@@ -1,6 +1,6 @@
 # CODE_NOTES — v0.1 carve-out 决策记录
 
-源：G:\DigitalPulse（digitalpulse-core 40 监控器）→ kynoptic（14 监控器）。依据：
+源：上游项目 DigitalPulse（digitalpulse-core 40 监控器）→ kynoptic（14 监控器）。依据：
 `R8-v01采集裁剪.md`、`schema-ddl-draft-v1.md`、`mcp-tool-spec-v1.md`。
 
 ## 1. 监控器裁剪与 PowerShell 归零
