@@ -72,21 +72,10 @@ impl Default for CollectorSettings {
     }
 }
 
-fn create_monitors() -> Vec<Box<dyn Monitor + Send>> {
-    // 默认启用集合由 registry::MONITOR_REGISTRY 决定（精确等于 v0.1 的 14 个，
-    // 见 registry 模块文档与 default_enabled_is_exactly_the_v01_fourteen 测试）。
-    let enabled: std::collections::HashSet<String> = crate::registry::default_enabled_ids()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    crate::registry::create_monitors_for(&enabled)
-}
-
-fn create_hooks() -> Vec<Box<dyn EventHook>> {
-    vec![
-        Box::new(monitors::keyboard_hook::KeyboardHook),
-        Box::new(monitors::mouse_hook::MouseHook),
-    ]
+fn create_monitors_for(
+    enabled: &std::collections::HashSet<String>,
+) -> Vec<Box<dyn Monitor + Send>> {
+    crate::registry::create_monitors_for(enabled)
 }
 
 fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
@@ -320,6 +309,20 @@ pub fn start_collection(db_path: &str) -> Collector {
 }
 
 pub fn start_collection_with(settings: CollectorSettings, db_path: &str) -> Collector {
+    let enabled: std::collections::HashSet<String> = crate::registry::default_enabled_ids()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    start_collection_custom(&enabled, settings, db_path)
+}
+
+/// 以显式启用集启动采集器（probe/诊断用）。
+/// 启用集为空或不含 hook id 时对应 Hook 不启动；其余行为与 [`start_collection_with`] 相同。
+pub fn start_collection_custom(
+    enabled: &std::collections::HashSet<String>,
+    settings: CollectorSettings,
+    db_path: &str,
+) -> Collector {
     env_logger::Builder::from_env("RUST_LOG")
         .filter_level(log::LevelFilter::Info)
         .try_init()
@@ -355,7 +358,7 @@ pub fn start_collection_with(settings: CollectorSettings, db_path: &str) -> Coll
         })
         .expect("Writer 启动失败");
 
-    let monitors = create_monitors();
+    let monitors = create_monitors_for(enabled);
     let monitor_count = monitors.len();
     log::info!("正在启动 {} 个 Monitor...", monitor_count);
 
@@ -388,7 +391,14 @@ pub fn start_collection_with(settings: CollectorSettings, db_path: &str) -> Coll
             .expect("InputAgg 聚合线程启动失败");
     }
 
-    let hooks = create_hooks();
+    // Hook 不带 name()（EventHook trait 最小面），按启用集条件构建。
+    let mut hooks: Vec<Box<dyn EventHook>> = Vec::new();
+    if enabled.contains("keyboard_hook") {
+        hooks.push(Box::new(monitors::keyboard_hook::KeyboardHook));
+    }
+    if enabled.contains("mouse_hook") {
+        hooks.push(Box::new(monitors::mouse_hook::MouseHook));
+    }
     let hook_count = hooks.len();
     log::info!("正在启动 {} 个 EventHook...", hook_count);
 

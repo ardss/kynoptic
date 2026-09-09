@@ -68,6 +68,7 @@ const GUID_DEVCLASS_BLUETOOTH: windows_sys::core::GUID =
 
 const INVALID_HANDLE_VALUE: isize = -1;
 const DIGCF_PRESENT: u32 = 0x00000002;
+const DIGCF_ALLCLASSES: u32 = 0x00000004;
 const SPDRP_DEVICEDESC: u32 = 0x00000000;
 
 #[repr(C)]
@@ -99,15 +100,67 @@ extern "system" {
         requiredsize: *mut u32,
     ) -> i32;
 
+    fn SetupDiGetDeviceInstanceIdW(
+        devinfo: isize,
+        devdata: *mut SP_DEVINFO_DATA,
+        buffer: *mut u16,
+        buffersize: u32,
+        requiredsize: *mut u32,
+    ) -> i32;
+
     fn SetupDiDestroyDeviceInfoList(devinfo: isize) -> i32;
 }
 
 fn enumerate_bluetooth_devices() -> HashSet<String> {
+    // 优先按 BTHENUM 枚举器取"远端蓝牙设备"（实例 ID 形如 BTHENUM\DEV_<mac>）。
+    // 实测（2026-09，Win11 26300）：GUID_DEVCLASS_BLUETOOTH 类枚举在新版系统上
+    // 对 BTHENUM 子设备返回空集，而枚举器路径可枚举到已连接的真实外设；
+    // 旧类 GUID 路径保留为兜底。
+    let remote = enumerate_bthenum();
+    if !remote.is_empty() {
+        return remote;
+    }
+    enumerate_by_class()
+}
+
+/// BTHENUM 枚举器路径：只保留远端设备（实例 ID 以 BTHENUM\DEV_ 开头），
+/// 剔除 AVRCP/A2DP 等服务接口条目。
+fn enumerate_bthenum() -> HashSet<String> {
+    enumerate_with(Some(("BTHENUM", |id: &str| {
+        id.starts_with(DEV_INSTANCE_PREFIX)
+    })))
+}
+
+/// 旧路径：GUID_DEVCLASS_BLUETOOTH 类枚举（存量系统兜底）。
+fn enumerate_by_class() -> HashSet<String> {
+    enumerate_with(None)
+}
+
+const DEV_INSTANCE_PREFIX: &str = "BTHENUM\\DEV_";
+
+type DeviceFilter = Option<(&'static str, fn(&str) -> bool)>;
+
+fn enumerate_with(filter: DeviceFilter) -> HashSet<String> {
     let mut devices = HashSet::new();
 
     unsafe {
-        let dev_info =
-            SetupDiGetClassDevsW(&GUID_DEVCLASS_BLUETOOTH, std::ptr::null(), 0, DIGCF_PRESENT);
+        let dev_info = match filter {
+            Some((enumerator, _)) => {
+                let w: Vec<u16> = enumerator
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                SetupDiGetClassDevsW(
+                    std::ptr::null(),
+                    w.as_ptr(),
+                    0,
+                    DIGCF_PRESENT | DIGCF_ALLCLASSES,
+                )
+            }
+            None => {
+                SetupDiGetClassDevsW(&GUID_DEVCLASS_BLUETOOTH, std::ptr::null(), 0, DIGCF_PRESENT)
+            }
+        };
 
         if dev_info == INVALID_HANDLE_VALUE {
             return devices;
@@ -137,7 +190,28 @@ fn enumerate_bluetooth_devices() -> HashSet<String> {
                 &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())],
             );
 
-            if !name.is_empty() {
+            let mut id_buf = [0u16; 512];
+            let id_ok = SetupDiGetDeviceInstanceIdW(
+                dev_info,
+                &mut dev_data,
+                id_buf.as_mut_ptr(),
+                id_buf.len() as u32,
+                std::ptr::null_mut(),
+            );
+            let instance_id = if id_ok != 0 {
+                String::from_utf16_lossy(
+                    &id_buf[..id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len())],
+                )
+            } else {
+                String::new()
+            };
+
+            let keep = match filter {
+                Some((_, pred)) => pred(&instance_id),
+                None => true,
+            };
+
+            if !name.is_empty() && keep {
                 devices.insert(name);
             }
 

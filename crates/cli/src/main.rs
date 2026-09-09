@@ -61,6 +61,7 @@ Subcommands:
   query     [--from T] [--to T] [--bucket B] [--limit N] [--json]
                                               Event query in time range
   mcp                                         Run MCP server over stdio
+  probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
 ";
 
 fn resolve_db() -> PathBuf {
@@ -769,6 +770,65 @@ fn cmd_mcp() -> Result<()> {
     Ok(())
 }
 
+// === probe ===
+
+/// `kynoptic-ctl probe [--monitor ID] [--secs N] [--all]`
+/// 实机探针：逐监控器启用、临时库采集 N 秒，报告事件数与 PASS/FAIL。
+fn cmd_probe(args: &[String]) -> Result<()> {
+    let mut monitor = String::new();
+    let mut secs: u64 = 15;
+    let mut all = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--monitor" => {
+                i += 1;
+                monitor = args.get(i).cloned().unwrap_or_default();
+            }
+            "--secs" => {
+                i += 1;
+                secs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(15);
+            }
+            "--all" => all = true,
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（支持 --monitor/--secs/--all）"
+                )))
+            }
+        }
+        i += 1;
+    }
+    if all {
+        let outcomes = kynoptic_core::probe::probe_all(secs);
+        kynoptic_core::probe::print_matrix(&outcomes);
+    } else {
+        if monitor.is_empty() {
+            return Err(Error::InvalidData(
+                "probe 需要 --monitor ID 或 --all".into(),
+            ));
+        }
+        let out = kynoptic_core::probe::probe_monitor(&monitor, secs);
+        println!(
+            "{} | dep={} | default={} | events={}",
+            out.id, out.dep, out.default_enabled, out.events
+        );
+        println!("sample: {}", out.sample);
+        for w in &out.warnings {
+            println!("log: {w}");
+        }
+        println!(
+            "verdict: {}{}",
+            out.verdict.as_str(),
+            if out.note.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", out.note)
+            }
+        );
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
@@ -784,6 +844,7 @@ fn main() -> ExitCode {
         "now" => cmd_now(&args[1..]),
         "query" => cmd_query(&args[1..]),
         "mcp" => cmd_mcp(),
+        "probe" => cmd_probe(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE);
             Ok(())

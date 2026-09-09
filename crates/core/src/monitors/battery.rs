@@ -49,6 +49,10 @@ impl Monitor for BatteryMonitor {
                     "charging": status.ac_online(),
                 }));
                 let _ = tx.try_send(event);
+            } else {
+                // 无电池（flag 0x80）：桌面机/无电池设备的正常语义，
+                // 显式记录一次便于 probe/诊断区分"硬件缺失"与"监控器失效"。
+                log::info!("battery: 无电池（AC 供电设备），不产出 battery_status 事件");
             }
             return;
         }

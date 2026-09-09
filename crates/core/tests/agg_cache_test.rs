@@ -19,7 +19,19 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 fn tmp_db_path() -> PathBuf {
     let seq = SEQ.fetch_add(1, Ordering::SeqCst);
     let mut p = std::env::temp_dir();
-    p.push(format!("dp_aggtest_{}_{}.db", std::process::id(), seq));
+    // 路钥含纳秒级时间戳：进程 id 会被 Windows 快速复用，若上次运行遗留同
+    // 名临时库（panic 跳过 cleanup / 删除时连接未关闭导致 delete-pending），
+    // 仅 pid+seq 会在同日重跑时命中旧文件，造成计数翻倍 / UNIQUE 冲突假失败。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 + d.as_secs() * 1_000_000_000)
+        .unwrap_or(0);
+    p.push(format!(
+        "dp_aggtest_{}_{}_{}.db",
+        std::process::id(),
+        seq,
+        nanos
+    ));
     p
 }
 

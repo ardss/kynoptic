@@ -34,7 +34,9 @@ impl Monitor for AudioOutputMonitor {
         let script = r#"
 Get-CimInstance Win32_PnPEntity -Namespace root/CIMV2 -ErrorAction SilentlyContinue |
   Where-Object { $_.PNPClass -eq 'AudioEndpoint' -and $_.Status -eq 'OK' } |
-  ForEach-Object { "$($_.FriendlyName)" }
+  # Win11 26300 实测：AudioEndpoint 的 FriendlyName 可能为空串（探测不到名称），
+  # PnP 实体的 Name 始终有值（如 "扬声器 (xxx)"），做回退。
+  ForEach-Object { $n = if ([string]::IsNullOrWhiteSpace($_.FriendlyName)) { $_.Name } else { $_.FriendlyName }; "$n" }
 "#;
         let output = match run_ps(script) {
             Some(o) if !o.trim().is_empty() => o,
