@@ -166,9 +166,9 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
                   CAST(substr(datetime(timestamp, '{off}'), 15, 2) AS INTEGER) AS mi,
                   SUM({keys_row}) AS keys,
                   SUM({clicks_row}) AS clicks,
-                  SUM(CASE WHEN event_type='mouse' AND event_action='input_agg'
+                  SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.move_distance_px'), 0) ELSE 0 END) AS dist,
-                  SUM(CASE WHEN event_type='mouse' AND event_action='input_agg'
+                  SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.moves'), 0)
                            WHEN event_type IN ('keyboard','mouse') AND event_action <> 'input_agg'
                            THEN 1 ELSE 0 END) AS samples,

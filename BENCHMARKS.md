@@ -2,8 +2,8 @@
 
 > 本文件是官网 overhead 声明的**事实核对源**。所有数字来自本仓库内可复现的
 > 基准 harness（`crates/core/examples/perf-*.rs`、`crates/mcp/examples/perf-query.rs`）。
-> 最近一次全量运行：**2026-09-08/09**（代码版本：writer busy-spin 修复 +
-> flush 30s 调优 + 迁移 0003 覆盖索引之后）。
+> 最近一次全量运行：**2026-09-09**（代码版本：perf2 —— 聚合读缓存
+> （agg_minute/agg_daily）+ get_anomalies 改读聚合 + 可配置 flush 间隔 + opt-in 分钟粒度输入聚合之后）。
 
 ## 机器与环境
 
@@ -60,11 +60,32 @@ flush 时机时直接回到 `try_recv` 空转，实测空载 CPU avg 35%~95% 单
 
 ### 每事件存储成本（perf-write，100k 事件）
 
-| 指标 | 实测 |
-|---|---|
-| 写吞吐（300/批真实写路径） | 42,071 events/s（2.38s / 100k） |
-| maintenance（checkpoint+VACUUM）后 DB | 45.5 MB |
-| **每事件字节** | **455 B/event**（混合真实形态：40% mouse/20% keyboard/20% window/20% system） |
+**方法论修正（2026-09-09）**：`maintenance()` 原本在 VACUUM **之前**做 WAL
+checkpoint，VACUUM 全程经 WAL 重写会把 WAL 再撑大一倍——旧数字 455 B/event
+（45.5 MB）实际含一份未截断的 WAL。修复为 VACUUM 后补一次 checkpoint 后的重测：
+
+| 指标 | 旧测（WAL 未截断虚高） | 重测（2026-09-09） |
+|---|---|---|
+| maintenance 后 DB（主文件+WAL） | 45.5 MB（含 ~12MB WAL 虚高） | **33.6 MB** |
+| **每事件字节（raw 默认）** | ~~455 B/event~~ | **336 B/event** |
+| 写吞吐（300/批真实写路径） | 42,071 events/s | 13.7k~24.6k events/s（机器噪声大，非记录指标） |
+
+### 分钟粒度输入聚合（opt-in 信息对照，非默认）
+
+`input_granularity="minute"`（默认 **raw**，原始数据不动）把 keyboard/mouse
+折叠为每分钟每桶一行 `input_agg` 计数行。同一 100k 合成工作负载
+（perf-write 附带 phase）：
+
+```json
+{"bench":"perf-write-minute","opt_in":true,"source_events":100000,
+  "stored_rows":40006,"db_bytes_after_maintenance":14884864,
+  "bytes_vs_raw_default":"2.3x smaller","rows_vs_raw_default":"2.5x fewer"}
+```
+
+注意：该合成负载把 100k 事件压在 ~2 分钟内（1ms 间隔），行数坍缩被低估；
+真实人手密度（~10-30 输入事件/分钟）下约坍缩到 ≤2 行/分钟。
+此为 opt-in 形态的信息数字，**不构成默认行为声明**（原始数据神圣：
+raw 路径字节形态与上表一致）。
 
 ### 空载日外推（perf-idle 600s 窗口）
 
@@ -107,13 +128,13 @@ SQLite WAL 每次提交的页开销（events 表 + 4~5 个索引 ≈ 6 个 4KB �
 
 | 查询 | p50 | p95 | 目标 p95 | 结论 |
 |---|---|---|---|---|
-| `kynoptic query --from --to --limit 20`（1d，子进程） | 13.7 ms | **18.5 ms** | < 50 ms | PASS |
-| get_summary[keys]（1d） | 0.12 ms | **0.26 ms** | < 50 ms | PASS |
-| get_summary[apps]（1d） | 1.31 ms | **2.42 ms** | < 50 ms | PASS |
-| get_summary[active_minutes]（1d） | 3.02 ms | **3.82 ms** | < 50 ms | PASS |
-| get_summary[focus_segments]（1d） | 5.51 ms | **7.16 ms** | < 50 ms | PASS |
-| get_timeline（7d，hour） | 0.24 ms | **0.43 ms** | < 50 ms | PASS |
-| **get_anomalies（7d）** | 1413 ms | **2778 ms** | < 50 ms | **FAIL** |
+| `kynoptic query --from --to --limit 20`（1d，子进程） | 14.3 ms | **19.8 ms** | < 50 ms | PASS |
+| get_summary[keys]（1d） | 0.57 ms | **0.79 ms** | < 50 ms | PASS |
+| get_summary[apps]（1d） | 1.90 ms | **2.52 ms** | < 50 ms | PASS |
+| get_summary[active_minutes]（1d） | 5.14 ms | **6.82 ms** | < 50 ms | PASS |
+| get_summary[focus_segments]（1d） | 2.95 ms | **3.63 ms** | < 50 ms | PASS |
+| get_timeline（7d，hour） | 0.24 ms | **0.34 ms** | < 50 ms | PASS |
+| **get_anomalies（7d）** | **26.7 ms** | **30.4 ms** | < 50 ms | **PASS** |
 
 ### get_anomalies 调优前后（三次测量，同一 1M 库）
 
@@ -121,17 +142,17 @@ SQLite WAL 每次提交的页开销（events 表 + 4~5 个索引 ≈ 6 个 4KB �
 |---|---|---|
 | 原始（substr 全表扫描，无覆盖索引） | 3756 ms | 5540 ms |
 | + sargable 日期区间谓词（charts.rs 三处） | 3613 ms | 4842 ms |
-| + 迁移 0003 覆盖索引（idx_events_type_ts / idx_events_app_ts） | **1413 ms** | **2778 ms** |
+| + 迁移 0003 覆盖索引（idx_events_type_ts / idx_events_app_ts） | 1413 ms | 2778 ms |
+| + perf2：agg_minute/agg_daily 读缓存，get_anomalies 改读聚合（events 原样保留，缓存缺失回退现算） | **26.7 ms** | **30.4 ms** |
 
-分项实测（修复后）：late_night 0.3ms、apm_burst ~4.5ms/天、marathon
-~4.6ms/天均已达标；**剩余瓶颈是 new_app_surge 的 per-app 全历史统计**
-（`app_history_totals`：每应用扫描其全部历史行做 COUNT(DISTINCT 天)，
-本合成库 app 高度集中——word.exe 一家 ~20 万行 → 每次 ~50-85ms × 应用数 × 7 天）。
-
-**达标路径（未在本轮实施，属功能项而非调参）**：按 schema 0002 已预留的
-`agg_minute` / `agg_daily` 预聚合表写入并改读聚合，可把 7 天异常扫描从
-O(全表) 降到 O(聚合行数)。注：合成库 app 集中度（2-3 个 app 占满 1M 行）
-远比真实使用极端；真实多应用负载下 get_anomalies 会显著快于本数字。
+分项实测（perf2 后）：late_night / apm_burst / marathon 均改读 agg_minute
+（7 天 × 1440 分钟 × ~4 bucket ≈ 4.3 万聚合行，而非 100 万原始行）；
+new_app_surge 的 per-app 全历史统计改读 agg_daily 的 `app:<name>` 行
+（`app_history_totals` 从 O(该应用全部历史行) 降到 O(该应用出现天数)）。
+聚合缓存是**派生只读数据**：writer flush 增量维护 + Database::open 懒回填 +
+全量重建幂等；查询端在缓存缺失时回退 events 现算（正确但慢）。测试断言
+聚合维护前后 events 行数与内容指纹完全不变。注：合成库 app 集中度（2-3 个
+app 占满 1M 行）远比真实使用极端，真实多应用负载下只会更快。
 
 ## 4. 启动延迟（STARTUP）
 
@@ -151,8 +172,10 @@ O(全表) 降到 O(聚合行数)。注：合成库 app 集中度（2-3 个 app �
 | 路径 | ns/call |
 |---|---|
 | AtomicU64 计数下限对照 | 1.6 |
-| 鼠标移动节流早退（绝大多数移动事件） | **62** |
-| 键盘按下全路径（含修饰键采样+JSON+入队） | **~1033（≈1µs）** |
+| 鼠标移动节流早退（raw 模式绝大多数移动事件） | **68.8** |
+| 键盘按下全路径（raw 模式，含修饰键采样+JSON+入队） | **~1033（≈1µs）** |
+| 键盘按下（minute 模式：纯原子计数） | **3.4** |
+| 鼠标移动（minute 模式：原子计数+距离） | **8.9** |
 
 结论：回调 <1µs/次（键盘全路径 1.03µs、鼠标节流路径 62ns），比人手
 感知阈值（~10ms）低 4 个数量级，不构成可感知输入延迟。
@@ -163,4 +186,4 @@ O(全表) 降到 O(聚合行数)。注：合成库 app 集中度（2-3 个 app �
 |---|---|
 | "near-zero overhead"（CPU） | **修复后成立**（空载 0.41% 单核）。修复前（writer busy-spin 占满 1 核）不成立——本基准正是该 bug 的发现手段。 |
 | "typical storage is KB-scale per day" | **仅对近零活动日成立**。实测活跃时段磁盘 ~5.8 MB/h（WAL 提交页开销主导），轻度使用 1-2h/天即 6-12 MB/天。建议文案限定为「空闲/低活动日 KB 级」或标注前提。 |
-| 隐含「查询瞬时」 | 1M 事件库上除 get_anomalies 外全部 p95 < 20ms；get_anomalies 7 天窗口秒级（见上文），建议勿对此工具做「瞬时」承诺，或先落地 agg 预聚合。 |
+| 隐含「查询瞬时」 | perf2 后 1M 事件库上**全部**查询 p95 < 50ms（get_anomalies 7d p95 ≈ 30ms，读聚合缓存）。可以恢复"近瞬时"表述，但建议注明"基于预聚合缓存"。 |

@@ -371,6 +371,9 @@ impl Database {
         } else {
             log::info!("数据库压缩完成");
         }
+        // VACUUM 全程经 WAL 重写（把 WAL 再次撑大），故检查点必须放在 VACUUM 之后，
+        // 否则"维护后库大小"被未截断的 WAL 虚增近一倍（perf-write 2026-09 实测）。
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     /// 刷新 daily_agg（异常检测的历史基线）——重算最近 2 天（今天 + 昨天）。

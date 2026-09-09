@@ -104,11 +104,6 @@ fn seed(db_path: &str) {
         }
     }
     conn.execute_batch("COMMIT;").unwrap();
-    // 聚合读缓存：与生产 Database::open 的懒回填一致，get_anomalies 读
-    // agg_minute/agg_daily（派生缓存；原始 events 原样保留）。
-    if kynoptic_core::db::agg::backfill_if_needed(&conn) {
-        println!("seed: agg 缓存回填完成");
-    }
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
         .unwrap();
@@ -118,6 +113,15 @@ fn seed(db_path: &str) {
 fn main() {
     let db_path = std::env::var("KYNOPTIC_DB").unwrap_or_else(|_| "target/perf-query-1m.db".into());
     seed(&db_path);
+    // 聚合读缓存：与生产 Database::open 的懒回填一致，get_anomalies 读
+    // agg_minute/agg_daily（派生缓存；原始 events 原样保留）。
+    {
+        let conn = Connection::open(&db_path).expect("open for backfill");
+        kynoptic_core::db::apply_pragmas(&conn).unwrap();
+        if kynoptic_core::db::agg::backfill_if_needed(&conn) {
+            println!("seed: agg 缓存回填完成");
+        }
+    }
 
     // ── MCP 数据面（进程内，等价 MCP server 持连接调用）──
     let conn = kynoptic_mcp::state::open_reader(&db_path).expect("open reader");

@@ -79,3 +79,46 @@ crates/cli 同时产出 `kynoptic` 与 `kynoptic-ctl` 两个 bin（同一 main.r
 网站 MCP 配置示例的 `command: "kynoptic"` 直接可用；历史文档中的
 `kynoptic-ctl` 亦保留。cargo 会提示"file present in multiple build targets"
 （同名源码双 bin 的正常提示，非告警级错误）。
+
+## 7. perf2：opt-in 分钟粒度输入聚合 + 可配置 flush 间隔（2026-09-09）
+
+**范围修正（用户决策）**：原始数据神圣。默认 `input_granularity = "raw"`——
+键盘/鼠标 Hook 逐事件原样落库，与 v0.1 行为完全一致（"膨胀就膨胀"）。
+分钟折叠仅作为 **opt-in** 磁盘优化实现，不做任何保留/清理/rollup（那是后续
+产品决策，本轮明确不做）。
+
+- `collector::CollectorSettings`：`input_granularity`（Raw[默认] | Minute）+
+  `write_flush_interval_secs`（代码默认 30s，从 constants 提升为配置项）。
+  **数据丢失风险 vs 磁盘足迹的 flush 默认值仍在评审中**，当前 30s 只是现状
+  保留，非遗依赖结论。
+- minute 模式：Hook 回调退化为纯原子计数（perf-hook 实测键盘 3.4ns / 移动
+  8.9ns vs raw 全路径 ~1µs），`InputAgg` 线程每秒 drain，按**本地分钟**折叠
+  为 `input_agg` 计数型事件（键盘 `{"keys","samples"}`、鼠标
+  `{"clicks","scroll_ticks","moves","move_distance_px","samples"}`），
+  ≤2 行/分钟；关停时 `flush_partial` 落库未满分钟的部分计数。
+- 计数语义保持：APM、活跃分钟、daily_agg、异常检测全部只依赖计数——查询层
+  用 `queries::KEYS_ROW_EXPR / CLICKS_ROW_EXPR` 统一兼容两种形态（含
+  `json_valid` 防 malformed event_data）。
+- 已知取舍：按键明细热力图与鼠标坐标热力图在 minute 模式下无原始样本
+  （计数型行不含 per-key/坐标），属 opt-in 换磁盘的显式代价。
+
+## 8. perf2：聚合读缓存（agg_minute / agg_daily）与懒回填（2026-09-09）
+
+- 定位：**派生只读缓存**，`db/agg.rs` 单一实现。原始 events 只增不改不删；
+  测试断言聚合维护（增量 + 两次全量重建）前后 events 行数与全行内容指纹
+  完全不变（`agg_maintenance_never_touches_raw_events`）。
+- bucket 语义（本地分钟桶）：`input_keys` / `input_clicks` / `input_moves`
+  （sum=曼哈顿距离px, count=次数）/ `window_switches`；agg_daily 只存
+  `app:<name>` 行（count=该应用当日事件数）。
+- 维护路径三合一：writer flush 增量 UPSERT（`Database::update_agg`）、
+  `Database::open` 懒回填（`backfill_if_needed`：agg 全空 + events 非空时
+  全量重建一次；**选懒回填而非 CLI reagg 命令**——存量库零操作自动获益，
+  CLI 子命令如后续运维需要再加）、`rebuild_all` 幂等全量重建。
+- 查询端：异常路径（late_night / top_burst / active_minutes / minute_stats /
+  day_totals / top_apps / app_history_totals）优先读缓存，**缓存缺失（表不
+  存在 / 该日无行）回退 events 现算**——正确性不依赖回填成功，只是慢。
+  效果：1M 行合成库 get_anomalies(7d) p50 1413→26.7ms、p95 2778→30.4ms
+  （详见 BENCHMARKS.md §3）。
+- 语义微差（记录在案）：缓存路径的分钟/小时桶按**本地时区**（与"今日"定义
+  同源）；events 现算回退路径沿用 UTC substr 切桶。深夜检测在非 UTC 时区的
+  回退路径上可能少计（旧有行为），缓存路径为本地口径。

@@ -153,13 +153,13 @@ pub fn today_range() -> (String, String) {
 // 这两个行级 CASE 表达式（外层 SUM），禁止再写只认 raw 形态的 COUNT(*)。
 pub(crate) const KEYS_ROW_EXPR: &str = "(CASE \
          WHEN event_type='keyboard' AND event_action='press' THEN 1 \
-         WHEN event_type='keyboard' AND event_action='input_agg' \
+         WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
            THEN COALESCE(json_extract(event_data, '$.keys'), 0) \
          ELSE 0 END)";
 
 pub(crate) const CLICKS_ROW_EXPR: &str = "(CASE \
          WHEN event_type='mouse' AND event_action='click' THEN 1 \
-         WHEN event_type='mouse' AND event_action='input_agg' \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
            THEN COALESCE(json_extract(event_data, '$.clicks'), 0) \
          ELSE 0 END)";
 
