@@ -259,8 +259,10 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
     // Update 在线搜索可达数分钟）。未完成就计数会把"慢"误判成"零事件"。
     // Hook 无轮询首采日志，无需等待首采：直接短窗口验证启停干净。
     if is_hook {
-        std::thread::sleep(std::time::Duration::from_secs(secs.max(3)));
         let mut collector = start_collection_custom(&enabled, settings, db_path.to_str().unwrap());
+        // 先启动后等待：hook 线程需要时间完成安装（tid 未就绪时 stop() 会空转，
+        // 留下僵尸 hook 持续向已关闭通道投递，污染后续探针的丢弃计数）
+        std::thread::sleep(std::time::Duration::from_secs(secs.max(3)));
         let (events, sample) = count_and_sample(&collector.db);
         let warnings: Vec<String> = log_buf.lock().unwrap()[log_start..]
             .iter()

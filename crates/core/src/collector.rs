@@ -15,8 +15,14 @@ use crate::types::{Event, EventHook, Monitor};
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
-    if tx.try_send(event).is_err() {
-        DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+    match tx.try_send(event) {
+        Ok(()) => {}
+        // 只计"真满"：Disconnected 表示采集器已关停（writer 已退出），
+        // 属关停尾部的一次性发送，计入丢弃只会污染后续会话的观测。
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
     }
 }
 

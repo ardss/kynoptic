@@ -1,0 +1,142 @@
+probe: window ...
+  → PASS events=1 
+probe: keyboard_hook ...
+  → PASS events=0 (hook 启动/停止干净（输入注入见 stress 报告）)
+probe: mouse_hook ...
+  → PASS events=0 (hook 启动/停止干净（输入注入见 stress 报告）)
+probe: idle ...
+  → EXPECTED-LIMITED events=0 (change-driven：窗口内无 ≥300s 空闲转换（设计语义）)
+probe: session ...
+  → EXPECTED-LIMITED events=0 (change-driven：窗口内无锁屏/解锁/显示器数量变化)
+probe: system ...
+  → PASS events=2 
+probe: network ...
+  → PASS events=2 
+probe: battery ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: device ...
+  → PASS events=2 
+probe: process ...
+  → PASS events=1 
+probe: audio ...
+  → PASS events=1 
+probe: brightness ...
+  → EXPECTED-LIMITED events=0 (硬件缺失：显示器无亮度控制接口（桌面外接屏），监控器自动禁用)
+probe: wifi ...
+  → PASS events=1 
+probe: power_plan ...
+  → PASS events=1 
+probe: browser ...
+  → EXPECTED-LIMITED events=0 (change-driven：窗口内前台非浏览器或无标签页切换)
+probe: clipboard ...
+  → PASS events=1 
+probe: file_activity ...
+  → PASS events=1 
+probe: media ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: screen_capture ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: usb_device ...
+  → PASS events=1 
+probe: bluetooth ...
+  → PASS events=1 
+probe: display ...
+  → PASS events=1 
+probe: external_display ...
+  → PASS events=1 
+probe: audio_input ...
+  → PASS events=1 
+probe: audio_output ...
+  → PASS events=1 
+probe: ime ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: location ...
+  → PASS events=1 
+probe: notification ...
+  → PASS events=1 
+probe: calendar ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: dns ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: security ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: firewall ...
+  → PASS events=1 
+probe: uac ...
+  → PASS events=1 
+probe: windows_update ...
+  → PASS events=1 
+probe: driver ...
+  → PASS events=1 
+probe: vpn ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: print ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 3 个事件)
+probe: stylus ...
+  → EXPECTED-LIMITED events=0 (硬件缺失：无手写笔/数位板 HID 设备)
+probe: thermal ...
+  → FAIL events=0 ([WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件)
+probe: gpu ...
+  → PASS events=3 
+
+monitor          dep         default   events  verdict
+------------------------------------------------------------------------
+window           native      on             1  PASS
+keyboard_hook    native      on             0  PASS
+  └ note: hook 启动/停止干净（输入注入见 stress 报告）
+mouse_hook       native      on             0  PASS
+  └ note: hook 启动/停止干净（输入注入见 stress 报告）
+idle             native      on             0  EXPECTED-LIMITED
+  └ note: change-driven：窗口内无 ≥300s 空闲转换（设计语义）
+session          native      on             0  EXPECTED-LIMITED
+  └ note: change-driven：窗口内无锁屏/解锁/显示器数量变化
+system           native      on             2  PASS
+network          native      on             2  PASS
+battery          native      on             0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+device           native      on             2  PASS
+process          native      on             1  PASS
+audio            native      on             1  PASS
+brightness       native      on             0  EXPECTED-LIMITED
+  └ note: 硬件缺失：显示器无亮度控制接口（桌面外接屏），监控器自动禁用
+wifi             native      on             1  PASS
+power_plan       native      on             1  PASS
+browser          native      off            0  EXPECTED-LIMITED
+  └ note: change-driven：窗口内前台非浏览器或无标签页切换
+clipboard        native      off            1  PASS
+file_activity    native      off            1  PASS
+media            native      off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+screen_capture   native      off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+usb_device       native      off            1  PASS
+bluetooth        native      off            1  PASS
+display          powershell  off            1  PASS
+external_display powershell  off            1  PASS
+audio_input      powershell  off            1  PASS
+audio_output     powershell  off            1  PASS
+ime              powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+location         powershell  off            1  PASS
+notification     powershell  off            1  PASS
+calendar         powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+dns              powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+security         powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+firewall         powershell  off            1  PASS
+uac              powershell  off            1  PASS
+windows_update   powershell  off            1  PASS
+driver           powershell  off            1  PASS
+vpn              powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+print            powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 3 个事件
+stylus           powershell  off            0  EXPECTED-LIMITED
+  └ note: 硬件缺失：无手写笔/数位板 HID 设备
+thermal          powershell  off            0  FAIL
+  └ note: [WARN] kynoptic_core::collector: 通道已满，丢弃了 1 个事件
+gpu              powershell  off            3  PASS
+------------------------------------------------------------------------
+total: 25 PASS / 5 EXPECTED-LIMITED / 10 FAIL
