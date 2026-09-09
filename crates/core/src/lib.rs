@@ -13,6 +13,7 @@ pub mod json_util;
 pub mod keyboard_layout;
 pub mod monitors;
 pub mod queries;
+pub mod registry;
 pub mod time;
 pub mod types;
 

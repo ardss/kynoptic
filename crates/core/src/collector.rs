@@ -73,20 +73,13 @@ impl Default for CollectorSettings {
 }
 
 fn create_monitors() -> Vec<Box<dyn Monitor + Send>> {
-    vec![
-        Box::new(monitors::window::WindowMonitor::default()),
-        Box::new(monitors::idle::IdleMonitor::default()),
-        Box::new(monitors::session::SessionMonitor::default()),
-        Box::new(monitors::audio::AudioMonitor::default()),
-        Box::new(monitors::brightness::BrightnessMonitor::default()),
-        Box::new(monitors::process::ProcessMonitor::default()),
-        Box::new(monitors::system::SystemMonitor),
-        Box::new(monitors::device::DeviceMonitor),
-        Box::new(monitors::network::NetworkMonitor::default()),
-        Box::new(monitors::battery::BatteryMonitor::default()),
-        Box::new(monitors::power_plan::PowerPlanMonitor::default()),
-        Box::new(monitors::wifi::WifiMonitor::default()),
-    ]
+    // 默认启用集合由 registry::MONITOR_REGISTRY 决定（精确等于 v0.1 的 14 个，
+    // 见 registry 模块文档与 default_enabled_is_exactly_the_v01_fourteen 测试）。
+    let enabled: std::collections::HashSet<String> = crate::registry::default_enabled_ids()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    crate::registry::create_monitors_for(&enabled)
 }
 
 fn create_hooks() -> Vec<Box<dyn EventHook>> {

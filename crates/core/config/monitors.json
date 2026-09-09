@@ -1,0 +1,252 @@
+{
+  "readme": [
+    "Kynoptic 监控器默认配置模板（40 个）。",
+    "本文件是 crates/core/src/registry.rs MONITOR_REGISTRY 的镜像，",
+    "registry::config_template_matches_registry 测试保证两者逐项一致。",
+    "默认启用 = v0.1 的 14 个（纯 windows-sys、零子进程）；",
+    "恢复的 26 个默认关闭（R8 2级 中敏感 / 3级 高敏感或主题外）。",
+    "dep: native = 纯 windows-sys；powershell = PS 子进程（待原生重写）。"
+  ],
+  "monitors": [
+    {
+      "id": "window",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "keyboard_hook",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "mouse_hook",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "idle",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "session",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "system",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "network",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "battery",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "device",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "process",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "audio",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "brightness",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "wifi",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "power_plan",
+      "default_enabled": true,
+      "sensitivity": "low",
+      "dep": "native"
+    },
+    {
+      "id": "browser",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "clipboard",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "file_activity",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "media",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "screen_capture",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "usb_device",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "bluetooth",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "native"
+    },
+    {
+      "id": "display",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "powershell"
+    },
+    {
+      "id": "external_display",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "powershell"
+    },
+    {
+      "id": "audio_input",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "powershell"
+    },
+    {
+      "id": "audio_output",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "powershell"
+    },
+    {
+      "id": "ime",
+      "default_enabled": false,
+      "sensitivity": "medium",
+      "dep": "powershell"
+    },
+    {
+      "id": "location",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "notification",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "calendar",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "dns",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "security",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "firewall",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "uac",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "windows_update",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "driver",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "vpn",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "print",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "stylus",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "thermal",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    },
+    {
+      "id": "gpu",
+      "default_enabled": false,
+      "sensitivity": "high",
+      "dep": "powershell"
+    }
+  ]
+}
