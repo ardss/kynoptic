@@ -1,5 +1,7 @@
 # Kynoptic
 
+English | [简体中文](README.zh-CN.md)
+
 A local-first activity awareness layer for Windows. Kynoptic records which
 applications you use, when your machine is busy, what changes on your system —
 and lets you (or your AI assistant) ask questions about it later. Everything
@@ -9,6 +11,8 @@ It answers the questions you actually have after the fact: "What was that tool
 I used last Tuesday?", "Why was my laptop hot at 2pm?", "How much time did I
 actually spend in the editor this week?" — through a CLI, a local dashboard,
 or MCP.
+
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![License](https://img.shields.io/badge/license-Apache--2.0-green) ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 - Website: <https://kynoptic.com>
 - Status: v0.1, in active development toward a September 14 launch. API surface
