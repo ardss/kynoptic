@@ -381,9 +381,12 @@ impl Inducers {
                     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
                         let payload = [0u8; 512];
                         while !stop.load(Ordering::Relaxed) {
-                            // 探针流量：发往公共黑洞端口，UDP 不等回应
-                            let _ = sock.send_to(&payload, "1.1.1.1:9");
-                            let _ = sock.send_to(&payload, "8.8.8.8:9");
+                            // 探针流量：突发发往公共黑洞端口（UDP 不等回应），
+                            // 保证 30s 增量窗口内 netstat 计数有明显 delta
+                            for _ in 0..32 {
+                                let _ = sock.send_to(&payload, "1.1.1.1:9");
+                                let _ = sock.send_to(&payload, "8.8.8.8:9");
+                            }
                             std::thread::sleep(std::time::Duration::from_millis(50));
                         }
                     }

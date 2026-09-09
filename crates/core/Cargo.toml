@@ -17,6 +17,8 @@ arc-swap = "1"
 windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_System_ProcessStatus",
     "Win32_System_Power",
     "Win32_System_Console",

@@ -98,12 +98,15 @@ struct ConnSnapshot {
 /// 返回 (bytes_sent, bytes_recv, packets_sent?, packets_recv?)。
 /// packets 为 None 表示该次未取到包计数。
 fn collect_network_io() -> (u64, u64, Option<u64>, Option<u64>) {
+    // 主路径：类型化 GetIfTable2（区域设置无关、零子进程）
+    if let Some(out) = iftable2_stats() {
+        return out;
+    }
+    // 兜底：netstat -e 文本解析（非中文系统可用）
     if let Some(out) = netstat_eth_stats() {
         return out;
     }
-    // netstat 不可用时降级到 FFI（仅 octets，累计值可能失真，仅 delta 可信）。
-    let (s, r) = collect_network_io_ffi();
-    (s, r, None, None)
+    (0, 0, None, None)
 }
 
 /// 调用 `netstat -e` 并解析输出。
@@ -164,87 +167,57 @@ fn parse_netstat_e(text: &str) -> Option<(u64, u64, Option<u64>, Option<u64>)> {
     }
 }
 
-/// FFI 兜底：netstat 不可用时，用 GetIfTable2 + 硬编码 MIB_IF_ROW2 偏移读取。
-/// 注意：此路径累计值在部分机器偏大，仅 delta 可信。
+/// GetIfTable2（类型化 MIB_IF_TABLE2）读取全接口流量统计。
+///
+/// 主路径（2026-09-09 probe 修复）：旧实现是"硬编码 MIB_IF_ROW2 字段偏移"的
+/// 裸指针读取，ROW_SIZE/偏移在较新系统上与真实布局不符，实测（Win11 26300）
+/// 恒返回 0 → delta 恒 0 → network 监控器静默零事件；同时 netstat -e 主路径
+/// 在中文（OEM 代码页 GBK）系统上因 from_utf8_lossy 把"字节"行打成乱码而解析
+/// 失败，两条路径同时失效。改为 windows-sys 类型化结构体：跨区域设置、
+/// 零子进程、无偏移假设。回环接口（Type=24）不计入。
 #[cfg(target_arch = "x86_64")]
-fn collect_network_io_ffi() -> (u64, u64) {
+fn iftable2_stats() -> Option<(u64, u64, Option<u64>, Option<u64>)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_SOFTWARE_LOOPBACK;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, MIB_IF_TABLE2,
+    };
+
     unsafe {
-        let mut table_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hr = GetIfTable2(&mut table_ptr);
-        if hr != 0 || table_ptr.is_null() {
-            return (0, 0);
+        let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table_ptr) != 0 || table_ptr.is_null() {
+            return None;
         }
 
-        let num_entries = *(table_ptr as *const u32);
-        let row_base = (table_ptr as *const u8).add(8);
-
-        const ROW_SIZE: usize = 848;
-        const IN_OCTETS_OFF: usize = 272;
-        const OUT_OCTETS_OFF: usize = 280;
-
+        let num = (*table_ptr).NumEntries as usize;
         let mut total_sent: u64 = 0;
         let mut total_recv: u64 = 0;
-
-        for i in 0..num_entries {
-            let row_ptr = row_base.add(i as usize * ROW_SIZE);
-            let recv = std::ptr::read_unaligned(row_ptr.add(IN_OCTETS_OFF) as *const u64);
-            let sent = std::ptr::read_unaligned(row_ptr.add(OUT_OCTETS_OFF) as *const u64);
-            total_recv = total_recv.saturating_add(recv);
-            total_sent = total_sent.saturating_add(sent);
+        let mut pkts_sent: u64 = 0;
+        let mut pkts_recv: u64 = 0;
+        for row in std::slice::from_raw_parts((*table_ptr).Table.as_ptr(), num) {
+            if row.Type == IF_TYPE_SOFTWARE_LOOPBACK {
+                continue;
+            }
+            total_recv = total_recv.saturating_add(row.InOctets);
+            total_sent = total_sent.saturating_add(row.OutOctets);
+            pkts_recv = pkts_recv.saturating_add(row.InUcastPkts);
+            pkts_sent = pkts_sent.saturating_add(row.OutUcastPkts);
         }
-
-        FreeMibTable(table_ptr);
-        (total_sent, total_recv)
+        FreeMibTable(table_ptr.cast());
+        // 全零（无活动接口）视为不可用，交由调用方走 netstat 兜底
+        if total_sent == 0 && total_recv == 0 {
+            return None;
+        }
+        Some((total_sent, total_recv, Some(pkts_sent), Some(pkts_recv)))
     }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn collect_network_io_ffi() -> (u64, u64) {
-    use std::mem::zeroed;
-    const IFROW_SIZE: usize = 860;
-    const IN_OCTETS_OFF: usize = 552;
-    const OUT_OCTETS_OFF: usize = 576;
-
-    unsafe {
-        let mut buf_size: u32 = 0;
-        let _ = GetIfTable(std::ptr::null_mut(), &mut buf_size, 0);
-        if buf_size == 0 {
-            return (0, 0);
-        }
-
-        let mut buf = vec![0u8; buf_size as usize];
-        if GetIfTable(buf.as_mut_ptr() as *mut std::ffi::c_void, &mut buf_size, 0) != 0 {
-            return (0, 0);
-        }
-
-        let num_entries = *(buf.as_ptr() as *const u32);
-        let row_base = buf.as_ptr().add(4);
-
-        let mut total_sent: u64 = 0;
-        let mut total_recv: u64 = 0;
-
-        for i in 0..num_entries {
-            let row_ptr = row_base.add(i as usize * IFROW_SIZE);
-            let in_oct: u32 = std::ptr::read_unaligned(row_ptr.add(IN_OCTETS_OFF) as *const u32);
-            let out_oct: u32 = std::ptr::read_unaligned(row_ptr.add(OUT_OCTETS_OFF) as *const u32);
-            total_recv = total_recv.saturating_add(in_oct as u64);
-            total_sent = total_sent.saturating_add(out_oct as u64);
-        }
-
-        let _ = zeroed::<u8>(); // 抑制未使用警告
-        (total_sent, total_recv)
-    }
+fn iftable2_stats() -> Option<(u64, u64, Option<u64>, Option<u64>)> {
+    None
 }
 
-extern "system" {
-    fn GetIfTable2(table: *mut *mut std::ffi::c_void) -> i32;
-    fn FreeMibTable(memory: *mut std::ffi::c_void);
-    #[cfg(not(target_arch = "x86_64"))]
-    fn GetIfTable(table: *mut std::ffi::c_void, size: *mut u32, order: i32) -> i32;
-}
-
-#[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
