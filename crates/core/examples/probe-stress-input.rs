@@ -129,7 +129,19 @@ fn main() {
             .unwrap_or_else(|_| format!("target/probe-stress-{}.db", std::process::id()));
 
         let sent_total = std::sync::Arc::new(AtomicU64::new(0));
-        let mut collector = collector::start_collection(&db_path);
+        // flush=1s：事件近实时可见（默认 30s flush 会让"末窗事件数/hook 存活"检查失真）
+        let settings = collector::CollectorSettings {
+            write_flush_interval_secs: 1,
+            ..Default::default()
+        };
+        let mut collector = collector::start_collection_custom(
+            &kynoptic_core::registry::default_enabled_ids()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+            settings,
+            &db_path,
+        );
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop2 = stop.clone();

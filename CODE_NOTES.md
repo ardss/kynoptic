@@ -174,3 +174,41 @@ crates/cli 同时产出 `kynoptic` 与 `kynoptic-ctl` 两个 bin（同一 main.r
 | audio_output | PS | ② | | print | PS | ③ |
 | ime | PS | ② | | stylus | PS | ③ |
 | thermal | PS | ③ | | gpu | PS | ③ |
+
+## 10. qa：实机探针（kynoptic-ctl probe）与 probe 期间修复（2026-09-09）
+
+新增 `kynoptic-ctl probe [--monitor ID] [--secs N] [--all]`（core 侧 `probe`
+模块）：对单个监控器构造"仅启用它"的配置，在独立临时库上真实采集 N 秒
+（1s flush），报告事件数/样本/警告与判定。--all 顺序跑满 40 个并输出矩阵。
+探针配套 `examples/probe-stress-input.rs`（SendInput 注入 + RSS/事件速率采样）。
+
+实机矩阵结论（Win11 26300 桌面机，15s 窗口）：**25 PASS / 15 EXPECTED-LIMITED
+/ 0 FAIL**。EXPECTED-LIMITED 均有明确环境原因（无电池、外接屏无亮度接口、
+无手写笔/VPN 网卡、Security 日志与 MSAcpi 需管理员、DNS/IME 事件日志为空、
+未装 Outlook、change-driven 监控器窗口内无状态变化）。
+
+probe 发现并修复的缺陷：
+
+- **ps.rs**：`powershell -Command` 在 cmdlet 产生被 SilentlyContinue 压制的
+  非终止错误时（Get-WinEvent 无记录等）即使 stdout 有效也退出码 1，原实现
+  丢弃全部输出 → driver 等事件日志型监控器静默零事件；且管道输出走 OEM
+  代码页（GBK），中文被 from_utf8_lossy 打碎。改为"stdout 非空即返回 +
+  注入 UTF-8 OutputEncoding"。
+- **network.rs**：GetIfTable2 裸指针硬编码偏移读取在 Win11 26300 上恒为 0
+  （delta 恒 0 → 静默零事件），netstat -e 解析在中文系统上又因 GBK 失效，
+  双路径同时死。改为类型化 MIB_IF_TABLE2（正确切片迭代，回环不计），
+  netstat 降为兜底。
+- **bluetooth.rs**：GUID_DEVCLASS_BLUETOOTH 类枚举在新系统对 BTHENUM 子设备
+  返回空集 → 永远零事件。改按 BTHENUM 枚举器取远端设备（BTHENUM\DEV_ 前缀
+  过滤），类 GUID 兜底。
+- **audio_output.rs**：AudioEndpoint 的 FriendlyName 在该构建上为空串 →
+  解析后设备列表为空 → 零事件。回退到 PnP Name。
+- **collector.rs**：全局静态 SHUTDOWN 在同进程多次启停采集器（probe --all）
+  时会把上一实例的监控线程"复活"成僵尸，并使关停尾部的 Disconnected 发送
+  污染全局丢弃计数。改为每 Collector 一份停机旗标；send_event 只计 Full。
+- battery：无电池时显式记一条 info（区分"硬件缺失"与"失效"）。
+
+集成测试 flake 根因：临时库路径仅 pid+seq，Windows pid 快速复用 + 测试
+panic/连接未关导致的遗留库在同日重跑时命中旧文件（计数翻倍/UNIQUE 冲突）。
+修复：路径加入纳秒级分量（agg_cache/db_integration/queries_integration 三处），
+全量 suite 连续 5 次零失败。

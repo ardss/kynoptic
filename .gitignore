@@ -1,2 +1,3 @@
 /target
 probe_all_run1.txt
+probe_all_*.txt
