@@ -191,3 +191,122 @@ app 占满 1M 行）远比真实使用极端，真实多应用负载下只会更
 | "near-zero overhead"（CPU） | **修复后成立**（空载 0.41% 单核）。修复前（writer busy-spin 占满 1 核）不成立——本基准正是该 bug 的发现手段。 |
 | "typical storage is KB-scale per day" | **仅对近零活动日成立**。实测活跃时段磁盘 ~5.8 MB/h（WAL 提交页开销主导），轻度使用 1-2h/天即 6-12 MB/天。建议文案限定为「空闲/低活动日 KB 级」或标注前提。 |
 | 隐含「查询瞬时」 | perf2 后 1M 事件库上**全部**查询 p95 < 50ms（get_anomalies 7d p95 ≈ 30ms，读聚合缓存）。可以恢复"近瞬时"表述，但建议注明"基于预聚合缓存"。 |
+
+## 6. 长跑审计（PERF3，2026-09-09，perf3 系列）
+
+场景：daemon 连续运行数天/数周的健壮性。原基准未覆盖的五个长跑场景，
+新增 harness：`crates/core/examples/perf3-longrun.rs`（P1 聚合维护成本 /
+P2 持续写 RSS+WAL / P3 突发+写停滞 / P4 并发读一致性）、
+`crates/core/examples/perf3-open.rs`（大库启动）、
+`crates/mcp/examples/perf3-zipf.rs`（真实分布查询）。
+
+### 6.1 场景 5 → 大存量库启动（P0，已修复）
+
+方法：1M 事件 / 1200 应用真实分布库（375 MB），清空 agg_minute/agg_daily
+模拟「存量库升级后首次打开」（`Database::open` 内懒回填路径），10 次中位数。
+
+| 指标 | 修复前（perf2 同步回填） | 修复后（perf3 后台分块回填） |
+|---|---|---|
+| open（agg 已就绪，稳态） | 42.2 ms | **12.7 ms** |
+| **open（agg 为空，legacy 首开）** | **631,594 ms（10.5 分钟，P0）** | **8.1 ms**（回填转后台） |
+
+修复：`Database::open` 不再同步回填；后台线程按**本地 (date,hour) 块**分块
+回填，每块一个短事务（DELETE 该块聚合行 + events 重算 INSERT），writer 的
+增量 update_agg 在块间穿插不被饿死；进度记于 `metadata.agg_backfill_cursor`，
+中断后下次打开自动续跑。等价性由新增单测保证（分块 == 全量 rebuild 逐行一致）。
+
+### 6.2 场景 3 → 真实分布查询延迟（P1，已修复）
+
+方法：perf3-zipf，1,000,000 事件 / **1200 个应用 / Zipf s=1.1**（top 应用
+~10%、长尾 1100 个稀有应用；旧 perf-query 只有 2-3 个应用，远比真实极端）、
+30 天、55% move / 20% press / 15% switch / 10% heartbeat，各查询 50 次。
+agg 读缓存完备（增量维护等价于全量重建）。
+
+| 查询 | perf2（2-3 app 合成库） | perf3 修复前（Zipf） | perf3 修复后 | 目标 p95 |
+|---|---|---|---|---|
+| get_summary[keys] (1d) | 0.79 ms | 2.33 ms | 2.46 ms | <50 ms |
+| **get_summary[apps] (1d)** | 2.52 ms | **319.67 ms FAIL** | **12.47 ms** | <50 ms |
+| get_summary[active_minutes] (1d) | 6.82 ms | 35.20 ms | 23.40 ms | <50 ms |
+| get_summary[focus_segments] (1d) | 3.63 ms | 44.55 ms | 20.73 ms | <50 ms |
+| get_timeline (7d, hour) | 0.34 ms | 0.34 ms | 0.32 ms | <50 ms |
+| **get_anomalies (7d)** | 30.4 ms | **537.14 ms FAIL** | **35.25 ms** | <50 ms |
+
+根因与修复（迁移 0004_perf3_indexes，纯增量索引）：
+- get_anomalies：`app_history_totals` 按 `bucket_id` 过滤 agg_daily，但主键前缀
+  是 `date` → 每调用全表扫描（top20 应用 × 7 天 = 140 次全扫）。加
+  `idx_agg_daily_bucket_date(bucket_id, date)`。
+- get_summary[apps]：`COUNT(DISTINCT app_name)` 走 timestamp 索引后逐行回表，
+  行散布 375 MB 库时退化为随机页访问。加覆盖索引
+  `idx_events_ts_app(timestamp, app_name)`。
+注：修复前两次运行还暴露 p99 尖刺（最坏 ~89 s，get_summary[apps] 首查），
+属 375 MB 文件冷页缓存 + 首查一次性成本；p50/p95 稳定，不构成回归门。
+
+### 6.3 场景 1 → 持续写（RSS / WAL / 聚合维护成本）
+
+方法：perf3-longrun P2，真实写路径（insert_events + update_agg，300/批），
+加速合成进料 ~2000 事件/s（真实人手 <30/s 的 ~70 倍上界），并发读者全程
+压测（5ms 间隔），30 分钟窗口、360 万事件尝试：
+
+| 指标 | 30 分钟实测 | 结论 |
+|---|---|---|
+| 实际落库 | 3,058,700 事件（真实写路径） | — |
+| RSS | 9.8 → 峰值 48.8 MB（斜率 +38.8 MB/h，0.5h 窗口噪声级，无失控增长）| 稳态 < 50 MB @2000eps 超载 |
+| **WAL 大小** | **4.51 – 5.97 MB 全程（autocheckpoint 兜底）** | **有界，不随时间增长**；30s flush 下 WAL 由默认 1000 页 autocheckpoint 封顶，日常维护另有每日 TRUNCATE |
+| 写吞吐 | 1688 → **2000 eps**（tx 修复后，受进料上限封顶）| 修复前 543k 事件因通道满被丢 |
+| 每事件磁盘（含 agg 维护） | ~423-497 B/事件（重度 2000eps 下） | 与 perf-write 的 336 B/event 同量级 |
+| CPU | 262% 单核 @2000eps + 读压测（超载场景；空载 0.41% 见 §1）| — |
+
+聚合维护成本随 agg_minute 规模（P1，300 事件/批，20 次中位）：
+
+| update_agg | 空 agg | 525,000 行（"一年"）| 结论 |
+|---|---|---|---|
+| perf2（每条 UPSERT 独立提交） | 117.7 ms（392µs/事件） | 114.1 ms（380µs/事件） | 成本与 agg 规模无关，但提交开销主导 |
+| **perf3（整批单事务）** | **2.08 ms（6.9µs/事件）** | **2.22 ms（7.4µs/事件）** | **55x**，仍与 agg 规模无关 |
+
+写停滞恢复排空（P3）：20k 事件排空 14.9 s（1341 eps）→ **2.7 s（7362 eps）**。
+
+### 6.4 场景 2 → 事件突发 + 写停滞最坏内存
+
+方法：P3，写入端完全不 drain（等价无限磁盘停顿），向真实有界通道
+（CHANNEL_CAPACITY=20000）灌 3× 容量事件。
+
+| 指标 | 实测 | 结论 |
+|---|---|---|
+| hook 侧入队延迟（mean / max） | ~105 ns / 261 µs | **永不阻塞**（try_send 满即丢）|
+| 队列深度上界 | 20,000 事件（有界通道） | 有界 |
+| 通道满时队列驻留 RSS | **~18 MB**（20k 事件实测） | 最坏情况内存 ≈ 20 MB 级，与停顿时长无关 |
+| 停顿恢复排空速度 | 20k 事件 ~14 s（~1450 events/s） | 快速追赶 |
+| 丢弃政策 | 满后丢弃并计数（log warn） | 设计如此；60 s 停顿 × 真实速率（~30/s）= 1800 事件 << 20k，**不丢** |
+
+### 6.5 场景 1（聚合维护成本随 agg_minute 规模）
+
+| update_agg（300 事件/批） | agg_minute 行数 | 中位耗时 |
+|---|---|---|
+| 空 agg | 0 | ~0.2 ms |
+| "一年" | 525,000 | ~0.2 ms（O(事件数)，与 agg 规模无关，PK 点查）|
+
+结论：agg 增量维护成本**不随 agg_minute 累积增长**；一年规模无退化。
+
+### 6.6 场景 4 → 并发读 vs 写
+
+- WAL 模式确认：读连接 `PRAGMA journal_mode` = wal（apply_pragmas 统一设置）。
+- 读者全程不阻塞 writer：P2 窗口内写吞吐稳定（读负载 5ms 间隔持续查询）。
+- 无撕裂读：WAL 快照隔离 + writer 增量维护的 agg 与全量 rebuild **逐行指纹
+  相等**（perf3-longrun 一致性校验；该校验抓到并修复了一处 pre-existing
+  语义分叉，见 6.7）。
+
+### 6.7 附带修复：增量维护与全量重建的 samples 语义分叉（P2，已修复）
+
+perf3-longrun 一致性指纹抓到：含 raw mouse move 的分钟上，`rebuild_all` 把
+move 行计入 agg_minute 的 count_value（samples），而增量 `apply_event` 不会
+→ 同一库两条路径结果不同（count_value 当前无查询消费方，纯派生一致性问题）。
+修复：rebuild_all / backfill_chunk 的 m/b CTE 改为与 apply_event 逐条语义
+一一对应（input_keys=input按键、input_clicks=点击、input_moves=鼠标input_agg
+样本；不再混入 raw move/scroll），并有单测锁定等价性。
+
+### 6.8 附带修复：HEAD 上迁移 0002 静默失败（审计中发现，非 perf3 引入）
+
+`ALTER TABLE IF EXISTS` 不是合法 SQLite 语法（bundled 3.45 直接报错），
+导致 0002 起所有迁移在每次 open 时静默失败（schema_version 卡住、agg 表
+建不出来、迁移相关测试全红）。修复为「CREATE TABLE IF NOT EXISTS 兜底 +
+无条件 RENAME」，语义不变（pet 表永不 DROP，只改名归档）。

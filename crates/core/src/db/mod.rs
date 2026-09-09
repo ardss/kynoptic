@@ -14,6 +14,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::thread;
 use std::time::Duration;
 
 use crate::constants;
@@ -251,9 +252,47 @@ impl Database {
         let writer = Connection::open(path)?;
         writer.execute_batch(SCHEMA)?;
         run_migrations(&writer);
-        // 懒回填聚合读缓存（存量库首开一次；agg 缺失时 get_anomalies 等
-        // 查询会退化为 events 全量现算）。原始 events 只读不动。
-        agg::backfill_if_needed(&writer);
+        // 懒回填聚合读缓存（存量库首开一次）——**后台分块执行，不阻塞 open**。
+        // perf3 2026-09 P0 实测：1M 事件存量库首开时同步回填把 Database::open
+        // 阻塞 10.5 分钟（631,594 ms；目标 <500ms）。改为：open 只做廉价门槛
+        // 检查（两条 EXISTS），分块（本地 date,hour）回填在后台线程执行——
+        // 每块一个短事务（DELETE 该块聚合行 + events 重算），writer 增量
+        // update_agg 可在块间穿插；进度记在 metadata.agg_backfill_cursor，
+        // 中断后下次 open 自动续跑。回填完成前聚合查询回退 events 现算
+        // （正确但慢），原始 events 只读不动。
+        if agg::backfill_needed(&writer) {
+            log::info!("检测到 agg 缓存缺失，转入后台分块回填（不阻塞启动）");
+            let bg_path = path.to_string();
+            let _ = thread::Builder::new()
+                .name("agg-backfill".into())
+                .spawn(move || match Connection::open(&bg_path) {
+                    Ok(c) => {
+                        if apply_pragmas(&c).is_err() {
+                            log::warn!("agg 回填连接 PRAGMA 设置失败（继续，用默认配置）");
+                        }
+                        match agg::backfill_all(&c) {
+                            Ok(n) => log::info!("agg 后台分块回填完成（{} 行 agg_minute）", n),
+                            Err(e) => log::warn!("agg 后台分块回填失败（下次打开续跑）: {e}"),
+                        }
+                    }
+                    Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
+                });
+        } else if agg::read_cursor_incomplete(&writer) {
+            // 上次分块回填中断（agg 已有部分行）：补齐剩余块
+            let bg_path = path.to_string();
+            let _ = thread::Builder::new()
+                .name("agg-backfill".into())
+                .spawn(move || match Connection::open(&bg_path) {
+                    Ok(c) => {
+                        let _ = apply_pragmas(&c);
+                        match agg::backfill_all(&c) {
+                            Ok(n) => log::info!("agg 后台分块回填续跑完成（{} 行）", n),
+                            Err(e) => log::warn!("agg 后台分块回填补齐失败: {e}"),
+                        }
+                    }
+                    Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
+                });
+        }
 
         let mut readers = Vec::with_capacity(constants::READER_POOL_SIZE);
         for _ in 0..constants::READER_POOL_SIZE {

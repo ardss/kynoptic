@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS current_state (
 
 -- pet 遗留表改名保留（永不删除用户数据；新库不存在时无操作）
 -- 注意：这里不使用 DROP。旧表数据一律改名归档。
-ALTER TABLE IF EXISTS pet_signals RENAME TO legacy_pet_signals;
-ALTER TABLE IF EXISTS pet_memory RENAME TO legacy_pet_memory;
-ALTER TABLE IF EXISTS pet_state RENAME TO legacy_pet_state;
+-- perf3 修复（2026-09-09）：SQLite（bundled 3.45）不支持 `ALTER TABLE IF EXISTS`
+-- ——原写法让 0002 起所有迁移静默失败（schema_version 卡在 0/1，agg 表建不出来）。
+-- 改为「缺则建空表 + 无条件 RENAME」：存量库的 pet 表原样改名；全新库只留下
+-- 空的 legacy_* 归档表，语义不变（永不 DROP 用户数据）。
+CREATE TABLE IF NOT EXISTS pet_signals (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS pet_memory (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS pet_state (id INTEGER PRIMARY KEY);
+ALTER TABLE pet_signals RENAME TO legacy_pet_signals;
+ALTER TABLE pet_memory RENAME TO legacy_pet_memory;
+ALTER TABLE pet_state RENAME TO legacy_pet_state;
