@@ -246,12 +246,31 @@ fn err_json(msg: &str) -> String {
     json!({"error": msg}).to_string()
 }
 
+/// 只读打开：优先走 MCP 工具面同款 `open_reader`（READ_ONLY + 全套 PRAGMA）。
+/// 非 WAL 库上 `journal_mode=WAL` 会写入失败，此时回退为纯 READ_ONLY 连接
+/// （仅设无副作用的 busy_timeout）——依然零写入、零迁移。
+fn open_read_only(db_path: &Path) -> Result<Connection> {
+    let path = db_path.to_string_lossy().to_string();
+    match kynoptic_mcp::state::open_reader(&path) {
+        Ok(conn) => Ok(conn),
+        Err(_) => {
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|e| {
+                        Error::InvalidData(format!("无法只读打开 {}: {e}", db_path.display()))
+                    })?;
+            conn.execute_batch("PRAGMA busy_timeout=5000;")
+                .map_err(|e| Error::InvalidData(e.to_string()))?;
+            Ok(conn)
+        }
+    }
+}
+
 // ─── HTTP 服务（std::net 手写最小 handler） ─────────────────────────────────
 
 /// 阻塞服务循环。仅绑定 127.0.0.1；每连接一线程、响应后立即关闭。
 pub fn serve(port: u16, db_path: &Path) -> Result<()> {
-    let conn = kynoptic_mcp::state::open_reader(&db_path.to_string_lossy())
-        .map_err(|e| Error::InvalidData(format!("无法只读打开 {}: {e}", db_path.display())))?;
+    let conn = open_read_only(db_path)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
         Error::Io(std::io::Error::other(format!(
             "绑定 127.0.0.1:{port} 失败: {e}"

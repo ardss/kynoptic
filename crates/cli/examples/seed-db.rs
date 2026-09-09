@@ -9,6 +9,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "kyn-seed.db".into());
     let conn = rusqlite::Connection::open(&db)?;
+    // 与生产库（采集器 Database::open）同口径：WAL，只读打开时才不因 journal_mode 报错
+    kynoptic_core::db::apply_pragmas(&conn)?;
     conn.execute_batch(kynoptic_core::db::SCHEMA)?;
     kynoptic_core::db::run_migrations(&conn);
 
