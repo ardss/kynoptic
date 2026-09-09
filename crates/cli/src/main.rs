@@ -34,6 +34,7 @@ use kynoptic_core::{Error, Result};
 
 // 引用父 crate 的 autostart 模块
 mod autostart;
+mod dashboard;
 
 /// 把 csv::Error 转为 [`Error`]：底层是 io 错误时保留为 Io，否则归为 InvalidData。
 /// （csv 不在 kynoptic-core 依赖内，故在 ctl 本地做转换。）
@@ -62,6 +63,7 @@ Subcommands:
                                               Event query in time range
   mcp                                         Run MCP server over stdio
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
+  dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
 ";
 
 fn resolve_db() -> PathBuf {
@@ -845,6 +847,7 @@ fn main() -> ExitCode {
         "query" => cmd_query(&args[1..]),
         "mcp" => cmd_mcp(),
         "probe" => cmd_probe(&args[1..]),
+        "dashboard" => dashboard::cmd_dashboard(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE);
             Ok(())
