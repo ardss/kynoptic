@@ -1,9 +1,10 @@
 //! 托盘图标:运行时用 GDI 在 32bpp 内存 DIB 上绘制,零 .ico 资源文件。
 //!
-//! 三态(中性色,v0.1 不做深浅色主题自适应):
-//! - Running = 实心圆(绿)
-//! - Paused  = 空心圆(灰描边)
-//! - Error   = 黄三角
+//! 母题来自品牌图标(B4 orbit-K):K 竖笔 + 斜笔 + 轨道弧 + 琥珀卫星点。
+//! 三态(扁平版,小尺寸可辨认优先):
+//! - Running = 蓝色 K 母题 + 琥珀点
+//! - Paused  = 同母题全灰
+//! - Error   = 黄三角(错误语义优先于品牌)
 //!
 //! 透明度实现:32bpp DIB 零初始化后,用非黑色画刷/画笔绘形;GDI 不写 alpha
 //! 字节(保持 0),收尾时逐像素修复——纯黑像素(未绘制的背景)alpha=0(透明),
@@ -14,9 +15,8 @@
 
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateDIBSection, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse, GetDC,
-    GetStockObject, Polygon, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, NULL_BRUSH, PS_SOLID,
+    CreateDIBSection, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse, GetDC, Polygon,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, PS_SOLID,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, GetSystemMetrics, ICONINFO, SM_CXSMICON,
@@ -35,9 +35,9 @@ impl TrayIcons {
         let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
         Some(Self {
             handles: [
-                draw(IconShape::FilledCircle, size)?,
-                draw(IconShape::HollowCircle, size)?,
-                draw(IconShape::Triangle, size)?,
+                draw(IconShape::Running, size)?,
+                draw(IconShape::Paused, size)?,
+                draw(IconShape::Error, size)?,
             ],
         })
     }
@@ -64,29 +64,34 @@ impl Drop for TrayIcons {
 /// 三态形状与配色(避开纯黑:纯黑被 alpha 修复当作透明背景)。
 #[derive(Clone, Copy)]
 enum IconShape {
-    FilledCircle,
-    HollowCircle,
-    Triangle,
+    /// 采集中:品牌蓝 K 母题 + 琥珀点
+    Running,
+    /// 已暂停:同母题全灰
+    Paused,
+    /// 异常:黄三角
+    Error,
 }
 
+/// COLORREF(0x00BBGGRR)。
+const BLUE_MAIN: u32 = 0x00FFA14E; // #4EA1FF
+const AMBER: u32 = 0x0054B4FF; // #FFB454
+const GRAY_MAIN: u32 = 0x00A0A0A0;
+const GRAY_DOT: u32 = 0x00C8C8C8;
+
 impl IconShape {
-    fn brush_color(self) -> u32 {
+    fn body_color(self) -> u32 {
         match self {
-            // 中性绿(RGB, COLORREF 为 0x00BBGGRR)
-            Self::FilledCircle => 0x005FA02E,
-            Self::HollowCircle => 0x00000000, // 内部不填(NULL_BRUSH),仅用 pen
-            // 中性黄
-            Self::Triangle => 0x0020C0E8,
+            Self::Running => BLUE_MAIN,
+            Self::Paused => GRAY_MAIN,
+            Self::Error => 0x0020C0E8,
         }
     }
 
-    fn pen_color(self) -> u32 {
+    fn dot_color(self) -> u32 {
         match self {
-            Self::FilledCircle => 0x00487924,
-            // 中性灰描边
-            Self::HollowCircle => 0x008A8A8A,
-            // 深黄褐描边
-            Self::Triangle => 0x00005A6A,
+            Self::Running => AMBER,
+            Self::Paused => GRAY_DOT,
+            Self::Error => 0x0020C0E8,
         }
     }
 }
@@ -143,33 +148,69 @@ fn draw(shape: IconShape, size: i32) -> Option<windows_sys::Win32::UI::WindowsAn
         let inset = 1.0;
         let lo = inset as i32;
         let hi = (m - inset).round() as i32;
+        let _ = hi; // 部分形状直接用 m 计算边界
 
         match shape {
-            IconShape::FilledCircle => {
-                let brush = CreateSolidBrush(shape.brush_color());
-                let pen = CreatePen(PS_SOLID, 1, shape.pen_color());
+            IconShape::Running | IconShape::Paused => {
+                let brush = CreateSolidBrush(shape.body_color());
                 let old_brush = SelectObject(mem, brush);
-                let old_pen = SelectObject(mem, pen);
-                Ellipse(mem, lo, lo, hi, hi);
-                SelectObject(mem, old_brush);
-                SelectObject(mem, old_pen);
-                DeleteObject(brush);
-                DeleteObject(pen);
-            }
-            IconShape::HollowCircle => {
+                // 竖笔:左侧圆角矩形(细体,留出右侧空间给轨道)
+                let stem_w = (m * 0.22).round() as i32;
+                let top = (m * 0.10).round() as i32;
+                let bot = (m * 0.90).round() as i32;
+                windows_sys::Win32::Graphics::Gdi::RoundRect(mem, lo, top, lo + stem_w, bot, 6, 6);
+                // 斜笔:一条粗线从竖笔中部到右下
                 let pen = CreatePen(
                     PS_SOLID,
-                    ((m / 10.0).round() as i32).max(1),
-                    shape.pen_color(),
+                    ((m * 0.16).round() as i32).max(1),
+                    shape.body_color(),
                 );
                 let old_pen = SelectObject(mem, pen);
-                let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
-                Ellipse(mem, lo, lo, hi, hi);
+                windows_sys::Win32::Graphics::Gdi::MoveToEx(
+                    mem,
+                    lo + stem_w / 2,
+                    (m * 0.52).round() as i32,
+                    std::ptr::null_mut(),
+                );
+                windows_sys::Win32::Graphics::Gdi::LineTo(mem, (m * 0.86).round() as i32, bot);
+                // 轨道弧(size>=24 才画,16px 下过于细碎)
+                if size >= 24 {
+                    let arc_pen = CreatePen(
+                        PS_SOLID,
+                        ((m * 0.07).round() as i32).max(1),
+                        shape.body_color(),
+                    );
+                    let old_arc = SelectObject(mem, arc_pen);
+                    let ar = m * 0.42;
+                    let acx = m * 0.52;
+                    let acy = m * 0.42;
+                    windows_sys::Win32::Graphics::Gdi::Arc(
+                        mem,
+                        (acx - ar).round() as i32,
+                        (acy - ar).round() as i32,
+                        (acx + ar).round() as i32,
+                        (acy + ar).round() as i32,
+                        (acx + ar * 0.87).round() as i32,
+                        (acy - ar * 0.50).round() as i32,
+                        (acx - ar * 0.87).round() as i32,
+                        (acy + ar * 0.50).round() as i32,
+                    );
+                    SelectObject(mem, old_arc);
+                    DeleteObject(arc_pen);
+                }
                 SelectObject(mem, old_pen);
-                SelectObject(mem, old_brush);
                 DeleteObject(pen);
+                // 琥珀卫星点(右上,轨道端点处)
+                let dr = (m * 0.13).round() as i32;
+                let dcx = (m * 0.84).round() as i32;
+                let dcy = (m * 0.16).round() as i32;
+                let dot = CreateSolidBrush(shape.dot_color());
+                SelectObject(mem, dot);
+                Ellipse(mem, dcx - dr, dcy - dr, dcx + dr, dcy + dr);
+                SelectObject(mem, old_brush);
+                DeleteObject(dot);
             }
-            IconShape::Triangle => {
+            IconShape::Error => {
                 // 顶点在上、底边在下,微收腰边距
                 let mut pts: [POINT; 3] = [
                     POINT {
@@ -185,8 +226,8 @@ fn draw(shape: IconShape, size: i32) -> Option<windows_sys::Win32::UI::WindowsAn
                         y: (m * 0.90).round() as i32,
                     },
                 ];
-                let brush = CreateSolidBrush(shape.brush_color());
-                let pen = CreatePen(PS_SOLID, 1, shape.pen_color());
+                let brush = CreateSolidBrush(shape.body_color());
+                let pen = CreatePen(PS_SOLID, 1, 0x00005A6A);
                 let old_brush = SelectObject(mem, brush);
                 let old_pen = SelectObject(mem, pen);
                 Polygon(mem, pts.as_mut_ptr(), 3);
