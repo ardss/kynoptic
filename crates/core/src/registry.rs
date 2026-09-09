@@ -313,6 +313,11 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
 ];
 
 /// 默认启用集合的 id 列表（顺序与注册表一致）。
+/// 全部 40 个监控器 id（= MONITOR_REGISTRY 全集）。
+pub fn all_monitor_ids() -> Vec<&'static str> {
+    MONITOR_REGISTRY.iter().map(|s| s.id).collect()
+}
+
 pub fn default_enabled_ids() -> Vec<&'static str> {
     MONITOR_REGISTRY
         .iter()

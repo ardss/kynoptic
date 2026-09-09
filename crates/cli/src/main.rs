@@ -50,6 +50,7 @@ fn map_csv_err(e: csv::Error) -> Error {
 const USAGE: &str = "kynoptic-ctl <subcommand> [options]
 
 Subcommands:
+  collect   [--db PATH] [--all]             Run the collector (Ctrl+C to stop)
   stats     [--date YYYY-MM-DD] [--days N]   Show summary stats
   export    [--days N] [--format csv|json|jsonl] [--out PATH]
   report    [--date YYYY-MM-DD] [--save PATH]   Generate Markdown report
@@ -831,10 +832,59 @@ fn cmd_probe(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `collect` 子命令：前台运行采集器（默认 14 监控器；--all 启用全部 40 个），
+/// Ctrl+C 优雅关停并打印本次会话统计。v0.1 的"跑起来"入口。
+fn cmd_collect(args: &[String]) -> Result<()> {
+    use kynoptic_core::collector;
+    use std::sync::atomic::Ordering;
+
+    let mut db_path = resolve_db().to_string_lossy().to_string();
+    let mut all = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--db" if i + 1 < args.len() => {
+                i += 1;
+                db_path = args[i].clone();
+            }
+            "--all" => all = true,
+            other => return Err(Error::InvalidData(format!("collect: 未知参数 {other}"))),
+        }
+        i += 1;
+    }
+
+    let mut c = if all {
+        let enabled: std::collections::HashSet<String> =
+            kynoptic_core::registry::all_monitor_ids().iter().map(|s| s.to_string()).collect();
+        eprintln!(
+            "kynoptic collect: {} monitors (ALL), db = {db_path}. Ctrl+C to stop.",
+            enabled.len()
+        );
+        collector::start_collection_custom(&enabled, collector::CollectorSettings::default(), &db_path)
+    } else {
+        eprintln!("kynoptic collect: default monitors, db = {db_path}. Ctrl+C to stop.");
+        collector::start_collection(&db_path)
+    };
+
+    // Ctrl+C → 优雅关停，保证缓冲事件 flush、session 正常关闭
+    let shutdown = c.shutdown_flag().clone();
+    ctrlc::set_handler(move || {
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    })
+    .map_err(|e| Error::InvalidData(format!("ctrl-c handler: {e}")))?;
+
+    // 阻塞等待 writer 退出（shutdown 后 join 返回）
+    c.wait();
+    let n = c.total_written.load(Ordering::Relaxed);
+    println!("collected {n} events into {db_path}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
     let result: Result<()> = match sub {
+        "collect" => cmd_collect(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "export" => cmd_export(&args[1..]),
         "report" => cmd_report(&args[1..]),

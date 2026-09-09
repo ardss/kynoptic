@@ -263,6 +263,18 @@ pub struct Collector {
 }
 
 impl Collector {
+    /// 停机旗标的克隆：供外部线程（CLI Ctrl+C handler）置位。
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
+    /// 阻塞直到 writer 线程退出（通常在 shutdown 置位后）。
+    pub fn wait(&mut self) {
+        if let Some(h) = self.writer_handle.take() {
+            let _ = h.join();
+        }
+    }
+
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
 
