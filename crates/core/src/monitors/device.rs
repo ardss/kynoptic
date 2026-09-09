@@ -7,12 +7,17 @@ use std::time::Duration;
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::SystemInformation::*;
 
-pub struct DeviceMonitor;
-
-impl Default for DeviceMonitor {
-    fn default() -> Self {
-        Self
-    }
+/// 设备硬件快照监控器。
+///
+/// `enable_disk_io` 控制磁盘 I/O 速率采集（见 [`collect_disk_io`]）：
+/// 完整实现已从上游恢复，但它依赖 PowerShell/WMI 子进程，而 device 是
+/// 默认启用的 14 个监控器之一（零子进程硬约束，见 CODE_NOTES.md §9），
+/// 故默认 `false`（disk_io 字段省略）。需要 I/O 速率时显式启用，
+/// 或等原生方案（PDH/IOCTL）落地后转默认。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeviceMonitor {
+    /// 是否采集磁盘 I/O 速率（PS 子进程，默认关闭）
+    pub enable_disk_io: bool,
 }
 
 impl Monitor for DeviceMonitor {
@@ -30,7 +35,11 @@ impl Monitor for DeviceMonitor {
         let snapshot = DeviceSnapshot {
             memory: collect_memory(),
             disks: collect_disk(),
-            disk_io: collect_disk_io(),
+            disk_io: if self.enable_disk_io {
+                collect_disk_io()
+            } else {
+                None
+            },
         };
         // 直接序列化 struct —— 字段名（memory/disks/disk_io 及其子字段）单一来源，
         // 不再手写 json! 宏。disk_io 为 None 时 skip_serializing_if 自动省略。
@@ -175,19 +184,25 @@ fn enumerate_logical_drives() -> Vec<[u16; 4]> {
 
 /// 采集磁盘 I/O 速率（read/write bytes per sec）。
 ///
-/// v0.1 注：上游实现通过 PowerShell/WMI（Win32_PerfFormattedData_PerfDisk_PhysicalDisk）
-/// 读取 `_Total` 实例速率。开源版硬性要求零子进程（见 R8-v01采集裁剪.md），
-/// 且原生无轻量等价 API（PDH/IOCTL 复杂度高），故 v0.1 暂返回 None——
-/// DeviceSnapshot.disk_io 为 Option 且 skip_serializing_if，缺省时自动省略该字段。
-/// `parse_disk_io` 纯函数与测试保留，待 v0.2 原生方案落地后复用。
+/// v0.2 恢复说明：上游原实现（PowerShell/WMI
+/// `Win32_PerfFormattedData_PerfDisk_PhysicalDisk` 读取 `_Total` 实例速率）
+/// 已原样恢复，但受"默认启用监控器零子进程"约束，仅当
+/// [`DeviceMonitor::enable_disk_io`] 为 true 时调用（见结构体文档）。
+/// 该 WMI 类返回**已计算好的速率值**（perf 引擎内部完成），属性名
+/// `DiskReadBytesPerSec` / `DiskWriteBytesPerSec` 是 WMI API 标识符，
+/// **不随系统语言变化**。此前用 `Get-Counter '\PhysicalDisk(_Total)\Disk
+/// Read Bytes/sec'`，计数器路径在纯中文 Windows 上会被本地化导致静默失败。
 fn collect_disk_io() -> Option<DiskIo> {
-    None
+    let script = r#"
+$d = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction SilentlyContinue
+if ($d) { "$($d.DiskReadBytesPerSec)|$($d.DiskWriteBytesPerSec)" }
+"#;
+    crate::monitors::ps::run_ps(script).and_then(|out| parse_disk_io(&out))
 }
 
-/// 纯函数：解析磁盘 I/O 速率字符串（"read|write"）——见 collect_disk_io 的 v0.1 注。
+/// 纯函数：解析磁盘 I/O 速率字符串（"read|write"）——见 collect_disk_io。
 ///
 /// 返回 DiskIo struct（字段名即契约）。便于单元测试：正常值、空输出、非数字、单字段。
-#[cfg(test)]
 fn parse_disk_io(out: &str) -> Option<DiskIo> {
     let parts: Vec<&str> = out.trim().split('|').collect();
     if parts.len() == 2 {
