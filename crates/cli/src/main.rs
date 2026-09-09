@@ -35,6 +35,8 @@ use kynoptic_core::{Error, Result};
 // 引用父 crate 的 autostart 模块
 mod autostart;
 mod dashboard;
+mod settings;
+mod update;
 
 /// 把 csv::Error 转为 [`Error`]：底层是 io 错误时保留为 Io，否则归为 InvalidData。
 /// （csv 不在 kynoptic-core 依赖内，故在 ctl 本地做转换。）
@@ -65,6 +67,7 @@ Subcommands:
   mcp                                         Run MCP server over stdio
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
+  update                                      Self-update from GitHub releases
 ";
 
 fn resolve_db() -> PathBuf {
@@ -854,13 +857,19 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     }
 
     let mut c = if all {
-        let enabled: std::collections::HashSet<String> =
-            kynoptic_core::registry::all_monitor_ids().iter().map(|s| s.to_string()).collect();
+        let enabled: std::collections::HashSet<String> = kynoptic_core::registry::all_monitor_ids()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         eprintln!(
             "kynoptic collect: {} monitors (ALL), db = {db_path}. Ctrl+C to stop.",
             enabled.len()
         );
-        collector::start_collection_custom(&enabled, collector::CollectorSettings::default(), &db_path)
+        collector::start_collection_custom(
+            &enabled,
+            collector::CollectorSettings::default(),
+            &db_path,
+        )
     } else {
         eprintln!("kynoptic collect: default monitors, db = {db_path}. Ctrl+C to stop.");
         collector::start_collection(&db_path)
@@ -898,6 +907,7 @@ fn main() -> ExitCode {
         "mcp" => cmd_mcp(),
         "probe" => cmd_probe(&args[1..]),
         "dashboard" => dashboard::cmd_dashboard(&args[1..]),
+        "update" => update::cmd_update(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE);
             Ok(())

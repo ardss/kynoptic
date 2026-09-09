@@ -12,6 +12,8 @@
 //! - `/api/timeline?hours=12`        近 N 小时按本地小时桶的应用分布（top5 + other）
 //! - `/api/anomalies?days=7`         复用 MCP `get_anomalies` 的同一异常检测
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
+//! - `/api/settings` (GET)           当前设置 + 全部监控器清单
+//! - `/api/settings` (POST)          更新设置（写 settings.json，不触碰 events）
 //!
 //! 无鉴权：仅绑定回环地址，不暴露到网络（页脚已声明）。
 
@@ -24,7 +26,10 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use kynoptic_core::queries;
+use kynoptic_core::registry;
 use kynoptic_core::{Error, Result};
+
+use crate::settings::{self, AppSettings};
 
 /// 内嵌静态页（与产品 monospace/终端风一致的暗色单页）。
 pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
@@ -183,14 +188,77 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     })
 }
 
+/// GET /api/settings — 当前设置 + 全部监控器清单（来自 MONITOR_REGISTRY）。
+pub fn api_settings(db_path: &Path) -> Value {
+    let s = settings::load(db_path);
+    settings_payload(&s)
+}
+
+/// 设置 + 监控器清单的统一响应体（GET 与 POST 共用）。
+fn settings_payload(s: &AppSettings) -> Value {
+    let monitors: Vec<Value> = registry::MONITOR_REGISTRY
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "default_enabled": m.default_enabled,
+                "sensitivity": m.sensitivity.as_str(),
+            })
+        })
+        .collect();
+    json!({
+        "enabled_monitors": s.enabled_monitors,
+        "autostart": s.autostart,
+        "dashboard_port": s.dashboard_port,
+        "monitors": monitors,
+    })
+}
+
+/// POST /api/settings — 接受 `enabled_monitors` / `autostart` / `dashboard_port`
+/// 任一子集；监控器 id 必须全部在注册表内，否则 400。写盘后返回新设置。
+pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
+    let req: Value = serde_json::from_str(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
+    let mut next = settings::load(db_path);
+    if let Some(v) = req.get("enabled_monitors") {
+        let ids: Vec<String> = v
+            .as_array()
+            .ok_or("enabled_monitors 应为字符串数组")?
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| "enabled_monitors 应为字符串数组".to_string())
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        if let Some(bad) = settings::first_invalid_id(&ids) {
+            return Err(format!("未知监控器 id: {bad}"));
+        }
+        next.enabled_monitors = ids;
+    }
+    if let Some(v) = req.get("autostart") {
+        next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;
+    }
+    if let Some(v) = req.get("dashboard_port") {
+        let port = v.as_u64().ok_or("dashboard_port 应为 0-65535 整数")?;
+        if port > u16::MAX as u64 {
+            return Err("dashboard_port 应为 0-65535 整数".into());
+        }
+        next.dashboard_port = port as u16;
+    }
+    settings::save(db_path, &next).map_err(|e| format!("写设置失败: {e}"))?;
+    Ok(settings_payload(&next))
+}
+
 // ─── 路由表 ─────────────────────────────────────────────────────────────────
 
 /// 路由：返回 (HTTP status, content-type, body)。
-/// `path` 含 query string；非 GET → 405；未知路径 → 404；参数坏 → 400。
-pub fn route(
+/// `path` 含 query string；`body` 仅 POST /api/settings 使用；
+/// 非 GET/POST → 405；未知路径 → 404；参数坏 → 400。
+pub fn route_req(
     conn: &Connection,
     method: &str,
     path: &str,
+    body: &str,
     db_path: &Path,
 ) -> (u16, &'static str, String) {
     let (route_path, query) = match path.split_once('?') {
@@ -237,6 +305,11 @@ pub fn route(
             "application/json",
             api_status(conn, db_path).to_string(),
         ),
+        ("GET", "/api/settings") => (200, "application/json", api_settings(db_path).to_string()),
+        ("POST", "/api/settings") => match api_settings_post(db_path, body) {
+            Ok(v) => (200, "application/json", v.to_string()),
+            Err(e) => (400, "application/json", err_json(&e)),
+        },
         ("GET", _) => (404, "application/json", err_json("not found")),
         (_, _) => (405, "application/json", err_json("method not allowed")),
     }
@@ -291,26 +364,48 @@ pub fn serve(port: u16, db_path: &Path) -> Result<()> {
 
 /// 读请求行 → route → 写响应。任何失败都静默断开（无日志面需求）。
 fn handle_client(conn: &Connection, stream: &mut TcpStream, db_path: &Path) -> std::io::Result<()> {
-    // 只取请求行；头部剩余字节读掉到空行（保持 keep-alive 语义不必要，Connection: close）。
+    // 读请求行 + 头部；POST 再按 Content-Length 补读请求体（上限 64 KiB）。
     let mut buf = [0u8; 4096];
     let mut raw = Vec::new();
-    loop {
+    let header_end = loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break raw.len();
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if raw.len() > 8192 {
+            break raw.len();
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..header_end.min(raw.len())]).to_string();
+    let content_length = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0)
+        .min(64 * 1024);
+    while raw.len() < header_end + content_length {
         let n = stream.read(&mut buf)?;
         if n == 0 {
             break;
         }
         raw.extend_from_slice(&buf[..n]);
-        if raw.windows(4).any(|w| w == b"\r\n\r\n") || raw.len() > 8192 {
-            break;
-        }
     }
-    let line = String::from_utf8_lossy(&raw);
-    let request_line = line.lines().next().unwrap_or_default();
+    let all = String::from_utf8_lossy(&raw);
+    let request_line = all.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or("/").to_string();
+    let body = all.get(header_end..).unwrap_or_default().to_string();
 
-    let (status, ctype, body) = route(conn, &method, &path, db_path);
+    let (status, ctype, body) = route_req(conn, &method, &path, &body, db_path);
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -497,38 +592,125 @@ mod tests {
 
     // === 路由表 ===
 
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-dash-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn settings_get_returns_registry_and_defaults() {
+        let dir = tmpdir("get");
+        let db = dir.join("kyn.db");
+        let (code, ctype, body) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/json");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let monitors = v["monitors"].as_array().unwrap();
+        assert_eq!(monitors.len(), 40);
+        assert_eq!(
+            monitors
+                .iter()
+                .filter(|m| m["default_enabled"] == json!(true))
+                .count(),
+            14
+        );
+        assert_eq!(v["enabled_monitors"].as_array().unwrap().len(), 14);
+        assert!(v["autostart"].is_boolean());
+        assert!(monitors[0]["sensitivity"].is_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_post_updates_and_persists() {
+        let dir = tmpdir("post");
+        let db = dir.join("kyn.db");
+        let body = r#"{"enabled_monitors":["window","keyboard_hook"],"autostart":true,"dashboard_port":9001}"#;
+        let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", body, &db);
+        assert_eq!(code, 200, "{out}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["enabled_monitors"], json!(["window", "keyboard_hook"]));
+        assert_eq!(v["autostart"], json!(true));
+        assert_eq!(v["dashboard_port"], json!(9001));
+        // 已写盘：重新 GET 应读到同样的值
+        let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+        let v2: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v2["enabled_monitors"], json!(["window", "keyboard_hook"]));
+        assert_eq!(v2["dashboard_port"], json!(9001));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_post_rejects_unknown_id_and_bad_input() {
+        let dir = tmpdir("post-bad");
+        let db = dir.join("kyn.db");
+        let (code, _, out) = route_req(
+            &mem_conn(),
+            "POST",
+            "/api/settings",
+            r#"{"enabled_monitors":["window","not_a_monitor"]}"#,
+            &db,
+        );
+        assert_eq!(code, 400);
+        assert!(out.contains("not_a_monitor"));
+        // 非法 JSON → 400
+        let (code, _, _) = route_req(&mem_conn(), "POST", "/api/settings", "{oops", &db);
+        assert_eq!(code, 400);
+        // autostart 类型错 → 400
+        let (code, _, _) = route_req(
+            &mem_conn(),
+            "POST",
+            "/api/settings",
+            r#"{"autostart":"yes"}"#,
+            &db,
+        );
+        assert_eq!(code, 400);
+        // 失败后不应留下写坏的设置文件
+        let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["enabled_monitors"].as_array().unwrap().len(), 14);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn route_table_and_error_codes() {
         let conn = mem_conn();
         let db = Path::new("kyn.db");
-        let (code, ctype, body) = route(&conn, "GET", "/", db);
+        let (code, ctype, body) = route_req(&conn, "GET", "/", "", db);
         assert_eq!(code, 200);
         assert!(ctype.starts_with("text/html"));
         assert!(body.contains("All data is local"), "页脚数据声明必须内嵌");
 
-        let (code, ctype, _) = route(&conn, "GET", "/api/status", db);
+        let (code, ctype, _) = route_req(&conn, "GET", "/api/status", "", db);
         assert_eq!(code, 200);
         assert_eq!(ctype, "application/json");
 
-        let (code, _, body) = route(&conn, "GET", "/api/summary?date=bad", db);
+        let (code, _, body) = route_req(&conn, "GET", "/api/summary?date=bad", "", db);
         assert_eq!(code, 400);
         assert!(body.contains("error"));
 
         // 缺省 date = 今日 → 200
-        let (code, _, _) = route(&conn, "GET", "/api/summary", db);
+        let (code, _, _) = route_req(&conn, "GET", "/api/summary", "", db);
         assert_eq!(code, 200);
 
-        let (code, _, _) = route(&conn, "GET", "/api/timeline?hours=6", db);
+        let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=6", "", db);
         assert_eq!(code, 200);
-        let (code, _, _) = route(&conn, "GET", "/api/timeline?hours=nope", db);
+        let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=nope", "", db);
         assert_eq!(code, 200, "hours 非法回退默认 12");
 
-        let (code, _, _) = route(&conn, "GET", "/api/anomalies?days=3", db);
+        let (code, _, _) = route_req(&conn, "GET", "/api/anomalies?days=3", "", db);
         assert_eq!(code, 200);
 
-        let (code, _, _) = route(&conn, "GET", "/nope", db);
+        let (code, _, _) = route_req(&conn, "GET", "/nope", "", db);
         assert_eq!(code, 404);
-        let (code, _, _) = route(&conn, "POST", "/api/status", db);
+        let (code, _, _) = route_req(&conn, "POST", "/api/status", "", db);
         assert_eq!(code, 405);
     }
 

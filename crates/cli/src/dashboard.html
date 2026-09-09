@@ -37,13 +37,35 @@
   .sev-info { color: var(--accent); } .sev-warn { color: var(--warn); } .sev-critical { color: #f85149; }
   footer { color: var(--dim); font-size: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
   .err { color: #f85149; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab { background: var(--panel); border: 1px solid var(--border); border-radius: 6px 6px 0 0;
+         padding: 6px 16px; cursor: pointer; color: var(--dim); }
+  .tab.active { color: var(--fg); border-bottom-color: var(--bg); }
+  .settings-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .settings-group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+                       color: var(--dim); margin: 0 0 8px; }
+  .mon-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+  .mon-row input { accent-color: var(--accent); }
+  .badge { font-size: 11px; border: 1px solid var(--border); border-radius: 3px;
+           padding: 0 5px; color: var(--warn); }
+  .settings-actions { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
+  button.save { background: var(--accent); color: #0d1117; border: none; border-radius: 6px;
+                padding: 6px 18px; font: inherit; cursor: pointer; }
+  button.save:disabled { opacity: 0.5; cursor: default; }
+  #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: #f85149; }
 </style>
 </head>
 <body>
 <header>
   <h1>kynoptic dashboard</h1>
   <div class="muted" id="status-line">loading…</div>
+  <div class="tabs">
+    <div class="tab active" id="tab-overview" onclick="showView('overview')">overview</div>
+    <div class="tab" id="tab-settings" onclick="showView('settings')">settings</div>
+  </div>
 </header>
+
+<div id="view-overview">
 
 <div class="cards" id="cards">
   <div class="card"><div class="label">active minutes</div><div class="value" id="c-active">–</div></div>
@@ -61,6 +83,41 @@
   <h2>anomalies — last 7 days</h2>
   <ul class="anomalies" id="anomalies"><li class="muted">loading…</li></ul>
 </section>
+</div>
+
+<div id="view-settings" style="display:none">
+<section>
+  <h2>settings — monitors</h2>
+  <div class="muted" style="margin-bottom:10px">
+    Changes are saved to settings.json next to your database.
+    Restart <code>kynoptic collect</code> for monitor changes to take effect.
+  </div>
+  <div class="settings-groups">
+    <div class="settings-group">
+      <h3>default enabled (14)</h3>
+      <div id="mon-default"></div>
+    </div>
+    <div class="settings-group">
+      <h3>opt-in (26)</h3>
+      <div id="mon-optin"></div>
+    </div>
+  </div>
+</section>
+<section>
+  <h2>settings — autostart</h2>
+  <div class="mon-row">
+    <input type="checkbox" id="set-autostart">
+    <label for="set-autostart">start kynoptic collect at login</label>
+  </div>
+  <div class="muted">Takes effect after reboot (applied by the system on next login).</div>
+</section>
+<section>
+  <div class="settings-actions">
+    <button class="save" id="settings-save" onclick="saveSettings()">save settings</button>
+    <span id="settings-msg"></span>
+  </div>
+</section>
+</div>
 
 <footer>
   All data is local. This page reads your kynoptic.db on this machine only.<br>
@@ -118,6 +175,59 @@ async function loadAnomalies() {
   el.innerHTML = a.anomalies.map(x =>
     '<li><span class="sev-' + esc(x.severity) + '">[' + esc(x.severity) + "]</span> " +
     esc(x.date) + " · " + esc(x.kind) + " — " + esc(x.message) + "</li>").join("");
+}
+function showView(name) {
+  document.getElementById("view-overview").style.display = name === "overview" ? "" : "none";
+  document.getElementById("view-settings").style.display = name === "settings" ? "" : "none";
+  document.getElementById("tab-overview").classList.toggle("active", name === "overview");
+  document.getElementById("tab-settings").classList.toggle("active", name === "settings");
+  if (name === "settings") loadSettings().catch(e => settingsMsg(e.message, false));
+}
+function settingsMsg(text, ok) {
+  const el = document.getElementById("settings-msg");
+  el.textContent = text;
+  el.className = ok ? "ok" : "bad";
+}
+async function loadSettings() {
+  const s = await jget("/api/settings");
+  const enabled = new Set(s.enabled_monitors);
+  const row = m =>
+    '<div class="mon-row"><input type="checkbox" class="mon-toggle" data-id="' + esc(m.id) + '"' +
+    (enabled.has(m.id) ? " checked" : "") + ' id="mon-' + esc(m.id) + '">' +
+    '<label for="mon-' + esc(m.id) + '">' + esc(m.id) + "</label>" +
+    (m.default_enabled ? "" : '<span class="badge">opt-in</span>') + "</div>";
+  document.getElementById("mon-default").innerHTML =
+    s.monitors.filter(m => m.default_enabled).map(row).join("");
+  document.getElementById("mon-optin").innerHTML =
+    s.monitors.filter(m => !m.default_enabled).map(row).join("");
+  document.getElementById("set-autostart").checked = s.autostart;
+  settingsMsg("", true);
+}
+async function saveSettings() {
+  const btn = document.getElementById("settings-save");
+  btn.disabled = true;
+  try {
+    const enabled_monitors = [...document.querySelectorAll(".mon-toggle")]
+      .filter(x => x.checked).map(x => x.dataset.id);
+    const body = {
+      enabled_monitors: enabled_monitors,
+      autostart: document.getElementById("set-autostart").checked
+    };
+    const r = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error(e.error || ("HTTP " + r.status));
+    }
+    settingsMsg("saved. restart kynoptic collect for changes to take effect.", true);
+  } catch (e) {
+    settingsMsg("save failed: " + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
 }
 Promise.all([loadStatus(), loadSummary(), loadTimeline(), loadAnomalies()]).catch(e => {
   const el = document.createElement("div");
