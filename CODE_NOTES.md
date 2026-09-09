@@ -180,7 +180,12 @@ crates/cli 同时产出 `kynoptic` 与 `kynoptic-ctl` 两个 bin（同一 main.r
 新增 `kynoptic-ctl probe [--monitor ID] [--secs N] [--all]`（core 侧 `probe`
 模块）：对单个监控器构造"仅启用它"的配置，在独立临时库上真实采集 N 秒
 （1s flush），报告事件数/样本/警告与判定。--all 顺序跑满 40 个并输出矩阵。
-探针配套 `examples/probe-stress-input.rs`（SendInput 注入 + RSS/事件速率采样）。
+探针配套 `examples/probe-stress-input.rs`（RSS/事件速率稳态观测）。
+**合成输入压测 DEFERRED**：曾用 SendInput 注入做 60s 压测（实测 45 events/s
+稳态、计数线性无丢失趋势、RSS 15.1→17.6MB 平稳、末窗 hook 存活），但注入会
+直接干扰真实桌面会话（鼠标抖动/按键），应用户要求已移除全部合成输入代码，
+示例改为纯被动观测。hook 健康性验证改为：perf-hook 回调成本基准（既有，
+键盘全路径 1.03µs）+ probe 启停干净性 + 真实使用下的被动速率观测。
 
 实机矩阵结论（Win11 26300 桌面机，15s 窗口）：**25 PASS / 15 EXPECTED-LIMITED
 / 0 FAIL**。EXPECTED-LIMITED 均有明确环境原因（无电池、外接屏无亮度接口、
