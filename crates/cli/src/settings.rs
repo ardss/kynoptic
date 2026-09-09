@@ -149,6 +149,7 @@ mod tests {
             enabled_monitors: vec!["window".into(), "keyboard_hook".into()],
             autostart: true,
             dashboard_port: 9000,
+            input_counts_only: true,
         };
         save(&db, &s).unwrap();
         assert_eq!(load(&db), s);
