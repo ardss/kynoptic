@@ -104,6 +104,11 @@ fn seed(db_path: &str) {
         }
     }
     conn.execute_batch("COMMIT;").unwrap();
+    // 聚合读缓存：与生产 Database::open 的懒回填一致，get_anomalies 读
+    // agg_minute/agg_daily（派生缓存；原始 events 原样保留）。
+    if kynoptic_core::db::agg::backfill_if_needed(&conn) {
+        println!("seed: agg 缓存回填完成");
+    }
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
         .unwrap();

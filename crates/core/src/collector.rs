@@ -8,6 +8,7 @@ use rand::Rng;
 
 use crate::constants;
 use crate::db::Database;
+use crate::input_agg;
 use crate::monitors;
 use crate::types::{Event, EventHook, Monitor};
 
@@ -35,6 +36,42 @@ fn rand_jitter() -> f64 {
     rand::thread_rng().gen_range(-1.0..=1.0)
 }
 
+// ─── 采集器设置 ───────────────────────────────────────────────────────────────
+
+/// 输入事件（键盘/鼠标 Hook）的存储粒度。
+///
+/// **默认 [`InputGranularity::Raw`]：逐事件原样落库（原始数据神圣，不做折叠）**。
+/// [`InputGranularity::Minute`] 为 opt-in 的磁盘优化：输入折叠为每分钟每桶一行
+/// `input_agg` 计数型事件（见 [`crate::input_agg`]），计数语义（APM/活跃分钟/
+/// daily_agg）保持，但按键明细与鼠标坐标不再存储。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputGranularity {
+    /// 逐事件原样落库（默认；行为与 v0.1 一致）
+    #[default]
+    Raw,
+    /// 每分钟每桶一行计数型事件（opt-in 磁盘优化）
+    Minute,
+}
+
+/// 采集器运行设置（代码内默认值；默认值调整属产品决策，见 CODE_NOTES.md §8）。
+#[derive(Debug, Clone, Copy)]
+pub struct CollectorSettings {
+    /// 输入事件存储粒度（默认 Raw）
+    pub input_granularity: InputGranularity,
+    /// writer 小批 flush 间隔秒数（默认 30s）。数值是"落库最大延迟"与
+    /// "每提交 WAL 页开销主导的磁盘足迹"之间的权衡，仍在校准中。
+    pub write_flush_interval_secs: u64,
+}
+
+impl Default for CollectorSettings {
+    fn default() -> Self {
+        Self {
+            input_granularity: InputGranularity::default(),
+            write_flush_interval_secs: constants::WRITE_FLUSH_INTERVAL_SECS,
+        }
+    }
+}
+
 fn create_monitors() -> Vec<Box<dyn Monitor + Send>> {
     vec![
         Box::new(monitors::window::WindowMonitor::default()),
@@ -57,6 +94,13 @@ fn create_hooks() -> Vec<Box<dyn EventHook>> {
         Box::new(monitors::keyboard_hook::KeyboardHook),
         Box::new(monitors::mouse_hook::MouseHook),
     ]
+}
+
+fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
+    db.insert_events(batch);
+    total_written.fetch_add(batch.len(), Ordering::Relaxed);
+    // 聚合读缓存增量维护（派生数据；失败仅 log，不影响原始写入）
+    db.update_agg(batch);
 }
 
 fn writer_loop(
@@ -112,8 +156,7 @@ fn writer_loop_inner(
                 Err(TryRecvError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        db.insert_events(&batch);
-                        total_written.fetch_add(n, Ordering::Relaxed);
+                        write_batch(db, &batch, total_written);
                     }
                     return Some(n);
                 }
@@ -126,8 +169,7 @@ fn writer_loop_inner(
         if batch.len() >= batch_size
             || (!batch.is_empty() && now.duration_since(last_flush) >= flush_interval)
         {
-            db.insert_events(&batch);
-            total_written.fetch_add(batch.len(), Ordering::Relaxed);
+            write_batch(db, &batch, total_written);
             batch.clear();
             last_flush = now;
         }
@@ -143,8 +185,7 @@ fn writer_loop_inner(
                 Err(RecvTimeoutError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        db.insert_events(&batch);
-                        total_written.fetch_add(n, Ordering::Relaxed);
+                        write_batch(db, &batch, total_written);
                     }
                     return Some(n);
                 }
@@ -164,8 +205,7 @@ fn writer_loop_inner(
                 Err(RecvTimeoutError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        db.insert_events(&batch);
-                        total_written.fetch_add(n, Ordering::Relaxed);
+                        write_batch(db, &batch, total_written);
                     }
                     return Some(n);
                 }
@@ -219,6 +259,8 @@ pub struct Collector {
     pub total_written: Arc<AtomicUsize>,
     pub writer_handle: Option<thread::JoinHandle<()>>,
     pub hooks: Vec<Box<dyn EventHook>>,
+    /// 设置副本：shutdown 时决定是否 flush 未满分钟的部分输入计数。
+    settings: CollectorSettings,
 }
 
 impl Collector {
@@ -227,6 +269,16 @@ impl Collector {
 
         for h in &self.hooks {
             h.stop();
+        }
+
+        // minute 粒度：关停兜底——把当前未满分钟的部分输入计数立即折叠落库，
+        // 不等聚合线程的下一次 rollover，保证"最后一分钟"不丢。
+        if self.settings.input_granularity == InputGranularity::Minute {
+            let events = input_agg::flush_partial(chrono::Local::now());
+            if !events.is_empty() {
+                write_batch(&self.db, &events, &self.total_written);
+                log::info!("关停 flush：{} 条 input_agg 部分分钟事件", events.len());
+            }
         }
 
         if let Some(handle) = self.writer_handle.take() {
@@ -254,6 +306,12 @@ impl Drop for Collector {
             for h in &self.hooks {
                 h.stop();
             }
+            if self.settings.input_granularity == InputGranularity::Minute {
+                let events = input_agg::flush_partial(chrono::Local::now());
+                if !events.is_empty() {
+                    write_batch(&self.db, &events, &self.total_written);
+                }
+            }
             if let Some(handle) = self.writer_handle.take() {
                 let _ = handle.join();
             }
@@ -263,7 +321,12 @@ impl Drop for Collector {
     }
 }
 
+/// 默认设置启动（Raw 粒度 + 30s flush）。需要自定义用 [`start_collection_with`]。
 pub fn start_collection(db_path: &str) -> Collector {
+    start_collection_with(CollectorSettings::default(), db_path)
+}
+
+pub fn start_collection_with(settings: CollectorSettings, db_path: &str) -> Collector {
     env_logger::Builder::from_env("RUST_LOG")
         .filter_level(log::LevelFilter::Info)
         .try_init()
@@ -293,7 +356,7 @@ pub fn start_collection(db_path: &str) -> Collector {
                 rx,
                 db_w,
                 constants::WRITE_BATCH_SIZE,
-                Duration::from_secs(constants::WRITE_FLUSH_INTERVAL_SECS),
+                Duration::from_secs(settings.write_flush_interval_secs.max(1)),
                 tw,
             );
         })
@@ -309,6 +372,27 @@ pub fn start_collection(db_path: &str) -> Collector {
             .name(m.name().into())
             .spawn(move || run_monitor(m, tx))
             .expect("Monitor 线程启动失败");
+    }
+
+    // 输入粒度：minute 模式下 Hook 回调退化为原子计数，由独立聚合线程每秒
+    // drain 并按分钟折叠成 input_agg 事件入队（见 input_agg 模块文档）。
+    input_agg::reset();
+    let minute_mode = settings.input_granularity == InputGranularity::Minute;
+    if minute_mode {
+        input_agg::activate();
+        let tx_agg = tx.clone();
+        thread::Builder::new()
+            .name("InputAgg".into())
+            .spawn(move || loop {
+                thread::sleep(Duration::from_secs(1));
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return;
+                }
+                for e in input_agg::drain(chrono::Local::now()) {
+                    send_event(&tx_agg, e);
+                }
+            })
+            .expect("InputAgg 聚合线程启动失败");
     }
 
     let hooks = create_hooks();
@@ -348,5 +432,6 @@ pub fn start_collection(db_path: &str) -> Collector {
         total_written,
         writer_handle: Some(writer_handle),
         hooks,
+        settings,
     }
 }

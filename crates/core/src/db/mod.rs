@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use crate::constants;
 
+pub mod agg;
 pub mod events;
 pub mod metadata;
 pub mod schema;
@@ -250,6 +251,9 @@ impl Database {
         let writer = Connection::open(path)?;
         writer.execute_batch(SCHEMA)?;
         run_migrations(&writer);
+        // 懒回填聚合读缓存（存量库首开一次；agg 缺失时 get_anomalies 等
+        // 查询会退化为 events 全量现算）。原始 events 只读不动。
+        agg::backfill_if_needed(&writer);
 
         let mut readers = Vec::with_capacity(constants::READER_POOL_SIZE);
         for _ in 0..constants::READER_POOL_SIZE {

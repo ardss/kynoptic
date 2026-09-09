@@ -107,11 +107,29 @@ fn main() {
     }
     let ns_mouse_throttled = t0.elapsed().as_nanos() as f64 / ITERS as f64;
 
+    // minute 粒度（opt-in）回调等价物：纯原子计数，无锁无分配无节流判断。
+    // 键盘：KEYS+SAMPLES 两次 fetch_add；鼠标移动：距离计算 + 4 次原子操作。
+    let t0 = Instant::now();
+    for i in 0..ITERS {
+        kynoptic_core::input_agg::record_key();
+        std::hint::black_box(i);
+    }
+    let ns_key_minute = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+
+    let t0 = Instant::now();
+    for i in 0..ITERS {
+        kynoptic_core::input_agg::record_move(100 + (i % 7) as i32, 200 + (i % 5) as i32);
+    }
+    let ns_move_minute = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+    kynoptic_core::input_agg::reset();
+
     println!(
         r#"{{"bench":"perf-hook","iters":{ITERS},
   "atomic_counter_baseline_ns_per_call":{ns_counter:.1},
   "keyboard_callback_equivalent_ns_per_call":{ns_kb:.1},
   "mouse_move_throttled_early_exit_ns_per_call":{ns_mouse_throttled:.1},
+  "keyboard_callback_minute_mode_ns_per_call":{ns_key_minute:.1},
+  "mouse_move_callback_minute_mode_ns_per_call":{ns_move_minute:.1},
   "drained":{drained}}}"#
     );
 }

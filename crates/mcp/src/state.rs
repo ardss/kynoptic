@@ -312,9 +312,15 @@ fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i6
     let mut out = Vec::new();
     let Ok(mut stmt) = conn.prepare(
         "SELECT substr(timestamp, 1, 16) AS minute, \
-                SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 ELSE 0 END), \
-                SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 ELSE 0 END) \
+                SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 \
+                         WHEN event_type='keyboard' AND event_action='input_agg' \
+                           THEN COALESCE(json_extract(event_data, '$.keys'), 0) ELSE 0 END), \
+                SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 \
+                         WHEN event_type='mouse' AND event_action='input_agg' \
+                           THEN COALESCE(json_extract(event_data, '$.clicks'), 0) ELSE 0 END) \
          FROM events WHERE timestamp >= ?1 AND timestamp < ?2 \
+           AND event_type IN ('keyboard','mouse') \
+           AND event_action IN ('press','click','input_agg') \
          GROUP BY minute ORDER BY minute",
     ) else {
         return out;
@@ -322,8 +328,8 @@ fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i6
     if let Ok(rows) = stmt.query_map(params![start, end], |r| {
         Ok((
             r.get::<_, String>(0)?,
-            r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
         ))
     }) {
         for row in rows.flatten() {

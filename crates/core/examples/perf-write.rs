@@ -84,4 +84,68 @@ fn main() {
         TOTAL as f64 / elapsed,
         bytes as f64 / events_count.max(1) as f64,
     );
+
+    // ── 信息对照（非默认）：minute 粒度（opt-in input_granularity="minute"）──
+    // 同一合成工作负载下，把 keyboard/mouse 折叠为每分钟每桶一行 input_agg
+    // 计数行（window/system 事件原样保留），测量存储形态差异。raw 仍是默认。
+    let minute_db = format!("{db_path}.minute");
+    let _ = std::fs::remove_file(&minute_db);
+    let dbm = Database::open(&minute_db).expect("open minute db");
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new(); // minute -> (keys,clicks,moves,samples)
+    let mut minute_events: Vec<Event> = Vec::new();
+    for e in &events {
+        match (e.event_type, e.event_action) {
+            (EventType::Keyboard, EventAction::Press) => {
+                let m = &e.timestamp[..16];
+                buckets.entry(m.to_string()).or_default().0 += 1;
+                buckets.get_mut(m).unwrap().3 += 1;
+            }
+            (EventType::Mouse, EventAction::Move) => {
+                let m = &e.timestamp[..16];
+                buckets.entry(m.to_string()).or_default().2 += 1;
+                buckets.get_mut(m).unwrap().3 += 1;
+            }
+            _ => minute_events.push(e.clone()),
+        }
+    }
+    for (minute, (keys, clicks, moves, samples)) in buckets {
+        let ts = format!("{minute}:00+00:00");
+        if keys > 0 {
+            let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard)
+                .data(serde_json::json!({ "keys": keys, "samples": samples }));
+            e.timestamp = ts.clone();
+            minute_events.push(e);
+        }
+        if clicks + moves > 0 {
+            let mut e =
+                Event::new(EventAction::InputAgg, EventType::Mouse).data(serde_json::json!({
+                    "clicks": clicks, "scroll_ticks": 0, "moves": moves,
+                    "move_distance_px": 0, "samples": samples,
+                }));
+            e.timestamp = ts;
+            minute_events.push(e);
+        }
+    }
+    minute_events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    let t1 = Instant::now();
+    for chunk in minute_events.chunks(BATCH) {
+        dbm.insert_events(chunk);
+    }
+    let minute_elapsed = t1.elapsed().as_secs_f64();
+    dbm.maintenance();
+    let minute_bytes = db_bytes(&minute_db);
+    let minute_rows: i64 = {
+        let r = dbm.reader();
+        r.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap_or(0)
+    };
+    println!(
+        r#"{{"bench":"perf-write-minute","opt_in":true,"source_events":{TOTAL},
+  "stored_rows":{minute_rows},"elapsed_secs":{minute_elapsed:.3},
+  "db_bytes_after_maintenance":{minute_bytes},
+  "bytes_vs_raw_default":"{:.1}x smaller","rows_vs_raw_default":"{:.1}x fewer"}}"#,
+        bytes as f64 / minute_bytes.max(1) as f64,
+        events_count as f64 / minute_rows.max(1) as f64,
+    );
 }

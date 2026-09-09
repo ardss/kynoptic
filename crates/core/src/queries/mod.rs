@@ -143,6 +143,26 @@ pub fn today_range() -> (String, String) {
 
 // ─── 共享结构体 ───────────────────────────────────────────────────────────────
 
+// ─── 输入计数的统一 SQL 表达式（raw 与 input_agg 两代事件形态兼容） ──────────
+//
+// 背景：输入采集有两种粒度（见 collector::CollectorSettings::input_granularity）——
+// - raw（默认）：keyboard/press、mouse/click 各自逐事件一行，计数 = COUNT(*)；
+// - minute（opt-in）：每分钟每桶一行 input_agg 计数型事件，计数藏在
+//   event_data JSON（$.keys / $.clicks）里。
+// 两种形态可在同一库中共存（中途切换粒度），故所有按键/点击计数查询统一走
+// 这两个行级 CASE 表达式（外层 SUM），禁止再写只认 raw 形态的 COUNT(*)。
+pub(crate) const KEYS_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='keyboard' AND event_action='press' THEN 1 \
+         WHEN event_type='keyboard' AND event_action='input_agg' \
+           THEN COALESCE(json_extract(event_data, '$.keys'), 0) \
+         ELSE 0 END)";
+
+pub(crate) const CLICKS_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='mouse' AND event_action='click' THEN 1 \
+         WHEN event_type='mouse' AND event_action='input_agg' \
+           THEN COALESCE(json_extract(event_data, '$.clicks'), 0) \
+         ELSE 0 END)";
+
 /// 一分钟内的活动统计——供 [`crate::analyzer`] 专注段 / APM 序列消费。
 #[derive(Debug, Clone, Default)]
 pub struct MinuteStat {

@@ -1,8 +1,16 @@
 //! 图表数据 + 当前值类查询（dashboard 图表 + analyzer/anomaly 读取）。
+//!
+//! 异常检测路径（本文件下半部分）优先读 agg_minute / agg_daily **读缓存**
+//! （见 [`crate::db::agg`]，派生数据，events 原样保留）；缓存缺失（表不存在 /
+//! 该日无缓存行）时回退 events 现算——保证未回填的库行为正确，只是慢。
+//!
+//! 输入计数类查询统一兼容两种事件形态：raw（press/click 逐行）与
+//! input_agg（minute 粒度计数行，见 mod.rs 的 KEYS_ROW_EXPR / CLICKS_ROW_EXPR）。
 
 use rusqlite::{params, Connection};
 
-use super::{get_string, string_or_log, DayTotals, MinuteStat};
+use super::{get_string, string_or_log, DayTotals, MinuteStat, CLICKS_ROW_EXPR, KEYS_ROW_EXPR};
+use crate::db::agg;
 
 // ─── 图表数据（get_events_today/get_apps/get_hourly/get_timeline/get_trend） ──
 
@@ -278,7 +286,7 @@ pub fn latest_event_ts(conn: &Connection) -> String {
 
 pub fn last_input_timestamp(conn: &Connection) -> Option<String> {
     conn.query_row(
-        "SELECT MAX(timestamp) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click','scroll','move')",
+        "SELECT MAX(timestamp) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click','scroll','move','input_agg')",
         [],
         |r| r.get(0),
     )
@@ -298,21 +306,51 @@ pub fn last_input_timestamp(conn: &Connection) -> Option<String> {
 /// 分别聚合 keys/clicks/switches,供专注段/APM 算法使用。
 pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
     let mut out = Vec::new();
+    // 优先读 agg_minute 读缓存（异常检测/分析路径提速）；无缓存回退 events 现算。
+    if agg::has_minute_for_date(conn, date) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT hour, minute, \
+                    CAST(MAX(CASE WHEN bucket_id='input_keys' THEN COALESCE(sum_value,0) ELSE 0 END) AS INTEGER), \
+                    CAST(MAX(CASE WHEN bucket_id='input_clicks' THEN COALESCE(sum_value,0) ELSE 0 END) AS INTEGER), \
+                    CAST(MAX(CASE WHEN bucket_id='window_switches' THEN COALESCE(sum_value,0) ELSE 0 END) AS INTEGER) \
+             FROM agg_minute \
+             WHERE date = ?1 AND bucket_id IN ('input_keys','input_clicks','window_switches') \
+             GROUP BY hour, minute ORDER BY hour, minute",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map(params![date], |r| {
+            let hour: i64 = r.get(0)?;
+            let minute: i64 = r.get(1)?;
+            Ok(MinuteStat {
+                minute: format!("{date}T{:02}:{:02}", hour, minute),
+                keys: r.get::<_, i64>(2)?,
+                clicks: r.get::<_, i64>(3)?,
+                switches: r.get::<_, i64>(4)?,
+            })
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+        return out;
+    }
     // 按用户本地时区切日（与 today_range 同源）。解析失败回退 UTC 前缀匹配。
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
-    let Ok(mut stmt) = conn.prepare(
+    let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT substr(timestamp, 1, 16) AS minute, \
-                SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 ELSE 0 END) AS keys, \
-                SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 ELSE 0 END) AS clicks, \
+                SUM({KEYS_ROW_EXPR}) AS keys, \
+                SUM({CLICKS_ROW_EXPR}) AS clicks, \
                 SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
+           AND event_type IN ('keyboard','mouse','window') \
          GROUP BY minute \
          ORDER BY minute",
-    ) else {
+    )) else {
         return out;
     };
     let Ok(rows) = stmt.query_map(params![start, end], |r| {
@@ -338,6 +376,27 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
 /// `SELECT DISTINCT substr(timestamp,1,16) WHERE event_type IN ('keyboard','mouse')`。
 pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
     let mut out = Vec::new();
+    // 优先读 agg_minute 读缓存（有任意输入桶行即视为活跃分钟，含 move-only 分钟）
+    if agg::has_minute_for_date(conn, date) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT hour, minute FROM agg_minute \
+             WHERE date = ?1 \
+               AND bucket_id IN ('input_keys','input_clicks','input_moves') \
+             GROUP BY hour, minute ORDER BY hour, minute",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map(params![date], |r| {
+            let hour: i64 = r.get(0)?;
+            let minute: i64 = r.get(1)?;
+            Ok(format!("{date}T{hour:02}:{minute:02}"))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+        return out;
+    }
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
@@ -365,20 +424,49 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
 /// 此前 [`crate::analyzer::analyze_day`] 手写一条带子查询的 SELECT；现在下沉到
 /// 数据访问层，业务层只做 apm_avg 计算。
 pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
+    // 优先读 agg_minute 读缓存
+    if agg::has_minute_for_date(conn, date) {
+        let Ok((keys, clicks, active_minutes)) = conn.query_row(
+            "SELECT \
+                CAST(COALESCE(SUM(CASE WHEN bucket_id='input_keys' THEN COALESCE(sum_value,0) ELSE 0 END), 0) AS INTEGER), \
+                CAST(COALESCE(SUM(CASE WHEN bucket_id='input_clicks' THEN COALESCE(sum_value,0) ELSE 0 END), 0) AS INTEGER), \
+                COUNT(DISTINCT CASE WHEN bucket_id IN ('input_keys','input_clicks','input_moves') \
+                                    THEN printf('%02d:%02d', hour, minute) END) \
+             FROM agg_minute WHERE date = ?1",
+            params![date],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        ) else {
+            return DayTotals::default();
+        };
+        return DayTotals {
+            keys,
+            clicks,
+            active_minutes,
+        };
+    }
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
     let Ok((keys, clicks, active_minutes)) = conn.query_row(
-        "SELECT \
-            COALESCE(SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 ELSE 0 END), 0), \
-            COALESCE(SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 ELSE 0 END), 0), \
-            (SELECT COUNT(DISTINCT substr(timestamp,1,16)) FROM events \
-             WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type IN ('keyboard','mouse')) \
-         FROM events \
-         WHERE timestamp >= ?1 AND timestamp < ?2",
+        &format!(
+            "SELECT \
+                COALESCE(SUM({KEYS_ROW_EXPR}), 0), \
+                COALESCE(SUM({CLICKS_ROW_EXPR}), 0), \
+                (SELECT COUNT(DISTINCT substr(timestamp,1,16)) FROM events \
+                 WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type IN ('keyboard','mouse')) \
+             FROM events \
+             WHERE timestamp >= ?1 AND timestamp < ?2 \
+               AND event_type IN ('keyboard','mouse')"
+        ),
         params![start, end],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     ) else {
         return DayTotals::default();
     };
@@ -425,15 +513,28 @@ pub fn top_app_window_in_range(
 /// 区间谓词；`substr(timestamp,1,10)=?` 对整列求值无法走索引，1M 行时每次
 /// 调用退化为全表扫描（~300ms+），get_anomalies(7d) 会累计到秒级。
 pub fn late_night_key_count(conn: &Connection, date: &str, hour_threshold: i64) -> i64 {
+    // 优先读 agg_minute 读缓存（O(当日聚合行数)），缺失回退 events 现算
+    if agg::has_minute_for_date(conn, date) {
+        return conn
+            .query_row(
+                "SELECT CAST(COALESCE(SUM(sum_value), 0) AS INTEGER) FROM agg_minute \
+                 WHERE date = ?1 AND hour >= ?2 AND bucket_id = 'input_keys'",
+                params![date, hour_threshold],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+    }
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
     conn.query_row(
-        "SELECT COUNT(*) FROM events \
-         WHERE timestamp >= ?1 AND timestamp < ?2 \
-           AND CAST(substr(timestamp, 12, 2) AS INTEGER) >= ?3 \
-           AND event_type = 'keyboard' AND event_action = 'press'",
+        &format!(
+            "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
+             WHERE timestamp >= ?1 AND timestamp < ?2 \
+               AND CAST(substr(timestamp, 12, 2) AS INTEGER) >= ?3 \
+               AND event_type = 'keyboard' AND event_action IN ('press','input_agg')"
+        ),
         params![start, end, hour_threshold],
         |r| r.get::<_, i64>(0),
     )
@@ -457,21 +558,45 @@ pub fn daily_agg_avg_apm_before(conn: &Connection, date: &str) -> f64 {
 /// 返回 (minute, count)，供 [`crate::anomaly`] 的 APM 突增检测消费。
 pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(String, i64)> {
     let mut out = Vec::new();
+    // 优先读 agg_minute 读缓存：每分钟 keys+clicks 合计
+    if agg::has_minute_for_date(conn, date) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT hour, minute, CAST(SUM(COALESCE(sum_value, 0)) AS INTEGER) AS n \
+             FROM agg_minute \
+             WHERE date = ?1 AND bucket_id IN ('input_keys','input_clicks') \
+             GROUP BY hour, minute HAVING n >= ?2 \
+             ORDER BY n DESC LIMIT 5",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map(params![date, min_count], |r| {
+            let hour: i64 = r.get(0)?;
+            let minute: i64 = r.get(1)?;
+            let n: i64 = r.get(2)?;
+            Ok((format!("{date}T{hour:02}:{minute:02}"), n))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+        return out;
+    }
     // 可走索引的日期区间谓词（见 late_night_key_count 性能注）
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT substr(timestamp, 1, 16), COUNT(*) AS n \
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT substr(timestamp, 1, 16), SUM({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}) AS n \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
            AND event_type IN ('keyboard', 'mouse') \
+           AND event_action IN ('press', 'click', 'input_agg') \
          GROUP BY 1 \
          HAVING n >= ?3 \
          ORDER BY n DESC \
          LIMIT 5",
-    ) else {
+    )) else {
         return out;
     };
     let Ok(rows) = stmt.query_map(params![start, end, min_count], |r| {
@@ -490,6 +615,25 @@ pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(
 /// 供 [`crate::anomaly`] 的新应用突增检测消费。
 pub fn top_apps_by_event_types(conn: &Connection, date: &str, limit: i64) -> Vec<(String, i64)> {
     let mut out = Vec::new();
+    // 优先读 agg_daily per-app 读缓存（该日有缓存行时）
+    if agg::has_app_daily(conn, Some(date)) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT substr(bucket_id, 5), COALESCE(count_value, 0) \
+             FROM agg_daily \
+             WHERE date = ?1 AND bucket_id LIKE 'app:%' \
+             ORDER BY count_value DESC LIMIT ?2",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map(params![date, limit], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+        return out;
+    }
     // 可走索引的日期区间谓词（见 late_night_key_count 性能注）
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
@@ -521,7 +665,22 @@ pub fn top_apps_by_event_types(conn: &Connection, date: &str, limit: i64) -> Vec
 /// 某应用在 `before_date` 之前的事件总数与出现天数。
 ///
 /// 返回 (hist_total, hist_days)，供 [`crate::anomaly`] 的新应用突增检测计算日均。
+///
+/// 性能：优先读 agg_daily per-app 读缓存（全历史 per-app 统计从 O(该应用全部
+/// 历史行) 降为 O(该应用出现天数)——perf-query 1M 行合成库上这是 get_anomalies
+/// 的最后一个秒级瓶颈）；无任何 app 缓存时回退 events 现算。
 pub fn app_history_totals(conn: &Connection, app: &str, before_date: &str) -> (i64, i64) {
+    if agg::has_app_daily(conn, None) {
+        return conn
+            .query_row(
+                "SELECT COALESCE(SUM(count_value), 0), COUNT(*) \
+                 FROM agg_daily \
+                 WHERE bucket_id = 'app:' || ?1 AND date < ?2 AND COALESCE(count_value, 0) > 0",
+                params![app, before_date],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or((0, 0));
+    }
     conn.query_row(
         "SELECT COUNT(*), COUNT(DISTINCT substr(timestamp, 1, 10)) \
          FROM events \

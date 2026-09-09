@@ -4,7 +4,7 @@
 
 use rusqlite::{params, Connection};
 
-use super::{count_or_log, get_count_i64};
+use super::{count_or_log, get_count_i64, CLICKS_ROW_EXPR, KEYS_ROW_EXPR};
 
 pub fn count_today_keys(conn: &Connection, today: &str, tomorrow: &str) -> i64 {
     count_keys_in_range(conn, today, tomorrow)
@@ -16,10 +16,15 @@ pub fn count_today_clicks(conn: &Connection, today: &str, tomorrow: &str) -> i64
 
 /// 任意 [start, end) 区间内的按键（keyboard/press）数。
 /// count_today_keys 的通用版本，供 tray.rs 等任意区间查询复用。
+/// 兼容 input_agg 计数行（minute 粒度，见 mod.rs 的 KEYS_ROW_EXPR）。
 pub fn count_keys_in_range(conn: &Connection, start: &str, end: &str) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type='keyboard' AND event_action='press' AND timestamp >= ?1 AND timestamp < ?2",
+            &format!(
+                "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type='keyboard' AND event_action IN ('press','input_agg') \
+                   AND timestamp >= ?1 AND timestamp < ?2"
+            ),
             params![start, end],
             get_count_i64,
         ),
@@ -31,7 +36,11 @@ pub fn count_keys_in_range(conn: &Connection, start: &str, end: &str) -> i64 {
 pub fn count_clicks_in_range(conn: &Connection, start: &str, end: &str) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type='mouse' AND event_action='click' AND timestamp >= ?1 AND timestamp < ?2",
+            &format!(
+                "SELECT COALESCE(SUM({CLICKS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type='mouse' AND event_action IN ('click','input_agg') \
+                   AND timestamp >= ?1 AND timestamp < ?2"
+            ),
             params![start, end],
             get_count_i64,
         ),
@@ -141,7 +150,10 @@ pub fn count_all_events(conn: &Connection) -> i64 {
 pub fn count_all_keys(conn: &Connection) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type='keyboard' AND event_action='press'",
+            &format!(
+                "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type='keyboard' AND event_action IN ('press','input_agg')"
+            ),
             [],
             get_count_i64,
         ),
@@ -152,7 +164,10 @@ pub fn count_all_keys(conn: &Connection) -> i64 {
 pub fn count_all_clicks(conn: &Connection) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type='mouse' AND event_action='click'",
+            &format!(
+                "SELECT COALESCE(SUM({CLICKS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type='mouse' AND event_action IN ('click','input_agg')"
+            ),
             [],
             get_count_i64,
         ),
@@ -186,7 +201,12 @@ pub fn yesterday_total_same_time(conn: &Connection) -> i64 {
     let yesterday_same_time = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click') AND timestamp >= ?1 AND timestamp < ?2",
+            &format!(
+                "SELECT COALESCE(SUM({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type IN ('keyboard','mouse') \
+                   AND event_action IN ('press','click','input_agg') \
+                   AND timestamp >= ?1 AND timestamp < ?2"
+            ),
             params![&yesterday_start, yesterday_same_time],
             get_count_i64,
         ),
@@ -197,7 +217,11 @@ pub fn yesterday_total_same_time(conn: &Connection) -> i64 {
 pub fn count_recent_input(conn: &Connection, since: &str) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click') AND timestamp >= ?1",
+            &format!(
+                "SELECT COALESCE(SUM({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type IN ('keyboard','mouse') \
+                   AND event_action IN ('press','click','input_agg') AND timestamp >= ?1"
+            ),
             params![since],
             get_count_i64,
         ),
@@ -208,7 +232,10 @@ pub fn count_recent_input(conn: &Connection, since: &str) -> i64 {
 pub fn count_keys_since(conn: &Connection, since_id: i64) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type='keyboard' AND event_action='press' AND id > ?1",
+            &format!(
+                "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type='keyboard' AND event_action IN ('press','input_agg') AND id > ?1"
+            ),
             params![since_id],
             get_count_i64,
         ),
@@ -219,7 +246,10 @@ pub fn count_keys_since(conn: &Connection, since_id: i64) -> i64 {
 pub fn count_clicks_since(conn: &Connection, since_id: i64) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type='mouse' AND event_action='click' AND id > ?1",
+            &format!(
+                "SELECT COALESCE(SUM({CLICKS_ROW_EXPR}), 0) FROM events \
+                 WHERE event_type='mouse' AND event_action IN ('click','input_agg') AND id > ?1"
+            ),
             params![since_id],
             get_count_i64,
         ),
@@ -233,15 +263,18 @@ pub fn count_clicks_since(conn: &Connection, since_id: i64) -> i64 {
 /// 查询失败时返回 (0, 0)，与逐条查询的容错一致。
 pub fn keys_clicks_since(conn: &Connection, since_id: i64) -> (i64, i64) {
     let res = conn.query_row(
-        "SELECT \
-            SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 ELSE 0 END), \
-            SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 ELSE 0 END) \
-         FROM events WHERE id > ?1",
+        &format!(
+            "SELECT \
+                COALESCE(SUM({KEYS_ROW_EXPR}), 0), \
+                COALESCE(SUM({CLICKS_ROW_EXPR}), 0) \
+             FROM events WHERE event_type IN ('keyboard','mouse') \
+               AND event_action IN ('press','click','input_agg') AND id > ?1"
+        ),
         params![since_id],
         |r| {
             // SUM 在无匹配行时返回 NULL，需转 0
-            let keys = r.get::<_, Option<i64>>(0)?.unwrap_or(0);
-            let clicks = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
+            let keys = r.get::<_, i64>(0)?;
+            let clicks = r.get::<_, i64>(1)?;
             Ok((keys, clicks))
         },
     );
@@ -259,14 +292,18 @@ pub fn keys_clicks_since(conn: &Connection, since_id: i64) -> (i64, i64) {
 /// 两次表扫描合并为一次。
 pub fn keys_clicks_today(conn: &Connection, today: &str, tomorrow: &str) -> (i64, i64) {
     let res = conn.query_row(
-        "SELECT \
-            SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 ELSE 0 END), \
-            SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 ELSE 0 END) \
-         FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
+        &format!(
+            "SELECT \
+                COALESCE(SUM({KEYS_ROW_EXPR}), 0), \
+                COALESCE(SUM({CLICKS_ROW_EXPR}), 0) \
+             FROM events WHERE event_type IN ('keyboard','mouse') \
+               AND event_action IN ('press','click','input_agg') \
+               AND timestamp >= ?1 AND timestamp < ?2"
+        ),
         params![today, tomorrow],
         |r| {
-            let keys = r.get::<_, Option<i64>>(0)?.unwrap_or(0);
-            let clicks = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
+            let keys = r.get::<_, i64>(0)?;
+            let clicks = r.get::<_, i64>(1)?;
             Ok((keys, clicks))
         },
     );
@@ -281,7 +318,7 @@ pub fn keys_clicks_today(conn: &Connection, today: &str, tomorrow: &str) -> (i64
 pub fn count_active_min_since(conn: &Connection, since_id: i64) -> i64 {
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(DISTINCT substr(timestamp,1,16)) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click') AND id > ?1",
+            "SELECT COUNT(DISTINCT substr(timestamp,1,16)) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click','input_agg') AND id > ?1",
             params![since_id],
             get_count_i64,
         ),

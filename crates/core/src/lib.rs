@@ -7,6 +7,7 @@ pub mod daily_agg;
 pub mod db;
 pub mod error;
 pub mod heatmap;
+pub mod input_agg;
 pub mod insights;
 pub mod json_util;
 pub mod keyboard_layout;

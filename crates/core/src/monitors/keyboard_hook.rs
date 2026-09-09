@@ -30,7 +30,15 @@ static KB_HOOK: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
-        // 克隆 Sender 后立即释放锁，避免在回调中长时间持锁。
+        // minute 粒度（opt-in）：纯原子计数，跳过修饰键采样与事件构造
+        if crate::input_agg::minute_mode() {
+            if matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                crate::input_agg::record_key();
+            }
+            return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        }
+
+        // raw 粒度（默认）：原行为——克隆 Sender 后立即释放锁，避免在回调中长时间持锁。
         let tx = KB_TX.lock().ok().and_then(|g| g.clone());
         if let Some(tx) = tx {
             let kb = &*(lparam as *const KBDLLHOOKSTRUCT);

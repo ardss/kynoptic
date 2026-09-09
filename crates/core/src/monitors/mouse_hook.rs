@@ -1,7 +1,8 @@
 //! 鼠标低级 Hook（SetWindowsHookExW WH_MOUSE_LL）
 //!
-//! 点击/滚轮/释放：全部发送。
-//! 移动：每 500ms 采样一次，避免事件洪泛。
+//! raw 粒度（默认）：点击/滚轮/释放全部发送，移动每 500ms 采样一次。
+//! minute 粒度（opt-in，见 collector::CollectorSettings）：回调退化为
+//! 纯原子计数（input_agg::record_*），不做节流（原子操作无洪泛风险）。
 
 use crate::types::*;
 use crossbeam_channel::Sender;
@@ -48,11 +49,27 @@ static LAST_MOVE_TIME: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
-        // 克隆 Sender 后立即释放锁，避免在回调中长时间持锁。
+        let ms = &*(lparam as *const MSLLHOOKSTRUCT);
+        // minute 粒度：纯原子计数（最廉价路径），直接返回
+        if crate::input_agg::minute_mode() {
+            match wparam as u32 {
+                WM_MOUSEMOVE => crate::input_agg::record_move(ms.pt.x, ms.pt.y),
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                    crate::input_agg::record_click()
+                }
+                WM_MOUSEWHEEL => {
+                    let delta = (ms.mouse_data >> 16) as i16 as i32;
+                    crate::input_agg::record_scroll((delta.unsigned_abs() / 120) as u64);
+                }
+                // 释放类事件只计样本，不影响点击计数口径
+                _ => {}
+            }
+            return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        }
+
+        // raw 粒度（默认）：原行为——克隆 Sender 后立即释放锁，避免在回调中长时间持锁。
         let tx = MOUSE_TX.lock().ok().and_then(|g| g.clone());
         if let Some(tx) = tx {
-            let ms = &*(lparam as *const MSLLHOOKSTRUCT);
-
             match wparam as u32 {
                 WM_MOUSEMOVE => {
                     // 节流：每 500ms 只发一次移动事件

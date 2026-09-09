@@ -24,13 +24,19 @@ pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
     let off = queries::local_offset_modifier();
 
     let (keys, clicks, active_min): (i64, i64, i64) = conn.query_row(
-        "SELECT
-            COALESCE(SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 ELSE 0 END), 0),
-            (SELECT COUNT(DISTINCT substr(datetime(timestamp, ?3), 1, 16)) FROM events
-             WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type IN ('keyboard','mouse'))
-         FROM events
-         WHERE timestamp >= ?1 AND timestamp < ?2",
+        &format!(
+            "SELECT
+                COALESCE(SUM({keys_row}), 0),
+                COALESCE(SUM({clicks_row}), 0),
+                (SELECT COUNT(DISTINCT substr(datetime(timestamp, ?3), 1, 16)) FROM events
+                 WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type IN ('keyboard','mouse'))
+             FROM events
+             WHERE timestamp >= ?1 AND timestamp < ?2
+               AND event_type IN ('keyboard','mouse')
+               AND event_action IN ('press','click','input_agg')",
+            keys_row = crate::queries::KEYS_ROW_EXPR,
+            clicks_row = crate::queries::CLICKS_ROW_EXPR,
+        ),
         params![start, end, off],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;

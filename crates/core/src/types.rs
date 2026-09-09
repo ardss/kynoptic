@@ -105,6 +105,8 @@ pub enum EventAction {
     PrintJob,
     Notification,
     ImeChange,
+    // 输入聚合（opt-in minute 粒度：每分钟每桶一行计数型事件）
+    InputAgg,
     // 音频
     AudioInputChange,
     AudioOutput,
@@ -162,6 +164,7 @@ impl EventAction {
             Self::ImeChange => "ime_change",
             Self::AudioInputChange => "audio_input_change",
             Self::AudioOutput => "audio_output",
+            Self::InputAgg => "input_agg",
         }
     }
 }
@@ -240,6 +243,7 @@ mod tests {
         assert_eq!(EventAction::Click.to_string(), "click");
         assert_eq!(EventAction::ThermalSnapshot.to_string(), "thermal_snapshot");
         assert_eq!(EventAction::AudioOutput.to_string(), "audio_output");
+        assert_eq!(EventAction::InputAgg.to_string(), "input_agg");
     }
 
     #[test]
