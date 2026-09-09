@@ -1,0 +1,130 @@
+//! kynoptic-tray — Kynoptic 托盘壳(v0.1 桌面产品形态)
+//!
+//! 单进程三职责:
+//! 1. 采集器:kynoptic_core::collector::start_collection(默认 14 监控器,
+//!    --all 启用全集);DB 路径用 kynoptic_core::db::resolve_db_path(--db 覆盖)
+//! 2. 本地 dashboard HTTP 服务(127.0.0.1,逻辑复制自 crates/cli/src/dashboard.rs,
+//!    该模块为 bin 私有无法库复用,见 dashboard.rs 头注)
+//! 3. 系统托盘图标(Shell_NotifyIconW)+ 五项右键菜单,无主窗口,仅消息循环
+//!
+//! 极致轻量铁律:纯 Win32 API(windows-sys)+ std::net,无 Tauri/WinUI3/web 框架,
+//! 无通知气泡,无合成输入注入。
+//!
+//! 暂停语义:Pause 仅停采集(置停机旗标 + Collector::shutdown 内 join writer),
+//! Resume 重新 start_collection;DB 与 dashboard 服务不重启。
+//!
+//! # 物理验证步骤(自动化 shell 里托盘 UI 不可见,属预期;需人工冒烟)
+//! 1. 双击 target/debug/kynoptic-tray.exe(或 cargo run -p kynoptic-tray)
+//! 2. 系统托盘出现绿色实心圆图标(hover 提示 "Kynoptic: collecting")
+//! 3. 右键菜单五项可用:Open Dashboard / Pause / Open data folder / 分隔线 / Quit
+//!    - Open Dashboard 打开 http://127.0.0.1:8422 面板
+//!    - Pause 后图标变灰色空心圆;Resume 变回绿色实心圆
+//!    - Open data folder 打开资源管理器并定位 DB 目录
+//!    - Quit 后进程退出、托盘图标消失、任务管理器确认 RSS < 5MB
+//!
+//! 用法:kynoptic-tray [--db PATH] [--port N] [--all]
+
+mod args;
+mod dashboard;
+mod icons;
+mod state;
+mod tray;
+
+use std::sync::mpsc;
+use std::thread;
+
+use tray::CollectorCmd;
+
+fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = match args::parse(&argv) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("kynoptic-tray: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘
+    let dash_db = parsed.db.clone();
+    let dash_port = parsed.port;
+    let _dash_handle = thread::Builder::new()
+        .name("Dashboard".into())
+        .spawn(move || {
+            if let Err(e) = dashboard::serve(dash_port, &dash_db) {
+                eprintln!("dashboard 服务退出: {e}");
+            }
+        })
+        .expect("dashboard 线程启动失败");
+
+    // 采集器属主线程:Collector 只在本线程构造/持有/关停(所有权不跨线程)
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCmd>();
+    let owner_db = parsed.db.clone();
+    let owner_all = parsed.all;
+    let owner = thread::Builder::new()
+        .name("CollectorOwner".into())
+        .spawn(move || {
+            let mut collector: Option<kynoptic_core::collector::Collector> = None;
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    CollectorCmd::Start => {
+                        // Resume/重启前先清掉上一实例(如有)
+                        if let Some(c) = collector.as_mut() {
+                            c.shutdown();
+                        }
+                        let enabled: std::collections::HashSet<String> = if owner_all {
+                            kynoptic_core::registry::all_monitor_ids()
+                        } else {
+                            kynoptic_core::registry::default_enabled_ids()
+                        }
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                        let db_str = owner_db.to_string_lossy().into_owned();
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            kynoptic_core::collector::start_collection_custom(
+                                &enabled,
+                                kynoptic_core::collector::CollectorSettings::default(),
+                                &db_str,
+                            )
+                        })) {
+                            Ok(c) => {
+                                log::info!("采集器已启动({} 个监控器)", enabled.len());
+                                collector = Some(c);
+                            }
+                            Err(_) => {
+                                eprintln!("采集器启动失败(DB 不可写?),采集暂停");
+                                // 保持 None:下次 Resume 再试
+                            }
+                        }
+                    }
+                    CollectorCmd::Pause => {
+                        if let Some(c) = collector.as_mut() {
+                            // 置停机旗标 -> hook stop -> join writer -> 关 session
+                            c.shutdown();
+                        }
+                        let _ = collector.take();
+                    }
+                    CollectorCmd::Quit => {
+                        if let Some(c) = collector.as_mut() {
+                            c.shutdown();
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("采集器属主线程启动失败");
+
+    // 初始启动采集
+    let _ = cmd_tx.send(CollectorCmd::Start);
+
+    // 托盘消息循环(阻塞直到 Quit;内部 NIM_ADD 失败会返回 false)
+    if !tray::run(parsed, cmd_tx.clone()) {
+        let _ = cmd_tx.send(CollectorCmd::Quit);
+    }
+
+    // 优雅收尾:等属主线程完成置旗标 + join writer。
+    // dashboard 服务线程不 join(listener 无关闭语义),随进程退出而终止。
+    let _ = owner.join();
+}

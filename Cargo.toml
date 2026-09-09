@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/cli",
     "crates/mcp",
+    "crates/tray",
 ]
 
 # workspace 根定义 profile（成员 crate 内的 profile 会被忽略）
