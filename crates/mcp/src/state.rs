@@ -479,12 +479,32 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
                 >= 90.0
         }
         "thermal_hot" => {
-            // v0.1 无温度监控器（R8 裁剪），数据面恒缺 → 永不触发
-            false
+            // thermal 监控器（恢复项，默认关闭：PS 依赖）启用后写入
+            // system/thermal_snapshot 的 max_temp_celsius；未启用时数据面缺 → 不触发
+            let Some(d) = latest_event_data(conn, EventType::System, EventAction::ThermalSnapshot)
+            else {
+                return Ok(false);
+            };
+            d.get("max_temp_celsius")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                >= 80.0
         }
         "disk_almost_full" => {
-            // v0.1 device.rs 磁盘 I/O 暂返回 None（见 CODE_NOTES §1）→ 永不触发
-            false
+            // device/device_snapshot 的 disks[].used_percent ≥ 90 视为磁盘告急
+            // （device 默认启用，容量字段始终存在；磁盘 I/O 速率为 PS 可选项不影响）
+            let Some(d) = latest_event_data(conn, EventType::Device, EventAction::DeviceSnapshot)
+            else {
+                return Ok(false);
+            };
+            d.get("disks")
+                .and_then(|v| v.as_array())
+                .map(|disks| {
+                    disks
+                        .iter()
+                        .any(|d| d.get("used_percent").and_then(|v| v.as_u64()).unwrap_or(0) >= 90)
+                })
+                .unwrap_or(false)
         }
         "marathon_session" => {
             let date = queries::today_local_str();
@@ -777,6 +797,37 @@ mod tests {
         let v = wait_for(&conn, "thermal_hot", 1).unwrap();
         assert_eq!(v["status"], json!("timeout"));
         assert_eq!(v["timeout_sec"], json!(1));
+    }
+
+    #[test]
+    fn disk_almost_full_triggers_on_used_percent() {
+        let conn = mem_conn();
+        // 无快照 → 不触发
+        assert!(!check_signal(&conn, "disk_almost_full").unwrap());
+        // used_percent 91 → 触发
+        insert(
+            &conn,
+            "2026-09-09T10:00:00Z",
+            "device",
+            "device_snapshot",
+            None,
+            Some(json!({"disks": [{"drive": "C", "used_percent": 91}]})),
+        );
+        assert!(check_signal(&conn, "disk_almost_full").unwrap());
+    }
+
+    #[test]
+    fn thermal_hot_triggers_on_max_temp() {
+        let conn = mem_conn();
+        insert(
+            &conn,
+            "2026-09-09T10:00:00Z",
+            "system",
+            "thermal_snapshot",
+            None,
+            Some(json!({"max_temp_celsius": 85.0})),
+        );
+        assert!(check_signal(&conn, "thermal_hot").unwrap());
     }
 
     #[test]
