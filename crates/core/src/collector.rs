@@ -12,12 +12,7 @@ use crate::input_agg;
 use crate::monitors;
 use crate::types::{Event, EventHook, Monitor};
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
-
-pub fn is_shutdown() -> bool {
-    SHUTDOWN.load(Ordering::Acquire)
-}
 
 pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
     if tx.try_send(event).is_err() {
@@ -91,12 +86,20 @@ fn writer_loop(
     batch_size: usize,
     flush_interval: Duration,
     total_written: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
 ) {
     use std::panic;
 
     loop {
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            writer_loop_inner(&rx, &db, batch_size, flush_interval, &total_written)
+            writer_loop_inner(
+                &rx,
+                &db,
+                batch_size,
+                flush_interval,
+                &total_written,
+                &shutdown,
+            )
         }));
         match result {
             Ok(Some(flush_count)) => {
@@ -118,6 +121,7 @@ fn writer_loop_inner(
     batch_size: usize,
     flush_interval: Duration,
     total_written: &AtomicUsize,
+    shutdown: &AtomicBool,
 ) -> Option<usize> {
     use crossbeam_channel::{RecvTimeoutError, TryRecvError};
     use std::time::Instant;
@@ -157,7 +161,7 @@ fn writer_loop_inner(
         }
 
         if batch.is_empty() {
-            if SHUTDOWN.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Acquire) {
                 // 外层已保证 batch 为空，无需 flush，直接退出
                 return Some(0);
             }
@@ -196,7 +200,11 @@ fn writer_loop_inner(
     }
 }
 
-fn run_monitor(m: Box<dyn Monitor + Send>, tx: crossbeam_channel::Sender<Event>) {
+fn run_monitor(
+    m: Box<dyn Monitor + Send>,
+    tx: crossbeam_channel::Sender<Event>,
+    shutdown: Arc<AtomicBool>,
+) {
     let name = m.name().to_string();
     let interval = m.interval();
 
@@ -209,7 +217,7 @@ fn run_monitor(m: Box<dyn Monitor + Send>, tx: crossbeam_channel::Sender<Event>)
     }
 
     loop {
-        if SHUTDOWN.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire) {
             return;
         }
 
@@ -227,7 +235,7 @@ fn run_monitor(m: Box<dyn Monitor + Send>, tx: crossbeam_channel::Sender<Event>)
 
         let deadline = std::time::Instant::now() + wait;
         while std::time::Instant::now() < deadline {
-            if SHUTDOWN.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Acquire) {
                 return;
             }
             thread::sleep(Duration::from_millis(200));
@@ -243,11 +251,14 @@ pub struct Collector {
     pub hooks: Vec<Box<dyn EventHook>>,
     /// 设置副本：shutdown 时决定是否 flush 未满分钟的部分输入计数。
     settings: CollectorSettings,
+    /// 本实例的停机旗标（每 Collector 一份：probe 会在同进程多次启停采集器，
+    /// 全局静态旗标会把上一个实例的监控线程"复活"成僵尸）。
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Collector {
     pub fn shutdown(&mut self) {
-        SHUTDOWN.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
 
         for h in &self.hooks {
             h.stop();
@@ -284,7 +295,7 @@ impl Drop for Collector {
                 self.session_id
             );
             // 注意：此分支只运行一次（shutdown 会 take writer_handle）
-            SHUTDOWN.store(true, Ordering::Release);
+            self.shutdown.store(true, Ordering::Release);
             for h in &self.hooks {
                 h.stop();
             }
@@ -328,10 +339,8 @@ pub fn start_collection_custom(
         .try_init()
         .ok();
 
-    // 复位全局采集状态，使 Collector 可被重启（如上一个实例已 shutdown）。
-    // 此前 SHUTDOWN 一旦置 true 永不复位，第二次 start_collection 的所有线程
-    // 会立刻看到 true 而空转退出；DROPPED_EVENTS 也应随新会话清零。
-    SHUTDOWN.store(false, Ordering::Release);
+    // 本实例独立的停机旗标（见 Collector.shutdown 字段文档）。
+    let shutdown = Arc::new(AtomicBool::new(false));
     DROPPED_EVENTS.store(0, Ordering::Relaxed);
 
     let db = Arc::new(Database::open(db_path).expect("数据库初始化失败"));
@@ -345,6 +354,7 @@ pub fn start_collection_custom(
 
     let db_w = db.clone();
     let tw = total_written.clone();
+    let sd_writer = shutdown.clone();
     let writer_handle = thread::Builder::new()
         .name("EventWriter".into())
         .spawn(move || {
@@ -354,6 +364,7 @@ pub fn start_collection_custom(
                 constants::WRITE_BATCH_SIZE,
                 Duration::from_secs(settings.write_flush_interval_secs.max(1)),
                 tw,
+                sd_writer,
             );
         })
         .expect("Writer 启动失败");
@@ -364,9 +375,10 @@ pub fn start_collection_custom(
 
     for m in monitors {
         let tx = tx.clone();
+        let sd = shutdown.clone();
         thread::Builder::new()
             .name(m.name().into())
-            .spawn(move || run_monitor(m, tx))
+            .spawn(move || run_monitor(m, tx, sd))
             .expect("Monitor 线程启动失败");
     }
 
@@ -377,11 +389,12 @@ pub fn start_collection_custom(
     if minute_mode {
         input_agg::activate();
         let tx_agg = tx.clone();
+        let sd_agg = shutdown.clone();
         thread::Builder::new()
             .name("InputAgg".into())
             .spawn(move || loop {
                 thread::sleep(Duration::from_secs(1));
-                if SHUTDOWN.load(Ordering::Acquire) {
+                if sd_agg.load(Ordering::Acquire) {
                     return;
                 }
                 for e in input_agg::drain(chrono::Local::now()) {
@@ -417,11 +430,12 @@ pub fn start_collection_custom(
     db.refresh_daily_agg();
 
     let db_clone = db.clone();
+    let sd_maint = shutdown.clone();
     thread::Builder::new()
         .name("Maintenance".into())
         .spawn(move || loop {
             thread::sleep(Duration::from_secs(constants::MAINTENANCE_INTERVAL_SECS));
-            if SHUTDOWN.load(Ordering::Acquire) {
+            if sd_maint.load(Ordering::Acquire) {
                 return;
             }
             log::info!("执行定期数据库维护...");
@@ -436,5 +450,6 @@ pub fn start_collection_custom(
         writer_handle: Some(writer_handle),
         hooks,
         settings,
+        shutdown,
     }
 }

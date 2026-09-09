@@ -154,9 +154,11 @@ fn first_matching(warnings: &[String], pat: &str) -> String {
 
 type LogBuf = Arc<Mutex<Vec<(log::Level, String)>>>;
 
-struct CaptureLogger {
-    buf: LogBuf,
-}
+/// 进程级共享捕获缓冲：--all 一次进程内跑 40 个探针，而全局日志器只能安装
+/// 一次——若每个探针自建缓冲，第二个探针起拿不到句柄，"等待首次采集完成"
+/// 会退化为纯窗口等待，慢采集监控器（如 windows_update 在线搜索）会被误判
+/// 为零事件。所有探针共享同一缓冲，用起始下标区分各自窗口。
+static LOG_BUF: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
 
 impl log::Log for CaptureLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
@@ -178,16 +180,21 @@ impl log::Log for CaptureLogger {
     fn flush(&self) {}
 }
 
-/// 安装捕获日志器（若全局日志器已设置则不覆盖，返回 None）。
-fn install_capture_logger() -> Option<LogBuf> {
-    let buf: LogBuf = Arc::new(Mutex::new(Vec::new()));
-    let logger = Box::new(CaptureLogger { buf: buf.clone() });
-    if log::set_boxed_logger(logger).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
-        Some(buf)
-    } else {
-        None
-    }
+struct CaptureLogger {
+    buf: LogBuf,
+}
+
+/// 安装进程级捕获日志器（幂等；返回共享缓冲）。
+fn install_capture_logger() -> LogBuf {
+    LOG_BUF
+        .get_or_init(|| {
+            let buf: LogBuf = Arc::new(Mutex::new(Vec::new()));
+            if log::set_boxed_logger(Box::new(CaptureLogger { buf: buf.clone() })).is_ok() {
+                log::set_max_level(log::LevelFilter::Info);
+            }
+            buf
+        })
+        .clone()
 }
 
 // ─── 探针核心 ─────────────────────────────────────────────────────────────────
@@ -234,8 +241,10 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
         .unwrap_or_else(|| panic!("未知监控器 id: {id}"));
     let is_hook = id == "keyboard_hook" || id == "mouse_hook";
 
-    // 捕获日志器必须先于 collector 内部的 env_logger try_init 安装
+    // 捕获日志器必须先于 collector 内部的 env_logger try_init 安装。
+    // 记录起始下标：本探针只看自己窗口内新增的日志行。
     let log_buf = install_capture_logger();
+    let log_start = log_buf.lock().unwrap().len();
 
     let db_path = temp_db_path(id);
     let enabled: HashSet<String> = [id.to_string()].into_iter().collect();
@@ -248,31 +257,47 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
 
     // 等首次采集完成（PS 子进程型首次查询可能远超窗口时长，例如 Windows
     // Update 在线搜索可达数分钟）。未完成就计数会把"慢"误判成"零事件"。
+    // Hook 无轮询首采日志，无需等待首采：直接短窗口验证启停干净。
+    if is_hook {
+        std::thread::sleep(std::time::Duration::from_secs(secs.max(3)));
+        let mut collector = start_collection_custom(&enabled, settings, db_path.to_str().unwrap());
+        let (events, sample) = count_and_sample(&collector.db);
+        let warnings: Vec<String> = log_buf.lock().unwrap()[log_start..]
+            .iter()
+            .filter(|(lvl, _)| *lvl <= log::Level::Warn)
+            .map(|(_, m)| m.clone())
+            .collect();
+        collector.shutdown();
+        if let Some(dir) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let (verdict, note) = classify(events, &warnings, true);
+        return ProbeOutcome {
+            id: spec.id,
+            dep: spec.dep.as_str(),
+            default_enabled: spec.default_enabled,
+            events,
+            sample,
+            warnings,
+            verdict,
+            note,
+        };
+    }
+
     let first_collect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(420);
-    let mut first_collect_ok = false;
+    let first_collect_ok;
+    let mut panicked;
     loop {
-        if let Some(buf) = &log_buf {
-            let msgs = buf.lock().unwrap();
-            if msgs
-                .iter()
-                .any(|(_, m)| m.contains(&format!("{id} 首次采集完成")))
-            {
-                first_collect_ok = true;
-            }
-            let panicked = msgs
-                .iter()
-                .any(|(_, m)| m.contains(&format!("{id} 首次采集 panic")));
-            drop(msgs);
-            if panicked {
-                break;
-            }
-        } else {
-            first_collect_ok = true; // 日志器被占用（并行探针场景）：退化为纯窗口等待
-        }
-        if first_collect_ok {
-            break;
-        }
-        if std::time::Instant::now() > first_collect_deadline {
+        let msgs = log_buf.lock().unwrap();
+        let done = msgs[log_start..]
+            .iter()
+            .any(|(_, m)| m.contains(&format!("{id} 首次采集完成")));
+        panicked = msgs[log_start..]
+            .iter()
+            .any(|(_, m)| m.contains(&format!("{id} 首次采集 panic")));
+        drop(msgs);
+        if done || panicked || std::time::Instant::now() > first_collect_deadline {
+            first_collect_ok = done;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -288,16 +313,11 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
     // shutdown 只停 writer；monitor 线程看到 SHUTDOWN 后自行退出，不影响读库
 
     let (events, sample) = count_and_sample(&collector.db);
-    let warnings: Vec<String> = log_buf
-        .map(|b| {
-            b.lock()
-                .unwrap()
-                .iter()
-                .filter(|(lvl, _)| *lvl <= log::Level::Warn)
-                .map(|(_, m)| m.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let warnings: Vec<String> = log_buf.lock().unwrap()[log_start..]
+        .iter()
+        .filter(|(lvl, _)| *lvl <= log::Level::Warn)
+        .map(|(_, m)| m.clone())
+        .collect();
 
     let (mut verdict, mut note) = classify(events, &warnings, is_hook);
     if events == 0 && warnings.is_empty() && first_collect_ok {
@@ -305,8 +325,11 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
             verdict = Verdict::ExpectedLimited;
             note = why.to_string();
         }
+    } else if panicked {
+        note = format!("首次采集 panic：{note}");
+        verdict = Verdict::Fail;
     } else if !first_collect_ok {
-        note = format!("首次采集在 420s 内未完成（超时或 panic）{}", note);
+        note = format!("首次采集在 420s 内未完成（超时）{note}");
         verdict = Verdict::Fail;
     }
 
