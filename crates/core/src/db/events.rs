@@ -105,6 +105,9 @@ impl Database {
 
     /// 清理超过保留天数的事件
     pub fn cleanup_old_events(&self) -> usize {
+        if self.retention_days <= 0 {
+            return 0; // 0 = 永不删除（默认）。铁律：原始数据只能显式 opt-in 才清理。
+        }
         self.with_writer(
             |conn| {
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(self.retention_days);

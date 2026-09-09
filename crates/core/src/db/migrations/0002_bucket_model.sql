@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS current_state (
   updated_at TEXT NOT NULL
 );
 
--- pet 遗留表清理（新库不存在，幂等）
-DROP TABLE IF EXISTS pet_signals;
-DROP TABLE IF EXISTS pet_memory;
-DROP TABLE IF EXISTS pet_state;
+-- pet 遗留表改名保留（永不删除用户数据；新库不存在时无操作）
+-- 注意：这里不使用 DROP。旧表数据一律改名归档。
+ALTER TABLE IF EXISTS pet_signals RENAME TO legacy_pet_signals;
+ALTER TABLE IF EXISTS pet_memory RENAME TO legacy_pet_memory;
+ALTER TABLE IF EXISTS pet_state RENAME TO legacy_pet_state;

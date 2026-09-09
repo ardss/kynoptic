@@ -21,14 +21,15 @@ pub const TRAY_UPDATE_INTERVAL_SECS: u64 = 5;
 pub const SNAPSHOT_CACHE_INTERVAL_SECS: u64 = 2;
 
 // === 数据库 ===
-pub const DEFAULT_RETENTION_DAYS: i64 = 90;
+/// 数据保留天数。0 = 永不删除（铁律：原始数据一字节不动；清理必须显式 opt-in）。
+pub const DEFAULT_RETENTION_DAYS: i64 = 0;
 pub const READER_POOL_SIZE: usize = 8;
 /// 数据库文件名（不含目录）。路径解析见 db::resolve_db_path。
 pub const DB_FILENAME: &str = "kynoptic.db";
 /// 读连接池耗尽时最多等待的周期数（每周期 5s）。
 /// 超过则降级为新建临时连接，避免调用方无限阻塞。
 pub const READER_POOL_MAX_WAITS: u32 = 3;
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段
