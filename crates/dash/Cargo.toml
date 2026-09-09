@@ -1,0 +1,18 @@
+[package]
+name = "kynoptic-dash"
+version = "0.1.0"
+edition = "2021"
+description = "本地只读 dashboard HTTP 服务（cli 与 tray 共用唯一实现；127.0.0.1、零 CDN、内嵌单页）"
+
+[dependencies]
+kynoptic-core = { path = "../core" }
+kynoptic-mcp = { path = "../mcp" }
+chrono = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+winreg = "0.52"
+
+[lints]
+workspace = true

@@ -802,6 +802,7 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "kynoptic-core",
+ "kynoptic-dash",
  "kynoptic-mcp",
  "log",
  "rusqlite",
@@ -829,6 +830,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kynoptic-dash"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kynoptic-core",
+ "kynoptic-mcp",
+ "log",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "winreg",
+]
+
+[[package]]
 name = "kynoptic-mcp"
 version = "0.1.0"
 dependencies = [
@@ -846,6 +861,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
+ "kynoptic-dash",
  "kynoptic-mcp",
  "log",
  "rusqlite",

@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kynoptic dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #c9d1d9; --dim: #8b949e; --brand: #4EA1FF; --amber: #FFB454;
+    --ok: #3fb950; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto; background: var(--bg); color: var(--fg);
+    font-family: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+    font-size: 14px; line-height: 1.5; padding: 24px; max-width: 960px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  h1::before { content: "▸ "; color: var(--brand); }
+  .muted { color: var(--dim); }
+  header { margin-bottom: 20px; position: relative; }
+  .lang-toggle {
+    position: absolute; top: 0; right: 0; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; color: var(--dim);
+    padding: 4px 12px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .lang-toggle:hover { color: var(--brand); border-color: var(--brand); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; }
+  .card .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .card .value { font-size: 22px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .value.small { font-size: 15px; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; }
+  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin: 0 0 10px; }
+  svg { display: block; max-width: 100%; }
+  ul.anomalies { list-style: none; margin: 0; padding: 0; }
+  ul.anomalies li { padding: 4px 0; border-bottom: 1px dashed var(--border); }
+  ul.anomalies li:last-child { border-bottom: none; }
+  .sev-info { color: var(--brand); } .sev-warn { color: var(--warn); } .sev-critical { color: #f85149; }
+  footer { color: var(--dim); font-size: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+  .err { color: #f85149; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab { background: var(--panel); border: 1px solid var(--border); border-radius: 6px 6px 0 0;
+         padding: 6px 16px; cursor: pointer; color: var(--dim); }
+  .tab.active { color: var(--fg); border-bottom-color: var(--bg); border-color: var(--brand); border-bottom-color: var(--bg); }
+  /* 双语：html[lang] 切换 .l.en / .l.zh */
+  html[lang="en"] .l.zh, html[lang="zh"] .l.en { display: none; }
+  .settings-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .settings-group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+                       color: var(--dim); margin: 0 0 8px; }
+  .mon-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+  .mon-row input { accent-color: var(--brand); }
+  .badge { font-size: 11px; border: 1px solid var(--border); border-radius: 3px;
+           padding: 0 5px; color: var(--amber); }
+  .settings-actions { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
+  button.save { background: var(--brand); color: #0d1117; border: none; border-radius: 6px;
+                padding: 6px 18px; font: inherit; cursor: pointer; }
+  button.save:disabled { opacity: 0.5; cursor: default; }
+  #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: #f85149; }
+  /* Top apps 横向条形榜 */
+  .app-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .app-label { width: 150px; color: var(--fg); overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; flex-shrink: 0; text-align: right; font-size: 13px; }
+  .app-track { flex: 1; height: 18px; background: var(--bg); border: 1px solid var(--border);
+               border-radius: 3px; overflow: hidden; }
+  .app-bar { height: 100%; background: var(--brand); min-width: 2px; }
+  .app-count { width: 64px; color: var(--dim); font-size: 12px; flex-shrink: 0; }
+  .hm-legend { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--dim); font-size: 12px; }
+  .hm-legend .sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>kynoptic dashboard</h1>
+  <button class="lang-toggle" id="lang-btn" onclick="toggleLang()">中文</button>
+  <div class="muted" id="status-line">loading…</div>
+  <div class="tabs">
+    <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
+    <div class="tab" id="tab-activity" onclick="showView('activity')"><span class="l en">Activity</span><span class="l zh">活动</span></div>
+    <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
+    <div class="tab" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></div>
+  </div>
+</header>
+
+<div id="view-overview">
+
+<div class="cards">
+  <div class="card"><div class="label"><span class="l en">session uptime</span><span class="l zh">会话时长</span></div><div class="value" id="c-uptime">–</div></div>
+  <div class="card"><div class="label"><span class="l en">today events</span><span class="l zh">今日事件</span></div><div class="value" id="c-today-events">–</div></div>
+  <div class="card"><div class="label"><span class="l en">monitors enabled</span><span class="l zh">启用监控器</span></div><div class="value" id="c-monitors">–</div></div>
+  <div class="card"><div class="label"><span class="l en">db size</span><span class="l zh">数据库大小</span></div><div class="value" id="c-dbsize">–</div></div>
+  <div class="card"><div class="label"><span class="l en">cpu</span><span class="l zh">处理器</span></div><div class="value" id="c-cpu">–</div></div>
+  <div class="card"><div class="label"><span class="l en">memory</span><span class="l zh">内存</span></div><div class="value" id="c-mem">–</div></div>
+  <div class="card"><div class="label"><span class="l en">foreground app</span><span class="l zh">前台应用</span></div><div class="value small" id="c-foreground">–</div></div>
+</div>
+
+<div class="cards">
+  <div class="card"><div class="label"><span class="l en">active minutes</span><span class="l zh">活跃分钟</span></div><div class="value" id="c-active">–</div></div>
+  <div class="card"><div class="label"><span class="l en">keys</span><span class="l zh">按键</span></div><div class="value" id="c-keys">–</div></div>
+  <div class="card"><div class="label"><span class="l en">clicks</span><span class="l zh">点击</span></div><div class="value" id="c-clicks">–</div></div>
+  <div class="card"><div class="label"><span class="l en">top app</span><span class="l zh">最常用应用</span></div><div class="value small" id="c-app">–</div></div>
+</div>
+
+<section>
+  <h2><span class="l en">timeline — last 12 hours (per local hour, events)</span><span class="l zh">时间线 — 近 12 小时（按本地小时，事件数）</span></h2>
+  <div id="timeline" class="muted">loading…</div>
+</section>
+</div>
+
+<div id="view-activity" style="display:none">
+<section>
+  <h2><span class="l en">today — events per hour (24h)</span><span class="l zh">今日 — 24 小时逐时事件量</span></h2>
+  <div id="hours-chart" class="muted">loading…</div>
+</section>
+<section>
+  <h2><span class="l en">activity heatmap — last 12 weeks (events per day)</span><span class="l zh">活跃度热力图 — 近 12 周（每日事件量）</span></h2>
+  <div id="heatmap">loading…</div>
+  <div class="hm-legend">
+    <span><span class="l en">less</span><span class="l zh">少</span></span>
+    <span class="sw" style="background:#161b22;border:1px solid var(--border)"></span>
+    <span class="sw" style="background:#1e3a5f"></span>
+    <span class="sw" style="background:#2d5f94"></span>
+    <span class="sw" style="background:#3b82c4"></span>
+    <span class="sw" style="background:#4EA1FF"></span>
+    <span><span class="l en">more</span><span class="l zh">多</span></span>
+  </div>
+</section>
+<section>
+  <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
+  <div id="top-apps" class="muted">loading…</div>
+</section>
+</div>
+
+<div id="view-anomalies" style="display:none">
+<section>
+  <h2><span class="l en">anomalies — last 7 days</span><span class="l zh">异常 — 近 7 天</span></h2>
+  <ul class="anomalies" id="anomalies"><li class="muted">loading…</li></ul>
+</section>
+</div>
+
+<div id="view-settings" style="display:none">
+<section>
+  <h2><span class="l en">settings — monitors</span><span class="l zh">设置 — 监控器</span></h2>
+  <div class="muted" style="margin-bottom:10px">
+    <span class="l en">Changes are saved to settings.json next to your database.
+      Restart kynoptic collect for monitor changes to take effect.</span>
+    <span class="l zh">更改保存到数据库旁的 settings.json。监控器开关需重启 kynoptic collect 后生效。</span>
+  </div>
+  <div class="settings-groups">
+    <div class="settings-group">
+      <h3><span class="l en">default enabled (14)</span><span class="l zh">默认启用（14）</span></h3>
+      <div id="mon-default"></div>
+    </div>
+    <div class="settings-group">
+      <h3><span class="l en">opt-in (26)</span><span class="l zh">可选启用（26）</span></h3>
+      <div id="mon-optin"></div>
+    </div>
+  </div>
+</section>
+<section>
+  <h2><span class="l en">settings — autostart</span><span class="l zh">设置 — 开机自启动</span></h2>
+  <div class="mon-row">
+    <input type="checkbox" id="set-autostart">
+    <label for="set-autostart"><span class="l en">start kynoptic collect at login</span><span class="l zh">登录时自动启动 kynoptic collect</span></label>
+  </div>
+  <h2><span class="l en">settings — input privacy</span><span class="l zh">设置 — 输入隐私</span></h2>
+  <div class="mon-row">
+    <input type="checkbox" id="set-counts" checked>
+    <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended; per-key detail off)</span>
+    <span class="l zh">仅按分钟计数保存键盘/鼠标输入（推荐；不记录逐键明细）</span></label>
+  </div>
+  <div class="muted"><span class="l en">Takes effect after the collector restarts.</span><span class="l zh">重启采集器后生效。</span></div>
+</section>
+<section>
+  <div class="settings-actions">
+    <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
+    <span id="settings-msg"></span>
+  </div>
+</section>
+</div>
+
+<footer>
+  <span class="l en">All data is local. This page reads your kynoptic.db on this machine only.<br>
+  Server binds 127.0.0.1 (localhost-only, not exposed to the network; no auth needed). Read-only: the dashboard never writes to your events. License: Apache-2.0.</span>
+  <span class="l zh">所有数据均在本地。本页只读取本机的 kynoptic.db。<br>
+  服务仅绑定 127.0.0.1（只监听本机回环，不暴露到网络，无需鉴权）。只读：面板绝不写入事件数据。许可证：Apache-2.0。</span>
+</footer>
+
+<script>
+"use strict";
+const PALETTE = ["#4EA1FF", "#FFB454", "#3fb950", "#bc8cff", "#39c5cf", "#8b949e"];
+/* 热力图五档色阶：深底色 → 品牌蓝 #4EA1FF */
+const HM_LEVELS = ["#161b22", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
+/* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS） */
+const T = {
+  en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
+        noSession: "not running", noData: "no data", saved: "saved. restart kynoptic collect for changes to take effect.",
+        saveFailed: "save failed: " },
+  zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
+        noSession: "未在运行", noData: "暂无数据", saved: "已保存。重启 kynoptic collect 后生效。",
+        saveFailed: "保存失败：" }
+};
+function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+async function jget(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + " → HTTP " + r.status);
+  return r.json();
+}
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + units[i];
+}
+function fmtUptime(sec) {
+  if (sec === null || sec === undefined) return t("noSession");
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+        m = Math.floor(sec % 3600 / 60);
+  if (d > 0) return d + "d " + h + "h";
+  if (h > 0) return h + "h " + m + "m";
+  return m + "m";
+}
+/* ─── i18n 切换 ─── */
+function applyLang(lang) {
+  document.documentElement.lang = lang;
+  localStorage.setItem("kyn-lang", lang);
+  document.getElementById("lang-btn").textContent = lang === "zh" ? "EN" : "中文";
+}
+function toggleLang() {
+  applyLang(document.documentElement.lang === "zh" ? "en" : "zh");
+  refreshAll().catch(() => {});
+}
+/* ─── 状态行 / Overview ─── */
+async function loadStatus() {
+  const s = await jget("/api/status");
+  const last = s.last_event_ts ? s.last_event_ts.replace("T", " ") : "(no events yet)";
+  document.getElementById("status-line").textContent =
+    s.today + " · last event: " + last + " UTC · read-only · " + s.db_path;
+}
+function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
+async function loadOverview() {
+  const o = await jget("/api/overview");
+  document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
+  document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
+  document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;
+  document.getElementById("c-dbsize").textContent = fmtBytes((o.db_size_bytes || 0) + (o.db_wal_bytes || 0));
+  document.getElementById("c-cpu").textContent = pct(o.cpu_pct);
+  document.getElementById("c-mem").textContent = pct(o.mem_pct);
+  document.getElementById("c-foreground").textContent = o.foreground_app || "–";
+  const s = await jget("/api/summary");
+  document.getElementById("c-active").textContent = s.active_minutes;
+  document.getElementById("c-keys").textContent = s.keys.toLocaleString();
+  document.getElementById("c-clicks").textContent = s.clicks.toLocaleString();
+  document.getElementById("c-app").textContent = s.top_app || "–";
+}
+/* ─── 12 小时时间线（横向条） ─── */
+async function loadTimeline() {
+  const tl = await jget("/api/timeline?hours=12");
+  const el = document.getElementById("timeline");
+  if (!tl.buckets.length) { el.textContent = t("noEvents"); return; }
+  const maxEvents = Math.max(1, ...tl.buckets.map(b => b.apps.reduce((a, x) => a + x.events, 0)));
+  const appColor = {};
+  let next = 0;
+  el.innerHTML = tl.buckets.map(b => {
+    const total = b.apps.reduce((a, x) => a + x.events, 0);
+    const segs = b.apps.map(x => {
+      if (!(x.app in appColor)) { appColor[x.app] = PALETTE[next % PALETTE.length]; next++; }
+      const w = (x.events / maxEvents * 100).toFixed(2);
+      return '<span style="height:100%;min-width:1px;width:' + w + "%;background:" + appColor[x.app] +
+        '" title="' + esc(x.app) + ": " + x.events + '"></span>';
+    }).join("");
+    return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
+      '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13)) + "</span>" +
+      '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' + segs + "</span></div>";
+  }).join("");
+}
+/* ─── 24 小时柱状图（手绘 SVG） ─── */
+async function loadHours() {
+  const h = await jget("/api/hours?date=today");
+  const values = h.values;
+  const el = document.getElementById("hours-chart");
+  const W = 880, H = 180, padL = 36, padB = 22, padT = 8;
+  const innerW = W - padL - 8, innerH = H - padT - padB;
+  const max = Math.max(1, ...values);
+  const bw = innerW / 24;
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + innerH - innerH * g / 4;
+    const v = Math.round(max * g / 4);
+    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
+      '" stroke="#30363d" stroke-width="1"/>';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="11" text-anchor="end">' + v + "</text>";
+  }
+  values.forEach((v, hr) => {
+    const bh = v / max * innerH;
+    const x = padL + hr * bw + 2, y = padT + innerH - bh;
+    svg += '<rect x="' + x + '" y="' + y + '" width="' + (bw - 4) + '" height="' + Math.max(bh, v > 0 ? 2 : 0) +
+      '" rx="2" fill="#4EA1FF"><title>' + hr + ":00 — " + v + '</title></rect>';
+    if (hr % 3 === 0) {
+      svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
+        '" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + "</text>";
+    }
+  });
+  svg += "</svg>";
+  el.innerHTML = svg;
+}
+/* ─── 12 周热力图（7 行 × N 列 SVG 格子） ─── */
+function hmLevel(v, max) {
+  if (v <= 0) return 0;
+  const r = v / max;
+  if (r <= 0.25) return 1;
+  if (r <= 0.5) return 2;
+  if (r <= 0.75) return 3;
+  return 4;
+}
+async function loadHeatmap() {
+  const hm = await jget("/api/heatmap?weeks=12");
+  const el = document.getElementById("heatmap");
+  const days = hm.days;
+  const max = Math.max(1, ...days.map(d => d.value));
+  const cell = 14, gap = 3;
+  const cols = Math.ceil(days.length / 7);
+  const W = 40 + cols * (cell + gap) + 8, H = 7 * (cell + gap) + 16;
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
+  const dayLabels = ["Mon", "", "Wed", "", "Fri", "", "Sun"];
+  dayLabels.forEach((lb, r) => {
+    if (lb) svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="#8b949e" font-size="10" text-anchor="end">' + lb + "</text>";
+  });
+  days.forEach((d, i) => {
+    const col = Math.floor(i / 7), row = i % 7;
+    const x = 40 + col * (cell + gap), y = row * (cell + gap);
+    const level = hmLevel(d.value, max);
+    svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
+      '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
+      (level === 0 ? "#30363d" : "none") + '"><title>' + d.date + " — " + d.value + '</title></rect>';
+  });
+  svg += "</svg>";
+  el.innerHTML = svg;
+}
+/* ─── Top Apps 横向条形榜 ─── */
+async function loadTopApps() {
+  const a = await jget("/api/apps?days=7");
+  const el = document.getElementById("top-apps");
+  if (!a.apps.length) { el.textContent = t("noData"); return; }
+  const max = Math.max(...a.apps.map(x => x.count));
+  el.innerHTML = a.apps.map(x =>
+    '<div class="app-row">' +
+    '<span class="app-label" title="' + esc(x.app) + '">' + esc(x.app) + "</span>" +
+    '<span class="app-track"><span class="app-bar" style="width:' + (x.count / max * 100).toFixed(2) + '%"></span></span>' +
+    '<span class="app-count">' + x.count.toLocaleString() + "</span></div>").join("");
+}
+/* ─── Anomalies ─── */
+async function loadAnomalies() {
+  const a = await jget("/api/anomalies?days=7");
+  const el = document.getElementById("anomalies");
+  if (!a.anomalies.length) { el.innerHTML = '<li class="muted">' + t("noAnomalies") + "</li>"; return; }
+  el.innerHTML = a.anomalies.map(x =>
+    '<li><span class="sev-' + esc(x.severity) + '">[' + esc(x.severity) + "]</span> " +
+    esc(x.date) + " · " + esc(x.kind) + " — " + esc(x.message) + "</li>").join("");
+}
+/* ─── Settings ─── */
+function settingsMsg(text, ok) {
+  const el = document.getElementById("settings-msg");
+  el.textContent = text;
+  el.className = ok ? "ok" : "bad";
+}
+async function loadSettings() {
+  const s = await jget("/api/settings");
+  const enabled = new Set(s.enabled_monitors);
+  const row = m =>
+    '<div class="mon-row"><input type="checkbox" class="mon-toggle" data-id="' + esc(m.id) + '"' +
+    (enabled.has(m.id) ? " checked" : "") + ' id="mon-' + esc(m.id) + '">' +
+    '<label for="mon-' + esc(m.id) + '">' + esc(m.id) + "</label>" +
+    (m.default_enabled ? "" : '<span class="badge"><span class="l en">opt-in</span><span class="l zh">可选</span></span>') + "</div>";
+  document.getElementById("mon-default").innerHTML =
+    s.monitors.filter(m => m.default_enabled).map(row).join("");
+  document.getElementById("mon-optin").innerHTML =
+    s.monitors.filter(m => !m.default_enabled).map(row).join("");
+  document.getElementById("set-autostart").checked = s.autostart;
+  document.getElementById("set-counts").checked = s.input_counts_only;
+  settingsMsg("", true);
+}
+async function saveSettings() {
+  const btn = document.getElementById("settings-save");
+  btn.disabled = true;
+  try {
+    const enabled_monitors = [...document.querySelectorAll(".mon-toggle")]
+      .filter(x => x.checked).map(x => x.dataset.id);
+    const body = {
+      enabled_monitors: enabled_monitors,
+      autostart: document.getElementById("set-autostart").checked,
+      input_counts_only: document.getElementById("set-counts").checked
+    };
+    const r = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error(e.error || ("HTTP " + r.status));
+    }
+    settingsMsg(t("saved"), true);
+  } catch (e) {
+    settingsMsg(t("saveFailed") + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+/* ─── 视图切换与轮询 ─── */
+let currentView = "overview";
+function showView(name) {
+  currentView = name;
+  for (const v of ["overview", "activity", "anomalies", "settings"]) {
+    document.getElementById("view-" + v).style.display = v === name ? "" : "none";
+    document.getElementById("tab-" + v).classList.toggle("active", v === name);
+  }
+  refreshView(name).catch(e => settingsMsg(e.message, false));
+}
+async function refreshView(name) {
+  if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
+  else if (name === "activity") await Promise.all([loadHours(), loadHeatmap(), loadTopApps()]);
+  else if (name === "anomalies") await loadAnomalies();
+  else if (name === "settings") await loadSettings();
+}
+async function refreshAll() {
+  await refreshView(currentView);
+}
+const savedLang = localStorage.getItem("kyn-lang") ||
+  ((navigator.language || "en").startsWith("zh") ? "zh" : "en");
+applyLang(savedLang);
+refreshAll().catch(e => {
+  const el = document.createElement("div");
+  el.className = "err";
+  el.textContent = "load failed: " + e.message;
+  document.body.prepend(el);
+});
+setInterval(() => { refreshAll().catch(() => {}); }, 10000);
+</script>
+</body>
+</html>

@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 kynoptic-core = { path = "../core" }
 kynoptic-mcp = { path = "../mcp" }
+kynoptic-dash = { path = "../dash" }
 chrono = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

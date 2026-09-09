@@ -3,8 +3,8 @@
 //! 单进程三职责:
 //! 1. 采集器:kynoptic_core::collector::start_collection(默认 14 监控器,
 //!    --all 启用全集);DB 路径用 kynoptic_core::db::resolve_db_path(--db 覆盖)
-//! 2. 本地 dashboard HTTP 服务(127.0.0.1,逻辑复制自 crates/cli/src/dashboard.rs,
-//!    该模块为 bin 私有无法库复用,见 dashboard.rs 头注)
+//! 2. 本地 dashboard HTTP 服务(127.0.0.1,实现在 kynoptic-dash crate,与
+//!    `kynoptic-ctl dashboard` 共用唯一代码,只读打开)
 //! 3. 系统托盘图标(Shell_NotifyIconW)+ 五项右键菜单,无主窗口,仅消息循环
 //!
 //! 极致轻量铁律:纯 Win32 API(windows-sys)+ std::net,无 Tauri/WinUI3/web 框架,
@@ -25,7 +25,6 @@
 //! 用法:kynoptic-tray [--db PATH] [--port N] [--all]
 
 mod args;
-mod dashboard;
 mod icons;
 mod state;
 mod tray;
@@ -51,7 +50,7 @@ fn main() {
     let _dash_handle = thread::Builder::new()
         .name("Dashboard".into())
         .spawn(move || {
-            if let Err(e) = dashboard::serve(dash_port, &dash_db) {
+            if let Err(e) = kynoptic_dash::serve(&dash_db, dash_port, true) {
                 eprintln!("dashboard 服务退出: {e}");
             }
         })
