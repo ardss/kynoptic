@@ -856,24 +856,28 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let mut c = if all {
-        let enabled: std::collections::HashSet<String> = kynoptic_core::registry::all_monitor_ids()
+    // 设置面板（dashboard /api/settings）写入的 settings.json 是监控器开关
+    // 的唯一事实源：collect 启动时读取；--all 显式覆盖为全集。
+    let enabled: std::collections::HashSet<String> = if all {
+        kynoptic_core::registry::all_monitor_ids()
             .iter()
             .map(|s| s.to_string())
-            .collect();
-        eprintln!(
-            "kynoptic collect: {} monitors (ALL), db = {db_path}. Ctrl+C to stop.",
-            enabled.len()
-        );
-        collector::start_collection_custom(
-            &enabled,
-            collector::CollectorSettings::default(),
-            &db_path,
-        )
+            .collect()
     } else {
-        eprintln!("kynoptic collect: default monitors, db = {db_path}. Ctrl+C to stop.");
-        collector::start_collection(&db_path)
+        crate::settings::load(std::path::Path::new(&db_path))
+            .enabled_monitors
+            .into_iter()
+            .collect()
     };
+    eprintln!(
+        "kynoptic collect: {} monitors, db = {db_path}. Ctrl+C to stop.",
+        enabled.len()
+    );
+    let mut c = collector::start_collection_custom(
+        &enabled,
+        collector::CollectorSettings::default(),
+        &db_path,
+    );
 
     // Ctrl+C → 优雅关停，保证缓冲事件 flush、session 正常关闭
     let shutdown = c.shutdown_flag().clone();
