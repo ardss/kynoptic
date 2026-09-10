@@ -184,7 +184,14 @@
   <div id="hours-chart" class="muted">loading…</div>
 </section>
 <section>
-  <h2><span class="l en">activity heatmap — last 12 weeks (events per day)</span><span class="l zh">活跃度热力图 — 近 12 周（每日事件量）</span></h2>
+  <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+    <span><span class="l en">activity heatmap (events per day)</span><span class="l zh">活跃度热力图（每日事件量）</span></span>
+    <span id="hm-range" style="display:inline-flex;gap:4px">
+      <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
+      <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
+      <button class="save hm-tab" data-weeks="52" style="padding:2px 12px;font-size:12px"><span class="l en">1yr</span><span class="l zh">一年</span></button>
+    </span>
+  </h2>
   <div id="heatmap">loading…</div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
@@ -498,8 +505,19 @@ function hmLevel(v, max) {
   if (r <= 0.75) return 3;
   return 4;
 }
+let HM_WEEKS = 12;
+function setHeatmapRange(weeks) {
+  HM_WEEKS = weeks;
+  document.querySelectorAll("#hm-range .hm-tab").forEach(b => {
+    const on = +b.dataset.weeks === weeks;
+    b.style.background = on ? "" : "var(--panel-2)";
+    b.style.color = on ? "" : "var(--dim)";
+    b.style.fontWeight = on ? "600" : "400";
+  });
+  loadHeatmap().catch(() => {});
+}
 async function loadHeatmap() {
-  const hm = await jget("/api/heatmap?weeks=12");
+  const hm = await jget("/api/heatmap?weeks=" + HM_WEEKS);
   const el = document.getElementById("heatmap");
   const days = hm.days;
   const max = Math.max(1, ...days.map(d => d.value));
@@ -1044,6 +1062,9 @@ async function refreshAll() {
 }
 const savedLang = localStorage.getItem("kyn-lang") ||
   ((navigator.language || "en").startsWith("zh") ? "zh" : "en");
+document.querySelectorAll("#hm-range .hm-tab").forEach(b =>
+  b.addEventListener("click", () => setHeatmapRange(+b.dataset.weeks)));
+setHeatmapRange(HM_WEEKS);
 applyLang(savedLang);
 // 日期框初始化为今天（显示具体日期，而不是 yyyy/mm/日 占位符）
 const TODAY_STR = (function () {
