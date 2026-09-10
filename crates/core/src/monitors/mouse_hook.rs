@@ -55,7 +55,12 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
             match wparam as u32 {
                 WM_MOUSEMOVE => crate::input_agg::record_move(ms.pt.x, ms.pt.y),
                 WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                    crate::input_agg::record_click()
+                    let button = match wparam as u32 {
+                        WM_LBUTTONDOWN => 0,
+                        WM_RBUTTONDOWN => 1,
+                        _ => 2,
+                    };
+                    crate::input_agg::record_click_button(button);
                 }
                 WM_MOUSEWHEEL => {
                     let delta = (ms.mouse_data >> 16) as i16 as i32;

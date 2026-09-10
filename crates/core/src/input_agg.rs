@@ -36,6 +36,19 @@ fn set_minute_mode(on: bool) {
 
 static KEYS: AtomicU64 = AtomicU64::new(0);
 static CLICKS: AtomicU64 = AtomicU64::new(0);
+/// per-key 频次（vk code 0..255 各一个原子计数）。只存"每个键按了多少次"，
+/// 不存内容、顺序、时间戳——与计数红线同口径（WhatPulse 式键盘热力图数据源）。
+static VK: [AtomicU64; 256] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; 256]
+};
+/// 点击分键（0=left 1=right 2=middle）
+static BUTTON: [AtomicU64; 3] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; 3]
+};
 static SCROLL_TICKS: AtomicU64 = AtomicU64::new(0);
 static MOVES: AtomicU64 = AtomicU64::new(0);
 static MOVE_DIST_PX: AtomicU64 = AtomicU64::new(0);
@@ -51,10 +64,22 @@ pub fn record_key() {
     SAMPLES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// 鼠标按下（click 计 1；release 不计）。
-pub fn record_click() {
+/// 键盘按下并带 vk code（minute 模式热力图路径）。
+pub fn record_key_vk(vk: u32) {
+    KEYS.fetch_add(1, Ordering::Relaxed);
+    SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if (vk as usize) < 256 {
+        VK[vk as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 鼠标按下并分键（0=left 1=right 2=middle；release 不计）。
+pub fn record_click_button(button: usize) {
     CLICKS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if button < 3 {
+        BUTTON[button].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// 滚轮（ticks = |delta|/120 整数刻度数）。
@@ -86,6 +111,10 @@ struct MinuteCounters {
     moves: u64,
     move_dist_px: u64,
     samples: u64,
+    /// per-key 频次（vk 索引；仅非零项参与 is_empty/add 语义，见下）
+    vk: Vec<(u8, u64)>,
+    /// 点击分键 [left, right, middle]
+    buttons: [u64; 3],
 }
 
 impl MinuteCounters {
@@ -104,6 +133,16 @@ impl MinuteCounters {
         self.moves += o.moves;
         self.move_dist_px += o.move_dist_px;
         self.samples += o.samples;
+        for (k, v) in o.vk {
+            if let Some(e) = self.vk.iter_mut().find(|(k2, _)| *k2 == k) {
+                e.1 += v;
+            } else {
+                self.vk.push((k, v));
+            }
+        }
+        for i in 0..3 {
+            self.buttons[i] += o.buttons[i];
+        }
     }
 }
 
@@ -132,6 +171,12 @@ impl MinuteKey {
 static PENDING: Mutex<Option<(MinuteKey, MinuteCounters)>> = Mutex::new(None);
 
 fn drain_atomics() -> MinuteCounters {
+    let vk: Vec<(u8, u64)> = VK
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u8, c.swap(0, Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect();
     MinuteCounters {
         keys: KEYS.swap(0, Ordering::Relaxed),
         clicks: CLICKS.swap(0, Ordering::Relaxed),
@@ -139,6 +184,12 @@ fn drain_atomics() -> MinuteCounters {
         moves: MOVES.swap(0, Ordering::Relaxed),
         move_dist_px: MOVE_DIST_PX.swap(0, Ordering::Relaxed),
         samples: SAMPLES.swap(0, Ordering::Relaxed),
+        vk,
+        buttons: [
+            BUTTON[0].swap(0, Ordering::Relaxed),
+            BUTTON[1].swap(0, Ordering::Relaxed),
+            BUTTON[2].swap(0, Ordering::Relaxed),
+        ],
     }
 }
 
@@ -149,11 +200,18 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
         return out;
     }
     if c.keys > 0 {
+        // per-key 频次以紧凑 map 输出（"65": 12, ...），零内容零顺序零时间戳
+        let vk_map: serde_json::Map<String, serde_json::Value> = c
+            .vk
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+            .collect();
         out.push(
             Event::new(EventAction::InputAgg, EventType::Keyboard)
                 .data(serde_json::json!({
                     "keys": c.keys,
                     "samples": c.samples,
+                    "vk": vk_map,
                 }))
                 .app("", ""),
         );
@@ -167,6 +225,9 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
                     "moves": c.moves,
                     "move_distance_px": c.move_dist_px,
                     "samples": c.samples,
+                    "clicks_left": c.buttons[0],
+                    "clicks_right": c.buttons[1],
+                    "clicks_middle": c.buttons[2],
                 }))
                 .app("", ""),
         );
@@ -224,6 +285,12 @@ pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
 pub fn reset() {
     set_minute_mode(false);
     drain_atomics();
+    for c in VK.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in BUTTON.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
     PREV_VALID.store(false, Ordering::Relaxed);
     PREV_X.store(0, Ordering::Relaxed);
     PREV_Y.store(0, Ordering::Relaxed);
@@ -277,11 +344,11 @@ mod tests {
         // 第 1 分钟：事件分两次 drain 到达（2 键 1 点击 → 1 键 1 点击）
         record_key();
         record_key();
-        record_click();
+        record_click_button(0);
         let evts = drain(t0);
         assert!(evts.is_empty(), "首个桶未完成，不应产出事件");
         record_key();
-        record_click();
+        record_click_button(0);
         // 跨入下一分钟：第 1 分钟已 drain 进桶的计数（2 键 1 点击）折叠为 2 行
         let t1 = local_min(2026, 6, 15, 10, 31);
         let evts = drain(t1);
@@ -348,6 +415,43 @@ mod tests {
             evts.is_empty(),
             "空分钟不应写行（活跃分钟语义依赖行的存在）"
         );
+    }
+
+    #[test]
+    fn per_key_and_button_counts_roll_up() {
+        let _g = guard();
+        reset();
+        record_key_vk(65); // A
+        record_key_vk(65);
+        record_key_vk(66); // B
+        record_key_vk(9999); // 越界安全忽略
+        record_click_button(0);
+        record_click_button(2);
+        let evts = drain(local_min(2026, 6, 15, 10, 30)); // 建桶
+        assert!(evts.is_empty());
+        let evts = flush_partial(local_min(2026, 6, 15, 10, 30));
+        let kb = evts
+            .iter()
+            .find(|e| e.event_type == EventType::Keyboard)
+            .expect("keyboard row");
+        let vk = kb
+            .event_data
+            .as_ref()
+            .and_then(|v| v.get("vk"))
+            .expect("vk map");
+        assert_eq!(vk.get("65").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(vk.get("66").and_then(|v| v.as_u64()), Some(1));
+        assert!(vk.get("9999").is_none(), "越界 vk 不入库");
+        let total: u64 = vk.as_object().unwrap().values().filter_map(|v| v.as_u64()).sum();
+        assert_eq!(total, 3);
+        let ms = evts
+            .iter()
+            .find(|e| e.event_type == EventType::Mouse)
+            .expect("mouse row");
+        let d = ms.event_data.as_ref().expect("mouse data");
+        assert_eq!(d.get("clicks_left").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(d.get("clicks_middle").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(d.get("clicks_right").and_then(|v| v.as_u64()), Some(0));
     }
 
     #[test]

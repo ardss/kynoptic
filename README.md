@@ -90,9 +90,11 @@ harness in this repo (full methodology and raw numbers in
 - Recorded data never leaves your machine by default. There is no account, no
   telemetry, no analytics, no network calls.
 - **Keyboard and mouse are stored as per-minute counts only — never key
-  contents.** Per-key detail is off by default and can be enabled explicitly
-  in settings. This boundary is the core of what separates Kynoptic from
-  spyware, and it is enforced in code, not policy.
+  contents, key order, or timing.** The dashboard keyboard heatmap uses
+  per-key frequency counts (how many times each key was pressed), which are
+  aggregate statistics, not content. Full per-key detail is off by default
+  and can be enabled explicitly in settings. This boundary is the core of
+  what separates Kynoptic from spyware, and it is enforced in code, not policy.
 - Aggregates are derived caches; the raw event log is append-only.
 - Deleting anything is opt-in and off by default; schema migrations archive
   tables by renaming instead of dropping.

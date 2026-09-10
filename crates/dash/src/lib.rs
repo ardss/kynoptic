@@ -303,9 +303,103 @@ pub fn api_hours(conn: &Connection, date: &str) -> std::result::Result<Value, St
     Ok(json!({"date": date, "values": map}))
 }
 
+/// GET /api/input?days= — 输入统计聚合（近 `days` 天，含今日）。
+///
+/// 数据源是 input_agg 分钟计数行（keyboard 行含 per-key 频次 `vk` map，
+/// mouse 行含分键点击/滚轮/移动距离）。只读聚合，缺天补零。
+/// `now` 注入以便测试。
+pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> std::result::Result<Value, String> {
+    let days = days.clamp(1, 365);
+    let since_date = today - chrono::Duration::days(i64::from(days) - 1);
+    let since = queries::local_day_range(&since_date.format("%Y-%m-%d").to_string())
+        .map(|(s, _)| s)
+        .unwrap_or_default();
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(datetime(timestamp, ?1), 1, 10) AS day, event_type, event_data \
+             FROM events \
+             WHERE event_action = 'input_agg' AND timestamp >= ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let off = {
+        let secs = Local::now().offset().local_minus_utc() as i64;
+        format!("{}{} seconds", if secs >= 0 { "+" } else { "-" }, secs.abs())
+    };
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map(params![&off, &since], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+
+    #[derive(Default)]
+    struct Totals {
+        keys: u64,
+        clicks: u64,
+        left: u64,
+        right: u64,
+        middle: u64,
+        scroll_ticks: u64,
+        moves: u64,
+        dist_px: u64,
+    }
+    let mut totals = Totals::default();
+    let mut key_freq: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut series: std::collections::BTreeMap<String, (u64, u64)> = std::collections::BTreeMap::new();
+
+    for (day, etype, data) in rows {
+        let v: Value = match data.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let e = series.entry(day).or_default();
+        if etype == "keyboard" {
+            let keys = num("keys");
+            totals.keys += keys;
+            e.0 += keys;
+            if let Some(map) = v.get("vk").and_then(|x| x.as_object()) {
+                for (k, n) in map {
+                    if let Some(n) = n.as_u64() {
+                        *key_freq.entry(k.clone()).or_default() += n;
+                    }
+                }
+            }
+        } else if etype == "mouse" {
+            let clicks = num("clicks");
+            totals.clicks += clicks;
+            totals.left += num("clicks_left");
+            totals.right += num("clicks_right");
+            totals.middle += num("clicks_middle");
+            totals.scroll_ticks += num("scroll_ticks");
+            totals.moves += num("moves");
+            totals.dist_px += num("move_distance_px");
+            e.1 += clicks;
+        }
+    }
+
+    let days_out: Vec<Value> = series
+        .iter()
+        .map(|(d, (keys, clicks))| json!({"date": d, "keys": keys, "clicks": clicks}))
+        .collect();
+    Ok(json!({
+        "days": days,
+        "keys_total": totals.keys,
+        "clicks_total": totals.clicks,
+        "clicks_left": totals.left,
+        "clicks_right": totals.right,
+        "clicks_middle": totals.middle,
+        "scroll_ticks": totals.scroll_ticks,
+        "moves": totals.moves,
+        "move_distance_px": totals.dist_px,
+        "key_freq": key_freq,
+        "series": days_out,
+    }))
+}
+
 /// GET /api/settings — 当前设置 + 全部监控器清单（来自 MONITOR_REGISTRY）。
-pub fn api_settings(db_path: &Path) -> Value {
-    let s = settings::load(db_path);
+pub fn api_settings(db_path: &Path) -> Value {    let s = settings::load(db_path);
     settings_payload(&s)
 }
 
@@ -453,6 +547,15 @@ pub fn route_req(
         ("GET", "/api/hours") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
             match api_hours(conn, &date) {
+                Ok(v) => (200, "application/json", v.to_string()),
+                Err(e) => (400, "application/json", err_json(&e)),
+            }
+        }
+        ("GET", "/api/input") => {
+            let days = qval("days")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(7);
+            match api_input_at(conn, days, today_naive()) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
             }

@@ -51,6 +51,8 @@
                        color: var(--dim); margin: 0 0 8px; }
   .mon-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
   .mon-row input { accent-color: var(--brand); }
+  .kb-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+  .kb text { pointer-events: none; font-family: var(--mono, monospace); }
   .badge { font-size: 11px; border: 1px solid var(--border); border-radius: 3px;
            padding: 0 5px; color: var(--amber); }
   .settings-actions { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
@@ -78,6 +80,7 @@
   <div class="tabs">
     <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
     <div class="tab" id="tab-activity" onclick="showView('activity')"><span class="l en">Activity</span><span class="l zh">活动</span></div>
+    <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
     <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
     <div class="tab" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></div>
   </div>
@@ -129,6 +132,40 @@
 <section>
   <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
   <div id="top-apps" class="muted">loading…</div>
+</section>
+</div>
+
+<div id="view-input" style="display:none">
+<div class="cards">
+  <div class="card"><div class="label"><span class="l en">keys — 7d</span><span class="l zh">按键 — 7 天</span></div><div class="value" id="i-keys">–</div></div>
+  <div class="card"><div class="label"><span class="l en">clicks — 7d</span><span class="l zh">点击 — 7 天</span></div><div class="value" id="i-clicks">–</div></div>
+  <div class="card"><div class="label"><span class="l en">scroll ticks — 7d</span><span class="l zh">滚轮刻度 — 7 天</span></div><div class="value" id="i-scroll">–</div></div>
+  <div class="card"><div class="label"><span class="l en">cursor travel — 7d</span><span class="l zh">光标行程 — 7 天</span></div><div class="value" id="i-dist">–</div></div>
+</div>
+
+<section>
+  <h2><span class="l en">keyboard heatmap — per-key frequency (counts only, no content)</span><span class="l zh">键盘热力图 — 按键频次（仅计数，无内容）</span></h2>
+  <div class="kb-wrap"><svg id="kb-heatmap" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 990 272"></svg></div>
+  <div class="hm-legend">
+    <span><span class="l en">less</span><span class="l zh">少</span></span>
+    <span class="sw" style="background:#161b22;border:1px solid var(--border)"></span>
+    <span class="sw" style="background:#1e3a5f"></span>
+    <span class="sw" style="background:#2d5f94"></span>
+    <span class="sw" style="background:#3b82c4"></span>
+    <span class="sw" style="background:#4EA1FF"></span>
+    <span><span class="l en">more</span><span class="l zh">多</span></span>
+  </div>
+</section>
+
+<section>
+  <h2><span class="l en">mouse — button mix and motion</span><span class="l zh">鼠标 — 按键分布与移动</span></h2>
+  <div id="mouse-rows"></div>
+  <div class="muted" id="mouse-extra"></div>
+</section>
+
+<section>
+  <h2><span class="l en">daily series — keys vs clicks</span><span class="l zh">每日对比 — 按键与点击</span></h2>
+  <div id="input-series"></div>
 </section>
 </div>
 
@@ -196,10 +233,10 @@ const HM_LEVELS = ["#161b22", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
 const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
         noSession: "not running", noData: "no data", saved: "saved. restart kynoptic collect for changes to take effect.",
-        saveFailed: "save failed: " },
+        saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存。重启 kynoptic collect 后生效。",
-        saveFailed: "保存失败：" }
+        saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -355,6 +392,100 @@ async function loadTopApps() {
     '<span class="app-track"><span class="app-bar" style="width:' + (x.count / max * 100).toFixed(2) + '%"></span></span>' +
     '<span class="app-count">' + x.count.toLocaleString() + "</span></div>").join("");
 }
+/* ─── Input（键盘热力图 + 鼠标统计） ─── */
+// ANSI 104 布局（无 numpad 区省略时 y 偏移不变）。[x, y, w, vk, label]，单位 u。
+const KB_U = 38, KB_PAD = 6;
+const KB_ROWS = [
+  // F 行
+  [[0,0,1,27,"Esc"],[2,0,1,112,"F1"],[3,0,1,113,"F2"],[4,0,1,114,"F3"],[5,0,1,115,"F4"],[6.5,0,1,116,"F5"],[7.5,0,1,117,"F6"],[8.5,0,1,118,"F7"],[9.5,0,1,119,"F8"],[11,0,1,120,"F9"],[12,0,1,121,"F10"],[13,0,1,122,"F11"],[14,0,1,123,"F12"]],
+  // 数字行
+  [[0,1,1,192,"`"],[1,1,1,49,"1"],[2,1,1,50,"2"],[3,1,1,51,"3"],[4,1,1,52,"4"],[5,1,1,53,"5"],[6,1,1,54,"6"],[7,1,1,55,"7"],[8,1,1,56,"8"],[9,1,1,57,"9"],[10,1,1,48,"0"],[11,1,1,189,"-"],[12,1,1,187,"="],[13,1,2,8,"Backspace"]],
+  // QWERTY
+  [[0,2,1.5,9,"Tab"],[1.5,2,1,81,"Q"],[2.5,2,1,87,"W"],[3.5,2,1,69,"E"],[4.5,2,1,82,"R"],[5.5,2,1,84,"T"],[6.5,2,1,89,"Y"],[7.5,2,1,85,"U"],[8.5,2,1,73,"I"],[9.5,2,1,79,"O"],[10.5,2,1,80,"P"],[11.5,2,1,219,"["],[12.5,2,1,221,"]"],[13.5,2,1.5,220,"\\"]],
+  // home row
+  [[0,3,1.75,20,"Caps"],[1.75,3,1,65,"A"],[2.75,3,1,83,"S"],[3.75,3,1,68,"D"],[4.75,3,1,70,"F"],[5.75,3,1,71,"G"],[6.75,3,1,72,"H"],[7.75,3,1,74,"J"],[8.75,3,1,75,"K"],[9.75,3,1,76,"L"],[10.75,3,1,186,";"],[11.75,3,1,222,"'"],[12.75,3,2.25,13,"Enter"]],
+  // bottom letter row
+  [[0,4,2.25,160,"Shift"],[2.25,4,1,90,"Z"],[3.25,4,1,88,"X"],[4.25,4,1,67,"C"],[5.25,4,1,86,"V"],[6.25,4,1,66,"B"],[7.25,4,1,78,"N"],[8.25,4,1,77,"M"],[9.25,4,1,188,","],[10.25,4,1,190,"."],[11.25,4,1,191,"/"],[12.25,4,2.75,161,"Shift"]],
+  // modifiers
+  [[0,5,1.25,162,"Ctrl"],[1.25,5,1.25,91,"Win"],[2.5,5,1.25,164,"Alt"],[3.75,5,6.25,32,""],[10,5,1.25,165,"Alt"],[11.25,5,1.25,92,"Win"],[12.5,5,1.25,93,"Menu"],[13.75,5,1.25,163,"Ctrl"]],
+  // 导航区（x 从 15.5 起）
+  [[15.5,0,1,44,"PrtSc"],[16.5,0,1,145,"ScrLk"],[17.5,0,1,19,"Pause"],[18.75,0,1,45,"Ins"],[19.75,0,1,36,"Home"],[20.75,0,1,33,"PgUp"],[22,0,1,46,"Del"],[23,0,1,35,"End"],[24,0,1,34,"PgDn"],[18.75,2,1,38,"↑"],[18.75,3,1,37,"←"],[19.75,3,1,40,"↓"],[20.75,3,1,39,"→"]],
+  // 小键盘
+  [[22,2,1,111,"/"],[23,2,1,106,"*"],[24,2,1,109,"-"],[22,3,1,103,"7"],[23,3,1,104,"8"],[24,3,1,105,"9"],[22,4,1,100,"4"],[23,4,1,101,"5"],[24,4,1,102,"6"],[25,3,1,107,"+"],[25,4,1,107,"+"],[22,5,1,97,"1"],[23,5,1,98,"2"],[24,5,1,99,"3"],[25,5,1,13,"⏎"],[22,6,2,96,"0"],[24,6,1,110,"."]],
+];
+const KB_H = 7;
+function kbColor(v, max) {
+  if (!v) return "#161b22";
+  const steps = ["#1e3a5f", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
+  return steps[Math.min(4, Math.floor(v / max * 5))];
+}
+function renderKeyboard(freq) {
+  const svg = document.getElementById("kb-heatmap");
+  const vals = Object.entries(freq).filter(([k]) => +k !== 32); // 空格独占上色会淹没全局
+  const max = Math.max(1, ...vals.map(([, v]) => v));
+  const ns = "http://www.w3.org/2000/svg";
+  svg.innerHTML = "";
+  for (const row of KB_ROWS) {
+    for (const [x, y, w, vk, label] of row) {
+      const g = document.createElementNS(ns, "g");
+      const rect = document.createElementNS(ns, "rect");
+      const v = freq[vk] || 0;
+      rect.setAttribute("x", x * KB_U + KB_PAD);
+      rect.setAttribute("y", y * KB_U + KB_PAD);
+      rect.setAttribute("width", w * KB_U - KB_PAD * 2);
+      rect.setAttribute("height", KB_U - KB_PAD * 2);
+      rect.setAttribute("rx", 4);
+      rect.setAttribute("fill", kbColor(v, max));
+      rect.setAttribute("stroke", "#2b3240");
+      rect.setAttribute("stroke-width", "1");
+      const t = document.createElementNS(ns, "text");
+      t.setAttribute("x", x * KB_U + (w * KB_U) / 2);
+      t.setAttribute("y", y * KB_U + KB_U / 2 + 1);
+      t.setAttribute("text-anchor", "middle");
+      t.setAttribute("dominant-baseline", "middle");
+      t.setAttribute("font-size", "11");
+      t.setAttribute("fill", v ? "#cdd9e5" : "#6e7681");
+      t.textContent = label;
+      const title = document.createElementNS(ns, "title");
+      title.textContent = label + ": " + (freq[vk] || 0).toLocaleString();
+      g.appendChild(rect); g.appendChild(t); g.appendChild(title);
+      svg.appendChild(g);
+    }
+  }
+}
+async function loadInput() {
+  const d = await jget("/api/input?days=7");
+  document.getElementById("i-keys").textContent = d.keys_total.toLocaleString();
+  document.getElementById("i-clicks").textContent = d.clicks_total.toLocaleString();
+  document.getElementById("i-scroll").textContent = d.scroll_ticks.toLocaleString();
+  document.getElementById("i-dist").textContent =
+    (d.move_distance_px / 96 / 39.37).toFixed(1) + " m";
+  renderKeyboard(d.key_freq || {});
+  const mix = [
+    ["left", d.clicks_left, "#4EA1FF"], ["right", d.clicks_right, "#2d5f94"],
+    ["middle", d.clicks_middle, "#1e3a5f"],
+  ];
+  const mx = Math.max(1, ...mix.map(m => m[1]));
+  document.getElementById("mouse-rows").innerHTML = mix.map(([name, v, c]) =>
+    '<div class="mon-row"><span class="muted" style="width:64px">' + esc(name) +
+    '</span><span class="app-track"><span class="app-bar" style="width:' +
+    (v / mx * 100).toFixed(2) + "%;background:" + c + '"></span></span>' +
+    '<span class="app-count">' + v.toLocaleString() + "</span></div>").join("");
+  document.getElementById("mouse-extra").textContent =
+    t("moves") + ": " + d.moves.toLocaleString() + "  ·  " +
+    t("scrollTicks") + ": " + d.scroll_ticks.toLocaleString();
+  const s = d.series || [];
+  const smax = Math.max(1, ...s.map(x => Math.max(x.keys, x.clicks)));
+  document.getElementById("input-series").innerHTML = s.length
+    ? s.map(x =>
+      '<div class="mon-row"><span class="muted" style="width:84px">' + esc(x.date) +
+      '</span><span class="app-track"><span class="app-bar" style="width:' +
+      (x.keys / smax * 100).toFixed(2) + '%"></span></span>' +
+      '<span class="app-track"><span class="app-bar" style="width:' +
+      (x.clicks / smax * 100).toFixed(2) + '%;background:#2d5f94"></span></span>' +
+      '<span class="app-count">' + x.keys.toLocaleString() + " / " + x.clicks.toLocaleString() + "</span></div>").join("")
+    : '<span class="muted">' + t("noData") + "</span>";
+}
 /* ─── Anomalies ─── */
 async function loadAnomalies() {
   const a = await jget("/api/anomalies?days=7");
@@ -417,7 +548,7 @@ async function saveSettings() {
 let currentView = "overview";
 function showView(name) {
   currentView = name;
-  for (const v of ["overview", "activity", "anomalies", "settings"]) {
+  for (const v of ["overview", "activity", "input", "anomalies", "settings"]) {
     document.getElementById("view-" + v).style.display = v === name ? "" : "none";
     document.getElementById("tab-" + v).classList.toggle("active", v === name);
   }
@@ -426,6 +557,7 @@ function showView(name) {
 async function refreshView(name) {
   if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
   else if (name === "activity") await Promise.all([loadHours(), loadHeatmap(), loadTopApps()]);
+  else if (name === "input") await loadInput();
   else if (name === "anomalies") await loadAnomalies();
   else if (name === "settings") await loadSettings();
 }
