@@ -149,8 +149,10 @@
 <section>
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
-    <input type="date" id="report-date" class="date-input" onchange="loadReport()">
+    <input type="date" id="report-date" class="date-input" style="min-width:150px" onchange="loadReport()">
     <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=''; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
+    <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
   <div id="report-timeline">loading…</div>
   <div id="report-legend" class="muted" style="margin-top:6px"></div>
@@ -305,14 +307,16 @@ const T = {
         kbDev: "Keyboard", msDev: "Mouse", keysCount: "keys", btns: "buttons",
         withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change",
         unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window).",
-        restoredHint: "reset to defaults on screen — click save to apply." },
+        restoredHint: "reset to defaults on screen — click save to apply.",
+        beforeData: "no data before" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
         kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "键",
         withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",
         unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
-        restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。" }
+        restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
+        beforeData: "该日期早于数据起点" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -543,6 +547,12 @@ function fmtMin(m) {
   const h = Math.floor(m / 60), mm = m % 60;
   return (h ? h + "h" : "") + (mm || !h ? mm + "m" : "");
 }
+function dayOffset(n) {
+  const d = new Date(Date.now() - n * 86400000);
+  document.getElementById("report-date").value =
+    d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  loadReport();
+}
 async function loadReport() {
   const dateVal = document.getElementById("report-date").value;
   const d = await jget("/api/report" + (dateVal ? "?date=" + dateVal : ""));
@@ -576,8 +586,15 @@ async function loadReport() {
       " · " + hm(seg.start_min) + "–" + hm(seg.end_min) + '</title></rect>';
   }
   svg += "</svg>";
-  document.getElementById("report-timeline").innerHTML = segs.length ? svg
-    : '<span class="muted">' + t("noData") + "</span>";
+  if (!segs.length) {
+    const since = d.data_since || "";
+    const hint = since
+      ? (dateVal && dateVal < since ? t("beforeData") + " " + since : t("noData"))
+      : t("noData");
+    document.getElementById("report-timeline").innerHTML = '<span class="muted">' + hint + "</span>";
+  } else {
+    document.getElementById("report-timeline").innerHTML = svg;
+  }
   document.getElementById("report-legend").innerHTML =
     [...new Set(segs.map(x => x.category))].map(c =>
       '<span style="margin-right:14px"><span class="sw" style="background:' + catColor(c) + '"></span>' + esc(c) + "</span>").join("");

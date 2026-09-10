@@ -538,11 +538,20 @@ pub fn api_report_at(conn: &Connection, date: &str, s: &settings::AppSettings) -
         .map(|(a, b)| json!({"start_min": a, "end_min": b, "minutes": b - a}))
         .collect();
 
+    // 数据起始日（库中最早事件），供前端限制可选日期范围
+    let data_since: Option<String> = conn
+        .query_row("SELECT MIN(substr(timestamp, 1, 10)) FROM events", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten();
+
     Ok(json!({
         "date": date,
         "segments": segments,
         "categories": categories,
         "focus": focus,
+        "data_since": data_since,
     }))
 }
 
