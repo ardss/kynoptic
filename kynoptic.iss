@@ -10,6 +10,12 @@ AppId={{8A6E2F3B-4C1D-4E7A-9B2F-KYNOPTIC001}}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
+AppCopyright=Copyright (c) 2026 ardss
+; 安装包 exe 与向导的图标（资源管理器里一眼认出是 Kynoptic）
+SetupIconFile=assets\kynoptic.ico
+WizardSmallImageFile=assets\wizard-small.png
+UninstallDisplayName={#AppName} {#AppVersion}
+UninstallDisplayIcon={app}\{#AppExeName}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -20,7 +26,7 @@ SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 PrivilegesRequired=lowest
-UninstallDisplayIcon={app}\{#AppExeName}
+CloseApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
