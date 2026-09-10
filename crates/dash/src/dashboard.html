@@ -52,7 +52,9 @@
   .mon-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
   .mon-row input { accent-color: var(--brand); }
   .date-input { background: var(--bg); color: var(--text); border: 1px solid var(--border);
-    border-radius: 6px; padding: 4px 8px; font-family: var(--mono, monospace); }
+    border-radius: 6px; padding: 4px 8px; font-family: var(--mono, monospace);
+    min-width: 150px; cursor: pointer; }
+  .date-input::-webkit-calendar-picker-indicator { cursor: pointer; }
   .kb-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
   .kb text { pointer-events: none; font-family: var(--mono, monospace); }
   .kb g:hover rect, .kb rect:hover { stroke: #4EA1FF; stroke-width: 2; }
@@ -149,7 +151,7 @@
 <section>
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
-    <input type="date" id="report-date" class="date-input" style="min-width:150px" onchange="loadReport()">
+    <input type="date" id="report-date" class="date-input" onchange="loadReport()" onclick="this.showPicker && this.showPicker()">
     <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=TODAY_STR; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
     <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
     <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
@@ -178,7 +180,7 @@
 <section>
   <h2><span class="l en">hour by hour — which app you were in (pick a day)</span><span class="l zh">逐时一览 — 这天每个小时你在用什么（可选日期）</span></h2>
   <div style="margin-bottom:8px">
-    <input type="date" id="apps-date" class="date-input" onchange="loadApps()">
+    <input type="date" id="apps-date" class="date-input" onclick="this.showPicker && this.showPicker()" onchange="loadApps()">
     <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=TODAY_STR; loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
   </div>
   <div id="apps-grid-chart">loading…</div>
