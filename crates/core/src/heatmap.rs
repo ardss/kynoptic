@@ -100,7 +100,7 @@ pub fn aggregate(press_data: Vec<String>) -> HeatmapResult {
 
     // 排序 heatmap（按 count 降序）
     let mut heatmap_entries: Vec<(String, i64)> = key_counts.into_iter().collect();
-    heatmap_entries.sort_by(|a, b| b.1.cmp(&a.1));
+    heatmap_entries.sort_by_key(|x| std::cmp::Reverse(x.1));
     let heatmap: Vec<KeyCount> = heatmap_entries
         .into_iter()
         .map(|(key, count)| KeyCount { key, count })
@@ -108,7 +108,7 @@ pub fn aggregate(press_data: Vec<String>) -> HeatmapResult {
 
     // 排序 shortcuts（按 count 降序，取 Top N）
     let mut combo_entries: Vec<(String, i64)> = combo_counts.into_iter().collect();
-    combo_entries.sort_by(|a, b| b.1.cmp(&a.1));
+    combo_entries.sort_by_key(|x| std::cmp::Reverse(x.1));
     let shortcuts: Vec<ShortcutCount> = combo_entries
         .into_iter()
         .take(TOP_SHORTCUTS)
@@ -227,7 +227,7 @@ pub fn aggregate_mouse(events: Vec<(String, String)>) -> MouseHeatmap {
     let grid_max = grid.iter().copied().max().unwrap_or(0);
 
     let mut buttons: Vec<(String, i64)> = button_counts.into_iter().collect();
-    buttons.sort_by(|a, b| b.1.cmp(&a.1));
+    buttons.sort_by_key(|x| std::cmp::Reverse(x.1));
     let buttons: Vec<KeyCount> = buttons
         .into_iter()
         .map(|(key, count)| KeyCount { key, count })
