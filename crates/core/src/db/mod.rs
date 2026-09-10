@@ -241,6 +241,20 @@ pub struct Database {
     /// 读连接池降级次数（耗尽后改用临时/内存连接）。
     /// 单调递增，供运维观测；持续增长说明读负载超出池容量。
     reader_degraded: AtomicU64,
+    /// 后台聚合回填完成信号（done, Condvar）。open 时无回填任务则立即置位。
+    backfill_done: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// RAII：回填线程退出时（无论成功/失败/panic）置完成信号。
+struct BackfillDoneGuard<'a>(&'a std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl Drop for BackfillDoneGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut d) = self.0 .0.lock() {
+            *d = true;
+        }
+        self.0 .1.notify_all();
+    }
 }
 
 impl Database {
@@ -260,38 +274,55 @@ impl Database {
         // update_agg 可在块间穿插；进度记在 metadata.agg_backfill_cursor，
         // 中断后下次 open 自动续跑。回填完成前聚合查询回退 events 现算
         // （正确但慢），原始 events 只读不动。
+        let backfill_done: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)> =
+            std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
         if agg::backfill_needed(&writer) {
             log::info!("检测到 agg 缓存缺失，转入后台分块回填（不阻塞启动）");
             let bg_path = path.to_string();
+            let done_flag = backfill_done.clone();
             let _ = thread::Builder::new()
                 .name("agg-backfill".into())
-                .spawn(move || match Connection::open(&bg_path) {
-                    Ok(c) => {
-                        if apply_pragmas(&c).is_err() {
-                            log::warn!("agg 回填连接 PRAGMA 设置失败（继续，用默认配置）");
+                .spawn(move || {
+                    let _guard = BackfillDoneGuard(&done_flag);
+                    match Connection::open(&bg_path) {
+                        Ok(c) => {
+                            if apply_pragmas(&c).is_err() {
+                                log::warn!("agg 回填连接 PRAGMA 设置失败（继续，用默认配置）");
+                            }
+                            match agg::backfill_all(&c) {
+                                Ok(n) => log::info!("agg 后台分块回填完成（{} 行 agg_minute）", n),
+                                Err(e) => log::warn!("agg 后台分块回填失败（下次打开续跑）: {e}"),
+                            }
                         }
-                        match agg::backfill_all(&c) {
-                            Ok(n) => log::info!("agg 后台分块回填完成（{} 行 agg_minute）", n),
-                            Err(e) => log::warn!("agg 后台分块回填失败（下次打开续跑）: {e}"),
-                        }
+                        Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
                     }
-                    Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
                 });
         } else if agg::read_cursor_incomplete(&writer) {
             // 上次分块回填中断（agg 已有部分行）：补齐剩余块
             let bg_path = path.to_string();
+            let done_flag = backfill_done.clone();
             let _ = thread::Builder::new()
                 .name("agg-backfill".into())
-                .spawn(move || match Connection::open(&bg_path) {
-                    Ok(c) => {
-                        let _ = apply_pragmas(&c);
-                        match agg::backfill_all(&c) {
-                            Ok(n) => log::info!("agg 后台分块回填续跑完成（{} 行）", n),
-                            Err(e) => log::warn!("agg 后台分块回填补齐失败: {e}"),
+                .spawn(move || {
+                    let _guard = BackfillDoneGuard(&done_flag);
+                    match Connection::open(&bg_path) {
+                        Ok(c) => {
+                            let _ = apply_pragmas(&c);
+                            match agg::backfill_all(&c) {
+                                Ok(n) => log::info!("agg 后台分块回填续跑完成（{} 行）", n),
+                                Err(e) => log::warn!("agg 后台分块回填补齐失败: {e}"),
+                            }
                         }
+                        Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
                     }
-                    Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
                 });
+        } else {
+            // 无回填任务：立即置完成信号
+            if let Ok(mut d) = backfill_done.0.lock() {
+                *d = true;
+            }
+            backfill_done.1.notify_all();
         }
 
         let mut readers = Vec::with_capacity(constants::READER_POOL_SIZE);
@@ -307,6 +338,7 @@ impl Database {
             readers: ReaderPool::new(readers),
             retention_days: constants::DEFAULT_RETENTION_DAYS,
             reader_degraded: AtomicU64::new(0),
+            backfill_done,
         })
     }
 
@@ -420,6 +452,23 @@ impl Database {
     /// 此前 daily_agg 只在 `ctl recompute` 手动刷新,采集器运行期间基线会滞后。
     /// 维护线程每天调用一次即可让 anomaly 的历史均值 APM 保持新鲜。
     /// 走写连接（daily_agg 是写操作），失败仅 log,不影响后续维护步骤。
+    /// 等待后台聚合回填完成（最多 `timeout`）。供测试与需要在回填结束后
+    /// 读取聚合缓存的调用方使用；超时返回 false。
+    pub fn wait_for_backfill(&self, timeout: std::time::Duration) -> bool {
+        let (lock, cvar) = &*self.backfill_done;
+        let guard = match lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *guard {
+            return true;
+        }
+        match cvar.wait_timeout_while(guard, timeout, |d| !*d) {
+            Ok((g, _)) => *g,
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn refresh_daily_agg(&self) {
         self.with_writer(
             |conn| match crate::daily_agg::recompute_recent_days(conn, 2) {

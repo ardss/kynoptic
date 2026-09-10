@@ -269,17 +269,16 @@ fn backfill_on_open_populates_missing_cache() {
     }
     let db = Database::open(path.to_str().unwrap()).unwrap();
     let conn = db.reader();
-    // 回填在后台线程分块执行（perf3：不阻塞 open），轮询等待完成，
-    // 超时视为失败——不能假设 open 返回时回填已结束。
-    let mut backfilled = false;
-    for _ in 0..100 {
-        if agg::has_minute_for_date(&conn, "2026-06-15") {
-            backfilled = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(backfilled, "首次 open 应触发后台懒回填聚合缓存（10s 内）");
+    // 回填在后台线程分块执行（perf3：不阻塞 open）。用完成信号同步等待，
+    // 而不是盲轮询——根治竞态。
+    assert!(
+        db.wait_for_backfill(std::time::Duration::from_secs(15)),
+        "首次 open 应触发后台懒回填并在超时前完成"
+    );
+    assert!(
+        agg::has_minute_for_date(&conn, "2026-06-15"),
+        "回填完成后该日应有 agg_minute 行"
+    );
     // 回填同样不改动 events
     assert_eq!(events_snapshot(&conn).0, 1);
     drop(conn);
