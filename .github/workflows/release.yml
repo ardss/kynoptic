@@ -1,0 +1,31 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release -p kynoptic -p kynoptic-tray
+      - name: Stage assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/kynoptic.exe dist/kynoptic.exe
+          Copy-Item target/release/kynoptic-tray.exe dist/kynoptic-tray.exe
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/ -ErrorAction SilentlyContinue
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/kynoptic.exe
+            dist/kynoptic-tray.exe
