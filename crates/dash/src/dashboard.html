@@ -461,7 +461,9 @@ async function loadOverview() {
   const h = o.host || {};
   document.getElementById("h-model").textContent = h.model || "–";
   document.getElementById("h-cpu").textContent = h.cpu || "–";
-  document.getElementById("h-gpu").textContent = (h.gpus || []).join(" + ") || "–";
+  let gpuTxt = (h.gpus || []).join(" + ") || "–";
+  if (h.gpu_usage_pct != null && gpuTxt !== "–") gpuTxt += "（" + h.gpu_usage_pct + "%）";
+  document.getElementById("h-gpu").textContent = gpuTxt;
   const mt = h.mem_total_gb, mu = h.mem_used_gb;
   document.getElementById("h-mem").textContent =
     (mu != null && mt) ? mu.toFixed(1) + " / " + mt + " GB (" + pct(o.mem_pct) + ")" : (mt ? mt + " GB" : "–");

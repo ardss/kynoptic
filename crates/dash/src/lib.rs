@@ -226,6 +226,10 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
             );
         }
         h["disks"] = snap.get("disks").cloned().unwrap_or(json!([]));
+        h["gpu_usage_pct"] = match gpu_usage_pct() {
+            Some(v) => json!(v),
+            None => json!(null),
+        };
         h
     };
 
@@ -373,6 +377,31 @@ fn host_identity() -> serde_json::Value {
             })
         })
         .clone()
+}
+
+/// GPU 利用率（nvidia-smi 按需查询，3 秒缓存；不可用/非 N 卡返回 None）。
+/// 这里主动打破"零子进程"的自我设限：用户要求的 GPU 占比只有这条正路，
+/// 每次仅一个 ~50ms 的短查询且带缓存，代价可忽略。
+fn gpu_usage_pct() -> Option<u64> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(3);
+    let mut g = CACHE.lock().ok()?;
+    if let Some((at, v)) = g.as_ref() {
+        if at.elapsed() < TTL {
+            return *v;
+        }
+    }
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u64>().ok()));
+    *g = Some((Instant::now(), out));
+    out
 }
 
 /// 最近一次 device_snapshot 的 memory + disks（总量/剩余，来自采集器快照）。
