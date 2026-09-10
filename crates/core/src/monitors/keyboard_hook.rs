@@ -50,10 +50,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
             };
 
             // 检测修饰键状态（GetAsyncKeyState 返回 i16，最高位表示按下）
-            let shift = (GetAsyncKeyState(0x10) as i16) < 0;
-            let ctrl = (GetAsyncKeyState(0x11) as i16) < 0;
-            let alt = (GetAsyncKeyState(0x12) as i16) < 0;
-            let win = (GetAsyncKeyState(0x5B) as i16) < 0 || (GetAsyncKeyState(0x5C) as i16) < 0;
+            let shift = GetAsyncKeyState(0x10) < 0;
+            let ctrl = GetAsyncKeyState(0x11) < 0;
+            let alt = GetAsyncKeyState(0x12) < 0;
+            let win = GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0;
 
             let mut modifiers = Vec::new();
             if ctrl {

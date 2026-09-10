@@ -82,10 +82,8 @@ pub fn parse_wifi_interfaces(text: &str) -> WifiInfo {
                 "State" | "状态" => info.state = val,
                 "SSID" if !val.is_empty() => info.ssid = val,
                 "Signal" | "信号" => info.signal = val,
-                "Receive rate" | "Transmit rate" | "接收速率" | "传输速率" => {
-                    if !val.is_empty() {
-                        info.speed = val;
-                    }
+                "Receive rate" | "Transmit rate" | "接收速率" | "传输速率" if !val.is_empty() => {
+                    info.speed = val;
                 }
                 _ => {}
             }
