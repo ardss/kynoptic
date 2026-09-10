@@ -94,4 +94,12 @@ mod tests {
         assert!(sv(&["--gpu"]).is_err());
         assert!(sv(&["--db"]).is_err());
     }
+
+    #[test]
+    fn accepts_minimized_flag_written_by_autostart_and_installer() {
+        // 回归:autostart 注册表与 watchdog 拉起都带 --minimized,
+        // 历史上未实现该参数导致自启动启动即报错退出。
+        assert!(sv(&["--minimized"]).is_ok());
+        assert!(sv(&["--minimized", "--all"]).is_ok());
+    }
 }
