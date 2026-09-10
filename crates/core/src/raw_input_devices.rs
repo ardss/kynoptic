@@ -204,9 +204,12 @@ mod tests {
             keys_total: None,
             function_keys: None,
         };
-        assert!(changed_since(&[a.clone()], None), "首见非空即变化");
         assert!(
-            !changed_since(&[a.clone()], Some(&[a.clone()])),
+            changed_since(std::slice::from_ref(&a), None),
+            "首见非空即变化"
+        );
+        assert!(
+            !changed_since(std::slice::from_ref(&a), Some(std::slice::from_ref(&a))),
             "相同拓扑不算变化"
         );
         let mut b = a.clone();

@@ -172,7 +172,6 @@ static PENDING: Mutex<Option<(MinuteKey, MinuteCounters)>> = Mutex::new(None);
 /// 秒级可见：drain 每秒被调用一次，把当前分钟累计值整体 UPSERT 覆盖到
 /// 数据库同一行（0005 迁移的部分唯一索引）。派生缓存行的原地覆盖不违反
 /// 原始数据只增铁律（铁律保护对象是 press/click 等原始事件）。
-
 fn drain_atomics() -> MinuteCounters {
     let vk: Vec<(u8, u64)> = VK
         .iter()

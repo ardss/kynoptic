@@ -472,10 +472,9 @@ pub fn start_collection_custom(
                     return;
                 }
                 ticks += 1;
-                if ticks
-                    % (constants::MAINTENANCE_INTERVAL_SECS / constants::DAILY_AGG_REFRESH_SECS)
-                    == 0
-                {
+                if ticks.is_multiple_of(
+                    constants::MAINTENANCE_INTERVAL_SECS / constants::DAILY_AGG_REFRESH_SECS,
+                ) {
                     log::info!("执行定期数据库维护...");
                     db_clone.maintenance();
                 } else {
