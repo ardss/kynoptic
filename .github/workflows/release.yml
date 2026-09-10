@@ -15,17 +15,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release
         run: cargo build --release -p kynoptic -p kynoptic-tray
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
       - name: Stage assets
         shell: pwsh
         run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item target/release/kynoptic.exe dist/kynoptic.exe
           Copy-Item target/release/kynoptic-tray.exe dist/kynoptic-tray.exe
           Copy-Item README.md dist/
           Copy-Item LICENSE dist/ -ErrorAction SilentlyContinue
+          # 便携版 zip
+          Compress-Archive -Path dist/* -DestinationPath "dist/Kynoptic-Portable-$ver.zip"
+          # 安装器（Inno Setup，双语向导）
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=$ver kynoptic.iss
+          # 校验和
+          $hashes = Get-ChildItem dist -File | Where-Object { $_.Name -notmatch 'SHA256' } |
+            ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
+          $hashes | Set-Content dist/SHA256SUMS.txt
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/kynoptic.exe
             dist/kynoptic-tray.exe
+            dist/Kynoptic-Portable-*.zip
+            dist/Kynoptic-Setup-*.exe
+            dist/SHA256SUMS.txt
