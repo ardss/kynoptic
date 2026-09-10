@@ -213,7 +213,24 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     // 系统信息：与 MCP get_current_status 同一实现（cpu/mem/前台应用）
     let sys = kynoptic_mcp::state::current_status(conn, None).unwrap_or_else(|_| json!({}));
 
+    // 硬件身份与容量：型号/CPU/GPU（注册表）+ 内存总量/磁盘（最近设备快照）
+    let snap = latest_device_snapshot(conn);
+    let host = {
+        let mut h = host_identity();
+        if let Some(mem) = snap.get("memory") {
+            h["mem_total_gb"] = mem.get("total_gb").cloned().unwrap_or(json!(null));
+            h["mem_used_gb"] = json!(
+                mem.get("total_gb").and_then(|v| v.as_f64()).zip(
+                    mem.get("available_gb").and_then(|v| v.as_f64()))
+                .map(|(t, a)| (t - a) * 10.0 / 10.0)
+            );
+        }
+        h["disks"] = snap.get("disks").cloned().unwrap_or(json!([]));
+        h
+    };
+
     json!({
+        "host": host,
         "today": today,
         "today_events": today_events,
         "monitors_enabled": s.enabled_monitors.len(),
@@ -310,6 +327,64 @@ pub fn api_hours(conn: &Connection, date: &str) -> std::result::Result<Value, St
         }
     }
     Ok(json!({"date": date, "values": map}))
+}
+
+/// 硬件身份信息（型号 / CPU / GPU 名）。注册表直读、零子进程；
+/// 值与进程同生命周期缓存（这些字段日常不变）。
+fn host_identity() -> serde_json::Value {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<serde_json::Value> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            use winreg::enums::HKEY_LOCAL_MACHINE;
+            use winreg::RegKey;
+            let rd = |path: &str, value: &str| -> String {
+                RegKey::predef(HKEY_LOCAL_MACHINE)
+                    .open_subkey(path)
+                    .and_then(|k| k.get_value::<String, _>(value))
+                    .unwrap_or_default()
+            };
+            let manufacturer = rd(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer");
+            let product = rd(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName");
+            let cpu = rd(
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "ProcessorNameString",
+            );
+            // GPU：显示适配器类驱动 0000-0009 的 DriverDesc。
+            // 过滤远程桌面/虚拟屏适配器（IddDriver、Virtual Display 等干扰项）。
+            let display_class = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+            let mut gpus: Vec<String> = Vec::new();
+            for idx in 0..10 {
+                let desc = rd(&format!("{}{}{:04}", display_class, "\\", idx), "DriverDesc");
+                let lower = desc.to_lowercase();
+                let virtual_adapter = ["idd", "virtual display", "parity", "basic render"]
+                    .iter()
+                    .any(|v| lower.contains(v));
+                if !desc.is_empty() && !virtual_adapter && !gpus.contains(&desc) {
+                    gpus.push(desc);
+                }
+            }
+            json!({
+                "model": if manufacturer.is_empty() { product.clone() } else {
+                    if product.is_empty() { manufacturer } else { format!("{manufacturer} {product}") }
+                },
+                "cpu": cpu,
+                "gpus": gpus,
+            })
+        })
+        .clone()
+}
+
+/// 最近一次 device_snapshot 的 memory + disks（总量/剩余，来自采集器快照）。
+fn latest_device_snapshot(conn: &Connection) -> serde_json::Value {
+    let Ok(data) = conn.query_row(
+        "SELECT event_data FROM events          WHERE event_action = 'device_snapshot' AND json_valid(event_data)            AND json_extract(event_data, '$.memory.total_gb') IS NOT NULL          ORDER BY id DESC LIMIT 1",
+        [],
+        |r| r.get::<_, Option<String>>(0),
+    ) else {
+        return json!({});
+    };
+    serde_json::from_str(&data.unwrap_or_default()).unwrap_or_else(|_| json!({}))
 }
 
 /// GET /api/input?days= — 输入统计聚合（近 `days` 天，含今日）。

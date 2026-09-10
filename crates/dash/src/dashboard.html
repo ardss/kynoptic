@@ -122,6 +122,9 @@
   button.save[style*="background:#2A3442"]:hover { border-color: var(--brand); color: var(--brand); }
   :is(button, .tab, input, .lang-toggle):focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
   #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: var(--bad); }
+  .host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .host-item > div:last-child { font-family: var(--font-data); font-size: 14px; margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 横向条形榜 */
   .app-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .app-label { width: 150px; color: var(--fg); overflow: hidden; text-overflow: ellipsis;
@@ -171,6 +174,17 @@
   <div class="card"><div class="label"><span class="l en">clicks</span><span class="l zh">点击</span></div><div class="value" id="c-clicks">–</div></div>
   <div class="card"><div class="label"><span class="l en">top app</span><span class="l zh">最常用应用</span></div><div class="value small" id="c-app">–</div></div>
 </div>
+
+<section>
+  <h2><span class="l en">this machine</span><span class="l zh">这台电脑</span></h2>
+  <div class="host-grid">
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">model</span><span class="l zh">型号</span></div><div id="h-model">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">cpu</span><span class="l zh">处理器</span></div><div id="h-cpu">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">gpu</span><span class="l zh">显卡</span></div><div id="h-gpu">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">memory</span><span class="l zh">内存</span></div><div id="h-mem">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">disk</span><span class="l zh">磁盘</span></div><div id="h-disk">–</div></div>
+  </div>
+</section>
 
 <section>
   <h2><span class="l en">timeline — last 12 hours (per local hour, events)</span><span class="l zh">时间线 — 近 12 小时（按本地小时，事件数）</span></h2>
@@ -443,6 +457,19 @@ async function loadOverview() {
   document.getElementById("c-cpu").textContent = pct(o.cpu_pct);
   document.getElementById("c-mem").textContent = pct(o.mem_pct);
   document.getElementById("c-foreground").textContent = o.foreground_app || "–";
+
+  const h = o.host || {};
+  document.getElementById("h-model").textContent = h.model || "–";
+  document.getElementById("h-cpu").textContent = h.cpu || "–";
+  document.getElementById("h-gpu").textContent = (h.gpus || []).join(" + ") || "–";
+  const mt = h.mem_total_gb, mu = h.mem_used_gb;
+  document.getElementById("h-mem").textContent =
+    (mu != null && mt) ? mu.toFixed(1) + " / " + mt + " GB (" + pct(o.mem_pct) + ")" : (mt ? mt + " GB" : "–");
+  const disks = h.disks || [];
+  const c = disks.find(x => x.drive === "C:") || disks[0];
+  document.getElementById("h-disk").textContent = c
+    ? (c.drive || "") + " " + (c.free_gb != null ? c.free_gb + " / " : "") + (c.total_gb != null ? c.total_gb + " GB" : "")
+    : "–";
   const s = await jget("/api/summary");
   document.getElementById("c-active").textContent = s.active_minutes;
   document.getElementById("c-keys").textContent = s.keys.toLocaleString();
