@@ -231,7 +231,12 @@ mod tests {
         let db = dir.join("kyn.db");
         let s = load(&db);
         assert_eq!(s.enabled_monitors.len(), 14);
-        assert!(!s.autostart, "测试环境无自启动注册表项");
+        // 注册表现状即缺省来源（可能为 true：托盘的设置同步会写 Run 项）
+        assert_eq!(
+            s.autostart,
+            autostart_registry_enabled(),
+            "autostart 缺省应与注册表 Run 项一致"
+        );
         assert_eq!(try_load(&db), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
