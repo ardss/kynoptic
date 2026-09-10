@@ -23,7 +23,7 @@ impl Monitor for SystemMonitor {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(60)
+        Duration::from_secs(10)
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {

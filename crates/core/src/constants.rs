@@ -17,7 +17,7 @@ pub const WRITE_FLUSH_INTERVAL_SECS: u64 = 30;
 pub const MAINTENANCE_INTERVAL_SECS: u64 = 24 * 3600;
 /// daily_agg 缓存刷新间隔。缓存读方（charts/insights）与实时读方（summary 卡片）
 /// 并存，若随 24h 维护才刷新，两个面板最长差一整天的数。1h 上限保证交叉一致。
-pub const DAILY_AGG_REFRESH_SECS: u64 = 3600;
+pub const DAILY_AGG_REFRESH_SECS: u64 = 600;
 pub const TRAY_UPDATE_INTERVAL_SECS: u64 = 5;
 /// SnapshotCache 后台重算间隔。前端 3s 轮询时读此缓存（0 SQL），
 /// 2s 重算保证缓存新鲜度足够，同时比每次轮询都 collect（9 SQL）省 ~85% 查询。

@@ -356,6 +356,10 @@
 </section>
 </div>
 
+<div class="muted" style="font-size:12px;margin:6px 0 14px">
+  <span class="l en">auto-refresh every 5s. per-key/mouse aggregates land within ~10-20s (minute buckets).</span>
+  <span class="l zh">数据每 5 秒自动刷新；键鼠聚合约 10-20 秒内可见（按分钟桶追加）。</span>
+</div>
 <footer>
   <span class="l en">All data is local. This page reads your kynoptic.db on this machine only.<br>
   Server binds 127.0.0.1 (localhost-only, not exposed to the network; no auth needed). Read-only: the dashboard never writes to your events. License: Apache-2.0.</span>
@@ -1086,7 +1090,7 @@ refreshAll().catch(e => {
 setInterval(() => {
   if (currentView === "settings") return;
   refreshAll().catch(() => {});
-}, 10000);
+}, 5000);
 </script>
 </body>
 </html>
