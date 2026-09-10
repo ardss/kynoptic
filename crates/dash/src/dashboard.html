@@ -931,7 +931,12 @@ refreshAll().catch(e => {
   el.textContent = "load failed: " + e.message;
   document.body.prepend(el);
 });
-setInterval(() => { refreshAll().catch(() => {}); }, 10000);
+// 设置页不参与 10s 轮询：轮询重渲染会用服务器状态覆盖未保存的勾选。
+// 只在进入页签和保存成功时（loadSettings/saveSettings 内部）重新加载。
+setInterval(() => {
+  if (currentView === "settings") return;
+  refreshAll().catch(() => {});
+}, 10000);
 </script>
 </body>
 </html>
