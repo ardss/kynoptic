@@ -266,7 +266,7 @@
   <h2><span class="l en">settings — autostart</span><span class="l zh">设置 — 开机自启动</span></h2>
   <div class="mon-row">
     <input type="checkbox" id="set-autostart">
-    <label for="set-autostart"><span class="l en">start kynoptic collect at login</span><span class="l zh">登录时自动启动 kynoptic collect</span></label>
+    <label for="set-autostart"><span class="l en">start kynoptic on login</span><span class="l zh">开机自启动 kynoptic（托盘常驻）</span></label>
   </div>
   <h2><span class="l en">settings — input privacy</span><span class="l zh">设置 — 输入隐私</span></h2>
   <div class="mon-row">
@@ -274,11 +274,12 @@
     <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended; per-key detail off)</span>
     <span class="l zh">仅按分钟计数保存键盘/鼠标输入（推荐；不记录逐键明细）</span></label>
   </div>
-  <div class="muted"><span class="l en">Takes effect after the collector restarts.</span><span class="l zh">重启采集器后生效。</span></div>
+  <div class="muted"><span class="l en">takes effect automatically after save.</span><span class="l zh">保存后自动生效。</span></div>
 </section>
 <section>
   <div class="settings-actions">
-    <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
+    <button class="save" style="background:#2b3240" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
+  <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
     <span id="settings-msg"></span>
   </div>
 </section>
@@ -303,13 +304,15 @@ const T = {
         saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks",
         kbDev: "Keyboard", msDev: "Mouse", keysCount: "keys", btns: "buttons",
         withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change",
-        unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window)." },
+        unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window).",
+        restoredHint: "reset to defaults on screen — click save to apply." },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
         kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "键",
         withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",
-        unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。" }
+        unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
+        restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -859,14 +862,41 @@ function settingsMsg(text, ok) {
   el.textContent = text;
   el.className = ok ? "ok" : "bad";
 }
+// 监控器双语名 + 新 loadSettings + restoreDefaults（替换原 loadSettings 整函数）
+const MON_NAMES = {
+  window: ["Windows", "窗口切换"], keyboard_hook: ["Keyboard", "键盘"], mouse_hook: ["Mouse", "鼠标"],
+  idle: ["Idle", "空闲"], session: ["Sessions", "会话"], system: ["System", "系统"],
+  network: ["Network", "网络"], battery: ["Battery", "电池"], device: ["Devices", "设备硬件"],
+  process: ["Processes", "进程"], audio: ["Audio", "音频"], brightness: ["Brightness", "亮度"],
+  wifi: ["Wi-Fi", "Wi-Fi"], power_plan: ["Power plan", "电源计划"],
+  browser: ["Browser tabs", "浏览器标签"], clipboard: ["Clipboard", "剪贴板"],
+  file_activity: ["Files", "文件活动"], media: ["Media", "媒体"],
+  screen_capture: ["Screen capture", "屏幕录制"], usb_device: ["USB", "USB 设备"],
+  bluetooth: ["Bluetooth", "蓝牙"], display: ["Displays", "显示器"],
+  external_display: ["Ext. display", "外接显示器"], audio_input: ["Microphone", "麦克风"],
+  audio_output: ["Speakers", "扬声器"], ime: ["IME", "输入法"], location: ["Location", "位置"],
+  notification: ["Notifications", "通知"], calendar: ["Calendar", "日历"], dns: ["DNS", "DNS 查询"],
+  security: ["Security", "安全事件"], firewall: ["Firewall", "防火墙"], uac: ["UAC", "UAC"],
+  windows_update: ["Updates", "系统更新"], driver: ["Drivers", "驱动"], vpn: ["VPN", "VPN"],
+  print: ["Print", "打印"], stylus: ["Stylus", "手写笔"], thermal: ["Thermal", "温度"],
+  gpu: ["GPU", "GPU"],
+};
+let LAST_SETTINGS = null;
 async function loadSettings() {
   const s = await jget("/api/settings");
+  LAST_SETTINGS = s;
   const enabled = new Set(s.enabled_monitors);
-  const row = m =>
-    '<div class="mon-row"><input type="checkbox" class="mon-toggle" data-id="' + esc(m.id) + '"' +
-    (enabled.has(m.id) ? " checked" : "") + ' id="mon-' + esc(m.id) + '">' +
-    '<label for="mon-' + esc(m.id) + '">' + esc(m.id) + "</label>" +
-    (m.default_enabled ? "" : '<span class="badge"><span class="l en">opt-in</span><span class="l zh">可选</span></span>') + "</div>";
+  const row = m => {
+    const n = MON_NAMES[m.id];
+    const label = n
+      ? '<span class="l en">' + n[0] + '</span><span class="l zh">' + n[1] + "</span>" +
+        ' <span class="muted" style="font-size:10px">' + esc(m.id) + "</span>"
+      : esc(m.id);
+    return '<div class="mon-row"><input type="checkbox" class="mon-toggle" data-id="' + esc(m.id) + '"' +
+      (enabled.has(m.id) ? " checked" : "") + ' id="mon-' + esc(m.id) + '">' +
+      '<label for="mon-' + esc(m.id) + '">' + label + "</label>" +
+      (m.default_enabled ? "" : '<span class="badge"><span class="l en">opt-in</span><span class="l zh">可选</span></span>') + "</div>";
+  };
   document.getElementById("mon-default").innerHTML =
     s.monitors.filter(m => m.default_enabled).map(row).join("");
   document.getElementById("mon-optin").innerHTML =
@@ -874,6 +904,15 @@ async function loadSettings() {
   document.getElementById("set-autostart").checked = s.autostart;
   document.getElementById("set-counts").checked = s.input_counts_only;
   settingsMsg("", true);
+}
+// 恢复默认勾选（仅改界面，需再点保存）
+function restoreDefaults() {
+  if (!LAST_SETTINGS) return;
+  for (const m of LAST_SETTINGS.monitors) {
+    const box = document.getElementById("mon-" + m.id);
+    if (box) box.checked = m.default_enabled;
+  }
+  settingsMsg(t("restoredHint"), true);
 }
 async function saveSettings() {
   const btn = document.getElementById("settings-save");
