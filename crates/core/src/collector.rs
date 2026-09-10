@@ -455,13 +455,26 @@ pub fn start_collection_custom(
     let sd_maint = shutdown.clone();
     thread::Builder::new()
         .name("Maintenance".into())
-        .spawn(move || loop {
-            thread::sleep(Duration::from_secs(constants::MAINTENANCE_INTERVAL_SECS));
-            if sd_maint.load(Ordering::Acquire) {
-                return;
+        .spawn(move || {
+            // 每小时刷新 daily_agg 派生缓存（图表与实时卡片不能互相矛盾）；
+            // 每 DAILY_AGG_REFRESH_SECS×24 做一次全量维护（清理/回填等重活）。
+            let mut ticks: u64 = 0;
+            loop {
+                thread::sleep(Duration::from_secs(constants::DAILY_AGG_REFRESH_SECS));
+                if sd_maint.load(Ordering::Acquire) {
+                    return;
+                }
+                ticks += 1;
+                if ticks % (constants::MAINTENANCE_INTERVAL_SECS
+                    / constants::DAILY_AGG_REFRESH_SECS)
+                    == 0
+                {
+                    log::info!("执行定期数据库维护...");
+                    db_clone.maintenance();
+                } else {
+                    db_clone.refresh_daily_agg();
+                }
             }
-            log::info!("执行定期数据库维护...");
-            db_clone.maintenance();
         })
         .expect("维护线程启动失败");
 
