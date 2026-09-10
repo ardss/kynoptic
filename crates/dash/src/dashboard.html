@@ -150,7 +150,7 @@
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
     <input type="date" id="report-date" class="date-input" style="min-width:150px" onchange="loadReport()">
-    <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=''; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=TODAY_STR; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
     <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
     <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
@@ -179,7 +179,7 @@
   <h2><span class="l en">hour by hour — which app you were in (pick a day)</span><span class="l zh">逐时一览 — 这天每个小时你在用什么（可选日期）</span></h2>
   <div style="margin-bottom:8px">
     <input type="date" id="apps-date" class="date-input" onchange="loadApps()">
-    <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=''; loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=TODAY_STR; loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
   </div>
   <div id="apps-grid-chart">loading…</div>
   <div id="apps-legend" class="muted" style="margin-top:6px"></div>
@@ -983,6 +983,15 @@ async function refreshAll() {
 const savedLang = localStorage.getItem("kyn-lang") ||
   ((navigator.language || "en").startsWith("zh") ? "zh" : "en");
 applyLang(savedLang);
+// 日期框初始化为今天（显示具体日期，而不是 yyyy/mm/日 占位符）
+const TODAY_STR = (function () {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+})();
+for (const id of ["report-date", "apps-date"]) {
+  const el = document.getElementById(id);
+  if (el && !el.value) el.value = TODAY_STR;
+}
 refreshAll().catch(e => {
   const el = document.createElement("div");
   el.className = "err";
