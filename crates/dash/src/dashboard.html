@@ -83,6 +83,7 @@
   <div class="tabs">
     <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
     <div class="tab" id="tab-activity" onclick="showView('activity')"><span class="l en">Activity</span><span class="l zh">活动</span></div>
+    <div class="tab" id="tab-report" onclick="showView('report')">><span class="l en">Report</span><span class="l zh">报告</span></div>
     <div class="tab" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></div>
     <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
     <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
@@ -136,6 +137,38 @@
 <section>
   <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
   <div id="top-apps" class="muted">loading…</div>
+</section>
+</div>
+
+<div id="view-report" style="display:none">
+<div class="cards">
+  <div class="card"><div class="label"><span class="l en">today goal</span><span class="l zh">今日目标</span></div><div class="value" id="r-goal">–</div></div>
+  <div class="card"><div class="label"><span class="l en">this week vs last</span><span class="l zh">本周 vs 上周</span></div><div class="value small" id="r-week">–</div></div>
+</div>
+
+<section>
+  <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
+  <div style="margin-bottom:8px">
+    <input type="date" id="report-date" class="date-input" onchange="loadReport()">
+    <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=''; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
+  </div>
+  <div id="report-timeline">loading…</div>
+  <div id="report-legend" class="muted" style="margin-top:6px"></div>
+</section>
+
+<section>
+  <h2><span class="l en">category share — time per category</span><span class="l zh">类别占比 — 各类时间分布（规则可在 settings.json 自定义）</span></h2>
+  <div id="report-cats"></div>
+</section>
+
+<section>
+  <h2><span class="l en">focus blocks — continuous stretches of 20+ min</span><span class="l zh">专注时段 — 连续 20 分钟以上的工作块</span></h2>
+  <div id="report-focus" class="muted">loading…</div>
+</section>
+
+<section>
+  <h2><span class="l en">28-day trend — active minutes per day</span><span class="l zh">28 天趋势 — 每日活跃分钟</span></h2>
+  <div id="report-trend">loading…</div>
 </section>
 </div>
 
@@ -497,6 +530,104 @@ function renderKeyboard(freq) {
   }
 }
 // 24h × Top 应用堆叠条（选定日期）+ 近 14 天每日 Top3
+// ─── 报告页：色带时间轴 / 类别占比 / 专注块 / 目标 / 趋势 ───
+const CAT_COLORS = { "开发":"#4EA1FF", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#E06C75",
+  "文档":"#C678DD", "设计":"#56B6C2", "其他":"#6e7681" };
+function catColor(name) { return CAT_COLORS[name] || "#888"; }
+function fmtMin(m) {
+  const h = Math.floor(m / 60), mm = m % 60;
+  return (h ? h + "h" : "") + (mm || !h ? mm + "m" : "");
+}
+async function loadReport() {
+  const dateVal = document.getElementById("report-date").value;
+  const d = await jget("/api/report" + (dateVal ? "?date=" + dateVal : ""));
+  const segs = d.segments || [];
+  const apps = [...new Set(segs.map(x => x.app))].slice(0, 8);
+  const W = 900, rowH = 22, padL = 130;
+  const H = 30 + apps.length * rowH + 26;
+  const px = m => padL + m / 1440 * (W - padL - 12);
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
+  for (let hr = 0; hr <= 24; hr += 3) {
+    const x = px(hr * 60);
+    svg += '<line x1="' + x + '" y1="16" x2="' + x + '" y2="' + (H - 18) +
+      '" stroke="#30363d" stroke-width="1"/>';
+    svg += '<text x="' + x + '" y="12" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + ":00</text>";
+  }
+  apps.forEach((app, i) => {
+    const y = 24 + i * rowH;
+    svg += '<text x="' + (padL - 8) + '" y="' + (y + 14) + '" fill="#8b949e" font-size="11" text-anchor="end">' +
+      esc(app.length > 20 ? app.slice(0, 19) + "…" : app) + "</text>";
+    svg += '<line x1="' + padL + '" y1="' + (y + rowH - 6) + '" x2="' + (W - 12) + '" y2="' + (y + rowH - 6) +
+      '" stroke="#161b22" stroke-width="10" stroke-linecap="round" opacity="0.6"/>';
+  });
+  for (const seg of segs) {
+    const i = apps.indexOf(seg.app);
+    if (i < 0) continue;
+    const y = 24 + i * rowH;
+    const hm = m => Math.floor(m / 60) + ":" + String(m % 60).padStart(2, "0");
+    svg += '<rect x="' + px(seg.start_min) + '" y="' + (y + rowH - 13) + '" width="' +
+      Math.max(px(seg.end_min) - px(seg.start_min), 1.5) + '" height="12" rx="3" fill="' +
+      catColor(seg.category) + '"><title>' + esc(seg.app) + " · " + esc(seg.category) +
+      " · " + hm(seg.start_min) + "–" + hm(seg.end_min) + '</title></rect>';
+  }
+  svg += "</svg>";
+  document.getElementById("report-timeline").innerHTML = segs.length ? svg
+    : '<span class="muted">' + t("noData") + "</span>";
+  document.getElementById("report-legend").innerHTML =
+    [...new Set(segs.map(x => x.category))].map(c =>
+      '<span style="margin-right:14px"><span class="sw" style="background:' + catColor(c) + '"></span>' + esc(c) + "</span>").join("");
+  const cats = (d.categories || []).sort((a, b) => b.minutes - a.minutes);
+  const cmax = Math.max(1, ...cats.map(c => c.minutes));
+  document.getElementById("report-cats").innerHTML = cats.length
+    ? cats.map(c => '<div class="mon-row"><span class="muted" style="width:56px">' + esc(c.category) +
+      '</span><span class="app-track"><span class="app-bar" style="width:' +
+      (c.minutes / cmax * 100).toFixed(2) + "%;background:" + catColor(c.category) + '"></span></span>' +
+      '<span class="app-count">' + fmtMin(c.minutes) + "</span></div>").join("")
+    : '<span class="muted">' + t("noData") + "</span>";
+  document.getElementById("report-focus").textContent = (d.focus || []).length
+    ? d.focus.map(function (f) {
+        const hm = m => Math.floor(m / 60) + ":" + String(m % 60).padStart(2, "0");
+        return hm(f.start_min) + "–" + hm(f.end_min) + " (" + fmtMin(f.minutes) + ")";
+      }).join("   ·   ")
+    : t("noData");
+  const st = await jget("/api/settings");
+  const tr = await jget("/api/trends");
+  const today = (tr.daily || []).slice(-1)[0];
+  const goal = st.daily_goal_minutes || 0;
+  document.getElementById("r-goal").textContent = goal
+    ? (today ? fmtMin(today.active_minutes) : "0m") + " / " + fmtMin(goal)
+    : "off";
+  const tw = tr.this_week || {}, lw = tr.last_week || {};
+  const pct = (a, b) => b ? (a >= b ? "▲ +" : "▼ ") + Math.round((a - b) / b * 100) + "%" : "–";
+  document.getElementById("r-week").innerHTML =
+    fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
+    " (" + pct(tw.active_minutes || 0, lw.active_minutes || 0) + ")</span>";
+  const tmax = Math.max(1, ...(tr.daily || []).map(x => x.active_minutes || 0));
+  const el = document.getElementById("report-trend");
+  if (!(tr.daily || []).length) { el.innerHTML = '<span class="muted">' + t("noData") + "</span>"; }
+  else {
+    const W = 880, H = 150, padL = 36, padB = 22, padT = 8;
+    const innerH = H - padT - padB, innerW = W - padL - 8;
+    const bw = innerW / tr.daily.length;
+    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
+    for (let g = 1; g <= 3; g++) {
+      const y = padT + innerH - innerH * g / 3;
+      svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
+        '" stroke="#30363d"/><text x="' + (padL - 6) + '" y="' + (y + 4) +
+        '" fill="#8b949e" font-size="11" text-anchor="end">' + Math.round(tmax * g / 3) + "</text>";
+    }
+    tr.daily.forEach(function (x, i) {
+      const bh = (x.active_minutes || 0) / tmax * innerH;
+      svg += '<rect x="' + (padL + i * bw + 2) + '" y="' + (padT + innerH - bh) +
+        '" width="' + (bw - 4) + '" height="' + Math.max(bh, 2) + '" rx="2" fill="#3FB68B"><title>' +
+        x.date + " — " + fmtMin(x.active_minutes || 0) + '</title></rect>';
+      if (i % 7 === 0) svg += '<text x="' + (padL + i * bw + bw / 2) + '" y="' + (H - 6) +
+        '" fill="#8b949e" font-size="10" text-anchor="middle">' + x.date.slice(5) + "</text>";
+    });
+    el.innerHTML = svg + "</svg>";
+  }
+}
+
 const APP_COLORS = ["#4EA1FF", "#3FB68B", "#E5C07B", "#E06C75", "#C678DD", "#56B6C2", "#2d5f94"];
 async function loadApps() {
   const dateVal = document.getElementById("apps-date").value;
@@ -773,7 +904,7 @@ async function saveSettings() {
 let currentView = "overview";
 function showView(name) {
   currentView = name;
-  for (const v of ["overview", "activity", "apps", "input", "anomalies", "settings"]) {
+  for (const v of ["overview", "activity", "apps", "report", "input", "anomalies", "settings"]) {
     document.getElementById("view-" + v).style.display = v === name ? "" : "none";
     document.getElementById("tab-" + v).classList.toggle("active", v === name);
   }
@@ -783,6 +914,7 @@ async function refreshView(name) {
   if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
   else if (name === "activity") await Promise.all([loadHours(), loadHeatmap(), loadTopApps()]);
   else if (name === "apps") await loadApps();
+  else if (name === "report") await loadReport();
   else if (name === "input") await loadInput();
   else if (name === "anomalies") await loadAnomalies();
   else if (name === "settings") await loadSettings();

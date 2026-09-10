@@ -433,6 +433,148 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
     }))
 }
 
+/// GET /api/report?date= — 单日报告：色带时间轴、类别占比、专注时段。
+///
+/// dwell 分段：window/switch 事件间隔即上一应用的停留时长；单段上限 120 分钟
+/// （离开电脑时的尾段不无限延长）。专注块：间隔 ≤5 分钟的连续活动且总长 ≥20 分钟。
+pub fn api_report_at(conn: &Connection, date: &str, s: &settings::AppSettings) -> std::result::Result<Value, String> {
+    let date = match date {
+        "" | "today" => queries::today_local_str(),
+        d => d.to_string(),
+    };
+    let (start, end) = queries::local_day_range(&date)
+        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') AS app, window_title              FROM events              WHERE event_type = 'window' AND event_action = 'switch'                AND timestamp >= ?1 AND timestamp < ?2              ORDER BY timestamp",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map(params![&start, &end], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    let day_start = chrono::DateTime::parse_from_rfc3339(&start)
+        .map_err(|e| e.to_string())?;
+
+    // 1) dwell 分段（分钟坐标）
+    let mut segs: Vec<(String, usize, usize)> = Vec::new(); // (app, start_min, end_min)
+    for (i, (ts, app, _title)) in rows.iter().enumerate() {
+        let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
+        let start_min = ((t - day_start).num_minutes().max(0) as usize).min(1439);
+        let end_min = if i + 1 < rows.len() {
+            match chrono::DateTime::parse_from_rfc3339(&rows[i + 1].0) {
+                Ok(t2) => ((t2 - day_start).num_minutes().max(0) as usize).min(1440),
+                Err(_) => start_min + 1,
+            }
+        } else {
+            (start_min + 1).min(1440)
+        };
+        let end_min = end_min.min(start_min + 120); // 离开电脑的尾段封顶 2h
+        if end_min <= start_min {
+            continue;
+        }
+        // 同应用连续段合并
+        if let Some(last) = segs.last_mut() {
+            if last.0 == *app && start_min.saturating_sub(last.1) <= 1 {
+                last.2 = end_min;
+                continue;
+            }
+        }
+        segs.push((app.clone(), start_min, end_min));
+    }
+
+    // 2) 分类
+    let classify = |app: &str| -> String {
+        for rule in &s.categories {
+            if rule.matches(app, "") {
+                return rule.name.clone();
+            }
+        }
+        "其他".to_string()
+    };
+    let segments: Vec<Value> = segs
+        .iter()
+        .map(|(app, a, b)| {
+            json!({"app": app, "category": classify(app), "start_min": a, "end_min": b})
+        })
+        .collect();
+
+    // 3) 类别占比（分钟）
+    let mut cat_min: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (app, a, b) in &segs {
+        *cat_min.entry(classify(app)).or_default() += (b - a) as i64;
+    }
+    let categories: Vec<Value> = cat_min
+        .iter()
+        .map(|(name, min)| json!({"category": name, "minutes": min}))
+        .collect();
+
+    // 4) 专注块：相邻段间隙 ≤5min 合并，总长 ≥20min
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for (_, a, b) in &segs {
+        if let Some(last) = blocks.last_mut() {
+            if a.saturating_sub(last.1) <= 5 {
+                last.1 = (*b).max(last.1);
+                continue;
+            }
+        }
+        blocks.push((*a, *b));
+    }
+    let focus: Vec<Value> = blocks
+        .iter()
+        .filter(|(a, b)| b - a >= 20)
+        .map(|(a, b)| json!({"start_min": a, "end_min": b, "minutes": b - a}))
+        .collect();
+
+    Ok(json!({
+        "date": date,
+        "segments": segments,
+        "categories": categories,
+        "focus": focus,
+    }))
+}
+
+/// GET /api/trends — 近 28 天每日 keys/clicks/active_minutes（来自 daily_agg 派生缓存）
+/// 与 本 7 天 vs 上 7 天对比。
+pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
+    let since_date = today - chrono::Duration::days(27);
+    let since = since_date.format("%Y-%m-%d").to_string();
+    let mut stmt = match conn.prepare(
+        "SELECT date, keys, clicks, active_minutes FROM daily_agg WHERE date >= ?1 ORDER BY date",
+    ) {
+        Ok(s) => s,
+        Err(_) => return json!({"daily": [], "this_week": {}, "last_week": {}}),
+    };
+    let rows: Vec<(String, i64, i64, i64)> = stmt
+        .query_map(params![&since], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    let daily: Vec<Value> = rows
+        .iter()
+        .map(|(d, k, c, m)| json!({"date": d, "keys": k, "clicks": c, "active_minutes": m}))
+        .collect();
+    let sum7 = |offset: usize| -> (i64, i64, i64) {
+        let n = rows.len();
+        let hi = n.saturating_sub(offset);
+        let lo = hi.saturating_sub(7);
+        rows[lo..hi].iter().fold((0, 0, 0), |acc, (_, k, c, m)| {
+            (acc.0 + k, acc.1 + c, acc.2 + m)
+        })
+    };
+    let (k1, c1, m1) = sum7(0);
+    let (k0, c0, m0) = sum7(7);
+    json!({
+        "daily": daily,
+        "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1},
+        "last_week": {"keys": k0, "clicks": c0, "active_minutes": m0},
+    })
+}
+
 /// GET /api/apps_grid?date= — 指定本地日的"小时 × 应用"使用矩阵。
 /// window 事件按本地小时桶 × 应用聚合，取当日 Top 6 应用 + 其余归并 other。
 pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Value, String> {
@@ -565,6 +707,8 @@ fn settings_payload(s: &AppSettings) -> Value {
         "autostart": s.autostart,
         "input_counts_only": s.input_counts_only,
         "dashboard_port": s.dashboard_port,
+        "daily_goal_minutes": s.daily_goal_minutes,
+        "categories": s.categories,
         "monitors": monitors,
     })
 }
@@ -596,6 +740,31 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;
+    }
+    if let Some(v) = req.get("daily_goal_minutes") {
+        let m = v.as_u64().ok_or("daily_goal_minutes 应为非负整数")?;
+        if m > 24 * 60 {
+            return Err("daily_goal_minutes 不能超过 1440".into());
+        }
+        next.daily_goal_minutes = m as u32;
+    }
+    if let Some(v) = req.get("categories") {
+        let arr = v.as_array().ok_or("categories 应为数组")?;
+        let mut rules = Vec::with_capacity(arr.len());
+        for r in arr {
+            let name = r
+                .get("name")
+                .and_then(|x| x.as_str())
+                .ok_or("categories[].name 缺失")?
+                .to_string();
+            let pattern = r
+                .get("pattern")
+                .and_then(|x| x.as_str())
+                .ok_or("categories[].pattern 缺失")?
+                .to_string();
+            rules.push(settings::CategoryRule { name, pattern });
+        }
+        next.categories = rules;
     }
     if let Some(v) = req.get("dashboard_port") {
         let port = v.as_u64().ok_or("dashboard_port 应为 0-65535 整数")?;
@@ -705,6 +874,19 @@ pub fn route_req(
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
+        ("GET", "/api/report") => {
+            let date = qval("date").unwrap_or_else(|| "today".to_string());
+            let s = settings::load(db_path);
+            match api_report_at(conn, &date, &s) {
+                Ok(v) => (200, "application/json", v.to_string()),
+                Err(e) => (400, "application/json", err_json(&e)),
+            }
+        }
+        ("GET", "/api/trends") => (
+            200,
+            "application/json",
+            api_trends_at(conn, today_naive()).to_string(),
+        ),
         ("GET", "/api/apps_grid") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
             match api_apps_grid_at(conn, &date) {

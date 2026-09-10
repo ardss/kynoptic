@@ -14,6 +14,37 @@ use kynoptic_core::registry;
 /// dashboard 默认端口。
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8422;
 
+/// 窗口分类规则（正则，匹配 app_name 或 window_title，大小写不敏感）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryRule {
+    pub name: String,
+    /// 不区分大小写的子串/正则模式（简化：按空格拆 token，任一 token 命中即归类）
+    pub pattern: String,
+}
+
+/// 内置默认分类（可被 settings.json 覆盖）。匹配顺序即优先级，未命中 → 其他。
+pub fn default_categories() -> Vec<CategoryRule> {
+    vec![
+        CategoryRule::rule("开发", "code dev vscode visualstudio git github powershell cmd terminal windowsterminal zcode idea pycharm jetbrains sublime vim emacs neovim clang rust cargo python node npm"),
+        CategoryRule::rule("浏览", "chrome msedge edge firefox browser safari opera vivaldi brave"),
+        CategoryRule::rule("通讯", "wechat weixin qq telegram discord slack dingtalk feishu outlook mail thunderbird"),
+        CategoryRule::rule("娱乐", "steam bilibili youtube spotify music netease douyin tiktok game epic"),
+        CategoryRule::rule("文档", "word excel powerpoint notepad pdf office wps typura obsidian notion"),
+        CategoryRule::rule("设计", "photoshop figma blender gimp inkscape premiere davinci affinity canva"),
+    ]
+}
+
+impl CategoryRule {
+    pub(crate) fn rule(name: &str, pattern: &str) -> Self {
+        Self { name: name.to_string(), pattern: pattern.to_string() }
+    }
+    /// app/title 是否命中该规则（token 子串匹配，大小写不敏感）。
+    pub fn matches(&self, app: &str, title: &str) -> bool {
+        let hay = format!("{} {}", app, title).to_lowercase();
+        self.pattern.split_whitespace().any(|tok| hay.contains(tok))
+    }
+}
+
 /// 应用设置文件内容。缺省值见 [`AppSettings::default`]。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -30,6 +61,16 @@ pub struct AppSettings {
     /// false = 逐键明细（opt-in，知情用户显式开启）。
     #[serde(default = "default_input_counts_only")]
     pub input_counts_only: bool,
+    /// 每日活跃目标（分钟，0 = 关闭目标进度条）。
+    #[serde(default = "default_daily_goal_minutes")]
+    pub daily_goal_minutes: u32,
+    /// 窗口分类规则（正则 token，匹配顺序即优先级，未命中 → 其他）。
+    #[serde(default = "default_categories")]
+    pub categories: Vec<CategoryRule>,
+}
+
+fn default_daily_goal_minutes() -> u32 {
+    480
 }
 
 fn default_input_counts_only() -> bool {
@@ -54,6 +95,8 @@ impl Default for AppSettings {
             autostart: false,
             dashboard_port: DEFAULT_DASHBOARD_PORT,
             input_counts_only: true,
+            daily_goal_minutes: 480,
+            categories: default_categories(),
         }
     }
 }
@@ -170,6 +213,8 @@ mod tests {
             autostart: true,
             dashboard_port: 9000,
             input_counts_only: true,
+            daily_goal_minutes: 480,
+            categories: default_categories(),
         };
         save(&db, &s).unwrap();
         assert_eq!(try_load(&db), Some(s));
