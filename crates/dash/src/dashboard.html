@@ -245,9 +245,11 @@
 <section>
   <h2><span class="l en">settings — monitors</span><span class="l zh">设置 — 监控器</span></h2>
   <div class="muted" style="margin-bottom:10px">
-    <span class="l en">Changes are saved to settings.json next to your database.
-      Restart kynoptic collect for monitor changes to take effect.</span>
-    <span class="l zh">更改保存到数据库旁的 settings.json。监控器开关需重启 kynoptic collect 后生效。</span>
+    <span class="l en">Changes are saved to settings.json next to your database and take
+      effect within a few seconds — the tray collector restarts automatically.
+      Autostart writes the Windows registry Run entry immediately.</span>
+    <span class="l zh">更改保存到数据库旁的 settings.json，托盘采集器自动重启使其生效（约 1-2 秒）。
+      开机自启动立即写入注册表 Run 项。</span>
   </div>
   <div class="settings-groups">
     <div class="settings-group">
@@ -297,13 +299,13 @@ const HM_LEVELS = ["#161b22", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
 /* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS） */
 const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
-        noSession: "not running", noData: "no data", saved: "saved. restart kynoptic collect for changes to take effect.",
+        noSession: "not running", noData: "no data", saved: "saved. changes take effect in a few seconds.",
         saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks",
         kbDev: "Keyboard", msDev: "Mouse", keysCount: "keys", btns: "buttons",
         withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change",
         unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window)." },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
-        noSession: "未在运行", noData: "暂无数据", saved: "已保存。重启 kynoptic collect 后生效。",
+        noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
         kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "键",
         withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",

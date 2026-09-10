@@ -42,6 +42,15 @@ use kynoptic_core::{Error, Result};
 
 use settings::AppSettings;
 
+/// 设置纪元：每次 POST /api/settings 成功即 +1。tray 监听该值变化，
+/// 自动用新设置重启采集器（保存即生效，无需手动重启）。
+pub static SETTINGS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 当前设置纪元（tray 轮询用）。
+pub fn settings_epoch() -> u64 {
+    SETTINGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 内嵌静态页（与产品 monospace/终端风一致的暗色双语单页）。
 pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
@@ -774,6 +783,7 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         next.dashboard_port = port as u16;
     }
     settings::save(db_path, &next).map_err(|e| format!("写设置失败: {e}"))?;
+    SETTINGS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(settings_payload(&next))
 }
 

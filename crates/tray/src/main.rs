@@ -71,21 +71,36 @@ fn main() {
                         if let Some(c) = collector.as_mut() {
                             c.shutdown();
                         }
+                        // 每次启动都读 settings.json（dashboard 保存即写此处），
+                        // 使"设置页勾选 = 实际采集集"单一事实源；--all 仍可覆盖。
+                        let app_settings = kynoptic_dash::settings::load(&owner_db);
                         let enabled: std::collections::HashSet<String> = if owner_all {
                             kynoptic_core::registry::all_monitor_ids()
+                                .into_iter()
+                                .map(String::from)
+                                .collect()
                         } else {
-                            kynoptic_core::registry::default_enabled_ids()
-                        }
-                        .into_iter()
-                        .map(String::from)
-                        .collect();
+                            app_settings
+                                .enabled_monitors
+                                .iter()
+                                .filter(|id| {
+                                    kynoptic_core::registry::all_monitor_ids().contains(&id.as_str())
+                                })
+                                .cloned()
+                                .collect()
+                        };
+                        let granularity = if app_settings.input_counts_only {
+                            kynoptic_core::collector::InputGranularity::Minute
+                        } else {
+                            kynoptic_core::collector::InputGranularity::Raw
+                        };
+                        let cs = kynoptic_core::collector::CollectorSettings {
+                            input_granularity: granularity,
+                            ..kynoptic_core::collector::CollectorSettings::default()
+                        };
                         let db_str = owner_db.to_string_lossy().into_owned();
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            kynoptic_core::collector::start_collection_custom(
-                                &enabled,
-                                kynoptic_core::collector::CollectorSettings::default(),
-                                &db_str,
-                            )
+                            kynoptic_core::collector::start_collection_custom(&enabled, cs, &db_str)
                         })) {
                             Ok(c) => {
                                 log::info!("采集器已启动({} 个监控器)", enabled.len());
@@ -115,6 +130,29 @@ fn main() {
         })
         .expect("采集器属主线程启动失败");
 
+    // 设置变更监听：dashboard 保存设置 -> SETTINGS_EPOCH +1 -> 自动重启采集器，
+    // 并把 autostart 同步到注册表 Run 项（保存即生效，无需手动重启进程）。
+    let watch_db = parsed.db.clone();
+    let watch_tx = cmd_tx.clone();
+    let mut last_epoch = kynoptic_dash::settings_epoch();
+    thread::Builder::new()
+        .name("SettingsWatch".into())
+        .spawn(move || loop {
+            thread::sleep(std::time::Duration::from_millis(1000));
+            let e = kynoptic_dash::settings_epoch();
+            if e != last_epoch {
+                last_epoch = e;
+                let st = kynoptic_dash::settings::load(&watch_db);
+                apply_autostart(st.autostart);
+                log::info!("设置已变更，自动重启采集器使其生效");
+                let _ = watch_tx.send(CollectorCmd::Start);
+            }
+        })
+        .expect("设置监听线程启动失败");
+
+    // 启动时按当前设置同步一次自启动
+    apply_autostart(kynoptic_dash::settings::load(&parsed.db).autostart);
+
     // 初始启动采集
     let _ = cmd_tx.send(CollectorCmd::Start);
 
@@ -126,4 +164,31 @@ fn main() {
     // 优雅收尾:等属主线程完成置旗标 + join writer。
     // dashboard 服务线程不 join(listener 无关闭语义),随进程退出而终止。
     let _ = owner.join();
+}
+
+
+/// 把 autostart 设置同步到注册表 Run 项（与 `kynoptic-ctl autostart` 同一键值）。
+fn apply_autostart(enable: bool) {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const VALUE_NAME: &str = "Kynoptic";
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY_PATH, winreg::enums::KEY_SET_VALUE) else {
+        eprintln!("autostart: 打开 Run 键失败");
+        return;
+    };
+    if enable {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let path = format!("\"{}\" --minimized", exe.display());
+                if let Err(e) = key.set_value(VALUE_NAME, &path) {
+                    eprintln!("autostart: 写入失败 {e}");
+                }
+            }
+            Err(e) => eprintln!("autostart: 取 exe 路径失败 {e}"),
+        }
+    } else {
+        let _ = key.delete_value(VALUE_NAME);
+    }
 }
