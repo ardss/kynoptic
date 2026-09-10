@@ -44,7 +44,7 @@ impl Monitor for PowerPlanMonitor {
 }
 
 fn get_active_plan() -> String {
-    let output = std::process::Command::new("powercfg")
+    let output = super::quiet_command("powercfg")
         .args(["/getactivescheme"])
         .output();
     match output {

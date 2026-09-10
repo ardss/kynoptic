@@ -16,7 +16,7 @@ pub fn run_ps(script: &str) -> Option<String> {
         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {}",
         script
     );
-    let output = std::process::Command::new("powershell")
+    let output = super::quiet_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &prefixed])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

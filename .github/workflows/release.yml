@@ -29,6 +29,7 @@ jobs:
           $ver = $env:GITHUB_REF_NAME.TrimStart("v")
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item target/release/kynoptic.exe dist/kynoptic.exe
+          Copy-Item target/release/kynoptic-watchdog.exe dist/kynoptic-watchdog.exe
           Copy-Item target/release/kynoptic-tray.exe dist/kynoptic-tray.exe
           Copy-Item README.md dist/
           Copy-Item LICENSE dist/ -ErrorAction SilentlyContinue
@@ -45,6 +46,7 @@ jobs:
         with:
           files: |
             dist/kynoptic.exe
+            dist/kynoptic-watchdog.exe
             dist/kynoptic-tray.exe
             dist/Kynoptic-Portable-*.zip
             dist/Kynoptic-Setup-*.exe

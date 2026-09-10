@@ -393,7 +393,7 @@ fn gpu_usage_pct() -> Option<u64> {
             return *v;
         }
     }
-    let out = std::process::Command::new("nvidia-smi")
+    let out = kynoptic_core::monitors::quiet_command("nvidia-smi")
         .args([
             "--query-gpu=utilization.gpu",
             "--format=csv,noheader,nounits",

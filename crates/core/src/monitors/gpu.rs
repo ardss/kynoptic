@@ -163,7 +163,7 @@ struct NvidiaStat {
 /// 调用 `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` 拉取每张 NVIDIA 卡的
 /// 利用率 / 温度 / 显存。失败或无 NVIDIA 驱动时返回空 Vec（调用方静默降级）。
 fn query_nvidia_smi() -> Vec<NvidiaStat> {
-    let output = match std::process::Command::new("nvidia-smi")
+    let output = match super::quiet_command("nvidia-smi")
         .args([
             "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",

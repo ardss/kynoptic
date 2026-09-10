@@ -111,10 +111,7 @@ fn collect_network_io() -> (u64, u64, Option<u64>, Option<u64>) {
 
 /// 调用 `netstat -e` 并解析输出。
 fn netstat_eth_stats() -> Option<(u64, u64, Option<u64>, Option<u64>)> {
-    let output = std::process::Command::new("netstat")
-        .arg("-e")
-        .output()
-        .ok()?;
+    let output = super::quiet_command("netstat").arg("-e").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     parse_netstat_e(&text)
 }

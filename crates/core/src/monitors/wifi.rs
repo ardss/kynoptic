@@ -31,7 +31,7 @@ impl Monitor for WifiMonitor {
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
-        let output = match std::process::Command::new("netsh")
+        let output = match super::quiet_command("netsh")
             .args(["wlan", "show", "interfaces"])
             .output()
         {
