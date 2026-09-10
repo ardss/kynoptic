@@ -206,11 +206,10 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
     }
     if c.keys > 0 {
         // per-key 频次以紧凑 map 输出（"65": 12, ...），零内容零顺序零时间戳
-        let vk_map: serde_json::Map<String, serde_json::Value> = c
-            .vk
-            .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
-            .collect();
+        let vk_map: serde_json::Map<String, serde_json::Value> =
+            c.vk.iter()
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect();
         out.push(
             Event::new(EventAction::InputAgg, EventType::Keyboard)
                 .data(serde_json::json!({
@@ -453,7 +452,12 @@ mod tests {
         assert_eq!(vk.get("65").and_then(|v| v.as_u64()), Some(2));
         assert_eq!(vk.get("66").and_then(|v| v.as_u64()), Some(1));
         assert!(vk.get("9999").is_none(), "越界 vk 不入库");
-        let total: u64 = vk.as_object().unwrap().values().filter_map(|v| v.as_u64()).sum();
+        let total: u64 = vk
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v.as_u64())
+            .sum();
         assert_eq!(total, 3);
         let ms = evts
             .iter()

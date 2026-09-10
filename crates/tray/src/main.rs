@@ -84,7 +84,8 @@ fn main() {
                                 .enabled_monitors
                                 .iter()
                                 .filter(|id| {
-                                    kynoptic_core::registry::all_monitor_ids().contains(&id.as_str())
+                                    kynoptic_core::registry::all_monitor_ids()
+                                        .contains(&id.as_str())
                                 })
                                 .cloned()
                                 .collect()
@@ -165,7 +166,6 @@ fn main() {
     // dashboard 服务线程不 join(listener 无关闭语义),随进程退出而终止。
     let _ = owner.join();
 }
-
 
 /// 把 autostart 设置同步到注册表 Run 项（与 `kynoptic-ctl autostart` 同一键值）。
 fn apply_autostart(enable: bool) {

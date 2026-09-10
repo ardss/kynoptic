@@ -35,17 +35,20 @@ pub struct InputDeviceInfo {
 
 /// 枚举本机输入设备（鼠标+键盘）。失败返回空（不 panic，不阻塞采集线程）。
 pub fn enumerate() -> Vec<InputDeviceInfo> {
+    use windows_sys::Win32::UI::Input::RID_DEVICE_INFO;
     use windows_sys::Win32::UI::Input::{
         GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICEINFO,
         RIDI_DEVICENAME, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     };
-    use windows_sys::Win32::UI::Input::RID_DEVICE_INFO;
 
     unsafe {
         let mut count: u32 = 0;
         // 第一次调用取所需缓冲大小
-        if GetRawInputDeviceList(std::ptr::null_mut(), &mut count, size_of::<RAWINPUTDEVICELIST>() as u32)
-            != 0
+        if GetRawInputDeviceList(
+            std::ptr::null_mut(),
+            &mut count,
+            size_of::<RAWINPUTDEVICELIST>() as u32,
+        ) != 0
         {
             return Vec::new();
         }
@@ -53,7 +56,11 @@ pub fn enumerate() -> Vec<InputDeviceInfo> {
             return Vec::new();
         }
         let mut list: Vec<RAWINPUTDEVICELIST> = vec![zeroed(); count as usize];
-        let n = GetRawInputDeviceList(list.as_mut_ptr(), &mut count, size_of::<RAWINPUTDEVICELIST>() as u32);
+        let n = GetRawInputDeviceList(
+            list.as_mut_ptr(),
+            &mut count,
+            size_of::<RAWINPUTDEVICELIST>() as u32,
+        );
         if n == u32::MAX {
             return Vec::new();
         }
@@ -78,14 +85,13 @@ pub fn enumerate() -> Vec<InputDeviceInfo> {
             ) != u32::MAX
                 && name_len > 0
             {
-                Some(String::from_utf16_lossy(&name_buf[..name_len.min(511) as usize]))
+                Some(String::from_utf16_lossy(
+                    &name_buf[..name_len.min(511) as usize],
+                ))
             } else {
                 None
             };
-            let (vid, pid) = name
-                .as_deref()
-                .map(parse_vid_pid)
-                .unwrap_or((None, None));
+            let (vid, pid) = name.as_deref().map(parse_vid_pid).unwrap_or((None, None));
 
             // 能力信息
             let mut info: RID_DEVICE_INFO = zeroed();
@@ -128,9 +134,11 @@ pub fn enumerate() -> Vec<InputDeviceInfo> {
                 function_keys,
             });
         }
-        out.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| {
-            a.device_path.cmp(&b.device_path)
-        }));
+        out.sort_by(|a, b| {
+            a.kind
+                .cmp(&b.kind)
+                .then_with(|| a.device_path.cmp(&b.device_path))
+        });
         out
     }
 }
@@ -153,10 +161,7 @@ fn parse_vid_pid(path: &str) -> (Option<String>, Option<String>) {
 
 /// 与上次快照比较：相同（设备集合与能力均未变）返回 None。
 /// 用于抑制重复事件——只增不删的表里，同一拓扑不该每 30s 写一行。
-pub fn changed_since(
-    current: &[InputDeviceInfo],
-    previous: Option<&[InputDeviceInfo]>,
-) -> bool {
+pub fn changed_since(current: &[InputDeviceInfo], previous: Option<&[InputDeviceInfo]>) -> bool {
     // 枚举失败/无设备时不写行（避免空行刷只增不删的表）
     if current.is_empty() {
         return false;
@@ -200,11 +205,20 @@ mod tests {
             function_keys: None,
         };
         assert!(changed_since(&[a.clone()], None), "首见非空即变化");
-        assert!(!changed_since(&[a.clone()], Some(&[a.clone()])), "相同拓扑不算变化");
+        assert!(
+            !changed_since(&[a.clone()], Some(&[a.clone()])),
+            "相同拓扑不算变化"
+        );
         let mut b = a.clone();
         b.buttons = Some(7);
-        assert!(changed_since(&[b], Some(std::slice::from_ref(&a))), "按键数变化算变化");
-        assert!(!changed_since(&[], Some(std::slice::from_ref(&a))), "拔掉后 current 空不算变化（保守）");
+        assert!(
+            changed_since(&[b], Some(std::slice::from_ref(&a))),
+            "按键数变化算变化"
+        );
+        assert!(
+            !changed_since(&[], Some(std::slice::from_ref(&a))),
+            "拔掉后 current 空不算变化（保守）"
+        );
     }
 
     #[test]

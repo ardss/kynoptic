@@ -219,11 +219,11 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         let mut h = host_identity();
         if let Some(mem) = snap.get("memory") {
             h["mem_total_gb"] = mem.get("total_gb").cloned().unwrap_or(json!(null));
-            h["mem_used_gb"] = json!(
-                mem.get("total_gb").and_then(|v| v.as_f64()).zip(
-                    mem.get("available_gb").and_then(|v| v.as_f64()))
-                .map(|(t, a)| (t - a) * 10.0 / 10.0)
-            );
+            h["mem_used_gb"] = json!(mem
+                .get("total_gb")
+                .and_then(|v| v.as_f64())
+                .zip(mem.get("available_gb").and_then(|v| v.as_f64()))
+                .map(|(t, a)| (t - a) * 10.0 / 10.0));
         }
         h["disks"] = snap.get("disks").cloned().unwrap_or(json!([]));
         h["gpu_usage_pct"] = match gpu_usage_pct() {
@@ -394,7 +394,10 @@ fn gpu_usage_pct() -> Option<u64> {
         }
     }
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -421,7 +424,11 @@ fn latest_device_snapshot(conn: &Connection) -> serde_json::Value {
 /// 数据源是 input_agg 分钟计数行（keyboard 行含 per-key 频次 `vk` map，
 /// mouse 行含分键点击/滚轮/移动距离）。只读聚合，缺天补零。
 /// `now` 注入以便测试。
-pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> std::result::Result<Value, String> {
+pub fn api_input_at(
+    conn: &Connection,
+    days: u32,
+    today: chrono::NaiveDate,
+) -> std::result::Result<Value, String> {
     let days = days.clamp(1, 365);
     let since_date = today - chrono::Duration::days(i64::from(days) - 1);
     let since = queries::local_day_range(&since_date.format("%Y-%m-%d").to_string())
@@ -436,7 +443,11 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
         .map_err(|e| e.to_string())?;
     let off = {
         let secs = Local::now().offset().local_minus_utc() as i64;
-        format!("{}{} seconds", if secs >= 0 { "+" } else { "-" }, secs.abs())
+        format!(
+            "{}{} seconds",
+            if secs >= 0 { "+" } else { "-" },
+            secs.abs()
+        )
     };
     let rows: Vec<(String, String, Option<String>)> = stmt
         .query_map(params![&off, &since], |r| {
@@ -461,7 +472,8 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
     }
     let mut totals = Totals::default();
     let mut key_freq: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut series: std::collections::BTreeMap<String, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut series: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
     let today_prefix = today.format("%Y-%m-%d").to_string();
     let mut hourly_today: [u64; 24] = [0; 24];
 
@@ -550,7 +562,11 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
 ///
 /// dwell 分段：window/switch 事件间隔即上一应用的停留时长；单段上限 120 分钟
 /// （离开电脑时的尾段不无限延长）。专注块：间隔 ≤5 分钟的连续活动且总长 ≥20 分钟。
-pub fn api_report_at(conn: &Connection, date: &str, s: &settings::AppSettings) -> std::result::Result<Value, String> {
+pub fn api_report_at(
+    conn: &Connection,
+    date: &str,
+    s: &settings::AppSettings,
+) -> std::result::Result<Value, String> {
     let date = match date {
         "" | "today" => queries::today_local_str(),
         d => d.to_string(),
@@ -569,13 +585,14 @@ pub fn api_report_at(conn: &Connection, date: &str, s: &settings::AppSettings) -
         .map_err(|e| e.to_string())?
         .flatten()
         .collect();
-    let day_start = chrono::DateTime::parse_from_rfc3339(&start)
-        .map_err(|e| e.to_string())?;
+    let day_start = chrono::DateTime::parse_from_rfc3339(&start).map_err(|e| e.to_string())?;
 
     // 1) dwell 分段（分钟坐标）
     let mut segs: Vec<(String, usize, usize)> = Vec::new(); // (app, start_min, end_min)
     for (i, (ts, app, _title)) in rows.iter().enumerate() {
-        let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
+        let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
         let start_min = ((t - day_start).num_minutes().max(0) as usize).min(1439);
         let end_min = if i + 1 < rows.len() {
             match chrono::DateTime::parse_from_rfc3339(&rows[i + 1].0) {
@@ -644,9 +661,11 @@ pub fn api_report_at(conn: &Connection, date: &str, s: &settings::AppSettings) -
 
     // 数据起始日（库中最早事件），供前端限制可选日期范围
     let data_since: Option<String> = conn
-        .query_row("SELECT MIN(substr(timestamp, 1, 10)) FROM events", [], |r| {
-            r.get::<_, Option<String>>(0)
-        })
+        .query_row(
+            "SELECT MIN(substr(timestamp, 1, 10)) FROM events",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
         .ok()
         .flatten();
 
@@ -713,7 +732,11 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
         .map_err(|e| e.to_string())?;
     let off = {
         let secs = Local::now().offset().local_minus_utc() as i64;
-        format!("{}{} seconds", if secs >= 0 { "+" } else { "-" }, secs.abs())
+        format!(
+            "{}{} seconds",
+            if secs >= 0 { "+" } else { "-" },
+            secs.abs()
+        )
     };
     let rows: Vec<(String, String, i64)> = stmt
         .query_map(params![&off, &start, &end], |r| {
@@ -733,8 +756,7 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
     let mut ranked: Vec<(String, i64)> = per_app.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let top: Vec<String> = ranked.iter().take(6).map(|(a, _)| a.clone()).collect();
-    let mut grid: std::collections::BTreeMap<String, [i64; 24]> =
-        std::collections::BTreeMap::new();
+    let mut grid: std::collections::BTreeMap<String, [i64; 24]> = std::collections::BTreeMap::new();
     for app in &top {
         grid.insert(app.clone(), [0; 24]);
     }
@@ -744,7 +766,11 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
         if let Ok(h) = hh.parse::<usize>() {
             if h < 24 {
                 hourly_total[h] += cnt;
-                let key = if top.contains(app) { app.as_str() } else { "(other)" };
+                let key = if top.contains(app) {
+                    app.as_str()
+                } else {
+                    "(other)"
+                };
                 if let Some(row) = grid.get_mut(key) {
                     row[h] += cnt;
                 }
@@ -778,7 +804,11 @@ pub fn api_daily_top_at(conn: &Connection, days: u32, today: chrono::NaiveDate) 
     };
     let off = {
         let secs = Local::now().offset().local_minus_utc() as i64;
-        format!("{}{} seconds", if secs >= 0 { "+" } else { "-" }, secs.abs())
+        format!(
+            "{}{} seconds",
+            if secs >= 0 { "+" } else { "-" },
+            secs.abs()
+        )
     };
     let rows: Vec<(String, String, i64)> = stmt
         .query_map(params![&off, &since], |r| {

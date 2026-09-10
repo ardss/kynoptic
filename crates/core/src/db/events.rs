@@ -64,15 +64,16 @@ impl Database {
                 // input_agg 聚合行走 UPSERT（同分钟同类型覆盖），其余照旧 INSERT
                 let is_agg = e.event_action == crate::types::EventAction::InputAgg;
                 // as_str() 返回 &'static str，替代原 to_string() 的每行堆分配
-                (if is_agg { &mut agg_stmt } else { &mut stmt } as &mut rusqlite::Statement<'_>).execute(params![
-                    e.timestamp,
-                    e.event_type.as_str(),
-                    e.event_action.as_str(),
-                    data_str,
-                    e.app_name,
-                    e.window_title,
-                    e.session_id,
-                ])?;
+                (if is_agg { &mut agg_stmt } else { &mut stmt } as &mut rusqlite::Statement<'_>)
+                    .execute(params![
+                        e.timestamp,
+                        e.event_type.as_str(),
+                        e.event_action.as_str(),
+                        data_str,
+                        e.app_name,
+                        e.window_title,
+                        e.session_id,
+                    ])?;
             }
         }
         tx.commit()?;

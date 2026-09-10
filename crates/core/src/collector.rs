@@ -472,8 +472,8 @@ pub fn start_collection_custom(
                     return;
                 }
                 ticks += 1;
-                if ticks % (constants::MAINTENANCE_INTERVAL_SECS
-                    / constants::DAILY_AGG_REFRESH_SECS)
+                if ticks
+                    % (constants::MAINTENANCE_INTERVAL_SECS / constants::DAILY_AGG_REFRESH_SECS)
                     == 0
                 {
                     log::info!("执行定期数据库维护...");

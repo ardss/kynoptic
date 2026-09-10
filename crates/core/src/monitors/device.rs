@@ -36,8 +36,14 @@ impl Monitor for DeviceMonitor {
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
         // 输入设备拓扑（型号能力/VID/PID）：仅与上次不同才随快照落库
         let input_devices = crate::raw_input_devices::enumerate();
-        let changed =
-            crate::raw_input_devices::changed_since(&input_devices, self.last_input_topology.lock().ok().as_deref().and_then(|g| g.as_deref()));
+        let changed = crate::raw_input_devices::changed_since(
+            &input_devices,
+            self.last_input_topology
+                .lock()
+                .ok()
+                .as_deref()
+                .and_then(|g| g.as_deref()),
+        );
         if changed {
             if let Ok(mut g) = self.last_input_topology.lock() {
                 *g = Some(input_devices.clone());
@@ -51,11 +57,7 @@ impl Monitor for DeviceMonitor {
             } else {
                 None
             },
-            input_devices: if changed {
-                Some(input_devices)
-            } else {
-                None
-            },
+            input_devices: if changed { Some(input_devices) } else { None },
         };
         // 直接序列化 struct —— 字段名（memory/disks/disk_io 及其子字段）单一来源，
         // 不再手写 json! 宏。disk_io 为 None 时 skip_serializing_if 自动省略。

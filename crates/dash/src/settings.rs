@@ -36,7 +36,10 @@ pub fn default_categories() -> Vec<CategoryRule> {
 
 impl CategoryRule {
     pub(crate) fn rule(name: &str, pattern: &str) -> Self {
-        Self { name: name.to_string(), pattern: pattern.to_string() }
+        Self {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+        }
     }
     /// app/title 是否命中该规则（token 子串匹配，大小写不敏感）。
     pub fn matches(&self, app: &str, title: &str) -> bool {
