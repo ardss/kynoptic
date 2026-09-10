@@ -44,6 +44,30 @@ fn main() {
         }
     };
 
+    // 单实例互斥体:防双开,同时是 watchdog 的存活探针
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+        let name: Vec<u16> = "Local\\KynopticTrayMutex\0".encode_utf16().collect();
+        unsafe {
+            // 只在句柄非空时才看 GetLastError:创建成功的新互斥体不重置
+            // last error,残留的 ERROR_ALREADY_EXISTS 会造成误判秒退。
+            let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+                eprintln!("kynoptic-tray: 已有实例在运行,退出");
+                return;
+            }
+        }
+    }
+
+    // 启动即清"用户主动退出"旗标:之后 watchdog 才有拉起依据
+    let exit_flag = parsed
+        .db
+        .parent()
+        .map(|p| p.join("tray-exit.flag"))
+        .unwrap_or_else(|| std::path::PathBuf::from("tray-exit.flag"));
+    let _ = std::fs::remove_file(&exit_flag);
+
     // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘。
     // 健壮性:全新首装时本线程先于采集器跑,数据库文件还不存在,只读打开
     // 必失败且托盘无控制台（错误不可见,外面就是"拒绝连接"）。因此先等库
@@ -184,6 +208,10 @@ fn main() {
     // 优雅收尾:等属主线程完成置旗标 + join writer。
     // dashboard 服务线程不 join(listener 无关闭语义),随进程退出而终止。
     let _ = owner.join();
+
+    // 优雅退出写旗标:watchdog 据此区分"用户主动退出"(不拉起)与"被杀/崩溃"(拉起)。
+    // 被杀路径走不到这里,旗标不存在,watchdog 会重新拉起托盘。
+    let _ = std::fs::write(&exit_flag, chrono::Utc::now().to_rfc3339());
 }
 
 /// 把 autostart 设置同步到注册表 Run 项（与 `kynoptic-ctl autostart` 同一键值）。

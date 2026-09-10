@@ -44,6 +44,9 @@ pub fn parse(args: &[String]) -> Result<Args, Error> {
                     .map_err(|_| Error::InvalidData(format!("端口非法: {raw}(0-65535)")))?;
             }
             "--all" => all = true,
+            // 开机自启动/看门狗拉起时带的参数:托盘本来就无可视窗口,
+            // 此处接受并忽略(历史上未实现,导致自启动启动即报错退出)。
+            "--minimized" => {}
             other => return Err(Error::InvalidData(format!("未知选项: {other}\n\n{USAGE}"))),
         }
         i += 1;

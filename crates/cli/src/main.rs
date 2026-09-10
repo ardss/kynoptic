@@ -68,6 +68,7 @@ Subcommands:
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update                                      Self-update from GitHub releases
+  watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
 ";
 
 fn resolve_db() -> PathBuf {
@@ -898,6 +899,86 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `kynoptic watchdog`：托盘看门狗（给计划任务每分钟调一次，`--once` 单次检查）。
+/// 探活 = 打开托盘的命名互斥体；托盘不在且非用户主动退出（无旗标）才拉起。
+/// 常驻模式（默认）每 15s 检查一轮；被杀/崩溃 -> 重新拉起 --minimized。
+fn cmd_watchdog(args: &[String]) -> Result<()> {
+    let mut db_path = kynoptic_core::db::resolve_db_path();
+    let mut once = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => {
+                let raw = it
+                    .next()
+                    .ok_or_else(|| Error::InvalidData("--db 需要路径".into()))?;
+                db_path = PathBuf::from(raw);
+            }
+            "--once" => once = true,
+            other => return Err(Error::InvalidData(format!("watchdog 未知参数: {other}"))),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        use std::os::windows::process::CommandExt;
+        let name: Vec<u16> = r"Local\KynopticTrayMutex"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        loop {
+            let running = unsafe {
+                let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+                if !h.is_null() {
+                    windows_sys::Win32::Foundation::CloseHandle(h);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !running {
+                let flag = db_path
+                    .parent()
+                    .map(|p| p.join("tray-exit.flag"))
+                    .unwrap_or_else(|| PathBuf::from("tray-exit.flag"));
+                if !flag.exists() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Some(dir) = exe.parent() {
+                            let tray = dir.join("kynoptic-tray.exe");
+                            if tray.exists() {
+                                use std::process::{Command, Stdio};
+                                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                                if let Err(e) = Command::new(&tray)
+                                    .arg("--minimized")
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .creation_flags(DETACHED_PROCESS)
+                                    .spawn()
+                                {
+                                    eprintln!("watchdog: 拉起托盘失败: {e}");
+                                }
+                                log::info!("watchdog: 托盘不在且非用户退出,已拉起");
+                            }
+                        }
+                    }
+                }
+            }
+            if once {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = once;
+        Ok(())
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
@@ -917,6 +998,7 @@ fn main() -> ExitCode {
         "probe" => cmd_probe(&args[1..]),
         "dashboard" => dashboard::cmd_dashboard(&args[1..]),
         "update" => update::cmd_update(&args[1..]),
+        "watchdog" => cmd_watchdog(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE);
             Ok(())
