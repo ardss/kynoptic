@@ -161,8 +161,15 @@ fn writer_loop_inner(
 
         log_dropped_events();
 
+        // 秒级可见：本批含 input_agg 聚合事件（每秒一次的累计 UPSERT）时立即提交，
+        // 不等缓冲窗口；该写入是单行覆盖，代价可忽略。
+        let has_agg = batch
+            .iter()
+            .any(|e| e.event_action == crate::types::EventAction::InputAgg);
+
         let now = Instant::now();
         if batch.len() >= batch_size
+            || has_agg
             || (!batch.is_empty() && now.duration_since(last_flush) >= flush_interval)
         {
             write_batch(db, &batch, total_written);

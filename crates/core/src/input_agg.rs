@@ -169,17 +169,9 @@ impl MinuteKey {
 }
 
 static PENDING: Mutex<Option<(MinuteKey, MinuteCounters)>> = Mutex::new(None);
-/// 部分刷新阈值：未满分钟的桶挂到这个年龄就先落一段（仪表盘 ~10-20s 内可见，
-/// 而不是等满一分钟）。每段只追加一次，计数总量与分钟去重口径均不受影响。
-const PARTIAL_FLUSH_MS: u64 = 10_000;
-static PENDING_OPENED_MS: AtomicU64 = AtomicU64::new(0);
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+/// 秒级可见：drain 每秒被调用一次，把当前分钟累计值整体 UPSERT 覆盖到
+/// 数据库同一行（0005 迁移的部分唯一索引）。派生缓存行的原地覆盖不违反
+/// 原始数据只增铁律（铁律保护对象是 press/click 等原始事件）。
 
 fn drain_atomics() -> MinuteCounters {
     let vk: Vec<(u8, u64)> = VK
@@ -265,21 +257,17 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
         match g.take() {
             Some((key, mut acc)) if key == cur => {
                 acc.add(drained);
-                if !acc.is_empty() && now_ms().saturating_sub(PENDING_OPENED_MS.load(Ordering::Relaxed)) >= PARTIAL_FLUSH_MS {
+                // 秒级可见：只要本分钟有输入，就把累计值整行 UPSERT（下游幂等覆盖）
+                if !acc.is_empty() {
                     out = events_for(key, &acc);
-                    PENDING_OPENED_MS.store(now_ms(), Ordering::Relaxed);
-                    *g = Some((cur, MinuteCounters::default()));
-                } else {
-                    *g = Some((key, acc));
                 }
+                *g = Some((key, acc));
             }
             Some((key, acc)) => {
                 out = events_for(key, &acc);
-                PENDING_OPENED_MS.store(now_ms(), Ordering::Relaxed);
                 *g = Some((cur, drained));
             }
             None => {
-                PENDING_OPENED_MS.store(now_ms(), Ordering::Relaxed);
                 *g = Some((cur, drained));
             }
         }
@@ -317,7 +305,6 @@ pub fn reset() {
     PREV_VALID.store(false, Ordering::Relaxed);
     PREV_X.store(0, Ordering::Relaxed);
     PREV_Y.store(0, Ordering::Relaxed);
-    PENDING_OPENED_MS.store(0, Ordering::Relaxed);
     if let Ok(mut g) = PENDING.lock() {
         *g = None;
     }

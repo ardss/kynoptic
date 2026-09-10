@@ -12,6 +12,15 @@ INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, w
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ";
 
+/// input_agg 行是派生聚合缓存（0005 迁移的部分唯一索引保证同分钟同类型恰一行）：
+/// 秒级刷新用累计值 UPSERT 覆盖，而非追加，避免一行/秒的行数膨胀。
+const UPSERT_INPUT_AGG_SQL: &str = "
+INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+ON CONFLICT(timestamp, event_type) WHERE event_action = 'input_agg'
+DO UPDATE SET event_data = excluded.event_data
+";
+
 impl Database {
     /// 批量插入事件
     ///
@@ -49,10 +58,13 @@ impl Database {
         // （原 tx.execute 每行都 prepare 一次，批量 300 条 = 300 次 prepare）。
         {
             let mut stmt = tx.prepare_cached(INSERT_SQL)?;
+            let mut agg_stmt = tx.prepare_cached(UPSERT_INPUT_AGG_SQL)?;
             for e in events {
                 let data_str = e.event_data.as_ref().map(|v| v.to_string());
+                // input_agg 聚合行走 UPSERT（同分钟同类型覆盖），其余照旧 INSERT
+                let is_agg = e.event_action == crate::types::EventAction::InputAgg;
                 // as_str() 返回 &'static str，替代原 to_string() 的每行堆分配
-                stmt.execute(params![
+                (if is_agg { &mut agg_stmt } else { &mut stmt } as &mut rusqlite::Statement<'_>).execute(params![
                     e.timestamp,
                     e.event_type.as_str(),
                     e.event_action.as_str(),

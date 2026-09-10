@@ -71,12 +71,14 @@ mod tests {
     fn save_then_load_roundtrip() {
         let dir = tmpdir("roundtrip");
         let db = dir.join("kyn.db");
-        let s = AppSettings {
+        let mut s = AppSettings {
             enabled_monitors: vec!["window".into(), "keyboard_hook".into()],
             autostart: true,
             dashboard_port: 9000,
             input_counts_only: true,
+            ..AppSettings::default()
         };
+        s.daily_goal_minutes = 480;
         save(&db, &s).unwrap();
         assert_eq!(load(&db), s);
         assert!(dir.join("settings.json").exists());
