@@ -433,6 +433,115 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
     }))
 }
 
+/// GET /api/apps_grid?date= — 指定本地日的"小时 × 应用"使用矩阵。
+/// window 事件按本地小时桶 × 应用聚合，取当日 Top 6 应用 + 其余归并 other。
+pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Value, String> {
+    let date = match date {
+        "" | "today" => queries::today_local_str(),
+        d => d.to_string(),
+    };
+    let (start, end) = queries::local_day_range(&date)
+        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(datetime(timestamp, ?1), 12, 2) AS hh,                     COALESCE(NULLIF(app_name,''), window_title, '(unknown)') AS app,                     COUNT(*) AS cnt              FROM events              WHERE event_type = 'window' AND timestamp >= ?2 AND timestamp < ?3              GROUP BY hh, app",
+        )
+        .map_err(|e| e.to_string())?;
+    let off = {
+        let secs = Local::now().offset().local_minus_utc() as i64;
+        format!("{}{} seconds", if secs >= 0 { "+" } else { "-" }, secs.abs())
+    };
+    let rows: Vec<(String, String, i64)> = stmt
+        .query_map(params![&off, &start, &end], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+
+    let mut per_app: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut by_hour_app: std::collections::BTreeMap<(String, String), i64> =
+        std::collections::BTreeMap::new();
+    for (hh, app, cnt) in rows {
+        *per_app.entry(app.clone()).or_default() += cnt;
+        *by_hour_app.entry((hh, app)).or_default() += cnt;
+    }
+    let mut ranked: Vec<(String, i64)> = per_app.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let top: Vec<String> = ranked.iter().take(6).map(|(a, _)| a.clone()).collect();
+    let mut grid: std::collections::BTreeMap<String, [i64; 24]> =
+        std::collections::BTreeMap::new();
+    for app in &top {
+        grid.insert(app.clone(), [0; 24]);
+    }
+    grid.insert("(other)".into(), [0; 24]);
+    let mut hourly_total = [0i64; 24];
+    for ((hh, app), cnt) in &by_hour_app {
+        if let Ok(h) = hh.parse::<usize>() {
+            if h < 24 {
+                hourly_total[h] += cnt;
+                let key = if top.contains(app) { app.as_str() } else { "(other)" };
+                if let Some(row) = grid.get_mut(key) {
+                    row[h] += cnt;
+                }
+            }
+        }
+    }
+    let grid_out: Vec<Value> = grid
+        .into_iter()
+        .map(|(app, hours)| json!({"app": app, "hours": hours}))
+        .collect();
+    let totals: Vec<Value> = ranked
+        .iter()
+        .take(6)
+        .map(|(a, n)| json!({"app": a, "count": n}))
+        .collect();
+    Ok(json!({"date": date, "grid": grid_out, "totals": totals, "hourly_total": hourly_total}))
+}
+
+/// GET /api/daily_top?days= — 近 `days` 天每日 Top 3 应用（window 事件）。
+pub fn api_daily_top_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> Value {
+    let days = days.clamp(1, 90);
+    let since_date = today - chrono::Duration::days(i64::from(days) - 1);
+    let since = queries::local_day_range(&since_date.format("%Y-%m-%d").to_string())
+        .map(|(s, _)| s)
+        .unwrap_or_default();
+    let mut stmt = match conn.prepare(
+        "SELECT substr(datetime(timestamp, ?1), 1, 10) AS d,                 COALESCE(NULLIF(app_name,''), window_title, '') AS app, COUNT(*) AS cnt          FROM events          WHERE event_type = 'window' AND timestamp >= ?2 AND app <> ''          GROUP BY d, app",
+    ) {
+        Ok(s) => s,
+        Err(_) => return json!({"days": days, "days_out": []}),
+    };
+    let off = {
+        let secs = Local::now().offset().local_minus_utc() as i64;
+        format!("{}{} seconds", if secs >= 0 { "+" } else { "-" }, secs.abs())
+    };
+    let rows: Vec<(String, String, i64)> = stmt
+        .query_map(params![&off, &since], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    let mut by_day: std::collections::BTreeMap<String, Vec<(String, i64)>> =
+        std::collections::BTreeMap::new();
+    for (d, app, cnt) in rows {
+        by_day.entry(d).or_default().push((app, cnt));
+    }
+    let days_out: Vec<Value> = by_day
+        .into_iter()
+        .map(|(d, mut apps)| {
+            apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            apps.truncate(3);
+            let top: Vec<Value> = apps
+                .into_iter()
+                .map(|(app, n)| json!({"app": app, "count": n}))
+                .collect();
+            json!({"date": d, "top": top})
+        })
+        .collect();
+    json!({"days": days, "days_out": days_out})
+}
+
 /// GET /api/settings — 当前设置 + 全部监控器清单（来自 MONITOR_REGISTRY）。
 pub fn api_settings(db_path: &Path) -> Value {
     let s = settings::load(db_path);
@@ -595,6 +704,23 @@ pub fn route_req(
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
             }
+        }
+        ("GET", "/api/apps_grid") => {
+            let date = qval("date").unwrap_or_else(|| "today".to_string());
+            match api_apps_grid_at(conn, &date) {
+                Ok(v) => (200, "application/json", v.to_string()),
+                Err(e) => (400, "application/json", err_json(&e)),
+            }
+        }
+        ("GET", "/api/daily_top") => {
+            let days = qval("days")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(14);
+            (
+                200,
+                "application/json",
+                api_daily_top_at(conn, days, today_naive()).to_string(),
+            )
         }
         ("GET", "/api/settings") => (200, "application/json", api_settings(db_path).to_string()),
         ("POST", "/api/settings") => match api_settings_post(db_path, body) {

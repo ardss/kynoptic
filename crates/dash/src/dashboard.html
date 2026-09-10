@@ -51,6 +51,8 @@
                        color: var(--dim); margin: 0 0 8px; }
   .mon-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
   .mon-row input { accent-color: var(--brand); }
+  .date-input { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font-family: var(--mono, monospace); }
   .kb-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
   .kb text { pointer-events: none; font-family: var(--mono, monospace); }
   .kb g:hover rect, .kb rect:hover { stroke: #4EA1FF; stroke-width: 2; }
@@ -81,6 +83,7 @@
   <div class="tabs">
     <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
     <div class="tab" id="tab-activity" onclick="showView('activity')"><span class="l en">Activity</span><span class="l zh">活动</span></div>
+    <div class="tab" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></div>
     <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
     <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
     <div class="tab" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></div>
@@ -133,6 +136,22 @@
 <section>
   <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
   <div id="top-apps" class="muted">loading…</div>
+</section>
+</div>
+
+<div id="view-apps" style="display:none">
+<section>
+  <h2><span class="l en">hour by hour — which app you were in (pick a day)</span><span class="l zh">逐时一览 — 这天每个小时你在用什么（可选日期）</span></h2>
+  <div style="margin-bottom:8px">
+    <input type="date" id="apps-date" class="date-input" onchange="loadApps()">
+    <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=''; loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
+  </div>
+  <div id="apps-grid-chart">loading…</div>
+  <div id="apps-legend" class="muted" style="margin-top:6px"></div>
+</section>
+<section>
+  <h2><span class="l en">daily focus — top apps per day (14d)</span><span class="l zh">每日主力 — 近 14 天每天的前三名应用</span></h2>
+  <div id="daily-top">loading…</div>
 </section>
 </div>
 
@@ -477,6 +496,61 @@ function renderKeyboard(freq) {
       svg.appendChild(g);
   }
 }
+// 24h × Top 应用堆叠条（选定日期）+ 近 14 天每日 Top3
+const APP_COLORS = ["#4EA1FF", "#3FB68B", "#E5C07B", "#E06C75", "#C678DD", "#56B6C2", "#2d5f94"];
+async function loadApps() {
+  const dateVal = document.getElementById("apps-date").value;
+  const d = await jget("/api/apps_grid" + (dateVal ? "?date=" + dateVal : ""));
+  const grid = d.grid || [];
+  const W = 880, H = 200, padL = 36, padB = 22, padT = 8;
+  const innerW = W - padL - 8, innerH = H - padT - padB;
+  const ht = d.hourly_total || [];
+  const hmax = Math.max(1, ...ht);
+  const bw = innerW / 24;
+  const colorOf = {};
+  grid.forEach((g, i) => { colorOf[g.app] = APP_COLORS[i % APP_COLORS.length]; });
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + innerH - innerH * g / 4;
+    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
+      '" stroke="#30363d" stroke-width="1"/>';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="11" text-anchor="end">' +
+      Math.round(hmax * g / 4) + "</text>";
+  }
+  for (let hr = 0; hr < 24; hr++) {
+    let yCur = padT + innerH;
+    for (const g of grid) {
+      const v = g.hours[hr] || 0;
+      if (!v) continue;
+      const bh = v / hmax * innerH;
+      yCur -= bh;
+      svg += '<rect x="' + (padL + hr * bw + 2) + '" y="' + yCur + '" width="' + (bw - 4) +
+        '" height="' + Math.max(bh, 2) + '" rx="1.5" fill="' + (colorOf[g.app] || "#888") +
+        '"><title>' + hr + ":00 — " + esc(g.app) + " (" + v + ')</title></rect>';
+    }
+    if (hr % 3 === 0) {
+      svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
+        '" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + "</text>";
+    }
+  }
+  svg += "</svg>";
+  document.getElementById("apps-grid-chart").innerHTML = svg;
+  document.getElementById("apps-legend").innerHTML = grid
+    .map(g => '<span style="margin-right:14px"><span class="sw" style="background:' +
+      (colorOf[g.app] || "#888") + '"></span>' + esc(g.app) + "</span>").join("");
+  const dt = await jget("/api/daily_top?days=14");
+  const rows = (dt.days_out || []).slice().reverse();
+  const cmax = Math.max(1, ...rows.flatMap(r => (r.top || []).map(t => t.count)));
+  document.getElementById("daily-top").innerHTML = rows.length
+    ? rows.map(r => '<div class="mon-row"><span class="muted" style="width:84px">' + esc(r.date) + "</span>" +
+      (r.top || []).map((t, i) =>
+        '<span class="app-track" style="flex:1"><span class="app-bar" style="width:' +
+        (t.count / cmax * 100).toFixed(2) + "%;background:" + APP_COLORS[i] + '"></span></span>' +
+        '<span style="width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
+        esc(t.app) + '">' + esc(t.app) + ' <span class="muted">(' + t.count + ")</span></span>").join("") +
+      "</div>").join("")
+    : '<span class="muted">' + t("noData") + "</span>";
+}
 // 顶视图鼠标部件：[kind, x, y, w, h, label]，kind 对应 clicks 字段
 const MOUSE_PARTS = [
   ["left", 212, 22, 66, 92, "L"],
@@ -699,7 +773,7 @@ async function saveSettings() {
 let currentView = "overview";
 function showView(name) {
   currentView = name;
-  for (const v of ["overview", "activity", "input", "anomalies", "settings"]) {
+  for (const v of ["overview", "activity", "apps", "input", "anomalies", "settings"]) {
     document.getElementById("view-" + v).style.display = v === name ? "" : "none";
     document.getElementById("tab-" + v).classList.toggle("active", v === name);
   }
@@ -708,6 +782,7 @@ function showView(name) {
 async function refreshView(name) {
   if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
   else if (name === "activity") await Promise.all([loadHours(), loadHeatmap(), loadTopApps()]);
+  else if (name === "apps") await loadApps();
   else if (name === "input") await loadInput();
   else if (name === "anomalies") await loadAnomalies();
   else if (name === "settings") await loadSettings();
