@@ -316,7 +316,7 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
         .unwrap_or_default();
     let mut stmt = conn
         .prepare(
-            "SELECT substr(datetime(timestamp, ?1), 1, 10) AS day, event_type, event_data \
+            "SELECT substr(datetime(timestamp, ?1), 1, 13) AS hour_bucket, event_type, event_data \
              FROM events \
              WHERE event_action = 'input_agg' AND timestamp >= ?2",
         )
@@ -340,6 +340,8 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
         left: u64,
         right: u64,
         middle: u64,
+        side1: u64,
+        side2: u64,
         scroll_ticks: u64,
         moves: u64,
         dist_px: u64,
@@ -347,14 +349,29 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
     let mut totals = Totals::default();
     let mut key_freq: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut series: std::collections::BTreeMap<String, (u64, u64)> = std::collections::BTreeMap::new();
+    let today_prefix = today.format("%Y-%m-%d").to_string();
+    let mut hourly_today: [u64; 24] = [0; 24];
 
-    for (day, etype, data) in rows {
+    for (bucket, etype, data) in rows {
         let v: Value = match data.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
             Some(v) => v,
             None => continue,
         };
         let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let day: String = bucket.chars().take(10).collect();
         let e = series.entry(day).or_default();
+        // 今日逐时输入量（keys+clicks），供"输入节奏"条形图
+        if bucket.starts_with(&today_prefix) {
+            if let Ok(h) = bucket.get(11..13).unwrap_or("").parse::<usize>() {
+                if h < 24 {
+                    if etype == "keyboard" {
+                        hourly_today[h] += num("keys");
+                    } else if etype == "mouse" {
+                        hourly_today[h] += num("clicks");
+                    }
+                }
+            }
+        }
         if etype == "keyboard" {
             let keys = num("keys");
             totals.keys += keys;
@@ -372,6 +389,8 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
             totals.left += num("clicks_left");
             totals.right += num("clicks_right");
             totals.middle += num("clicks_middle");
+            totals.side1 += num("clicks_side1");
+            totals.side2 += num("clicks_side2");
             totals.scroll_ticks += num("scroll_ticks");
             totals.moves += num("moves");
             totals.dist_px += num("move_distance_px");
@@ -390,6 +409,9 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
         "clicks_left": totals.left,
         "clicks_right": totals.right,
         "clicks_middle": totals.middle,
+        "clicks_side1": totals.side1,
+        "clicks_side2": totals.side2,
+        "hourly_today": hourly_today,
         "scroll_ticks": totals.scroll_ticks,
         "moves": totals.moves,
         "move_distance_px": totals.dist_px,
@@ -399,7 +421,8 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
 }
 
 /// GET /api/settings — 当前设置 + 全部监控器清单（来自 MONITOR_REGISTRY）。
-pub fn api_settings(db_path: &Path) -> Value {    let s = settings::load(db_path);
+pub fn api_settings(db_path: &Path) -> Value {
+    let s = settings::load(db_path);
     settings_payload(&s)
 }
 

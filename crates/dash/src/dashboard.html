@@ -53,6 +53,7 @@
   .mon-row input { accent-color: var(--brand); }
   .kb-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
   .kb text { pointer-events: none; font-family: var(--mono, monospace); }
+  .kb g:hover rect, .kb rect:hover { stroke: #4EA1FF; stroke-width: 2; }
   .badge { font-size: 11px; border: 1px solid var(--border); border-radius: 3px;
            padding: 0 5px; color: var(--amber); }
   .settings-actions { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
@@ -158,9 +159,20 @@
 </section>
 
 <section>
-  <h2><span class="l en">mouse — button mix and motion</span><span class="l zh">鼠标 — 按键分布与移动</span></h2>
+  <h2><span class="l en">mouse — click map on device (hover for counts)</span><span class="l zh">鼠标 — 按键分布图（悬浮查看次数）</span></h2>
+  <div class="kb-wrap"><svg id="mouse-svg" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 560 260"></svg></div>
   <div id="mouse-rows"></div>
   <div class="muted" id="mouse-extra"></div>
+</section>
+
+<section>
+  <h2><span class="l en">today — input rhythm (keys+clicks per hour)</span><span class="l zh">今日 — 24 小时输入节奏（按键+点击）</span></h2>
+  <div id="input-hours"></div>
+</section>
+
+<section>
+  <h2><span class="l en">top keys — most pressed (7d)</span><span class="l zh">Top 按键 — 按压次数最多（7 天）</span></h2>
+  <div id="top-keys"></div>
 </section>
 
 <section>
@@ -453,6 +465,67 @@ function renderKeyboard(freq) {
     }
   }
 }
+// 顶视图鼠标部件：[kind, x, y, w, h, label]，kind 对应 clicks 字段
+const MOUSE_PARTS = [
+  ["left", 212, 22, 66, 92, "L"],
+  ["right", 282, 22, 66, 92, "R"],
+  ["middle", 270, 26, 20, 34, "M"],
+  ["scroll_ticks", 272, 64, 16, 26, ""],
+  ["clicks_side1", 202, 96, 12, 34, "S1"],
+  ["clicks_side2", 202, 138, 12, 34, "S2"],
+];
+function renderMouse(d) {
+  const svg = document.getElementById("mouse-svg");
+  const vals = MOUSE_PARTS.map(p => d[p[0]] || 0);
+  const max = Math.max(1, ...vals);
+  const partColor = v => v ? kbColor(v, max) : "#161b22";
+  let s = '<defs><clipPath id="mbody"><rect x="210" y="20" width="140" height="220" rx="62"/></clipPath></defs>';
+  s += '<rect x="210" y="20" width="140" height="220" rx="62" fill="#0d1117" stroke="#2b3240" stroke-width="2"/>';
+  for (const [kind, x, y, w, h, label] of MOUSE_PARTS) {
+    const v = d[kind] || 0;
+    const fill = kind === "scroll_ticks"
+      ? (v ? "#2d5f94" : "#161b22")
+      : partColor(v);
+    s += '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h +
+      '" rx="6" fill="' + fill + '" stroke="#2b3240" stroke-width="1"' +
+      ' clip-path="' + (kind.startsWith("clicks_side") ? "none" : "url(#mbody)") + '">' +
+      '<title>' + esc(labelName(kind)) + ": " + v.toLocaleString() + '</title></rect>';
+    if (label) {
+      const lx = kind.startsWith("clicks_side") ? x - 8 : x + w / 2;
+      s += '<text x="' + lx + '" y="' + (y + h / 2 + 4) +
+        '" fill="#6e7681" font-size="12" text-anchor="middle"' +
+        (kind.startsWith("clicks_side") ? "" : ' clip-path="url(#mbody)"') + '>' + label + "</text>";
+    }
+  }
+  s += '<text x="350" y="60" fill="#6e7681" font-size="12">L ' + (d.clicks_left || 0).toLocaleString() +
+    ' · R ' + (d.clicks_right || 0).toLocaleString() +
+    ' · M ' + (d.clicks_middle || 0).toLocaleString() + "</text>";
+  s += '<text x="350" y="82" fill="#6e7681" font-size="12">S1 ' + (d.clicks_side1 || 0).toLocaleString() +
+    ' · S2 ' + (d.clicks_side2 || 0).toLocaleString() +
+    ' · ' + t("scrollTicks") + ' ' + (d.scroll_ticks || 0).toLocaleString() + "</text>";
+  svg.innerHTML = s;
+}
+function labelName(kind) {
+  const names = { left: "Left", right: "Right", middle: "Middle",
+    clicks_side1: "Side 1", clicks_side2: "Side 2", scroll_ticks: t("scrollTicks") };
+  return names[kind] || kind;
+}
+// vk → 键名（Top 按键列表用）
+const VK_NAMES = { 8: "BkSp", 9: "Tab", 13: "Enter", 19: "Pause", 20: "Caps", 27: "Esc", 32: "Space",
+  33: "PgUp", 34: "PgDn", 35: "End", 36: "Home", 37: "←", 38: "↑", 39: "→", 40: "↓",
+  44: "PrtSc", 45: "Ins", 46: "Del", 91: "WinL", 92: "WinR", 93: "Menu",
+  96: "N0", 97: "N1", 98: "N2", 99: "N3", 100: "N4", 101: "N5", 102: "N6", 103: "N7", 104: "N8", 105: "N9",
+  106: "Num*", 107: "Num+", 109: "Num-", 110: "Num.", 111: "Num/",
+  144: "NumLk", 145: "ScrLk", 160: "ShiftL", 161: "ShiftR", 162: "CtrlL", 163: "CtrlR",
+  164: "AltL", 165: "AltR" };
+function vkName(vk) {
+  if (VK_NAMES[vk]) return VK_NAMES[vk];
+  if (vk >= 48 && vk <= 57) return String.fromCharCode(vk);
+  if (vk >= 65 && vk <= 90) return String.fromCharCode(vk);
+  if (vk >= 112 && vk <= 123) return "F" + (vk - 111);
+  const punc = { 186: ";", 187: "=", 188: ",", 189: "-", 190: ".", 191: "/", 192: "`", 219: "[", 220: "\\", 221: "]", 222: "'" };
+  return punc[vk] || ("vk" + vk);
+}
 async function loadInput() {
   const d = await jget("/api/input?days=7");
   document.getElementById("i-keys").textContent = d.keys_total.toLocaleString();
@@ -461,19 +534,52 @@ async function loadInput() {
   document.getElementById("i-dist").textContent =
     (d.move_distance_px / 96 / 39.37).toFixed(1) + " m";
   renderKeyboard(d.key_freq || {});
-  const mix = [
-    ["left", d.clicks_left, "#4EA1FF"], ["right", d.clicks_right, "#2d5f94"],
-    ["middle", d.clicks_middle, "#1e3a5f"],
-  ];
-  const mx = Math.max(1, ...mix.map(m => m[1]));
-  document.getElementById("mouse-rows").innerHTML = mix.map(([name, v, c]) =>
-    '<div class="mon-row"><span class="muted" style="width:64px">' + esc(name) +
-    '</span><span class="app-track"><span class="app-bar" style="width:' +
-    (v / mx * 100).toFixed(2) + "%;background:" + c + '"></span></span>' +
-    '<span class="app-count">' + v.toLocaleString() + "</span></div>").join("");
+  renderMouse(d);
   document.getElementById("mouse-extra").textContent =
     t("moves") + ": " + d.moves.toLocaleString() + "  ·  " +
-    t("scrollTicks") + ": " + d.scroll_ticks.toLocaleString();
+    t("scrollTicks") + ": " + (d.scroll_ticks || 0).toLocaleString();
+  // 今日 24 小时输入节奏（复用活动页的柱状图风格）
+  const values = d.hourly_today || [];
+  const hEl = document.getElementById("input-hours");
+  if (values.length) {
+    const W = 880, H = 160, padL = 36, padB = 22, padT = 8;
+    const innerW = W - padL - 8, innerH = H - padT - padB;
+    const mx = Math.max(1, ...values);
+    const bw = innerW / 24;
+    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
+    for (let g = 0; g <= 4; g++) {
+      const y = padT + innerH - innerH * g / 4;
+      svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
+        '" stroke="#30363d" stroke-width="1"/>';
+      svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="11" text-anchor="end">' +
+        Math.round(mx * g / 4) + "</text>";
+    }
+    values.forEach((v, hr) => {
+      const bh = v / mx * innerH;
+      const x = padL + hr * bw + 2, y = padT + innerH - bh;
+      svg += '<rect x="' + x + '" y="' + y + '" width="' + (bw - 4) + '" height="' + Math.max(bh, v > 0 ? 2 : 0) +
+        '" rx="2" fill="#4EA1FF"><title>' + hr + ":00 — " + v.toLocaleString() + '</title></rect>';
+      if (hr % 3 === 0) {
+        svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
+          '" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + "</text>";
+      }
+    });
+    svg += "</svg>";
+    hEl.innerHTML = svg;
+  } else {
+    hEl.innerHTML = '<span class="muted">' + t("noData") + "</span>";
+  }
+  // Top 按键（7 天）
+  const top = Object.entries(d.key_freq || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  const tmax = Math.max(1, ...(top.map(x => x[1])));
+  document.getElementById("top-keys").innerHTML = top.length
+    ? top.map(([vk, n]) =>
+      '<div class="mon-row"><span class="muted" style="width:56px">' + esc(vkName(+vk)) +
+      '</span><span class="app-track"><span class="app-bar" style="width:' +
+      (n / tmax * 100).toFixed(2) + '%"></span></span>' +
+      '<span class="app-count">' + n.toLocaleString() + "</span></div>").join("")
+    : '<span class="muted">' + t("noData") + "</span>";
+  // 每日对比
   const s = d.series || [];
   const smax = Math.max(1, ...s.map(x => Math.max(x.keys, x.clicks)));
   document.getElementById("input-series").innerHTML = s.length

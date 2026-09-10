@@ -19,6 +19,7 @@ const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_XBUTTONDOWN: u32 = 0x020B;
 const WM_MOUSEMOVE: u32 = 0x0200;
 
 /// 移动事件最小间隔（ms）
@@ -54,11 +55,14 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
         if crate::input_agg::minute_mode() {
             match wparam as u32 {
                 WM_MOUSEMOVE => crate::input_agg::record_move(ms.pt.x, ms.pt.y),
-                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
                     let button = match wparam as u32 {
                         WM_LBUTTONDOWN => 0,
                         WM_RBUTTONDOWN => 1,
-                        _ => 2,
+                        WM_MBUTTONDOWN => 2,
+                        // LL hook：X 按钮编号在 mouse_data 低字（1/2）
+                        WM_XBUTTONDOWN => (ms.mouse_data & 0xffff).clamp(1, 2) as usize + 2,
+                        _ => 0,
                     };
                     crate::input_agg::record_click_button(button);
                 }

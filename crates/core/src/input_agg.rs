@@ -43,11 +43,11 @@ static VK: [AtomicU64; 256] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; 256]
 };
-/// 点击分键（0=left 1=right 2=middle）
-static BUTTON: [AtomicU64; 3] = {
+/// 点击分键（0=left 1=right 2=middle 3=side1(XBUTTON1) 4=side2(XBUTTON2)）
+static BUTTON: [AtomicU64; 5] = {
     #[allow(clippy::declare_interior_mutable_const)]
     const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; 3]
+    [Z; 5]
 };
 static SCROLL_TICKS: AtomicU64 = AtomicU64::new(0);
 static MOVES: AtomicU64 = AtomicU64::new(0);
@@ -73,11 +73,11 @@ pub fn record_key_vk(vk: u32) {
     }
 }
 
-/// 鼠标按下并分键（0=left 1=right 2=middle；release 不计）。
+/// 鼠标按下并分键（0=left 1=right 2=middle 3=side1 4=side2；release 不计）。
 pub fn record_click_button(button: usize) {
     CLICKS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
-    if button < 3 {
+    if button < 5 {
         BUTTON[button].fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -114,7 +114,7 @@ struct MinuteCounters {
     /// per-key 频次（vk 索引；仅非零项参与 is_empty/add 语义，见下）
     vk: Vec<(u8, u64)>,
     /// 点击分键 [left, right, middle]
-    buttons: [u64; 3],
+    buttons: [u64; 5],
 }
 
 impl MinuteCounters {
@@ -140,7 +140,7 @@ impl MinuteCounters {
                 self.vk.push((k, v));
             }
         }
-        for i in 0..3 {
+        for i in 0..5 {
             self.buttons[i] += o.buttons[i];
         }
     }
@@ -189,6 +189,8 @@ fn drain_atomics() -> MinuteCounters {
             BUTTON[0].swap(0, Ordering::Relaxed),
             BUTTON[1].swap(0, Ordering::Relaxed),
             BUTTON[2].swap(0, Ordering::Relaxed),
+            BUTTON[3].swap(0, Ordering::Relaxed),
+            BUTTON[4].swap(0, Ordering::Relaxed),
         ],
     }
 }
@@ -228,6 +230,8 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
                     "clicks_left": c.buttons[0],
                     "clicks_right": c.buttons[1],
                     "clicks_middle": c.buttons[2],
+                    "clicks_side1": c.buttons[3],
+                    "clicks_side2": c.buttons[4],
                 }))
                 .app("", ""),
         );
