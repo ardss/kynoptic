@@ -63,17 +63,19 @@ fn current_version(conn: &Connection) -> i64 {
 }
 
 /// 执行全部未应用的编号迁移。每个迁移在独立事务内执行：
-/// 成功后写入 schema_version，失败则回滚该迁移并中止（不做部分升级）。
-pub fn run_migrations(conn: &Connection) {
+/// 成功后写入 schema_version；任一迁移失败则回滚并**硬失败**（审查 P1：
+/// 旧版吞错会让库带病运行——schema_version 卡住导致下次启动重跑迁移
+/// 再失败，或唯一索引缺失使 input_agg UPSERT 全链路静默归零）。
+pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let mut applied = current_version(conn);
     for (idx, (name, sql)) in MIGRATIONS.iter().enumerate() {
         let version = (idx + 1) as i64;
         if applied >= version {
             continue;
         }
-        let _ = conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .and_then(|_| conn.execute_batch(sql))
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let outcome = conn
+            .execute_batch(sql)
             .and_then(|_| {
                 conn.execute(
                     "INSERT INTO metadata (key, value) VALUES ('schema_version', ?1)
@@ -81,16 +83,16 @@ pub fn run_migrations(conn: &Connection) {
                     params![version.to_string()],
                 )
             })
-            .and_then(|_| conn.execute_batch("COMMIT;"))
-            .inspect_err(|e| {
-                log::error!("迁移 {name} 失败: {e}");
-                let _ = conn.execute_batch("ROLLBACK;");
-            })
-            .map(|_| {
-                log::info!("已应用迁移 {name} (v{version})");
-                applied = version;
-            });
+            .and_then(|_| conn.execute_batch("COMMIT;"));
+        if let Err(e) = outcome {
+            let _ = conn.execute_batch("ROLLBACK;");
+            log::error!("迁移 {name} 失败，数据库保持原版本: {e}");
+            return Err(e);
+        }
+        log::info!("已应用迁移 {name} (v{version})");
+        applied = version;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,11 +105,11 @@ mod tests {
     fn migrations_apply_and_are_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        run_migrations(&conn);
+        let _ = run_migrations(&conn);
         assert_eq!(current_version(&conn), constants::CURRENT_SCHEMA_VERSION);
 
         // 幂等：重复执行不报错、版本不变
-        run_migrations(&conn);
+        let _ = run_migrations(&conn);
         assert_eq!(current_version(&conn), constants::CURRENT_SCHEMA_VERSION);
 
         // bucket 模型表存在
@@ -151,7 +153,7 @@ mod tests {
              INSERT INTO metadata (key, value) VALUES ('schema_version', '1');",
         )
         .unwrap();
-        run_migrations(&conn);
+        let _ = run_migrations(&conn);
         assert_eq!(current_version(&conn), constants::CURRENT_SCHEMA_VERSION);
         let n: i64 = conn
             .query_row(

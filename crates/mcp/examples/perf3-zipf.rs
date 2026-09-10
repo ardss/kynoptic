@@ -64,14 +64,14 @@ fn seed(db_path: &str) {
     if std::path::Path::new(db_path).exists() {
         println!("seed: 复用已有 {db_path}（补跑迁移，确保 0004 索引到位）");
         let conn = Connection::open(db_path).expect("open existing db");
-        kynoptic_core::db::run_migrations(&conn);
+        let _ = kynoptic_core::db::run_migrations(&conn);
         return;
     }
     println!("seed: 生成 {EVENTS} 条事件（{APPS} apps, Zipf s={ZIPF_S}）到 {db_path} ...");
     let conn = Connection::open(db_path).expect("create db");
     kynoptic_core::db::apply_pragmas(&conn).unwrap();
     conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
-    kynoptic_core::db::run_migrations(&conn);
+    let _ = kynoptic_core::db::run_migrations(&conn);
 
     let cdf = zipf_cdf();
     let base = chrono::Utc::now() - chrono::Duration::days(DAYS);

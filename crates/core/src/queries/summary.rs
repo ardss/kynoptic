@@ -291,6 +291,13 @@ pub fn keys_clicks_since(conn: &Connection, since_id: i64) -> (i64, i64) {
 /// 用于 SystemSnapshot::collect，将 count_today_keys + count_today_clicks
 /// 两次表扫描合并为一次。
 pub fn keys_clicks_today(conn: &Connection, today: &str, tomorrow: &str) -> (i64, i64) {
+    // 日期必须经 local_day_range 换算成 UTC RFC3339 边界：events.timestamp
+    // 是 UTC 字符串，直接与本地日期字符串比较会在 UTC+X 凌晨整段错位
+    // （实测：本地 0-8 点"今日键鼠"恒为 0）。tomorrow 参数保留兼容旧签名。
+    let _ = tomorrow;
+    let Some((start, end)) = crate::queries::local_day_range(today) else {
+        return (0, 0);
+    };
     let res = conn.query_row(
         &format!(
             "SELECT \
@@ -300,7 +307,7 @@ pub fn keys_clicks_today(conn: &Connection, today: &str, tomorrow: &str) -> (i64
                AND event_action IN ('press','click','input_agg') \
                AND timestamp >= ?1 AND timestamp < ?2"
         ),
-        params![today, tomorrow],
+        params![start, end],
         |r| {
             let keys = r.get::<_, i64>(0)?;
             let clicks = r.get::<_, i64>(1)?;

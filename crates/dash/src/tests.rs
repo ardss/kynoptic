@@ -5,7 +5,7 @@ use super::*;
 fn mem_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
-    kynoptic_core::db::run_migrations(&conn);
+    let _ = kynoptic_core::db::run_migrations(&conn);
     conn
 }
 
@@ -464,4 +464,19 @@ fn top5_with_other_stable_ordering() {
         .map(|(n, c)| ((*n).to_string(), *c))
         .collect();
     assert_eq!(top5_with_other(small).len(), 2);
+}
+
+#[test]
+fn loopback_host_whitelist() {
+    use super::loopback_host_ok;
+    assert!(loopback_host_ok("127.0.0.1:8422", 8422));
+    assert!(loopback_host_ok("127.0.0.1", 8422));
+    assert!(loopback_host_ok("localhost", 8422));
+    assert!(loopback_host_ok("localhost:8422", 8422));
+    assert!(loopback_host_ok("127.0.0.1:8422.", 8422));
+    // DNS rebinding：攻击者域名 rebind 到 127.0.0.1，Host 是攻击者域 → 拒绝
+    assert!(!loopback_host_ok("evil.example.com", 8422));
+    assert!(!loopback_host_ok("", 8422));
+    assert!(!loopback_host_ok("192.168.1.5:8422", 8422));
+    assert!(!loopback_host_ok("127.0.0.2:8422", 8422));
 }

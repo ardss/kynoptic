@@ -573,7 +573,7 @@ mod tests {
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
-        kynoptic_core::db::run_migrations(&conn);
+        let _ = kynoptic_core::db::run_migrations(&conn);
         conn
     }
 

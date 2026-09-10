@@ -265,7 +265,8 @@ impl Database {
 
         let writer = Connection::open(path)?;
         writer.execute_batch(SCHEMA)?;
-        run_migrations(&writer);
+        // 迁移失败硬失败（审查 P1）：宁可不启动，不带病运行
+        run_migrations(&writer)?;
         // 懒回填聚合读缓存（存量库首开一次）——**后台分块执行，不阻塞 open**。
         // perf3 2026-09 P0 实测：1M 事件存量库首开时同步回填把 Database::open
         // 阻塞 10.5 分钟（631,594 ms；目标 <500ms）。改为：open 只做廉价门槛

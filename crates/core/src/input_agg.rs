@@ -251,7 +251,9 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
     let drained = drain_atomics();
     let cur = MinuteKey::of(now_local);
     let mut out = Vec::new();
-    if let Ok(mut g) = PENDING.lock() {
+    // 锁中毒不应静默清零输入统计（审查 P2）：取回内部数据继续
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    {
         match g.take() {
             Some((key, mut acc)) if key == cur => {
                 acc.add(drained);
@@ -277,17 +279,15 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
 pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
     let drained = drain_atomics();
     let cur = MinuteKey::of(now_local);
-    if let Ok(mut g) = PENDING.lock() {
-        let (key, mut acc) = match g.take() {
-            Some((k, a)) => (k, a),
-            None => (cur, MinuteCounters::default()),
-        };
-        // 极端兜底：pending 桶与当前分钟不一致（聚合线程刚 rollover 但事件
-        // 尚未落库），以 pending 桶为准输出，避免把计数归错分钟。
-        acc.add(drained);
-        return events_for(key, &acc);
-    }
-    Vec::new()
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let (key, mut acc) = match g.take() {
+        Some((k, a)) => (k, a),
+        None => (cur, MinuteCounters::default()),
+    };
+    // 极端兜底：pending 桶与当前分钟不一致（聚合线程刚 rollover 但事件
+    // 尚未落库），以 pending 桶为准输出，避免把计数归错分钟。
+    acc.add(drained);
+    events_for(key, &acc)
 }
 
 /// 重置全部聚合状态（采集器启动/重启时调用，避免跨会话串数）。
@@ -303,9 +303,8 @@ pub fn reset() {
     PREV_VALID.store(false, Ordering::Relaxed);
     PREV_X.store(0, Ordering::Relaxed);
     PREV_Y.store(0, Ordering::Relaxed);
-    if let Ok(mut g) = PENDING.lock() {
-        *g = None;
-    }
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    *g = None;
 }
 
 /// 进入 minute 聚合模式（仅 [`crate::collector::start_collection_with`] 调用）。

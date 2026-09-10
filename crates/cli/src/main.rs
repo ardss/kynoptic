@@ -82,7 +82,7 @@ fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     kynoptic_core::db::apply_pragmas(&conn)?;
     conn.execute_batch(kynoptic_core::db::SCHEMA)?;
-    kynoptic_core::db::run_migrations(&conn);
+    let _ = kynoptic_core::db::run_migrations(&conn); // schema 建库路径已含迁移；此处仅兜底
     Ok(conn)
 }
 

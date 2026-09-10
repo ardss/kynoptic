@@ -387,24 +387,64 @@ fn gpu_usage_pct() -> Option<u64> {
     use std::time::{Duration, Instant};
     static CACHE: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(3);
-    let mut g = CACHE.lock().ok()?;
-    if let Some((at, v)) = g.as_ref() {
-        if at.elapsed() < TTL {
-            return *v;
+    // 缓存命中检查持锁，子进程绝不持锁（审查 P1：持锁跑无超时子进程，
+    // nvidia-smi 卡死 = 面板整体死锁）。
+    {
+        let g = CACHE.lock().ok()?;
+        if let Some((at, v)) = g.as_ref() {
+            if at.elapsed() < TTL {
+                return *v;
+            }
         }
     }
-    let out = kynoptic_core::monitors::quiet_command("nvidia-smi")
-        .args([
+    let out = command_output_capped(
+        kynoptic_core::monitors::quiet_command("nvidia-smi").args([
             "--query-gpu=utilization.gpu",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u64>().ok()));
+        ]),
+        Duration::from_secs(3),
+    )
+    .filter(|(ok, _)| *ok)
+    .and_then(|(_, s)| s.lines().next().and_then(|l| l.trim().parse::<u64>().ok()));
+    let mut g = CACHE.lock().ok()?;
     *g = Some((Instant::now(), out));
     out
+}
+
+/// 带超时的子进程 Output（审查 P1：std 无 wait_timeout，手写轮询；
+/// 超时 kill；输出量小，退出后读取不会堵管道缓冲）。
+fn command_output_capped(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => break None,
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let mut s = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut s);
+    }
+    Some((status.success(), s))
 }
 
 /// 最近一次 device_snapshot 的 memory + disks（总量/剩余，来自采集器快照）。
@@ -1058,10 +1098,15 @@ pub fn route_req(
             )
         }
         ("GET", "/api/settings") => (200, "application/json", api_settings(db_path).to_string()),
-        ("POST", "/api/settings") => match api_settings_post(db_path, body) {
-            Ok(v) => (200, "application/json", v.to_string()),
-            Err(e) => (400, "application/json", err_json(&e)),
-        },
+        ("POST", "/api/settings") => {
+            // 读-改-写整段串行化（审查 P1：并发 POST 会用旧快照覆盖对方字段）
+            static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = SETTINGS_WRITE.lock();
+            match api_settings_post(db_path, body) {
+                Ok(v) => (200, "application/json", v.to_string()),
+                Err(e) => (400, "application/json", err_json(&e)),
+            }
+        }
         ("GET", _) => (404, "application/json", err_json("not found")),
         (_, _) => (405, "application/json", err_json("method not allowed")),
     }
@@ -1107,7 +1152,10 @@ fn open_read_only(db_path: &Path) -> Result<Connection> {
 /// 端口 0 = 随机空闲端口（实际端口经 log 输出）。
 pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
     let _ = readonly;
-    let conn = open_read_only(db_path)?;
+    // 预检 DB 可打开（保留原有报错路径）；实际服务每连接各自只读打开
+    let _conn = open_read_only(db_path)?;
+    #[allow(unused_variables)]
+    let db_owned = db_path.to_path_buf();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
         Error::Io(std::io::Error::other(format!(
             "绑定 127.0.0.1:{port} 失败: {e}"
@@ -1123,16 +1171,35 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         db_path.display()
     );
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        // 连接内共享 &Connection：单线程逐连接串行处理即可（本地面板低并发）。
-        let _ = handle_client(&conn, &mut stream, db_path);
+        let Ok(stream) = stream else { continue };
+        // 每连接一线程 + 5s 读写超时（审查 P0：旧实现单线程串行且无超时，
+        // 一个半开连接/慢客户端就能挂死 accept 循环，整个面板假死）。
+        // Connection 非 Sync，无法跨线程共享——每连接只读打开一次（本地低并发）。
+        let db_owned = db_owned.clone();
+        let _ = std::thread::Builder::new()
+            .name("dash-conn".into())
+            .spawn(move || {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                if let Err(e) = handle_client(stream, &db_owned, bound) {
+                    log::warn!("dashboard 连接处理失败: {e}");
+                }
+            });
     }
     Ok(())
 }
 
-/// 读请求行 → route → 写响应。任何失败都静默断开（无日志面需求）。
-fn handle_client(conn: &Connection, stream: &mut TcpStream, db_path: &Path) -> std::io::Result<()> {
-    // 读请求行 + 头部；POST 再按 Content-Length 补读请求体（上限 64 KiB）。
+fn loopback_host_ok(host: &str, port: u16) -> bool {
+    let h = host.trim();
+    let h = h.strip_suffix('.').unwrap_or(h);
+    matches!(h, "127.0.0.1" | "localhost")
+        || h == format!("127.0.0.1:{port}")
+        || h == format!("localhost:{port}")
+}
+
+/// 读请求行 → 校验 → route → 写响应。任何失败都静默断开（无日志面需求）。
+fn handle_client(mut stream: TcpStream, db_path: &Path, port: u16) -> std::io::Result<()> {
+    // 读请求行 + 头部（字节层解析；上限 8 KiB，超限 431，审查 P2）。
     let mut buf = [0u8; 4096];
     let mut raw = Vec::new();
     let header_end = loop {
@@ -1145,20 +1212,53 @@ fn handle_client(conn: &Connection, stream: &mut TcpStream, db_path: &Path) -> s
             break pos + 4;
         }
         if raw.len() > 8192 {
-            break raw.len();
+            return http_simple(&mut stream, 431, "text/plain", "headers too large");
         }
     };
     let head = String::from_utf8_lossy(&raw[..header_end.min(raw.len())]).to_string();
-    let content_length = head
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| v.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0)
-        .min(64 * 1024);
+
+    let (mut host, mut origin, mut fetch_site, mut marker, mut content_length) =
+        (String::new(), None, None, false, 0usize);
+    for l in head.lines().skip(1) {
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        let v = v.trim().to_string();
+        match k.trim().to_ascii_lowercase().as_str() {
+            "host" => host = v,
+            "origin" => origin = Some(v),
+            "sec-fetch-site" => fetch_site = Some(v),
+            "x-kynoptic" => marker = v == "1",
+            "content-length" => content_length = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    // DNS rebinding 防线：Host 必须是回环名。
+    if !loopback_host_ok(&host, port) {
+        return http_simple(&mut stream, 403, "text/plain", "forbidden host");
+    }
+    // CSRF 防线（审查 P0：无校验的 POST 可被任意网页打——最恶劣路径是静默
+    // 开启逐键记录）。写请求必须带自定义头 X-Kynoptic: 1：跨站表单/simple
+    // request 发不出自定义头；fetch 带它必触发 preflight，本服务不应答 CORS，
+    // 攻击请求到不了这里。Origin/Sec-Fetch-Site 双保险。
+    let is_post = head.lines().next().unwrap_or_default().starts_with("POST");
+    if is_post {
+        let origin_ok = origin
+            .as_deref()
+            .map(|o| {
+                o == format!("http://127.0.0.1:{port}") || o == format!("http://localhost:{port}")
+            })
+            .unwrap_or(true);
+        if !marker || !origin_ok || fetch_site.as_deref() == Some("cross-site") {
+            return http_simple(
+                &mut stream,
+                403,
+                "application/json",
+                "{\"error\":\"cross-origin write blocked\"}",
+            );
+        }
+    }
+    content_length = content_length.min(64 * 1024);
     while raw.len() < header_end + content_length {
         let n = stream.read(&mut buf)?;
         if n == 0 {
@@ -1166,19 +1266,31 @@ fn handle_client(conn: &Connection, stream: &mut TcpStream, db_path: &Path) -> s
         }
         raw.extend_from_slice(&buf[..n]);
     }
-    let all = String::from_utf8_lossy(&raw);
-    let request_line = all.lines().next().unwrap_or_default();
+    // body 按字节层切分后再转字符串（审查 P2：lossy 替换会错位索引）。
+    let body = String::from_utf8_lossy(&raw[header_end.min(raw.len())..]).to_string();
+    let request_line = head.lines().next().unwrap_or_default().to_string();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or("/").to_string();
-    let body = all.get(header_end..).unwrap_or_default().to_string();
 
-    let (status, ctype, body) = route_req(conn, &method, &path, &body, db_path);
+    let conn = open_read_only(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let (status, ctype, body) = route_req(&conn, &method, &path, &body, db_path);
+    http_simple(&mut stream, status, ctype, &body)
+}
+
+fn http_simple(
+    stream: &mut TcpStream,
+    status: u16,
+    ctype: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
     };
     write!(

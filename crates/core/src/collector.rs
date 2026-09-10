@@ -293,16 +293,8 @@ impl Collector {
             h.stop();
         }
 
-        // minute 粒度：关停兜底——把当前未满分钟的部分输入计数立即折叠落库，
-        // 不等聚合线程的下一次 rollover，保证"最后一分钟"不丢。
-        if self.settings.input_granularity == InputGranularity::Minute {
-            let events = input_agg::flush_partial(chrono::Local::now());
-            if !events.is_empty() {
-                write_batch(&self.db, &events, &self.total_written);
-                log::info!("关停 flush：{} 条 input_agg 部分分钟事件", events.len());
-            }
-        }
-
+        // minute 粒度的"最后一分钟不丢"由聚合线程负责：它看到停机旗标后
+        // 先 flush 入队再退出（通道顺序安全）。这里不再绕过通道直写。
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
         }
@@ -329,6 +321,9 @@ impl Drop for Collector {
                 h.stop();
             }
             if self.settings.input_granularity == InputGranularity::Minute {
+                // 给聚合线程一个唤醒周期，让它的关停 flush 先入队；
+                // 若线程已死则这里兜底直写（尽量少丢）。
+                thread::sleep(Duration::from_millis(1100));
                 let events = input_agg::flush_partial(chrono::Local::now());
                 if !events.is_empty() {
                     write_batch(&self.db, &events, &self.total_written);
@@ -431,6 +426,9 @@ pub fn start_collection_custom(
                 }
             })
             .expect("InputAgg 聚合线程启动失败");
+        // 关停兜底在聚合线程内做：看到停机旗标后先把未满分钟的部分计数
+        // flush 入队再退出——与队列中残留的秒级快照保持单一顺序，消除
+        // "小快照后写覆盖最终行"的竞态（审查 P1）。
     }
 
     // Hook 不带 name()（EventHook trait 最小面），按启用集条件构建。

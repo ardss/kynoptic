@@ -58,6 +58,25 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 ; 用户从托盘菜单主动退出则写旗标,watchdog 不拉起。随 autostart 任务一起安装。
 Filename: "schtasks"; Parameters: "/Create /F /SC MINUTE /MO 1 /TN ""Kynoptic Watchdog"" /TR ""'{app}\kynoptic-watchdog.exe' watchdog --once"""; Tasks: autostart; Flags: runhidden
 
+[Code]
+// 安装前禁用看门狗计划任务：CloseApplications 只处理已持句柄的进程，
+// 防不住 watchdog 每分钟把旧托盘拉起来撞"文件被占用"（审查 P1）。
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  CmdResult: Integer;
+begin
+  Result := '';
+  Exec('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE', '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  CmdResult: Integer;
+begin
+  if CurStep = ssPostInstall then
+    Exec('schtasks', '/Change /TN "Kynoptic Watchdog" /ENABLE', '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+end;
+
 [UninstallRun]
 Filename: "schtasks"; Parameters: "/Delete /F /TN ""Kynoptic Watchdog"""; Flags: runhidden; RunOnceId: "DelWatchdog"
 

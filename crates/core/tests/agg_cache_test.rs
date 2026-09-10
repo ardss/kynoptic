@@ -108,12 +108,15 @@ fn counts_include_input_agg_rows() {
     let tomorrow = queries::date_offset_str(1);
     let (start, end) = queries::local_day_range(&today).unwrap();
 
+    // raw 行与 agg 行分属不同分钟：两种粒度模式互斥，同分钟只有一种形态
+    // （agg 行代表整分钟总量）。agg 行本身用 MAX 快照语义防秒级累计膨胀。
+    let agg_minute = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
     let events = vec![
         raw(&now, "keyboard", "press", None), // 1 raw key
-        minute_agg_row(&now, "keyboard", json!({"keys": 5, "samples": 5})), // +5 agg keys
+        minute_agg_row(&agg_minute, "keyboard", json!({"keys": 5, "samples": 5})), // +5 agg keys
         raw(&now, "mouse", "click", None),    // 1 raw click
         minute_agg_row(
-            &now,
+            &agg_minute,
             "mouse",
             json!({"clicks": 3, "moves": 7, "move_distance_px": 42, "scroll_ticks": 2, "samples": 12}),
         ),
@@ -259,7 +262,7 @@ fn backfill_on_open_populates_missing_cache() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
-        kynoptic_core::db::run_migrations(&conn);
+        let _ = kynoptic_core::db::run_migrations(&conn);
         conn.execute(
             "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id)
              VALUES ('2026-06-15T12:00:00+00:00', 'keyboard', 'press', NULL, NULL, NULL, 1)",

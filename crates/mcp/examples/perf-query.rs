@@ -51,7 +51,7 @@ fn seed(db_path: &str) {
     let conn = Connection::open(db_path).expect("create db");
     kynoptic_core::db::apply_pragmas(&conn).unwrap();
     conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
-    kynoptic_core::db::run_migrations(&conn);
+    let _ = kynoptic_core::db::run_migrations(&conn);
 
     let base = chrono::Utc::now() - chrono::Duration::days(DAYS);
     conn.execute_batch("BEGIN IMMEDIATE;").unwrap();

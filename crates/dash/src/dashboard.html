@@ -1062,7 +1062,7 @@ async function saveSettings() {
     };
     const r = await fetch("/api/settings", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Kynoptic": "1" },
       body: JSON.stringify(body)
     });
     if (!r.ok) {

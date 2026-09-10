@@ -89,9 +89,16 @@ impl Database {
                 continue;
             };
             let data_str = e.event_data.as_ref().map(|v| v.to_string());
-            // 降级路径同样用 prepare_cached + as_str
+            // 降级路径同样用 prepare_cached + as_str；input_agg 行必须走
+            // UPSERT（裸 INSERT 撞部分唯一索引会静默丢行，且关停 flush 无自愈）
+            let is_agg = e.event_action == crate::types::EventAction::InputAgg;
             let result = (|| -> rusqlite::Result<()> {
-                let mut stmt = tx.prepare_cached(INSERT_SQL)?;
+                let sql: &str = if is_agg {
+                    UPSERT_INPUT_AGG_SQL
+                } else {
+                    INSERT_SQL
+                };
+                let mut stmt = tx.prepare_cached(sql)?;
                 stmt.execute(params![
                     e.timestamp,
                     e.event_type.as_str(),

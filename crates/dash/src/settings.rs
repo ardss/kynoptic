@@ -122,10 +122,26 @@ pub fn try_load(db_path: &Path) -> Option<AppSettings> {
 /// 读取设置；文件不存在/损坏时返回缺省（autostart 先探测现有注册表
 /// Run 项，与 `kynoptic-ctl autostart status` 同一事实源）。
 pub fn load(db_path: &Path) -> AppSettings {
-    try_load(db_path).unwrap_or_else(|| AppSettings {
-        autostart: autostart_registry_enabled(),
-        ..AppSettings::default()
-    })
+    match try_load(db_path) {
+        Some(s) => s,
+        None => {
+            // 文件存在但损坏：改名留档（审查 P1：坏文件若留原地，下次保存
+            // 会用默认值静默覆盖用户配置；数据不删铁律，只改名）。
+            let path = settings_path(db_path);
+            if path.exists() {
+                let bak = path.with_extension("json.corrupt.bak");
+                let _ = std::fs::rename(&path, &bak);
+                log::warn!(
+                    "settings.json 损坏，已留档为 {}，本次回退默认值",
+                    bak.display()
+                );
+            }
+            AppSettings {
+                autostart: autostart_registry_enabled(),
+                ..AppSettings::default()
+            }
+        }
+    }
 }
 
 /// 写盘（原子性：先写 .tmp 再改名，避免半截 JSON）。

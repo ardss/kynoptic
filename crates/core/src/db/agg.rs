@@ -40,6 +40,15 @@ ON CONFLICT(date, hour, minute, bucket_id) DO UPDATE SET
     count_value = COALESCE(count_value, 0) + excluded.count_value
 ";
 
+/// input_agg 专用：事件携带的是"本分钟累计快照"，同分钟桶必须覆盖而非累加。
+const UPSERT_MINUTE_SNAPSHOT: &str = "
+INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT(date, hour, minute, bucket_id) DO UPDATE SET
+    sum_value = MAX(COALESCE(sum_value, 0), excluded.sum_value),
+    count_value = MAX(COALESCE(count_value, 0), excluded.count_value)
+";
+
 const UPSERT_DAILY_APP: &str = "
 INSERT INTO agg_daily (date, bucket_id, sum_value, count_value)
 VALUES (?1, 'app:' || ?2, NULL, ?3)
@@ -64,7 +73,7 @@ fn apply_event(conn: &Connection, e: &Event) -> rusqlite::Result<()> {
             let samples = json_counter(e, "samples");
             if keys > 0 {
                 conn.execute(
-                    UPSERT_MINUTE,
+                    UPSERT_MINUTE_SNAPSHOT,
                     params![date, hour, minute, "input_keys", keys, samples],
                 )?;
             }
@@ -76,13 +85,13 @@ fn apply_event(conn: &Connection, e: &Event) -> rusqlite::Result<()> {
             let samples = json_counter(e, "samples");
             if clicks > 0 {
                 conn.execute(
-                    UPSERT_MINUTE,
+                    UPSERT_MINUTE_SNAPSHOT,
                     params![date, hour, minute, "input_clicks", clicks, samples],
                 )?;
             }
             if moves > 0 || dist > 0 {
                 conn.execute(
-                    UPSERT_MINUTE,
+                    UPSERT_MINUTE_SNAPSHOT,
                     params![date, hour, minute, "input_moves", dist, moves],
                 )?;
             }
@@ -534,7 +543,7 @@ mod tests {
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(crate::db::SCHEMA).unwrap();
-        crate::db::run_migrations(&c);
+        let _ = crate::db::run_migrations(&c);
         c
     }
 
@@ -736,7 +745,7 @@ mod perf3_tests {
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(crate::db::SCHEMA).unwrap();
-        crate::db::run_migrations(&c);
+        let _ = crate::db::run_migrations(&c);
         c
     }
 

@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 与生产库（采集器 Database::open）同口径：WAL，只读打开时才不因 journal_mode 报错
     kynoptic_core::db::apply_pragmas(&conn)?;
     conn.execute_batch(kynoptic_core::db::SCHEMA)?;
-    kynoptic_core::db::run_migrations(&conn);
+    let _ = kynoptic_core::db::run_migrations(&conn);
 
     let local_now = Local::now();
     let utc = |hour: u32, min: u32, days_ago: i64| -> String {

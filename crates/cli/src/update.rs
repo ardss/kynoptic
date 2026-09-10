@@ -43,6 +43,16 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             "检测到本程序由包管理器安装（路径含其管理目录）。请改用: {cmd}"
         )));
     }
+    // 安装版（Inno Setup）自更新会造成版本漂移：self_update 只换本 exe，
+    // 托盘/看门狗仍是旧版，且卸载数据库记录与磁盘不一致（审查 P1）。
+    // 有 unins000.exe 即认定安装版，指引重跑 Setup（新版发布后 Setup 可覆盖装）。
+    if let Some(dir) = std::path::Path::new(&exe).parent() {
+        if dir.join("unins000.exe").exists() {
+            return Err(crate::Error::InvalidData(
+                "检测到本程序为安装版。请重新下载并运行 Kynoptic-Setup 完成升级（自更新仅适用于便携版）".to_string(),
+            ));
+        }
+    }
 
     let cur = self_update::cargo_crate_version!();
     eprintln!("checking GitHub releases for kynoptic v{cur}...");
