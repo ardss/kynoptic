@@ -162,6 +162,7 @@
   <h2><span class="l en">mouse — click map on device (hover for counts)</span><span class="l zh">鼠标 — 按键分布图（悬浮查看次数）</span></h2>
   <div class="kb-wrap"><svg id="mouse-svg" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 560 260"></svg></div>
   <div class="muted" id="device-line" style="margin-bottom:8px"></div>
+  <div class="muted" id="mouse-unattr" style="margin-bottom:8px"></div>
   <div class="muted" id="mouse-extra"></div>
 </section>
 
@@ -247,12 +248,14 @@ const T = {
         noSession: "not running", noData: "no data", saved: "saved. restart kynoptic collect for changes to take effect.",
         saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks",
         kbDev: "Keyboard", msDev: "Mouse", keysCount: "keys", btns: "buttons",
-        withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change" },
+        withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change",
+        unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window)." },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存。重启 kynoptic collect 后生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
         kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "键",
-        withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）" }
+        withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",
+        unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -569,6 +572,12 @@ async function loadInput() {
     .join("  ·  ");
   document.getElementById("device-line").textContent =
     [...new Set(devTxt.split("  ·  "))].join("  ·  ") || t("noDevice");
+  // 旧版行没有分键字段：总额超出按键明细之和时如实提示（随 7 天窗口滚动自愈）
+  const attr = (d.clicks_left || 0) + (d.clicks_right || 0) + (d.clicks_middle || 0)
+    + (d.clicks_side1 || 0) + (d.clicks_side2 || 0);
+  const unattr = (d.clicks_total || 0) - attr;
+  document.getElementById("mouse-unattr").textContent = unattr > 0
+    ? t("unattr").replace("{n}", unattr.toLocaleString()) : "";
   // 今日 24 小时输入节奏（复用活动页的柱状图风格）
   const values = d.hourly_today || [];
   const hEl = document.getElementById("input-hours");
