@@ -17,7 +17,11 @@ jobs:
         run: cargo build --release -p kynoptic -p kynoptic-tray
       - name: Install Inno Setup
         shell: pwsh
-        run: choco install innosetup --version=6.3.3 -y --no-progress
+        run: |
+          # runner 预装 InnoSetup 6.x 时直接用（choco 锁版本会与预装冲突）
+          if (!(Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
       - name: Fetch Chinese language file for Inno Setup
         shell: pwsh
         run: |
