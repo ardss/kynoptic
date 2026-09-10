@@ -1,22 +1,22 @@
-//! `kynoptic-ctl` — CLI 管理工具
-//!
-//! 替代 Python 时代的 `python -m kynoptic stats/export/report/dashboard/db`
-//!
-//! 错误类型统一为 [`kynoptic_core::Error`]（io/serde/csv/rusqlite 自动 `?`
-//! 转换），main 处统一打印后返回 FAILURE。
-//!
-//! 子命令：
-//!   stats     — 今日/指定日统计摘要
-//!   export    — 导出事件为 CSV/JSON/JSONL
-//!   report    — 生成每日 Markdown 报告
-//!   db        — 数据库维护 (stats/cleanup/vacuum/checkpoint)
-//!   analyze   — 单日完整分析 (focus/fragmentation/anomaly)
-//!   ghost     — 清扫幽灵 session
-//!   autostart — 开关开机自启动
-//!   migrate   — 从旧 Python db 导入（已迁移到 scripts/migrate_legacy_db.py）
-//!   now       — 当前机器状态（compact 表格 / --json）
-//!   query     — 时间范围事件查询 (--from/--to/--bucket/--limit/--json)
-//!   mcp       — 启动 MCP server（stdio，Claude Desktop: command "kynoptic" args ["mcp"]）
+// `kynoptic-ctl` — CLI 管理工具
+//
+// 替代 Python 时代的 `python -m kynoptic stats/export/report/dashboard/db`
+//
+// 错误类型统一为 [`kynoptic_core::Error`]（io/serde/csv/rusqlite 自动 `?`
+// 转换），main 处统一打印后返回 FAILURE。
+//
+// 子命令：
+//   stats     — 今日/指定日统计摘要
+//   export    — 导出事件为 CSV/JSON/JSONL
+//   report    — 生成每日 Markdown 报告
+//   db        — 数据库维护 (stats/cleanup/vacuum/checkpoint)
+//   analyze   — 单日完整分析 (focus/fragmentation/anomaly)
+//   ghost     — 清扫幽灵 session
+//   autostart — 开关开机自启动
+//   migrate   — 从旧 Python db 导入（已迁移到 scripts/migrate_legacy_db.py）
+//   now       — 当前机器状态（compact 表格 / --json）
+//   query     — 时间范围事件查询 (--from/--to/--bucket/--limit/--json)
+//   mcp       — 启动 MCP server（stdio，Claude Desktop: command "kynoptic" args ["mcp"]）
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
