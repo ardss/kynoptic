@@ -402,8 +402,21 @@ pub fn api_input_at(conn: &Connection, days: u32, today: chrono::NaiveDate) -> s
         .iter()
         .map(|(d, (keys, clicks))| json!({"date": d, "keys": keys, "clicks": clicks}))
         .collect();
+    // 最近一次输入设备拓扑快照（device_snapshot.input_devices，仅拓扑变化时写入）
+    let input_devices: Vec<Value> = conn
+        .query_row(
+            "SELECT event_data FROM events              WHERE event_action = 'device_snapshot' AND json_extract(event_data, '$.input_devices') IS NOT NULL              ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s?).ok())
+        .and_then(|v| v.get("input_devices").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
     Ok(json!({
         "days": days,
+        "input_devices": input_devices,
         "keys_total": totals.keys,
         "clicks_total": totals.clicks,
         "clicks_left": totals.left,

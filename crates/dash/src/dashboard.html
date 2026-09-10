@@ -161,7 +161,7 @@
 <section>
   <h2><span class="l en">mouse — click map on device (hover for counts)</span><span class="l zh">鼠标 — 按键分布图（悬浮查看次数）</span></h2>
   <div class="kb-wrap"><svg id="mouse-svg" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 560 260"></svg></div>
-  <div id="mouse-rows"></div>
+  <div class="muted" id="device-line" style="margin-bottom:8px"></div>
   <div class="muted" id="mouse-extra"></div>
 </section>
 
@@ -245,10 +245,14 @@ const HM_LEVELS = ["#161b22", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
 const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
         noSession: "not running", noData: "no data", saved: "saved. restart kynoptic collect for changes to take effect.",
-        saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks" },
+        saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks",
+        kbDev: "Keyboard", msDev: "Mouse", keysCount: "keys", btns: "buttons",
+        withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存。重启 kynoptic collect 后生效。",
-        saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度" }
+        saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
+        kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "键",
+        withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -474,14 +478,28 @@ const MOUSE_PARTS = [
   ["clicks_side1", 202, 96, 12, 34, "S1"],
   ["clicks_side2", 202, 138, 12, 34, "S2"],
 ];
+// 常见 USB 厂商（VID → 名，离线子集；完整库见 linux-usb.org usb.ids）
+const USB_VENDORS = { "046d":"Logitech", "1532":"Razer", "045e":"Microsoft", "1038":"SteelSeries",
+  "1b1c":"Corsair", "04d9":"Holtek", "1c4f":"SiGma", "25a7":"Areson", "391d":"391D", "3837":"3837",
+  "04f2":"Chicony", "04ca":"Liteon", "062a":"2.4G/赛睿兼容", "093a":"Pixart", "1ea7":"SHARKOON",
+  "05ac":"Apple", "17ef":"Lenovo", "413c":"Dell", "03f0":"HP", "1043":"ASUS", "145f":"Trust",
+  "0458":"Genius", "06cb":"Synaptics", "04f3":"Elan", "04b3":"IBM", "056a":"Wacom", "256c":"Huion" };
+function vendorName(vid) {
+  return (vid && USB_VENDORS[vid.toLowerCase()]) || (vid ? "VID_" + vid.toUpperCase() : null);
+}
 function renderMouse(d) {
   const svg = document.getElementById("mouse-svg");
-  const vals = MOUSE_PARTS.map(p => d[p[0]] || 0);
+  // 真实硬件拓扑：任一鼠标报告按键数 >= 5 才画侧键（物理建模，不画不存在的键）
+  const mice = (d.input_devices || []).filter(x => x.kind === "mouse");
+  const maxButtons = Math.max(0, ...mice.map(m => m.buttons || 0));
+  const hasSide = maxButtons >= 5;
+  const parts = MOUSE_PARTS.filter(p => hasSide || !p[0].startsWith("clicks_side"));
+  const vals = parts.map(p => d[p[0]] || 0);
   const max = Math.max(1, ...vals);
   const partColor = v => v ? kbColor(v, max) : "#161b22";
   let s = '<defs><clipPath id="mbody"><rect x="210" y="20" width="140" height="220" rx="62"/></clipPath></defs>';
   s += '<rect x="210" y="20" width="140" height="220" rx="62" fill="#0d1117" stroke="#2b3240" stroke-width="2"/>';
-  for (const [kind, x, y, w, h, label] of MOUSE_PARTS) {
+  for (const [kind, x, y, w, h, label] of parts) {
     const v = d[kind] || 0;
     const fill = kind === "scroll_ticks"
       ? (v ? "#2d5f94" : "#161b22")
@@ -538,6 +556,19 @@ async function loadInput() {
   document.getElementById("mouse-extra").textContent =
     t("moves") + ": " + d.moves.toLocaleString() + "  ·  " +
     t("scrollTicks") + ": " + (d.scroll_ticks || 0).toLocaleString();
+  // 设备型号行（Raw Input 枚举：仅硬件能力元数据）
+  const devs = d.input_devices || [];
+  const kbDevs = devs.filter(x => x.kind === "keyboard");
+  const msDevs = devs.filter(x => x.kind === "mouse");
+  const devTxt = []
+    .concat(kbDevs.map(x => t("kbDev") + " " + (vendorName(x.vid) || "HID") +
+      (x.keys_total ? " (" + x.keys_total + " " + t("keysCount") + ")" : "")))
+    .concat(msDevs.map(x => t("msDev") + " " + (vendorName(x.vid) || "HID") +
+      (x.buttons ? " (" + x.buttons + " " + t("btns") +
+        ((x.buttons >= 5 ? ", " + t("withSide") : "")) + ")" : "")))
+    .join("  ·  ");
+  document.getElementById("device-line").textContent =
+    [...new Set(devTxt.split("  ·  "))].join("  ·  ") || t("noDevice");
   // 今日 24 小时输入节奏（复用活动页的柱状图风格）
   const values = d.hourly_today || [];
   const hEl = document.getElementById("input-hours");

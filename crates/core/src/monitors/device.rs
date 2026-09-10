@@ -14,10 +14,12 @@ use windows_sys::Win32::System::SystemInformation::*;
 /// 默认启用的 14 个监控器之一（零子进程硬约束，见 CODE_NOTES.md §9），
 /// 故默认 `false`（disk_io 字段省略）。需要 I/O 速率时显式启用，
 /// 或等原生方案（PDH/IOCTL）落地后转默认。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 pub struct DeviceMonitor {
     /// 是否采集磁盘 I/O 速率（PS 子进程，默认关闭）
     pub enable_disk_io: bool,
+    /// 上次输入设备拓扑（Raw Input 枚举，仅变化时写行）
+    last_input_topology: std::sync::Mutex<Option<Vec<crate::raw_input_devices::InputDeviceInfo>>>,
 }
 
 impl Monitor for DeviceMonitor {
@@ -32,11 +34,25 @@ impl Monitor for DeviceMonitor {
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
+        // 输入设备拓扑（型号能力/VID/PID）：仅与上次不同才随快照落库
+        let input_devices = crate::raw_input_devices::enumerate();
+        let changed =
+            crate::raw_input_devices::changed_since(&input_devices, self.last_input_topology.lock().ok().as_deref().and_then(|g| g.as_deref()));
+        if changed {
+            if let Ok(mut g) = self.last_input_topology.lock() {
+                *g = Some(input_devices.clone());
+            }
+        }
         let snapshot = DeviceSnapshot {
             memory: collect_memory(),
             disks: collect_disk(),
             disk_io: if self.enable_disk_io {
                 collect_disk_io()
+            } else {
+                None
+            },
+            input_devices: if changed {
+                Some(input_devices)
             } else {
                 None
             },
@@ -86,6 +102,9 @@ struct DeviceSnapshot {
     disks: Vec<DiskItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_io: Option<DiskIo>,
+    /// 输入设备拓扑快照（仅变化时随事件携带）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_devices: Option<Vec<crate::raw_input_devices::InputDeviceInfo>>,
 }
 
 fn collect_memory() -> MemInfo {
@@ -250,6 +269,7 @@ mod tests {
     #[test]
     fn device_snapshot_contract_keys() {
         let snap = DeviceSnapshot {
+            input_devices: None,
             memory: MemInfo {
                 total_gb: 32,
                 available_gb: 14,
@@ -293,6 +313,7 @@ mod tests {
     fn device_snapshot_disk_io_none_is_omitted() {
         // disk_io 为 None 时应省略该键（前端判断 != null）
         let snap = DeviceSnapshot {
+            input_devices: None,
             memory: MemInfo {
                 total_gb: 32,
                 available_gb: 14,

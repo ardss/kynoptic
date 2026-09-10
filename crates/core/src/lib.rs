@@ -14,6 +14,7 @@ pub mod keyboard_layout;
 pub mod monitors;
 pub mod probe;
 pub mod queries;
+pub mod raw_input_devices;
 pub mod registry;
 pub mod time;
 pub mod types;
