@@ -6,75 +6,135 @@
 <title>kynoptic dashboard</title>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --fg: #c9d1d9; --dim: #8b949e; --brand: #4EA1FF; --amber: #FFB454;
-    --ok: #3fb950; --warn: #d29922;
+    /* 表面 */
+    --bg: #0A0E14; --panel: #10151E; --panel-2: #161D28;
+    --border: #232B38; --border-soft: #1A2130;
+    /* 文字 */
+    --fg: #E4EBF4; --dim: #93A1B3; --faint: #5C6B80;
+    /* 语义色 */
+    --brand: #5BA8FF; --accent-ink: #06121F;
+    --ok: #43D6A0; --warn: #F5B454; --bad: #FF6B6B;
+    --amber: #F5B454; /* 兼容旧引用 */
+    --radius: 10px; --radius-s: 6px;
+    --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --font-data: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+    --space: 8px;
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0 auto; background: var(--bg); color: var(--fg);
-    font-family: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
-    font-size: 14px; line-height: 1.5; padding: 24px; max-width: 960px;
-  }
-  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
-  h1::before { content: "▸ "; color: var(--brand); }
-  .muted { color: var(--dim); }
-  header { margin-bottom: 20px; position: relative; }
-  .lang-toggle {
-    position: absolute; top: 0; right: 0; background: var(--panel);
-    border: 1px solid var(--border); border-radius: 6px; color: var(--dim);
-    padding: 4px 12px; font: inherit; font-size: 12px; cursor: pointer;
-  }
-  .lang-toggle:hover { color: var(--brand); border-color: var(--brand); }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; }
-  .card .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
-  .card .value { font-size: 22px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .card .value.small { font-size: 15px; }
-  section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; }
-  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin: 0 0 10px; }
-  svg { display: block; max-width: 100%; }
-  ul.anomalies { list-style: none; margin: 0; padding: 0; }
-  ul.anomalies li { padding: 4px 0; border-bottom: 1px dashed var(--border); }
-  ul.anomalies li:last-child { border-bottom: none; }
-  .sev-info { color: var(--brand); } .sev-warn { color: var(--warn); } .sev-critical { color: #f85149; }
-  footer { color: var(--dim); font-size: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
-  .err { color: #f85149; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-  .tab { background: var(--panel); border: 1px solid var(--border); border-radius: 6px 6px 0 0;
-         padding: 6px 16px; cursor: pointer; color: var(--dim); }
-  .tab.active { color: var(--fg); border-bottom-color: var(--bg); border-color: var(--brand); border-bottom-color: var(--bg); }
   /* 双语：html[lang] 切换 .l.en / .l.zh */
   html[lang="en"] .l.zh, html[lang="zh"] .l.en { display: none; }
-  .settings-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-  .settings-group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
-                       color: var(--dim); margin: 0 0 8px; }
-  .mon-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
-  .mon-row input { accent-color: var(--brand); }
-  .date-input { background: var(--bg); color: var(--text); border: 1px solid var(--border);
-    border-radius: 6px; padding: 4px 8px; font-family: var(--mono, monospace);
+  html { color-scheme: dark; }
+  body {
+    margin: 0 auto; background: var(--bg); color: var(--fg);
+    font-family: var(--font-ui); font-size: 14px; line-height: 1.55;
+    padding: 20px 24px 40px; max-width: 1120px;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* 数字一律等宽：仪器读数感 */
+  .value, .app-count, #status-line, .badge, .date-input, .kb text,
+  #c-cpu, #c-mem, #settings-msg { font-variant-numeric: tabular-nums; }
+  h1 {
+    font-size: 17px; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 2px;
+    font-family: var(--font-ui);
+  }
+  h1::before { content: ""; display: none; }
+  .muted { color: var(--dim); }
+  header { margin-bottom: 18px; position: relative; padding-bottom: 14px;
+           border-bottom: 1px solid var(--border-soft); }
+  header::after { /* 签名元素：状态光带 */
+    content: ""; position: absolute; left: 0; bottom: -1px; width: 72px; height: 2px;
+    background: linear-gradient(90deg, var(--brand), transparent);
+  }
+  #status-line { font-family: var(--font-data); font-size: 12px; color: var(--faint); margin-top: 4px; }
+  .lang-toggle {
+    position: absolute; top: -4px; right: 0; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 999px; color: var(--dim);
+    padding: 4px 14px; font: inherit; font-size: 12px; cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+  .lang-toggle:hover { color: var(--brand); border-color: var(--brand); }
+  /* 页签：分段下划线式 */
+  .tabs { display: flex; gap: 2px; margin: 14px 0 18px; flex-wrap: wrap;
+          background: var(--panel); border: 1px solid var(--border-soft);
+          border-radius: var(--radius); padding: 4px; width: fit-content; }
+  .tab { background: transparent; border: none; border-radius: var(--radius-s);
+         padding: 6px 16px; cursor: pointer; color: var(--dim); font: inherit;
+         font-size: 13.5px; transition: background .15s, color .15s; }
+  .tab:hover { color: var(--fg); background: var(--panel-2); }
+  .tab.active { color: var(--fg); background: var(--panel-2);
+                box-shadow: inset 0 -2px 0 var(--brand); }
+  /* 卡片 */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
+    padding: 12px 16px; transition: border-color .15s;
+  }
+  .card:hover { border-color: var(--border); }
+  .card .label { color: var(--faint); font-size: 11.5px; text-transform: uppercase;
+                 letter-spacing: 0.12em; font-weight: 600; }
+  .card .value { font-family: var(--font-data); font-size: 24px; font-weight: 600;
+                 margin-top: 4px; letter-spacing: -0.01em;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .value.small { font-size: 15px; font-weight: 400; }
+  /* 区块 */
+  section { background: var(--panel); border: 1px solid var(--border-soft);
+            border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px; }
+  section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em;
+               color: var(--dim); margin: 0 0 12px; font-weight: 600;
+               padding-left: 10px; border-left: 2px solid var(--brand); line-height: 1.4; }
+  svg { display: block; max-width: 100%; }
+  ul.anomalies { list-style: none; margin: 0; padding: 0; }
+  ul.anomalies li { padding: 6px 0; border-bottom: 1px dashed var(--border-soft);
+                    font-family: var(--font-data); font-size: 13px; }
+  ul.anomalies li:last-child { border-bottom: none; }
+  .sev-info { color: var(--brand); } .sev-warn { color: var(--warn); } .sev-critical { color: var(--bad); }
+  footer { color: var(--faint); font-size: 12px; border-top: 1px solid var(--border-soft);
+           padding-top: 14px; margin-top: 8px; }
+  .err { color: var(--bad); }
+  /* 设置 */
+  .settings-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+  .settings-group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em;
+                       color: var(--faint); margin: 0 0 8px; font-weight: 600; }
+  .mon-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13.5px; }
+  .mon-row input { accent-color: var(--brand); width: 15px; height: 15px; }
+  .mon-row .muted[style*="font-size:10px"] { font-family: var(--font-data); }
+  .date-input { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: var(--radius-s); padding: 5px 10px; font-family: var(--font-data); font-size: 13px;
     min-width: 150px; cursor: pointer; }
-  .date-input::-webkit-calendar-picker-indicator { cursor: pointer; }
-  .kb-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
-  .kb text { pointer-events: none; font-family: var(--mono, monospace); }
-  .kb g:hover rect, .kb rect:hover { stroke: #4EA1FF; stroke-width: 2; }
-  .badge { font-size: 11px; border: 1px solid var(--border); border-radius: 3px;
-           padding: 0 5px; color: var(--amber); }
+  .date-input:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+  .date-input::-webkit-calendar-picker-indicator { cursor: pointer; filter: invert(0.7); }
+  /* 键盘/鼠标图容器 */
+  .kb-wrap { background: var(--bg); border: 1px solid var(--border-soft);
+             border-radius: var(--radius); padding: 10px; }
+  .kb text { pointer-events: none; font-family: var(--font-data); }
+  .kb g:hover rect, .kb rect:hover { stroke: var(--brand); stroke-width: 2; }
+  .badge { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px;
+           padding: 0 7px; color: var(--warn); background: rgba(245,180,84,0.08); }
   .settings-actions { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
-  button.save { background: var(--brand); color: #0d1117; border: none; border-radius: 6px;
-                padding: 6px 18px; font: inherit; cursor: pointer; }
+  /* 按钮体系：主按钮实心，次按钮描边 */
+  button.save { background: var(--brand); color: var(--accent-ink); border: 1px solid var(--brand);
+                border-radius: var(--radius-s); padding: 6px 18px; font: inherit; font-size: 13.5px;
+                font-weight: 600; cursor: pointer; transition: filter .15s; }
+  button.save:hover { filter: brightness(1.12); }
   button.save:disabled { opacity: 0.5; cursor: default; }
-  #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: #f85149; }
-  /* Top apps 横向条形榜 */
+  button.save[style*="#2A3442"], button.save[style*="background:#2A3442"] {
+    background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); font-weight: 400; }
+  button.save[style*="background:#2A3442"]:hover { border-color: var(--brand); color: var(--brand); }
+  :is(button, .tab, input, .lang-toggle):focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+  #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: var(--bad); }
+  /* 横向条形榜 */
   .app-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .app-label { width: 150px; color: var(--fg); overflow: hidden; text-overflow: ellipsis;
                white-space: nowrap; flex-shrink: 0; text-align: right; font-size: 13px; }
-  .app-track { flex: 1; height: 18px; background: var(--bg); border: 1px solid var(--border);
-               border-radius: 3px; overflow: hidden; }
-  .app-bar { display: block; height: 100%; background: var(--brand); min-width: 2px; }
-  .app-count { width: 64px; color: var(--dim); font-size: 12px; flex-shrink: 0; }
-  .hm-legend { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--dim); font-size: 12px; }
-  .hm-legend .sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+  .app-track { flex: 1; height: 16px; background: var(--bg); border: 1px solid var(--border-soft);
+               border-radius: 4px; overflow: hidden; display: block; }
+  .app-bar { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
+  .app-count { font-family: var(--font-data); font-size: 12.5px; color: var(--dim); flex-shrink: 0; }
+  .hm-legend { display: flex; align-items: center; gap: 6px; margin-top: 10px;
+               color: var(--faint); font-size: 12px; }
+  .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px;
+        margin: 0 2px; vertical-align: -1px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
@@ -85,7 +145,7 @@
   <div class="tabs">
     <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
     <div class="tab" id="tab-activity" onclick="showView('activity')"><span class="l en">Activity</span><span class="l zh">活动</span></div>
-    <div class="tab" id="tab-report" onclick="showView('report')">><span class="l en">Report</span><span class="l zh">报告</span></div>
+    <div class="tab" id="tab-report" onclick="showView('report')"><span class="l en">Report</span><span class="l zh">报告</span></div>
     <div class="tab" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></div>
     <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
     <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
@@ -128,11 +188,11 @@
   <div id="heatmap">loading…</div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
-    <span class="sw" style="background:#161b22;border:1px solid var(--border)"></span>
+    <span class="sw" style="background:#0B0F16;border:1px solid var(--border)"></span>
     <span class="sw" style="background:#1e3a5f"></span>
     <span class="sw" style="background:#2d5f94"></span>
     <span class="sw" style="background:#3b82c4"></span>
-    <span class="sw" style="background:#4EA1FF"></span>
+    <span class="sw" style="background:#5BA8FF"></span>
     <span><span class="l en">more</span><span class="l zh">多</span></span>
   </div>
 </section>
@@ -153,8 +213,8 @@
   <div style="margin-bottom:8px">
     <input type="date" id="report-date" class="date-input" onchange="loadReport()" onclick="this.showPicker && this.showPicker()">
     <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=TODAY_STR; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
-    <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
-    <button class="save" style="margin-left:8px;background:#2b3240" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
+    <button class="save" style="margin-left:8px;background:#2A3442" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
+    <button class="save" style="margin-left:8px;background:#2A3442" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
   <div id="report-timeline">loading…</div>
   <div id="report-legend" class="muted" style="margin-top:6px"></div>
@@ -205,11 +265,11 @@
   <div class="kb-wrap"><svg id="kb-heatmap" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 910 234"></svg></div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
-    <span class="sw" style="background:#161b22;border:1px solid var(--border)"></span>
+    <span class="sw" style="background:#0B0F16;border:1px solid var(--border)"></span>
     <span class="sw" style="background:#1e3a5f"></span>
     <span class="sw" style="background:#2d5f94"></span>
     <span class="sw" style="background:#3b82c4"></span>
-    <span class="sw" style="background:#4EA1FF"></span>
+    <span class="sw" style="background:#5BA8FF"></span>
     <span><span class="l en">more</span><span class="l zh">多</span></span>
   </div>
 </section>
@@ -282,7 +342,7 @@
 </section>
 <section>
   <div class="settings-actions">
-    <button class="save" style="background:#2b3240" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
+    <button class="save" style="background:#2A3442" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
   <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
     <span id="settings-msg"></span>
   </div>
@@ -298,9 +358,9 @@
 
 <script>
 "use strict";
-const PALETTE = ["#4EA1FF", "#FFB454", "#3fb950", "#bc8cff", "#39c5cf", "#8b949e"];
+const PALETTE = ["#5BA8FF", "#FFB454", "#3fb950", "#bc8cff", "#39c5cf", "#93A1B3"];
 /* 热力图五档色阶：深底色 → 品牌蓝 #4EA1FF */
-const HM_LEVELS = ["#161b22", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
+const HM_LEVELS = ["#0B0F16", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
 /* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS） */
 const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
@@ -413,17 +473,17 @@ async function loadHours() {
     const y = padT + innerH - innerH * g / 4;
     const v = Math.round(max * g / 4);
     svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
-      '" stroke="#30363d" stroke-width="1"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="11" text-anchor="end">' + v + "</text>";
+      '" stroke="#232B38" stroke-width="1"/>';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#93A1B3" font-size="11" text-anchor="end">' + v + "</text>";
   }
   values.forEach((v, hr) => {
     const bh = v / max * innerH;
     const x = padL + hr * bw + 2, y = padT + innerH - bh;
     svg += '<rect x="' + x + '" y="' + y + '" width="' + (bw - 4) + '" height="' + Math.max(bh, v > 0 ? 2 : 0) +
-      '" rx="2" fill="#4EA1FF"><title>' + hr + ":00 — " + v + '</title></rect>';
+      '" rx="2" fill="#5BA8FF"><title>' + hr + ":00 — " + v + '</title></rect>';
     if (hr % 3 === 0) {
       svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
-        '" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + "</text>";
+        '" fill="#93A1B3" font-size="11" text-anchor="middle">' + hr + "</text>";
     }
   });
   svg += "</svg>";
@@ -449,7 +509,7 @@ async function loadHeatmap() {
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
   const dayLabels = ["Mon", "", "Wed", "", "Fri", "", "Sun"];
   dayLabels.forEach((lb, r) => {
-    if (lb) svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="#8b949e" font-size="10" text-anchor="end">' + lb + "</text>";
+    if (lb) svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="#93A1B3" font-size="10" text-anchor="end">' + lb + "</text>";
   });
   days.forEach((d, i) => {
     const col = Math.floor(i / 7), row = i % 7;
@@ -457,7 +517,7 @@ async function loadHeatmap() {
     const level = hmLevel(d.value, max);
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
-      (level === 0 ? "#30363d" : "none") + '"><title>' + d.date + " — " + d.value + '</title></rect>';
+      (level === 0 ? "#232B38" : "none") + '"><title>' + d.date + " — " + d.value + '</title></rect>';
   });
   svg += "</svg>";
   el.innerHTML = svg;
@@ -504,8 +564,8 @@ const KB_ROWS = [].concat(
    [18.75,5,2,1,96,"0"],[20.75,5,1,1,110,"."]],
 );
 function kbColor(v, max) {
-  if (!v) return "#161b22";
-  const steps = ["#1e3a5f", "#1e3a5f", "#2d5f94", "#3b82c4", "#4EA1FF"];
+  if (!v) return "#0B0F16";
+  const steps = ["#1e3a5f", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
   return steps[Math.min(4, Math.floor(v / max * 5))];
 }
 function renderKeyboard(freq) {
@@ -524,7 +584,7 @@ function renderKeyboard(freq) {
       rect.setAttribute("height", h * KB_U - KB_PAD * 2);
       rect.setAttribute("rx", 4);
       rect.setAttribute("fill", kbColor(v, max));
-      rect.setAttribute("stroke", "#2b3240");
+      rect.setAttribute("stroke", "#2A3442");
       rect.setAttribute("stroke-width", "1");
       const t = document.createElementNS(ns, "text");
       t.setAttribute("x", x * KB_U + (w * KB_U) / 2);
@@ -532,7 +592,7 @@ function renderKeyboard(freq) {
       t.setAttribute("text-anchor", "middle");
       t.setAttribute("dominant-baseline", "middle");
       t.setAttribute("font-size", "11");
-      t.setAttribute("fill", v ? "#cdd9e5" : "#6e7681");
+      t.setAttribute("fill", v ? "#E4EBF4" : "#5C6B80");
       t.textContent = label;
       const title = document.createElementNS(ns, "title");
       title.textContent = label + ": " + (freq[vk] || 0).toLocaleString();
@@ -542,8 +602,8 @@ function renderKeyboard(freq) {
 }
 // 24h × Top 应用堆叠条（选定日期）+ 近 14 天每日 Top3
 // ─── 报告页：色带时间轴 / 类别占比 / 专注块 / 目标 / 趋势 ───
-const CAT_COLORS = { "开发":"#4EA1FF", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#E06C75",
-  "文档":"#C678DD", "设计":"#56B6C2", "其他":"#6e7681" };
+const CAT_COLORS = { "开发":"#5BA8FF", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#E06C75",
+  "文档":"#C678DD", "设计":"#56B6C2", "其他":"#5C6B80" };
 function catColor(name) { return CAT_COLORS[name] || "#888"; }
 function fmtMin(m) {
   const h = Math.floor(m / 60), mm = m % 60;
@@ -567,15 +627,15 @@ async function loadReport() {
   for (let hr = 0; hr <= 24; hr += 3) {
     const x = px(hr * 60);
     svg += '<line x1="' + x + '" y1="16" x2="' + x + '" y2="' + (H - 18) +
-      '" stroke="#30363d" stroke-width="1"/>';
-    svg += '<text x="' + x + '" y="12" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + ":00</text>";
+      '" stroke="#232B38" stroke-width="1"/>';
+    svg += '<text x="' + x + '" y="12" fill="#93A1B3" font-size="11" text-anchor="middle">' + hr + ":00</text>";
   }
   apps.forEach((app, i) => {
     const y = 24 + i * rowH;
-    svg += '<text x="' + (padL - 8) + '" y="' + (y + 14) + '" fill="#8b949e" font-size="11" text-anchor="end">' +
+    svg += '<text x="' + (padL - 8) + '" y="' + (y + 14) + '" fill="#93A1B3" font-size="11" text-anchor="end">' +
       esc(app.length > 20 ? app.slice(0, 19) + "…" : app) + "</text>";
     svg += '<line x1="' + padL + '" y1="' + (y + rowH - 6) + '" x2="' + (W - 12) + '" y2="' + (y + rowH - 6) +
-      '" stroke="#161b22" stroke-width="10" stroke-linecap="round" opacity="0.6"/>';
+      '" stroke="#0B0F16" stroke-width="10" stroke-linecap="round" opacity="0.6"/>';
   });
   for (const seg of segs) {
     const i = apps.indexOf(seg.app);
@@ -637,8 +697,8 @@ async function loadReport() {
     for (let g = 1; g <= 3; g++) {
       const y = padT + innerH - innerH * g / 3;
       svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
-        '" stroke="#30363d"/><text x="' + (padL - 6) + '" y="' + (y + 4) +
-        '" fill="#8b949e" font-size="11" text-anchor="end">' + Math.round(tmax * g / 3) + "</text>";
+        '" stroke="#232B38"/><text x="' + (padL - 6) + '" y="' + (y + 4) +
+        '" fill="#93A1B3" font-size="11" text-anchor="end">' + Math.round(tmax * g / 3) + "</text>";
     }
     tr.daily.forEach(function (x, i) {
       const bh = (x.active_minutes || 0) / tmax * innerH;
@@ -646,13 +706,13 @@ async function loadReport() {
         '" width="' + (bw - 4) + '" height="' + Math.max(bh, 2) + '" rx="2" fill="#3FB68B"><title>' +
         x.date + " — " + fmtMin(x.active_minutes || 0) + '</title></rect>';
       if (i % 7 === 0) svg += '<text x="' + (padL + i * bw + bw / 2) + '" y="' + (H - 6) +
-        '" fill="#8b949e" font-size="10" text-anchor="middle">' + x.date.slice(5) + "</text>";
+        '" fill="#93A1B3" font-size="10" text-anchor="middle">' + x.date.slice(5) + "</text>";
     });
     el.innerHTML = svg + "</svg>";
   }
 }
 
-const APP_COLORS = ["#4EA1FF", "#3FB68B", "#E5C07B", "#E06C75", "#C678DD", "#56B6C2", "#2d5f94"];
+const APP_COLORS = ["#5BA8FF", "#3FB68B", "#E5C07B", "#E06C75", "#C678DD", "#56B6C2", "#2d5f94"];
 async function loadApps() {
   const dateVal = document.getElementById("apps-date").value;
   const d = await jget("/api/apps_grid" + (dateVal ? "?date=" + dateVal : ""));
@@ -668,8 +728,8 @@ async function loadApps() {
   for (let g = 0; g <= 4; g++) {
     const y = padT + innerH - innerH * g / 4;
     svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
-      '" stroke="#30363d" stroke-width="1"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="11" text-anchor="end">' +
+      '" stroke="#232B38" stroke-width="1"/>';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#93A1B3" font-size="11" text-anchor="end">' +
       Math.round(hmax * g / 4) + "</text>";
   }
   for (let hr = 0; hr < 24; hr++) {
@@ -685,7 +745,7 @@ async function loadApps() {
     }
     if (hr % 3 === 0) {
       svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
-        '" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + "</text>";
+        '" fill="#93A1B3" font-size="11" text-anchor="middle">' + hr + "</text>";
     }
   }
   svg += "</svg>";
@@ -733,29 +793,29 @@ function renderMouse(d) {
   const parts = MOUSE_PARTS.filter(p => hasSide || !p[0].startsWith("clicks_side"));
   const vals = parts.map(p => d[p[0]] || 0);
   const max = Math.max(1, ...vals);
-  const partColor = v => v ? kbColor(v, max) : "#161b22";
+  const partColor = v => v ? kbColor(v, max) : "#0B0F16";
   let s = '<defs><clipPath id="mbody"><rect x="210" y="20" width="140" height="220" rx="62"/></clipPath></defs>';
-  s += '<rect x="210" y="20" width="140" height="220" rx="62" fill="#0d1117" stroke="#2b3240" stroke-width="2"/>';
+  s += '<rect x="210" y="20" width="140" height="220" rx="62" fill="#0B0F16" stroke="#2A3442" stroke-width="2"/>';
   for (const [kind, x, y, w, h, label] of parts) {
     const v = d[kind] || 0;
     const fill = kind === "scroll_ticks"
-      ? (v ? "#2d5f94" : "#161b22")
+      ? (v ? "#2d5f94" : "#0B0F16")
       : partColor(v);
     s += '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h +
-      '" rx="6" fill="' + fill + '" stroke="#2b3240" stroke-width="1"' +
+      '" rx="6" fill="' + fill + '" stroke="#2A3442" stroke-width="1"' +
       ' clip-path="' + (kind.startsWith("clicks_side") ? "none" : "url(#mbody)") + '">' +
       '<title>' + esc(labelName(kind)) + ": " + v.toLocaleString() + '</title></rect>';
     if (label) {
       const lx = kind.startsWith("clicks_side") ? x - 8 : x + w / 2;
       s += '<text x="' + lx + '" y="' + (y + h / 2 + 4) +
-        '" fill="#6e7681" font-size="12" text-anchor="middle"' +
+        '" fill="#5C6B80" font-size="12" text-anchor="middle"' +
         (kind.startsWith("clicks_side") ? "" : ' clip-path="url(#mbody)"') + '>' + label + "</text>";
     }
   }
-  s += '<text x="350" y="60" fill="#6e7681" font-size="12">L ' + (d.clicks_left || 0).toLocaleString() +
+  s += '<text x="350" y="60" fill="#5C6B80" font-size="12">L ' + (d.clicks_left || 0).toLocaleString() +
     ' · R ' + (d.clicks_right || 0).toLocaleString() +
     ' · M ' + (d.clicks_middle || 0).toLocaleString() + "</text>";
-  s += '<text x="350" y="82" fill="#6e7681" font-size="12">S1 ' + (d.clicks_side1 || 0).toLocaleString() +
+  s += '<text x="350" y="82" fill="#5C6B80" font-size="12">S1 ' + (d.clicks_side1 || 0).toLocaleString() +
     ' · S2 ' + (d.clicks_side2 || 0).toLocaleString() +
     ' · ' + t("scrollTicks") + ' ' + (d.scroll_ticks || 0).toLocaleString() + "</text>";
   svg.innerHTML = s;
@@ -824,18 +884,18 @@ async function loadInput() {
     for (let g = 0; g <= 4; g++) {
       const y = padT + innerH - innerH * g / 4;
       svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
-        '" stroke="#30363d" stroke-width="1"/>';
-      svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="11" text-anchor="end">' +
+        '" stroke="#232B38" stroke-width="1"/>';
+      svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#93A1B3" font-size="11" text-anchor="end">' +
         Math.round(mx * g / 4) + "</text>";
     }
     values.forEach((v, hr) => {
       const bh = v / mx * innerH;
       const x = padL + hr * bw + 2, y = padT + innerH - bh;
       svg += '<rect x="' + x + '" y="' + y + '" width="' + (bw - 4) + '" height="' + Math.max(bh, v > 0 ? 2 : 0) +
-        '" rx="2" fill="#4EA1FF"><title>' + hr + ":00 — " + v.toLocaleString() + '</title></rect>';
+        '" rx="2" fill="#5BA8FF"><title>' + hr + ":00 — " + v.toLocaleString() + '</title></rect>';
       if (hr % 3 === 0) {
         svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
-          '" fill="#8b949e" font-size="11" text-anchor="middle">' + hr + "</text>";
+          '" fill="#93A1B3" font-size="11" text-anchor="middle">' + hr + "</text>";
       }
     });
     svg += "</svg>";
