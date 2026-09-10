@@ -44,14 +44,33 @@ fn main() {
         }
     };
 
-    // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘
+    // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘。
+    // 健壮性:全新首装时本线程先于采集器跑,数据库文件还不存在,只读打开
+    // 必失败且托盘无控制台（错误不可见,外面就是"拒绝连接"）。因此先等库
+    // 文件就绪（至多 60s）,serve 失败再写日志文件,绝不静默消失。
     let dash_db = parsed.db.clone();
     let dash_port = parsed.port;
     let _dash_handle = thread::Builder::new()
         .name("Dashboard".into())
         .spawn(move || {
-            if let Err(e) = kynoptic_dash::serve(&dash_db, dash_port, true) {
-                eprintln!("dashboard 服务退出: {e}");
+            for _ in 0..120 {
+                if dash_db.exists() {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(500));
+            }
+            match kynoptic_dash::serve(&dash_db, dash_port, true) {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = format!(
+                        "[{}] dashboard 服务退出: {e}\n",
+                        chrono::Utc::now().to_rfc3339()
+                    );
+                    eprint!("{msg}");
+                    if let Some(dir) = dash_db.parent() {
+                        let _ = std::fs::write(dir.join("dashboard-error.log"), &msg);
+                    }
+                }
             }
         })
         .expect("dashboard 线程启动失败");
