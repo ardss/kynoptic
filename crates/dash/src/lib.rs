@@ -354,7 +354,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         human.dedup();
         automation.sort_unstable();
         automation.dedup();
-        let presence = bridge_count(&human, 2);
+        // 桥接阈值可配置（审查 DeepSeek：默认 2 分钟，用户可在设置页调 0-15）
+        let bridge = (s.presence_bridge_minutes.min(15)) as i64;
+        let presence = bridge_count(&human, bridge);
         let first_presence = first_ts.as_deref().map(minute_hhmm).unwrap_or(Value::Null);
         let last_presence = last_ts.as_deref().map(minute_hhmm).unwrap_or(Value::Null);
         (
@@ -379,7 +381,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
         for pair in rows.windows(2) {
             if let (Some(a), Some(b)) = (parse(&pair[0].0), parse(&pair[1].0)) {
-                let secs = (b - a).num_seconds().min(1800);
+                let secs = (b - a).num_seconds(); // 不封顶：连续 N 小时就是 N 小时（审查 DeepSeek）
                 *fg_dwell.entry(pair[0].1.clone()).or_insert(0) += secs;
             }
         }
@@ -396,6 +398,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "today_events": today_events,
         "presence_minutes": presence_minutes,
         "automation_minutes": automation_minutes,
+        "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,
         "fg_top": fg_top.map(|(a, _)| Value::from(a)).unwrap_or(Value::Null),
         "first_activity": first_presence,
@@ -426,13 +429,27 @@ pub fn api_heatmap_at(conn: &Connection, weeks: u32, today: chrono::NaiveDate) -
     let weeks = weeks.clamp(1, 52);
     let days = i64::from(weeks) * 7;
     let since = today - chrono::Duration::days(days - 1);
-    let since_utc = queries::local_day_range(&since.format("%Y-%m-%d").to_string())
+    let _since_utc = queries::local_day_range(&since.format("%Y-%m-%d").to_string())
         .map(|(s, _)| s)
         .unwrap_or_default();
-    let mut by_date: std::collections::BTreeMap<String, i64> =
-        queries::daily_counts_since(conn, &since_utc)
-            .into_iter()
-            .collect();
+    // 审查（DeepSeek）：口径从"每日事件条数"改为"每日键鼠输入分钟"（绝对值，
+    // 不再做窗口内相对分档）——事件条数会被系统事件与自动化注入通胀
+    let mut by_date: std::collections::BTreeMap<String, i64> = {
+        let mut m = std::collections::BTreeMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT date, COUNT(DISTINCT hour * 60 + minute) FROM agg_minute              WHERE sum_value > 0 AND bucket_id IN ('input_keys','input_clicks','input_moves')                AND date >= ?1 GROUP BY date",
+        ) {
+            let since_str = since.format("%Y-%m-%d").to_string();
+            if let Ok(rows) = stmt.query_map(params![&since_str], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (d, v) in rows.flatten() {
+                    m.insert(d, v);
+                }
+            }
+        }
+        m
+    };
     let mut out = Vec::new();
     let mut d = since;
     while d <= today {
@@ -964,8 +981,8 @@ pub fn api_insights(conn: &Connection) -> Value {
 
 /// GET /api/report?date= — 单日报告：色带时间轴、类别占比、专注时段。
 ///
-/// dwell 分段：window/switch 事件间隔即上一应用的停留时长；单段上限 120 分钟
-/// （离开电脑时的尾段不无限延长）。专注块：间隔 ≤5 分钟的连续活动且总长 ≥20 分钟。
+/// dwell 分段：window/switch 事件间隔即上一应用的停留时长（不封顶）。
+/// 专注块：间隔 ≤5 分钟的连续活动且总长 ≥20 分钟。
 pub fn api_report_at(
     conn: &Connection,
     date: &str,
@@ -1006,7 +1023,8 @@ pub fn api_report_at(
         } else {
             (start_min + 1).min(1440)
         };
-        let end_min = end_min.min(start_min + 120); // 离开电脑的尾段封顶 2h
+        // 审查（DeepSeek 骂评）：不再 120 分钟封顶——连续同应用 3 小时就是
+        // 3 小时前台时长，截断会把深度工作阉割掉；离场判定交给"人在场"指标
         if end_min <= start_min {
             continue;
         }
@@ -1113,10 +1131,18 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
     };
     let (k1, c1, m1) = sum7(0);
     let (k0, c0, m0) = sum7(7);
+    // 审查（DeepSeek）：上周数据不足（<3 个有数据日）时对比无意义——上周置空，
+    // 前端显示"上周数据不足，已跳过对比"而非误导性增长率
+    let last_week_days = rows.len().saturating_sub(7).min(7);
+    let last_week = if last_week_days >= 3 {
+        json!({"keys": k0, "clicks": c0, "active_minutes": m0})
+    } else {
+        json!(null)
+    };
     json!({
         "daily": daily,
         "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1},
-        "last_week": {"keys": k0, "clicks": c0, "active_minutes": m0},
+        "last_week": last_week,
     })
 }
 
@@ -1264,6 +1290,7 @@ fn settings_payload(s: &AppSettings) -> Value {
         "input_counts_only": s.input_counts_only,
         "dashboard_port": s.dashboard_port,
         "daily_goal_minutes": s.daily_goal_minutes,
+        "presence_bridge_minutes": s.presence_bridge_minutes,
         "categories": s.categories,
         "monitors": monitors,
     })
@@ -1296,6 +1323,13 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;
+    }
+    if let Some(v) = req.get("presence_bridge_minutes") {
+        let m = v.as_u64().ok_or("presence_bridge_minutes 应为非负整数")?;
+        if m > 15 {
+            return Err("presence_bridge_minutes 不能超过 15".into());
+        }
+        next.presence_bridge_minutes = m as u32;
     }
     if let Some(v) = req.get("daily_goal_minutes") {
         let m = v.as_u64().ok_or("daily_goal_minutes 应为非负整数")?;

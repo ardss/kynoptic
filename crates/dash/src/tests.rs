@@ -199,23 +199,31 @@ fn overview_cpu_mem_from_system_heartbeat_like_current_status() {
 // === heatmap ===
 
 #[test]
-fn heatmap_fills_missing_days_with_zero_and_counts_events() {
+fn heatmap_fills_missing_days_with_zero_and_counts_input_minutes() {
     let conn = mem_conn();
-    // 本地 2026-09-09（今天，测试锚点）3 事件，09-07 1 事件
-    for _ in 0..3 {
-        insert(&conn, &local_ts(0, 9, 0), "keyboard", "press", None);
+    // 口径（审查 DeepSeek）：热力图 = 每日"有键鼠输入的分钟数"（agg_minute，
+    // 绝对值），不再是事件条数。今天 2 个输入分钟，前天 1 个。
+    for (h, m) in [(10, 0), (10, 30)] {
+        conn.execute(
+            "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) VALUES ('2026-09-09', ?1, ?2, 'input_keys', 5, 5)",
+            rusqlite::params![h, m],
+        )
+        .unwrap();
     }
-    insert(&conn, &local_ts(-2, 9, 0), "mouse", "click", None);
+    conn.execute(
+        "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) VALUES ('2026-09-07', 9, 15, 'input_keys', 3, 3)",
+        [],
+    )
+    .unwrap();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
     let v = api_heatmap_at(&conn, 1, today);
     let days = v["days"].as_array().unwrap();
     assert_eq!(days.len(), 7, "weeks=1 → 7 天补全: {v}");
     assert_eq!(days[6]["date"], json!("2026-09-09"));
-    assert_eq!(days[6]["value"], json!(3));
+    assert_eq!(days[6]["value"], json!(2), "两个不同输入分钟");
     assert_eq!(days[4]["date"], json!("2026-09-07"));
     assert_eq!(days[4]["value"], json!(1));
     assert_eq!(days[0]["value"], json!(0), "缺数天补零");
-    // 未来不出现（今日为界）
     assert_eq!(days[0]["date"], json!("2026-09-03"));
 }
 

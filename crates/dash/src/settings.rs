@@ -67,6 +67,10 @@ pub struct AppSettings {
     /// 每日活跃目标（分钟，0 = 关闭目标进度条）。
     #[serde(default = "default_daily_goal_minutes")]
     pub daily_goal_minutes: u32,
+    /// 人在场桥接阈值（分钟，0-15）：相邻真实键鼠分钟间隙不超过该值时按
+    /// "无输入阅读"计入在场（审查 DeepSeek：2 分钟拍脑袋试点改为可配置）。
+    #[serde(default = "default_presence_bridge_minutes")]
+    pub presence_bridge_minutes: u32,
     /// 窗口分类规则（正则 token，匹配顺序即优先级，未命中 → 其他）。
     #[serde(default = "default_categories")]
     pub categories: Vec<CategoryRule>,
@@ -74,6 +78,10 @@ pub struct AppSettings {
 
 fn default_daily_goal_minutes() -> u32 {
     480
+}
+
+fn default_presence_bridge_minutes() -> u32 {
+    2
 }
 
 fn default_input_counts_only() -> bool {
@@ -99,6 +107,7 @@ impl Default for AppSettings {
             dashboard_port: DEFAULT_DASHBOARD_PORT,
             input_counts_only: true,
             daily_goal_minutes: 480,
+            presence_bridge_minutes: 2,
             categories: default_categories(),
         }
     }
@@ -244,6 +253,7 @@ mod tests {
             dashboard_port: 9000,
             input_counts_only: true,
             daily_goal_minutes: 480,
+            presence_bridge_minutes: 2,
             categories: default_categories(),
         };
         save(&db, &s).unwrap();

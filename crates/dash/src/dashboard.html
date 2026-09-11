@@ -185,7 +185,7 @@
 </div>
 
 <section>
-  <h2><span class="l en">timeline — last 12 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 12 小时（在场 / 自动化 / 无人）</span></h2>
+  <h2><span class="l en">timeline — last 24 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 24 小时（在场 / 自动化 / 无人）</span></h2>
   <div id="timeline" class="muted">loading…</div>
 </section>
 
@@ -206,7 +206,7 @@
 
 <div id="view-report" style="display:none">
 <div class="cards">
-  <div class="card"><div class="label"><span class="l en">today goal</span><span class="l zh">今日目标</span></div><div class="value" id="r-goal">–</div></div>
+  <div class="card"><div class="label"><span class="l en">keyboard/mouse input vs goal</span><span class="l zh">键鼠输入分钟 / 目标</span></div><div class="value" id="r-goal">–</div></div>
   <div class="card"><div class="label"><span class="l en">this week vs last</span><span class="l zh">本周 vs 上周</span></div><div class="value small" id="r-week">–</div></div>
 </div>
 
@@ -234,7 +234,7 @@
 
 <section>
   <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-    <span><span class="l en">activity heatmap (events per day)</span><span class="l zh">活跃度热力图（每日事件量）</span></span>
+    <span><span class="l en">activity heatmap (keyboard/mouse minutes per day)</span><span class="l zh">活跃度热力图（每日键鼠输入分钟，绝对分档）</span></span>
     <span id="hm-range" style="display:inline-flex;gap:4px">
       <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
       <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
@@ -252,6 +252,7 @@
     <span><span class="l en">more</span><span class="l zh">多</span></span>
   </div>
 </section>
+<div class="muted" style="font-size:12px;margin:8px 0"><span class="l en">Raw data export: kynoptic export --format csv --days 30</span><span class="l zh">原始数据导出：kynoptic export --format csv --days 30</span></div>
 <section>
   <h2><span class="l en">28-day trend — keyboard/mouse minutes per day</span><span class="l zh">28 天趋势 — 每日键鼠输入分钟</span></h2>
   <div id="report-trend">loading…</div>
@@ -287,7 +288,7 @@
 </div>
 
 <section>
-  <h2><span class="l en">keyboard heatmap — per-key frequency (counts only, no content)</span><span class="l zh">键盘热力图 — 按键频次（仅计数，无内容）</span></h2>
+  <h2><span class="l en">keyboard heatmap — per-key frequency (counts only, no content; rendered on ANSI-104)</span><span class="l zh">键盘热力图 — 按键频次（仅计数无内容；按 ANSI-104 布局渲染，非标准布局位置会偏；含自动化注入输入）</span></h2>
   <div class="kb-wrap"><svg id="kb-heatmap" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 910 234"></svg></div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
@@ -329,6 +330,7 @@
 </div>
 
 <div id="view-anomalies" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Deviation from your own 7-day same-hour baseline — no cloud, no universal thresholds.</span><span class="l zh">基于你自己近 7 天同时段历史基线的偏差检测——没有云端、没有通用阈值，异常只相对你自己的常态。</span></div>
 <section>
   <h2><span class="l en">anomalies — last 7 days</span><span class="l zh">异常 — 近 7 天</span></h2>
   <ul class="anomalies" id="anomalies"><li class="muted">loading…</li></ul>
@@ -375,6 +377,11 @@
     <label for="set-autostart"><span class="l en">start kynoptic on login</span><span class="l zh">开机自启动 kynoptic（托盘常驻）</span></label>
   </div>
   <h2><span class="l en">settings — input privacy</span><span class="l zh">设置 — 输入隐私</span></h2>
+  <div class="mon-row" style="display:flex;align-items:center;gap:8px">
+    <label for="set-bridge" style="white-space:nowrap"><span class="l en">presence reading-bridge (minutes, 0-15):</span><span class="l zh">人在场阅读桥接（分钟，0-15）：</span></label>
+    <input type="number" id="set-bridge" min="0" max="15" style="width:64px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
+    <span class="muted" style="font-size:11px"><span class="l en">gaps of ≤N minutes without input still count as presence (reading)</span><span class="l zh">连续 N 分钟内无键鼠输入仍按"读屏"计入在场</span></span>
+  </div>
   <div class="mon-row">
     <input type="checkbox" id="set-counts" checked>
     <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended; per-key detail off)</span>
@@ -514,18 +521,20 @@ async function loadInsights() {
     el.innerHTML = '<div class="card"><div class="value">–</div><div class="label"><span class="l en">Not enough data yet — insights appear after a day of collection</span><span class="l zh">数据还不够——采集满一天后这里会出现洞察</span></div></div>';
     return;
   }
-  el.innerHTML = d.insights.map(it => {
+  el.innerHTML = '<div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Insights are statistical patterns mined from your activity — they describe, not explain.</span><span class="l zh">洞察 = 从活动数据中挖出的统计规律，描述现象，不解释因果。</span></div>'
+    + d.insights.map(it => {
     const title = zh ? it.title_zh : it.title_en;
     const text = zh ? it.text_zh : it.text_en;
     return '<div class="card" style="margin-bottom:12px;">'
       + '<div class="label">' + esc(title) + '</div>'
       + '<div style="font-size:16px; line-height:1.7; margin-top:6px;">' + esc(text) + '</div>'
       + '</div>';
-  }).join("");
+  }).join("")
+    + '<div class="muted" style="font-size:12px;margin-top:10px"><span class="l en">Export raw data: kynoptic export --format csv --days 30</span><span class="l zh">导出原始数据：kynoptic export --format csv --days 30</span></div>';
 }
 /* ─── 12 小时时间线（横向条） ─── */
 async function loadTimeline() {
-  const tl = await jget("/api/timeline?hours=12");
+  const tl = await jget("/api/timeline?hours=24");
   const el = document.getElementById("timeline");
   if (!tl.buckets.length) { el.textContent = t("noEvents"); return; }
   const maxEvents = Math.max(1, ...tl.buckets.map(b => b.apps.reduce((a, x) => a + x.events, 0)));
@@ -561,12 +570,12 @@ async function loadTimeline() {
 }
 /* ─── 24 小时柱状图（手绘 SVG） ─── */
 /* ─── 12 周热力图（7 行 × N 列 SVG 格子） ─── */
+// 绝对分档（审查 DeepSeek：相对分档会让异常高峰把整周压成浅色）
 function hmLevel(v, max) {
   if (v <= 0) return 0;
-  const r = v / max;
-  if (r <= 0.25) return 1;
-  if (r <= 0.5) return 2;
-  if (r <= 0.75) return 3;
+  if (v <= 15) return 1;
+  if (v <= 45) return 2;
+  if (v <= 90) return 3;
   return 4;
 }
 let HM_WEEKS = 12;
@@ -766,11 +775,11 @@ async function loadReport() {
   document.getElementById("r-goal").textContent = goal
     ? (today ? fmtMin(today.active_minutes) : "0m") + " / " + fmtMin(goal)
     : "off";
-  const tw = tr.this_week || {}, lw = tr.last_week || {};
-  const pct = (a, b) => b ? (a >= b ? "▲ +" : "▼ ") + Math.round((a - b) / b * 100) + "%" : "–";
-  document.getElementById("r-week").innerHTML =
-    fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
-    " (" + pct(tw.active_minutes || 0, lw.active_minutes || 0) + ")</span>";
+  const tw = tr.this_week || {}, lw = tr.last_week;
+  document.getElementById("r-week").innerHTML = lw
+    ? fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
+      " (" + ((lw.active_minutes || 0) ? ((tw.active_minutes || 0) >= (lw.active_minutes || 0) ? "▲ +" : "▼ ") + Math.round(((tw.active_minutes || 0) - (lw.active_minutes || 0)) / (lw.active_minutes || 0) * 100) + "%" : "–") + ")</span>"
+    : "<span class='muted'>上周数据不足，已跳过对比</span>";
   const tmax = Math.max(1, ...(tr.daily || []).map(x => x.active_minutes || 0));
   const el = document.getElementById("report-trend");
   if (!(tr.daily || []).length) { el.innerHTML = '<span class="muted">' + t("noData") + "</span>"; }
@@ -1089,6 +1098,7 @@ async function loadSettings() {
   document.getElementById("mon-optin").innerHTML =
     s.monitors.filter(m => !m.default_enabled).map(row).join("");
   document.getElementById("set-autostart").checked = s.autostart;
+  document.getElementById("set-bridge").value = (s.presence_bridge_minutes ?? 2);
   document.getElementById("set-counts").checked = s.input_counts_only;
   settingsMsg("", true);
 }
@@ -1110,7 +1120,8 @@ async function saveSettings() {
     const body = {
       enabled_monitors: enabled_monitors,
       autostart: document.getElementById("set-autostart").checked,
-      input_counts_only: document.getElementById("set-counts").checked
+      input_counts_only: document.getElementById("set-counts").checked,
+      presence_bridge_minutes: Math.max(0, Math.min(15, parseInt(document.getElementById("set-bridge").value || "2", 10) || 0))
     };
     const r = await fetch("/api/settings", {
       method: "POST",
