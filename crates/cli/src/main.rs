@@ -119,7 +119,7 @@ fn cmd_stats(args: &[String]) -> Result<()> {
     let conn = open_db(&db_path)?;
     if days == 1 {
         let date = if date.is_empty() {
-            Utc::now().format("%Y-%m-%d").to_string()
+            queries::today_local_str()
         } else {
             parse_date(&date)?
         };
@@ -203,14 +203,15 @@ fn cmd_export(args: &[String]) -> Result<()> {
             ])
             .map_err(map_csv_err)?;
             for r in &rows {
+                // 外部可控字段（app_name/window_title/event_data）做公式注入中和
                 w.write_record(&[
                     r.id.to_string(),
                     r.timestamp.clone(),
                     r.event_type.clone(),
                     r.event_action.clone(),
-                    r.event_data.clone().unwrap_or_default(),
-                    r.app_name.clone().unwrap_or_default(),
-                    r.window_title.clone().unwrap_or_default(),
+                    csv_cell(&r.event_data.clone().unwrap_or_default()),
+                    csv_cell(&r.app_name.clone().unwrap_or_default()),
+                    csv_cell(&r.window_title.clone().unwrap_or_default()),
                     r.session_id.map(|x| x.to_string()).unwrap_or_default(),
                 ])
                 .map_err(map_csv_err)?;
@@ -273,7 +274,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
         i += 1;
     }
     let date = if date.is_empty() {
-        Utc::now().format("%Y-%m-%d").to_string()
+        queries::today_local_str()
     } else {
         parse_date(&date)?
     };
@@ -370,12 +371,38 @@ fn cmd_db(args: &[String]) -> Result<()> {
             println!("wal file:    {} bytes", size_wal);
         }
         "cleanup" => {
-            let days: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(90);
+            // 铁律（审查 P0）：原始 events 永不删——默认只清 sessions；
+            // 确要删事件必须显式 `cleanup <days> --yes` 且 days>=30。
+            // 参数解析失败一律报错，不再静默落 90（曾致 cleanup 0 / -1 /
+            // abc 全部变成危险的全量删除）。
+            let mut with_events = false;
+            let mut days_arg: Option<i64> = None;
+            for a in &args[1..] {
+                match a.as_str() {
+                    "--yes" => with_events = true,
+                    v => {
+                        days_arg =
+                            Some(v.parse().map_err(|_| {
+                                Error::InvalidData(format!("cleanup: 无效天数 {v:?}"))
+                            })?);
+                    }
+                }
+            }
+            let days = days_arg.unwrap_or(90);
+            if with_events && days < 30 {
+                return Err(Error::InvalidData(
+                    "删除原始事件被拒绝: 天数必须 >= 30 且显式带 --yes".into(),
+                ));
+            }
             let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
-            let n = queries::delete_events_before(&conn, &cutoff)?;
             let ns = queries::delete_closed_sessions_before(&conn, &cutoff)?;
+            let n = if with_events {
+                queries::delete_events_before(&conn, &cutoff)?
+            } else {
+                0
+            };
             println!(
-                "✓ 清理: 删除 {} 事件, {} sessions（保留 {} 天）",
+                "✓ 清理: 删除 {} 事件, {} sessions（保留 {} 天；原始事件默认保留）",
                 n, ns, days
             );
         }
@@ -418,7 +445,7 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
         i += 1;
     }
     let date = if date.is_empty() {
-        Utc::now().format("%Y-%m-%d").to_string()
+        queries::today_local_str()
     } else {
         parse_date(&date)?
     };
@@ -458,7 +485,7 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
 // === ghost ===
 fn cmd_ghost() -> Result<()> {
     let db_path = resolve_db();
-    let db = Database::open(db_path.to_str().unwrap())?;
+    let db = Database::open(db_path.to_str().unwrap_or("?"))?;
     let n = db.close_ghost_sessions();
     println!("✓ 关闭了 {} 个 session", n);
     // 重新计算所有天的 daily_agg（让 stats/anomaly 立刻反映新数据）
@@ -578,6 +605,11 @@ fn parse_when(s: &str, is_upper_bound: bool) -> Result<String> {
             }
             for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
                 if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+                    // 用户输入的是本地钟表时间（审查 P2：按 UTC 补偏移会错 8 小时）
+                    use chrono::TimeZone;
+                    if let Some(local) = chrono::Local.from_local_datetime(&dt).single() {
+                        return Ok(local.to_rfc3339());
+                    }
                     return Ok(format!("{}+00:00", dt.format("%Y-%m-%dT%H:%M:%S")));
                 }
             }
@@ -979,6 +1011,17 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
     }
 }
 
+/// CSV 公式注入中和（审查 P1：窗口标题是网页等外部可控输入，以 = + - @
+/// 或制表符开头的单元格被 Excel 打开会当公式执行）。前缀单引号使其降级
+/// 为纯文本。
+fn csv_cell(v: &str) -> String {
+    if v.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']) {
+        format!("'{v}")
+    } else {
+        v.to_string()
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
@@ -1050,10 +1093,11 @@ mod tests {
     fn parse_when_rfc3339_passthrough_and_naive_datetime() {
         let t = parse_when("2026-09-09T12:30:00+08:00", false).unwrap();
         assert_eq!(t, "2026-09-09T12:30:00+08:00");
+        // 无时区的钟表时间按本地时区解释（审查 P2：按 UTC 补偏移会错 8 小时）
         let naive = parse_when("2026-09-09T12:30", false).unwrap();
-        assert_eq!(naive, "2026-09-09T12:30:00+00:00");
+        assert!(naive.starts_with("2026-09-09T12:30:00"), "{naive}");
         let naive_s = parse_when("2026-09-09T12:30:45", true).unwrap();
-        assert_eq!(naive_s, "2026-09-09T12:30:45+00:00");
+        assert!(naive_s.starts_with("2026-09-09T12:30:45"), "{naive_s}");
     }
 
     #[test]

@@ -96,20 +96,14 @@ fn writer_loop(
     batch_size: usize,
     flush_interval: Duration,
     total_written: Arc<AtomicUsize>,
-    shutdown: Arc<AtomicBool>,
+    // 退出条件已改为只认通道断开（生产者随停机旗标退出后自然 Disconnected）
+    _shutdown: Arc<AtomicBool>,
 ) {
     use std::panic;
 
     loop {
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            writer_loop_inner(
-                &rx,
-                &db,
-                batch_size,
-                flush_interval,
-                &total_written,
-                &shutdown,
-            )
+            writer_loop_inner(&rx, &db, batch_size, flush_interval, &total_written)
         }));
         match result {
             Ok(Some(flush_count)) => {
@@ -131,7 +125,6 @@ fn writer_loop_inner(
     batch_size: usize,
     flush_interval: Duration,
     total_written: &AtomicUsize,
-    shutdown: &AtomicBool,
 ) -> Option<usize> {
     use crossbeam_channel::{RecvTimeoutError, TryRecvError};
     use std::time::Instant;
@@ -178,10 +171,9 @@ fn writer_loop_inner(
         }
 
         if batch.is_empty() {
-            if shutdown.load(Ordering::Acquire) {
-                // 外层已保证 batch 为空，无需 flush，直接退出
-                return Some(0);
-            }
+            // 审查 P1：退出只认通道断开（所有生产者退出后 Disconnected）。
+            // 不能 batch 空+shutdown 就抢跑——聚合线程的关停终值 flush
+            // 会撞上已断开的通道被静默丢弃。shutdown 前会 join 全部生产者。
             match rx.recv_timeout(flush_interval.min(Duration::from_millis(500))) {
                 Ok(event) => batch.push(event),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -265,6 +257,10 @@ pub struct Collector {
     pub session_id: i64,
     pub total_written: Arc<AtomicUsize>,
     pub writer_handle: Option<thread::JoinHandle<()>>,
+    /// InputAgg 聚合线程句柄：关停时先 join 它（终值 flush 入队）再 join
+    /// writer，顺序保证终值必被落库（审查 P1：此前句柄即弃，flush 撞上
+    /// writer 已退出的通道被静默丢弃）。
+    agg_handle: Option<thread::JoinHandle<()>>,
     pub hooks: Vec<Box<dyn EventHook>>,
     /// 设置副本：shutdown 时决定是否 flush 未满分钟的部分输入计数。
     settings: CollectorSettings,
@@ -293,8 +289,11 @@ impl Collector {
             h.stop();
         }
 
-        // minute 粒度的"最后一分钟不丢"由聚合线程负责：它看到停机旗标后
-        // 先 flush 入队再退出（通道顺序安全）。这里不再绕过通道直写。
+        // minute 粒度的"最后一分钟不丢"由聚合线程负责：先 join 它（终值
+        // flush 已入队），再 join writer（审查 P1：顺序不能反）。
+        if let Some(h) = self.agg_handle.take() {
+            let _ = h.join();
+        }
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
         }
@@ -320,10 +319,13 @@ impl Drop for Collector {
             for h in &self.hooks {
                 h.stop();
             }
+            // 先 join 聚合线程（它的终值 flush 已入队），再 join writer
+            if let Some(h) = self.agg_handle.take() {
+                let _ = h.join();
+            }
             if let Some(handle) = self.writer_handle.take() {
-                // 先 join writer：通道里残留的秒级小快照全部落库后，
-                // 再直写部分分钟终值——直写必然后发生，不会被旧快照覆盖
-                // （审查 P1：先直写后 join 会让 writer 把终值覆盖回小值）
+                // 再 join writer：通道里残留的秒级小快照全部落库后，
+                // 直写部分分钟终值必然后发生，不会被旧快照覆盖
                 let _ = handle.join();
                 if self.settings.input_granularity == InputGranularity::Minute {
                     let events = input_agg::flush_partial(chrono::Local::now());
@@ -410,28 +412,31 @@ pub fn start_collection_custom(
     // drain 并按分钟折叠成 input_agg 事件入队（见 input_agg 模块文档）。
     input_agg::reset();
     let minute_mode = settings.input_granularity == InputGranularity::Minute;
+    let mut agg_handle: Option<thread::JoinHandle<()>> = None;
     if minute_mode {
         input_agg::activate();
         let tx_agg = tx.clone();
         let sd_agg = shutdown.clone();
-        thread::Builder::new()
-            .name("InputAgg".into())
-            .spawn(move || loop {
-                thread::sleep(Duration::from_secs(1));
-                if sd_agg.load(Ordering::Acquire) {
-                    // 关停兜底（审查 P1：必须在这里入队而不是 shutdown 直写——
-                    // 本线程是最后一个生产者，入队晚于队列里残留的秒级小快照，
-                    // writer 按序落库即天然消除"小快照后写覆盖最终行"竞态）
-                    for e in input_agg::flush_partial(chrono::Local::now()) {
+        agg_handle = Some(
+            thread::Builder::new()
+                .name("InputAgg".into())
+                .spawn(move || loop {
+                    thread::sleep(Duration::from_secs(1));
+                    if sd_agg.load(Ordering::Acquire) {
+                        // 关停兜底（审查 P1：必须在这里入队而不是 shutdown 直写——
+                        // 本线程是最后一个生产者，入队晚于队列里残留的秒级小快照，
+                        // writer 按序落库即天然消除"小快照后写覆盖最终行"竞态）
+                        for e in input_agg::flush_partial(chrono::Local::now()) {
+                            send_event(&tx_agg, e);
+                        }
+                        return;
+                    }
+                    for e in input_agg::drain(chrono::Local::now()) {
                         send_event(&tx_agg, e);
                     }
-                    return;
-                }
-                for e in input_agg::drain(chrono::Local::now()) {
-                    send_event(&tx_agg, e);
-                }
-            })
-            .expect("InputAgg 聚合线程启动失败");
+                })
+                .expect("InputAgg 聚合线程启动失败"),
+        );
     }
 
     // Hook 不带 name()（EventHook trait 最小面），按启用集条件构建。
@@ -490,6 +495,7 @@ pub fn start_collection_custom(
         session_id,
         total_written,
         writer_handle: Some(writer_handle),
+        agg_handle,
         hooks,
         settings,
         shutdown,

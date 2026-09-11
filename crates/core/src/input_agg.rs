@@ -169,10 +169,11 @@ impl MinuteKey {
 }
 
 static PENDING: Mutex<Option<(MinuteKey, MinuteCounters)>> = Mutex::new(None);
-/// 重启抑制：activate 后的当前剩余分钟内不发事件（审查 P1——重启后计数器
-/// 从零开始，同分钟秒级快照比库里已存终值小，UPSERT 会把大值覆盖回小值；
-/// 抑制到下次 rollover，代价是重启时起 ≤59s 键鼠不计数）。
-static SUPPRESS_FIRST_MINUTE: AtomicBool = AtomicBool::new(true);
+/// 重启抑制（二轮审查重设计）：绑定**具体分钟**而非裸布尔。activate 时记下
+/// 当前分钟，该分钟内不发事件（重启后计数器从零开始，秒级小快照会把库里
+/// 已存的大终值覆盖回小值）；过期条件 = rollover 或 flush 遇到不同分钟，
+/// 且被抑制分钟的计数**直接丢弃**（注释语义"≤59s 不计数"的严格实现）。
+static SUPPRESS_MINUTE: Mutex<Option<MinuteKey>> = Mutex::new(None);
 /// 秒级可见：drain 每秒被调用一次，把当前分钟累计值整体 UPSERT 覆盖到
 /// 数据库同一行（0005 迁移的部分唯一索引）。派生缓存行的原地覆盖不违反
 /// 原始数据只增铁律（铁律保护对象是 press/click 等原始事件）。
@@ -257,21 +258,26 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
     let mut out = Vec::new();
     // 锁中毒不应静默清零输入统计（审查 P2）：取回内部数据继续
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
     {
-        // 抑制旗只在"仍是 activate 时的那一分钟"生效；rolleover 分支自然解除。
-        let in_suppressed_minute = SUPPRESS_FIRST_MINUTE.load(Ordering::Acquire);
+        // 抑制判定绑定具体分钟（二轮审查：裸布尔在 rollover/None 分支清不掉）
+        let suppressing = matches!(&*sup, Some(k) if *k == cur);
         match g.take() {
             Some((key, mut acc)) if key == cur => {
                 acc.add(drained);
                 // 秒级可见：只要本分钟有输入，就把累计值整行 UPSERT（下游幂等覆盖）
-                if !acc.is_empty() && !in_suppressed_minute {
+                if !acc.is_empty() && !suppressing {
                     out = events_for(key, &acc);
                 }
                 *g = Some((key, acc));
             }
             Some((key, acc)) => {
-                out = events_for(key, &acc);
-                SUPPRESS_FIRST_MINUTE.store(false, Ordering::Release);
+                // rollover：被抑制分钟攒的计数**直接丢弃**——它们是重启后
+                // 的小值，写出去会把库里上一会话的大终值覆盖回小值
+                if !suppressing {
+                    out = events_for(key, &acc);
+                }
+                *sup = None;
                 *g = Some((cur, drained));
             }
             None => {
@@ -286,6 +292,14 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
 pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
     let drained = drain_atomics();
     let cur = MinuteKey::of(now_local);
+    // 抑制分钟内：残留计数直接丢弃（小值覆盖大终值的口子，二轮审查 P1）
+    {
+        let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(sup.as_ref(), Some(k) if *k == cur) {
+            *sup = None;
+            return Vec::new();
+        }
+    }
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     let (key, mut acc) = match g.take() {
         Some((k, a)) => (k, a),
@@ -317,7 +331,8 @@ pub fn reset() {
 /// 进入 minute 聚合模式（仅 [`crate::collector::start_collection_with`] 调用）。
 pub(crate) fn activate() {
     set_minute_mode(true);
-    SUPPRESS_FIRST_MINUTE.store(true, Ordering::Release);
+    let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
+    *sup = Some(MinuteKey::of(chrono::Local::now()));
 }
 
 #[cfg(test)]

@@ -178,7 +178,7 @@ fn foreground_app(
 fn idle_seconds(conn: &Connection) -> Option<f64> {
     let ts: String = conn
         .query_row(
-            "SELECT timestamp FROM events ORDER BY timestamp DESC LIMIT 1",
+            "SELECT timestamp FROM events WHERE event_type IN ('keyboard','mouse','window') ORDER BY timestamp DESC LIMIT 1",
             [],
             |r| r.get(0),
         )

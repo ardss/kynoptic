@@ -25,7 +25,8 @@ or MCP.
 - **40 monitors** cover the system: foreground window and app switches,
   keyboard/mouse activity counts, idle time, battery, network interfaces,
   devices, processes, audio, brightness, Wi-Fi and more. **14 are enabled by
-  default** (pure Win32 APIs, zero subprocesses); 26 more (browser tabs,
+  default** (pure Win32 APIs; note wifi/power-plan probes shell out to
+  netsh/powercfg); 26 more (browser tabs,
   clipboard, Bluetooth, and others) ship in the binary and are opt-in.
 - **Raw events are stored untouched** in SQLite on your machine. Aggregate
   tables (per-minute/per-day buckets) exist only as derived read caches for
@@ -88,7 +89,7 @@ harness in this repo (full methodology and raw numbers in
 ## Privacy
 
 - Recorded data never leaves your machine by default. There is no account, no
-  telemetry, no analytics, no network calls.
+  telemetry, no analytics, no network calls except the user-invoked kynoptic update (GitHub).
 - **Keyboard and mouse are stored as per-minute counts only — never key
   contents, key order, or timing.** The dashboard keyboard heatmap uses
   per-key frequency counts (how many times each key was pressed), which are

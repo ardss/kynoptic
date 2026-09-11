@@ -162,6 +162,17 @@ pub fn first_invalid_id(ids: &[String]) -> Option<String> {
 
 /// 注册表 Run 项里 Kynoptic 是否已启用（缺省 autostart 的探测源）。
 /// 仅 Windows 有实际意义；其他平台恒 false。
+/// 注册表 Run 键探测的公开版（tray 启动同步用，见 tray/main.rs）。
+#[cfg(target_os = "windows")]
+pub fn autostart_registry_enabled_pub() -> bool {
+    autostart_registry_enabled()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn autostart_registry_enabled_pub() -> bool {
+    false
+}
+
 #[cfg(target_os = "windows")]
 fn autostart_registry_enabled() -> bool {
     use winreg::enums::HKEY_CURRENT_USER;

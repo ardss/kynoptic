@@ -194,8 +194,20 @@ fn main() {
         })
         .expect("设置监听线程启动失败");
 
-    // 启动时按当前设置同步一次自启动
-    apply_autostart(kynoptic_dash::settings::load(&parsed.db).autostart);
+    // 启动时按当前设置同步一次自启动。
+    // 审查 P1：settings.json 与注册表 Run 键不一致时（典型：安装器刚写好
+    // Run 键，磁盘残留的旧 settings.json 里 autostart=false），**注册表为准**
+    // 回写设置——注册表是用户在安装向导/仪表盘里最近一次显式操作的产物，
+    // 不能被启动时序静默撤销。
+    {
+        let mut st = kynoptic_dash::settings::load(&parsed.db);
+        let reg = kynoptic_dash::settings::autostart_registry_enabled_pub();
+        if reg && !st.autostart {
+            st.autostart = true;
+            let _ = kynoptic_dash::settings::save(&parsed.db, &st);
+        }
+        apply_autostart(st.autostart);
+    }
 
     // 初始启动采集
     let _ = cmd_tx.send(CollectorCmd::Start);

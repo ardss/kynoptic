@@ -21,7 +21,8 @@ mod imp {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _disp) = hkcu.create_subkey(RUN_KEY_PATH)?;
 
-        let mut cmd = exe_path.to_string_lossy().to_string();
+        // exe 路径必须整体加引号（审查 P1：含空格路径会被 Run 键按前缀歧义解析）
+        let mut cmd = format!("\"{}\"", exe_path.to_string_lossy());
         for a in args {
             if a.contains(' ') {
                 cmd.push_str(&format!(" \"{}\"", a));

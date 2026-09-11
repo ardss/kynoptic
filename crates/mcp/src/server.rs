@@ -247,7 +247,14 @@ fn tool_definitions() -> Vec<Value> {
 /// 单行解析失败回 -32700（不中断会话——坏行之后的消息照常处理）。
 pub fn serve<R: BufRead, W: Write>(reader: R, writer: &mut W, server: &McpServer) {
     for line in reader.lines() {
-        let Ok(line) = line else { break };
+        let Ok(line) = line else {
+            // 非 UTF-8 字节：按 parse error 回应并继续会话（审查 P1：
+            // 此前直接 break 静默退出，与畸形 JSON 的容错策略自相矛盾）
+            let resp = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error: invalid UTF-8\"}}";
+            let _ = writeln!(writer, "{resp}");
+            let _ = writer.flush();
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }

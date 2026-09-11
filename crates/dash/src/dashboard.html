@@ -440,6 +440,8 @@ function applyLang(lang) {
 }
 function toggleLang() {
   applyLang(document.documentElement.lang === "zh" ? "en" : "zh");
+  // 设置页不刷新：语言切换不能覆盖未保存的勾选（与轮询豁免同一理由）
+  if (currentView === "settings") return;
   refreshAll().catch(() => {});
 }
 /* ─── 状态行 / Overview ─── */
@@ -554,8 +556,11 @@ function setHeatmapRange(weeks) {
   });
   loadHeatmap().catch(() => {});
 }
+let HM_SEQ = 0;
 async function loadHeatmap() {
+  const seq = ++HM_SEQ;
   const hm = await jget("/api/heatmap?weeks=" + HM_WEEKS);
+  if (seq !== HM_SEQ) return; // 连点 12/26/52 周：只让最后一次的响应生效
   const el = document.getElementById("heatmap");
   const days = hm.days;
   const max = Math.max(1, ...days.map(d => d.value));
@@ -1123,7 +1128,11 @@ refreshAll().catch(e => {
 // 只在进入页签和保存成功时（loadSettings/saveSettings 内部）重新加载。
 setInterval(() => {
   if (currentView === "settings") return;
-  refreshAll().catch(() => {});
+  refreshAll().catch(() => {
+    // 审查 P1：轮询失败不能静默停在旧数据，给出可见的断连提示
+    const el = document.getElementById("status-line");
+    if (el) { el.textContent = "LDisconnected - retrying"; el.style.color = "#e06c6c"; }
+  });
 }, 5000);
 </script>
 </body>

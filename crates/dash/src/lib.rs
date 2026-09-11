@@ -1185,9 +1185,9 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         // 一个半开连接/慢客户端就能挂死 accept 循环，整个面板假死）。
         // Connection 非 Sync，无法跨线程共享——每连接只读打开一次（本地低并发）。
         let db_owned = db_owned.clone();
-        let inflight = inflight.clone();
+        let inflight_inner = inflight.clone();
         inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("dash-conn".into())
             .spawn(move || {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
@@ -1195,8 +1195,13 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 if let Err(e) = handle_client(stream, &db_owned, bound) {
                     log::warn!("dashboard 连接处理失败: {e}");
                 }
-                inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            });
+                inflight_inner.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            })
+            .is_err()
+        {
+            // spawn 失败必须归还名额，否则累计 64 次后面板永久 503（审查 P2）
+            inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(())
 }
