@@ -502,15 +502,8 @@ async function loadOverview() {
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
   document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;
   document.getElementById("c-dbsize").textContent = fmtBytes((o.db_size_bytes || 0) + (o.db_wal_bytes || 0));
-  document.getElementById("c-cpu").textContent = pct(o.cpu_pct);
-  document.getElementById("c-mem").textContent = pct(o.mem_pct);
-  document.getElementById("c-foreground").textContent = o.foreground_app || "–";
 
   const s = await jget("/api/summary");
-  document.getElementById("c-active").textContent = s.active_minutes;
-  document.getElementById("c-keys").textContent = s.keys.toLocaleString();
-  document.getElementById("c-clicks").textContent = s.clicks.toLocaleString();
-  document.getElementById("c-app").textContent = s.top_app || "–";
 }
 /* ─── 洞察页：从原始数据挖掘出的叙事式发现 ─── */
 async function loadInsights() {
