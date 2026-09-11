@@ -160,6 +160,17 @@
 <div id="view-overview">
 
 <div class="cards">
+  <div class="card" style="grid-column: 1 / -1; display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 24px; padding:18px 22px;">
+    <div>
+      <div class="label"><span class="l en">time at computer today</span><span class="l zh">今日在电脑前</span></div>
+      <div class="value" id="c-presence" style="font-size:40px;">–</div>
+    </div>
+    <div style="font-size:13px; color:var(--dim); line-height:1.7;">
+      <div><span class="l en">first activity</span><span class="l zh">首次活动</span>: <span id="c-first">–</span></div>
+      <div><span class="l en">last activity</span><span class="l zh">最近活动</span>: <span id="c-last">–</span></div>
+      <div><span class="l en">activity events</span><span class="l zh">活动事件</span>: <span id="c-presence-events">–</span></div>
+    </div>
+  </div>
   <div class="card"><div class="label"><span class="l en">session uptime</span><span class="l zh">会话时长</span></div><div class="value" id="c-uptime">–</div></div>
   <div class="card"><div class="label"><span class="l en">today events</span><span class="l zh">今日事件</span></div><div class="value" id="c-today-events">–</div></div>
   <div class="card"><div class="label"><span class="l en">monitors enabled</span><span class="l zh">启用监控器</span></div><div class="value" id="c-monitors">–</div></div>
@@ -454,6 +465,16 @@ async function loadStatus() {
 function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
 async function loadOverview() {
   const o = await jget("/api/overview");
+  // 今日在电脑前：分钟 -> X 小时 Y 分钟
+  const pm = o.presence_minutes || 0;
+  const hh = Math.floor(pm / 60), mm = pm % 60;
+  document.getElementById("c-presence").textContent =
+    (document.documentElement.lang === "zh")
+      ? hh + " 小时 " + mm + " 分钟"
+      : hh + "h " + mm + "m";
+  document.getElementById("c-first").textContent = o.first_activity || "–";
+  document.getElementById("c-last").textContent = o.last_activity || "–";
+  document.getElementById("c-presence-events").textContent = (o.today_events || 0).toLocaleString();
   document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
   document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;

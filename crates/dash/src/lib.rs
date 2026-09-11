@@ -233,10 +233,42 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         h
     };
 
+    // 今日在电脑前：有键鼠/窗口活动的分钟数 + 首次/最近活动时刻（审查需求：
+    // 用户第一眼要看的是聚合后的"人在电脑前多久"，而不是原始事件数）
+    let presence_minutes = queries::active_minutes_today(conn, &start, &end);
+    let (first_activity, last_activity): (Value, Value) = conn
+        .query_row(
+            "SELECT MIN(timestamp), MAX(timestamp) FROM events              WHERE event_type IN ('keyboard','mouse','window')                AND timestamp >= ?1 AND timestamp < ?2",
+            params![&start, &end],
+            |r| {
+                let f: Option<String> = r.get(0)?;
+                let l: Option<String> = r.get(1)?;
+                Ok((f, l))
+            },
+        )
+        .map(|(f, l)| {
+            let hm = |ts: Option<String>| -> Value {
+                // RFC3339 UTC -> 本地 HH:MM
+                ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                    .map(|t| {
+                        t.with_timezone(&chrono::Local)
+                            .format("%H:%M")
+                            .to_string()
+                    })
+                    .map(Value::from)
+                    .unwrap_or(Value::Null)
+            };
+            (hm(f), hm(l))
+        })
+        .unwrap_or((Value::Null, Value::Null));
+
     json!({
         "host": host,
         "today": today,
         "today_events": today_events,
+        "presence_minutes": presence_minutes,
+        "first_activity": first_activity,
+        "last_activity": last_activity,
         "monitors_enabled": s.enabled_monitors.len(),
         "monitors_total": registry::MONITOR_REGISTRY.len(),
         "input_counts_only": s.input_counts_only,
