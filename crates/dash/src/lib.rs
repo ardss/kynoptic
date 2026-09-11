@@ -172,11 +172,30 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     })
 }
 
-/// GET /api/overview — 运行信息卡片数据。
-///
-/// 会话：sessions 表最近一条（end_time IS NULL 视为进行中）；
-/// 系统信息复用 MCP `get_current_status` 同一数据面（current_state 表优先，
-/// 缺失时从最新 system/heartbeat 与 window/switch 事件推导）。
+/// 相邻在场分钟间隙 <= gap 分钟按在场桥接，返回桥接后的总在场分钟数
+/// （经典 afk 模型：活动重置计时器，短间隙是"读屏不敲键"）
+fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
+    if sorted_minutes.is_empty() {
+        return 0;
+    }
+    let mut total = 1i64;
+    let mut prev = sorted_minutes[0];
+    for &m in &sorted_minutes[1..] {
+        let step = (m - prev).min(gap + 1);
+        total += step.max(1);
+        prev = m;
+    }
+    total
+}
+
+/// "YYYY-MM-DDTHH:MM"（UTC 分钟串）-> 本地 "HH:MM"
+fn minute_hhmm(minute_str: &str) -> Value {
+    chrono::DateTime::parse_from_rfc3339(&format!("{}:00+00:00", minute_str))
+        .ok()
+        .map(|t| Value::from(t.with_timezone(&chrono::Local).format("%H:%M").to_string()))
+        .unwrap_or(Value::Null)
+}
+
 pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     let today = queries::today_local_str();
     let (start, end) = queries::today_range();
@@ -233,42 +252,91 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         h
     };
 
-    // 今日在电脑前：有键鼠/窗口活动的分钟数 + 首次/最近活动时刻（审查需求：
-    // 用户第一眼要看的是聚合后的"人在电脑前多久"，而不是原始事件数）
-    let presence_minutes = queries::active_minutes_today(conn, &start, &end);
-    let (first_activity, last_activity): (Value, Value) = conn
-        .query_row(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM events              WHERE event_type IN ('keyboard','mouse','window')                AND timestamp >= ?1 AND timestamp < ?2",
-            params![&start, &end],
-            |r| {
-                let f: Option<String> = r.get(0)?;
-                let l: Option<String> = r.get(1)?;
-                Ok((f, l))
-            },
+    // 三指标模型（审查用户需求+语义审计）：
+    //   人在场 = 过滤注入后的真实键鼠分钟（相邻分钟间隙 <=2 分钟按"无输入阅读"桥接）
+    //   自动化活动 = 有注入输入（LLKHF/LLMHF_INJECTED，如 SendKeys/自动化）的分钟数
+    //   窗口切换不计时长（可能是自动化开窗），只用于前台应用归类
+    let (presence_minutes, automation_minutes, first_presence, last_presence) = {
+        let mut human: Vec<i64> = Vec::new();
+        let mut automation: Vec<i64> = Vec::new();
+        let mut first_ts: Option<String> = None;
+        let mut last_ts: Option<String> = None;
+        let minute_of_day = |minute_str: &str| -> Option<i64> {
+            chrono::DateTime::parse_from_rfc3339(&format!("{}:00+00:00", minute_str))
+                .ok()
+                .map(|t| {
+                    use chrono::Timelike;
+                    let l = t.with_timezone(&chrono::Local);
+                    l.hour() as i64 * 60 + l.minute() as i64
+                })
+        };
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT substr(timestamp,1,16), MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)), MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0))              FROM events WHERE event_action = 'input_agg' AND json_valid(event_data)                AND timestamp >= ?1 AND timestamp < ?2              GROUP BY substr(timestamp,1,16)",
+        ) {
+            let rows = stmt.query_map(params![&start, &end], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for (minute_str, human_keys, injected) in rows.flatten() {
+                    let mod_ = minute_of_day(&minute_str);
+                    if human_keys > 0 {
+                        if let Some(m) = mod_ {
+                            human.push(m);
+                        }
+                        if first_ts.is_none() {
+                            first_ts = Some(minute_str.clone());
+                        }
+                        last_ts = Some(minute_str);
+                    } else if injected > 0 {
+                        if let Some(m) = mod_ {
+                            automation.push(m);
+                        }
+                    }
+                }
+            }
+        }
+        // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT substr(timestamp,1,16) FROM events              WHERE event_action IN ('press','click')                AND timestamp >= ?1 AND timestamp < ?2",
+        ) {
+            let rows = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0));
+            if let Ok(rows) = rows {
+                for minute_str in rows.flatten() {
+                    if let Some(m) = minute_of_day(&minute_str) {
+                        human.push(m);
+                    }
+                }
+            }
+        }
+        // 桥接：排序去重后，相邻在场分钟间隙 <=2 分钟（即缺失 1-2 分钟）按
+        // "无输入阅读"计入在场。跑段累计覆盖分钟数。
+        human.sort_unstable();
+        human.dedup();
+        automation.sort_unstable();
+        automation.dedup();
+        let presence = bridge_count(&human, 2);
+        let first_presence = first_ts.as_deref().map(minute_hhmm).unwrap_or(Value::Null);
+        let last_presence = last_ts.as_deref().map(minute_hhmm).unwrap_or(Value::Null);
+        (
+            presence,
+            automation.len() as i64,
+            first_presence,
+            last_presence,
         )
-        .map(|(f, l)| {
-            let hm = |ts: Option<String>| -> Value {
-                // RFC3339 UTC -> 本地 HH:MM
-                ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
-                    .map(|t| {
-                        t.with_timezone(&chrono::Local)
-                            .format("%H:%M")
-                            .to_string()
-                    })
-                    .map(Value::from)
-                    .unwrap_or(Value::Null)
-            };
-            (hm(f), hm(l))
-        })
-        .unwrap_or((Value::Null, Value::Null));
+    };
 
     json!({
         "host": host,
         "today": today,
         "today_events": today_events,
         "presence_minutes": presence_minutes,
-        "first_activity": first_activity,
-        "last_activity": last_activity,
+        "automation_minutes": automation_minutes,
+        "first_activity": first_presence,
+        "last_activity": last_presence,
         "monitors_enabled": s.enabled_monitors.len(),
         "monitors_total": registry::MONITOR_REGISTRY.len(),
         "input_counts_only": s.input_counts_only,

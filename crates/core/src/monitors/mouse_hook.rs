@@ -64,7 +64,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
                         WM_XBUTTONDOWN => (ms.mouse_data & 0xffff).clamp(1, 2) as usize + 2,
                         _ => 0,
                     };
-                    crate::input_agg::record_click_button(button);
+                    // LLMHF_INJECTED（0x1）：合成输入单独计数
+                    let injected = ms.flags & 0x1 != 0;
+                    crate::input_agg::record_click_button(button, injected);
                 }
                 WM_MOUSEWHEEL => {
                     let delta = (ms.mouse_data >> 16) as i16 as i32;

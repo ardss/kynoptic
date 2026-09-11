@@ -33,8 +33,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
         // minute 粒度（opt-in）：纯原子计数，跳过修饰键采样与事件构造
         if crate::input_agg::minute_mode() {
             if matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
-                let vk = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) }.vk_code;
-                crate::input_agg::record_key_vk(vk);
+                let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+                // LLKHF_INJECTED（0x10）：SendKeys/SendInput 等合成输入，
+                // 单独计数供"人在场 vs 自动化活动"分离
+                let injected = kb.flags & 0x10 != 0;
+                crate::input_agg::record_key_vk(kb.vk_code, injected);
             }
             return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
         }

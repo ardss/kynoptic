@@ -50,6 +50,9 @@ static BUTTON: [AtomicU64; 5] = {
     [Z; 5]
 };
 static SCROLL_TICKS: AtomicU64 = AtomicU64::new(0);
+/// 注入输入（自动化/合成）单独计数，绝不混入人的活动（三指标模型）
+static INJECTED_KEYS: AtomicU64 = AtomicU64::new(0);
+static INJECTED_CLICKS: AtomicU64 = AtomicU64::new(0);
 static MOVES: AtomicU64 = AtomicU64::new(0);
 static MOVE_DIST_PX: AtomicU64 = AtomicU64::new(0);
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -65,18 +68,26 @@ pub fn record_key() {
 }
 
 /// 键盘按下并带 vk code（minute 模式热力图路径）。
-pub fn record_key_vk(vk: u32) {
+/// injected = LLKHF_INJECTED（SendKeys/SendInput 等合成输入）——单独计数，
+/// 供"人在场 vs 自动化活动"分离（三指标模型，审查用户需求）。
+pub fn record_key_vk(vk: u32, injected: bool) {
     KEYS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if injected {
+        INJECTED_KEYS.fetch_add(1, Ordering::Relaxed);
+    }
     if (vk as usize) < 256 {
         VK[vk as usize].fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// 鼠标按下并分键（0=left 1=right 2=middle 3=side1 4=side2；release 不计）。
-pub fn record_click_button(button: usize) {
+pub fn record_click_button(button: usize, injected: bool) {
     CLICKS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if injected {
+        INJECTED_CLICKS.fetch_add(1, Ordering::Relaxed);
+    }
     if button < 5 {
         BUTTON[button].fetch_add(1, Ordering::Relaxed);
     }
@@ -115,6 +126,9 @@ struct MinuteCounters {
     vk: Vec<(u8, u64)>,
     /// 点击分键 [left, right, middle]
     buttons: [u64; 5],
+    /// 注入输入（合成/自动化）子集计数，<= keys/clicks（三指标模型）
+    injected_keys: u64,
+    injected_clicks: u64,
 }
 
 impl MinuteCounters {
@@ -129,6 +143,8 @@ impl MinuteCounters {
     fn add(&mut self, o: MinuteCounters) {
         self.keys += o.keys;
         self.clicks += o.clicks;
+        self.injected_keys += o.injected_keys;
+        self.injected_clicks += o.injected_clicks;
         self.scroll_ticks += o.scroll_ticks;
         self.moves += o.moves;
         self.move_dist_px += o.move_dist_px;
@@ -191,6 +207,8 @@ fn drain_atomics() -> MinuteCounters {
         moves: MOVES.swap(0, Ordering::Relaxed),
         move_dist_px: MOVE_DIST_PX.swap(0, Ordering::Relaxed),
         samples: SAMPLES.swap(0, Ordering::Relaxed),
+        injected_keys: INJECTED_KEYS.swap(0, Ordering::Relaxed),
+        injected_clicks: INJECTED_CLICKS.swap(0, Ordering::Relaxed),
         vk,
         buttons: [
             BUTTON[0].swap(0, Ordering::Relaxed),
@@ -214,31 +232,39 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
             c.vk.iter()
                 .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
                 .collect();
+        let mut kd = serde_json::json!({
+            "keys": c.keys,
+            "samples": c.samples,
+            "vk": vk_map,
+        });
+        if c.injected_keys > 0 {
+            kd["injected_keys"] = serde_json::json!(c.injected_keys);
+        }
         out.push(
             Event::new(EventAction::InputAgg, EventType::Keyboard)
-                .data(serde_json::json!({
-                    "keys": c.keys,
-                    "samples": c.samples,
-                    "vk": vk_map,
-                }))
+                .data(kd)
                 .app("", ""),
         );
     }
     if c.clicks > 0 || c.scroll_ticks > 0 || c.moves > 0 || c.move_dist_px > 0 {
+        let mut md = serde_json::json!({
+            "clicks": c.clicks,
+            "scroll_ticks": c.scroll_ticks,
+            "moves": c.moves,
+            "move_distance_px": c.move_dist_px,
+            "samples": c.samples,
+            "clicks_left": c.buttons[0],
+            "clicks_right": c.buttons[1],
+            "clicks_middle": c.buttons[2],
+            "clicks_side1": c.buttons[3],
+            "clicks_side2": c.buttons[4],
+        });
+        if c.injected_clicks > 0 {
+            md["injected_clicks"] = serde_json::json!(c.injected_clicks);
+        }
         out.push(
             Event::new(EventAction::InputAgg, EventType::Mouse)
-                .data(serde_json::json!({
-                    "clicks": c.clicks,
-                    "scroll_ticks": c.scroll_ticks,
-                    "moves": c.moves,
-                    "move_distance_px": c.move_dist_px,
-                    "samples": c.samples,
-                    "clicks_left": c.buttons[0],
-                    "clicks_right": c.buttons[1],
-                    "clicks_middle": c.buttons[2],
-                    "clicks_side1": c.buttons[3],
-                    "clicks_side2": c.buttons[4],
-                }))
+                .data(md)
                 .app("", ""),
         );
     }
@@ -321,6 +347,8 @@ pub fn reset() {
     for c in BUTTON.iter() {
         c.store(0, Ordering::Relaxed);
     }
+    INJECTED_KEYS.store(0, Ordering::Relaxed);
+    INJECTED_CLICKS.store(0, Ordering::Relaxed);
     PREV_VALID.store(false, Ordering::Relaxed);
     PREV_X.store(0, Ordering::Relaxed);
     PREV_Y.store(0, Ordering::Relaxed);
@@ -375,11 +403,11 @@ mod tests {
         // 第 1 分钟：事件分两次 drain 到达（2 键 1 点击 → 1 键 1 点击）
         record_key();
         record_key();
-        record_click_button(0);
+        record_click_button(0, false);
         let evts = drain(t0);
         assert!(evts.is_empty(), "首个桶未完成，不应产出事件");
         record_key();
-        record_click_button(0);
+        record_click_button(0, false);
         // 跨入下一分钟：第 1 分钟已 drain 进桶的计数（2 键 1 点击）折叠为 2 行
         let t1 = local_min(2026, 6, 15, 10, 31);
         let evts = drain(t1);
@@ -452,12 +480,12 @@ mod tests {
     fn per_key_and_button_counts_roll_up() {
         let _g = guard();
         reset();
-        record_key_vk(65); // A
-        record_key_vk(65);
-        record_key_vk(66); // B
-        record_key_vk(9999); // 越界安全忽略
-        record_click_button(0);
-        record_click_button(2);
+        record_key_vk(65, false); // A
+        record_key_vk(65, false);
+        record_key_vk(66, false); // B
+        record_key_vk(9999, false); // 越界安全忽略
+        record_click_button(0, false);
+        record_click_button(2, false);
         let evts = drain(local_min(2026, 6, 15, 10, 30)); // 建桶
         assert!(evts.is_empty());
         let evts = flush_partial(local_min(2026, 6, 15, 10, 30));

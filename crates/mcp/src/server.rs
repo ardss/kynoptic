@@ -277,26 +277,45 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
         if line.trim().is_empty() {
             continue;
         }
-        let server = server.clone();
-        let writer = writer.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name("mcp-req".into())
-                .spawn(move || {
-                    let response = match serde_json::from_str::<Value>(&line) {
-                        Ok(msg) => server.handle(&msg),
-                        Err(e) => Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": null,
-                            "error": { "code": -32700, "message": format!("parse error: {e}") },
-                        })),
-                    };
-                    if let Some(r) = response {
-                        respond(&writer, &r.to_string());
-                    }
-                })
-                .expect("mcp-req spawn"),
-        );
+        // 审查 P2：wait_for 最长 1800s，同步处理会卡死读循环且客户端断开后
+        // 进程僵住——仅这类长请求走后台线程；其余顺序处理保证 JSONL 响应有序
+        let is_long = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|m| {
+                Some(
+                    m.get("method")?.as_str()? == "tools/call"
+                        && m.pointer("/params/name")?.as_str()? == "wait_for",
+                )
+            })
+            .unwrap_or(false);
+        if is_long {
+            let server = server.clone();
+            let writer = writer.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name("mcp-wait".into())
+                    .spawn(move || {
+                        if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+                            if let Some(r) = server.handle(&msg) {
+                                respond(&writer, &r.to_string());
+                            }
+                        }
+                    })
+                    .expect("mcp-wait spawn"),
+            );
+            continue;
+        }
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => server.handle(&msg),
+            Err(e) => Some(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": format!("parse error: {e}") },
+            })),
+        };
+        if let Some(r) = response {
+            respond(&writer, &r.to_string());
+        }
     }
     for t in threads {
         let _ = t.join();
