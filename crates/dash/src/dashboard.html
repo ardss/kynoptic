@@ -148,7 +148,6 @@
   <div class="muted" id="status-line">loading…</div>
   <div class="tabs">
     <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
-    <div class="tab" id="tab-activity" onclick="showView('activity')"><span class="l en">Activity</span><span class="l zh">活动</span></div>
     <div class="tab" id="tab-report" onclick="showView('report')"><span class="l en">Report</span><span class="l zh">报告</span></div>
     <div class="tab" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></div>
     <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
@@ -161,85 +160,47 @@
 <div id="view-overview">
 
 <div class="cards">
-  <div class="card" style="grid-column: 1 / -1; display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 48px; padding:18px 22px;">
-    <div>
-      <div class="label"><span class="l en">human presence today</span><span class="l zh">今日人在场</span></div>
-      <div class="value" id="c-presence" style="font-size:40px;">–</div>
-      <div style="font-size:12px; color:var(--dim);">
-        <span class="l en">first</span><span class="l zh">首次</span> <span id="c-first">–</span>
-        · <span class="l en">last</span><span class="l zh">最近</span> <span id="c-last">–</span>
-      </div>
-    </div>
-    <div>
-      <div class="label"><span class="l en">automation activity</span><span class="l zh">自动化活动</span></div>
-      <div class="value" id="c-automation" style="font-size:40px; color:var(--dim);">–</div>
-      <div style="font-size:12px; color:var(--dim); max-width:220px;">
-        <span class="l en">injected input (SendKeys etc), excluded from presence</span><span class="l zh">注入输入（SendKeys 等）单独计，不计入人在场</span>
-      </div>
+  <div class="card">
+    <div class="label"><span class="l en">human presence today</span><span class="l zh">今日人在场</span></div>
+    <div class="value" style="font-size:34px;" id="c-presence">–</div>
+    <div style="font-size:12px; color:var(--dim);">
+      <span class="l en">first</span><span class="l zh">首次在场</span> <span id="c-first">–</span>
+      · <span class="l en">last</span><span class="l zh">最近在场</span> <span id="c-last">–</span>
     </div>
   </div>
-  <div class="card"><div class="label"><span class="l en">session uptime</span><span class="l zh">会话时长</span></div><div class="value" id="c-uptime">–</div></div>
-  <div class="card"><div class="label"><span class="l en">today events</span><span class="l zh">今日事件</span></div><div class="value" id="c-today-events">–</div></div>
-  <div class="card"><div class="label"><span class="l en">monitors enabled</span><span class="l zh">启用监控器</span></div><div class="value" id="c-monitors">–</div></div>
-  <div class="card"><div class="label"><span class="l en">db size</span><span class="l zh">数据库大小</span></div><div class="value" id="c-dbsize">–</div></div>
-  <div class="card"><div class="label"><span class="l en">cpu</span><span class="l zh">处理器</span></div><div class="value" id="c-cpu">–</div></div>
-  <div class="card"><div class="label"><span class="l en">memory</span><span class="l zh">内存</span></div><div class="value" id="c-mem">–</div></div>
-  <div class="card"><div class="label"><span class="l en">foreground app</span><span class="l zh">前台应用</span></div><div class="value small" id="c-foreground">–</div></div>
-</div>
-
-<div class="cards">
-  <div class="card"><div class="label"><span class="l en">active minutes</span><span class="l zh">活跃分钟</span></div><div class="value" id="c-active">–</div></div>
-  <div class="card"><div class="label"><span class="l en">keys</span><span class="l zh">按键</span></div><div class="value" id="c-keys">–</div></div>
-  <div class="card"><div class="label"><span class="l en">clicks</span><span class="l zh">点击</span></div><div class="value" id="c-clicks">–</div></div>
-  <div class="card"><div class="label"><span class="l en">top app</span><span class="l zh">最常用应用</span></div><div class="value small" id="c-app">–</div></div>
+  <div class="card">
+    <div class="label"><span class="l en">automation activity today</span><span class="l zh">今日自动化活动</span></div>
+    <div class="value" style="font-size:34px; color:var(--dim);" id="c-automation">–</div>
+    <div style="font-size:12px; color:var(--dim);">
+      <span class="l en">injected input, excluded from presence</span><span class="l zh">注入输入，不计入人在场</span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="label"><span class="l en">foreground app time today</span><span class="l zh">今日前台应用时长</span></div>
+    <div class="value" style="font-size:34px;" id="c-fgdwell">–</div>
+    <div style="font-size:12px; color:var(--dim);">
+      <span class="l en">top</span><span class="l zh">最长驻留</span>: <span id="c-fgtop">–</span>
+    </div>
+  </div>
 </div>
 
 <section>
-  <h2><span class="l en">this machine</span><span class="l zh">这台电脑</span></h2>
-  <div class="host-grid">
-    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">model</span><span class="l zh">型号</span></div><div id="h-model">–</div></div>
-    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">cpu</span><span class="l zh">处理器</span></div><div id="h-cpu">–</div></div>
-    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">gpu</span><span class="l zh">显卡</span></div><div id="h-gpu">–</div></div>
-    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">memory</span><span class="l zh">内存</span></div><div id="h-mem">–</div></div>
-    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">disk</span><span class="l zh">磁盘</span></div><div id="h-disk">–</div></div>
-    <div class="host-item" style="grid-column: 1 / -1"><div class="muted" style="font-size:11px"><span class="l en">disks (all)</span><span class="l zh">磁盘（全部）</span></div><div id="h-disks" style="white-space:normal">–</div></div>
-  </div>
-</section>
-
-<section>
-  <h2><span class="l en">timeline — last 12 hours (per local hour, events)</span><span class="l zh">时间线 — 近 12 小时（按本地小时，事件数）</span></h2>
+  <h2><span class="l en">timeline — last 12 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 12 小时（在场 / 自动化 / 无人）</span></h2>
   <div id="timeline" class="muted">loading…</div>
 </section>
-</div>
 
-<div id="view-activity" style="display:none">
 <section>
-  <h2><span class="l en">today — events per hour (24h)</span><span class="l zh">今日 — 24 小时逐时事件量</span></h2>
-  <div id="hours-chart" class="muted">loading…</div>
-</section>
-<section>
-  <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-    <span><span class="l en">activity heatmap (events per day)</span><span class="l zh">活跃度热力图（每日事件量）</span></span>
-    <span id="hm-range" style="display:inline-flex;gap:4px">
-      <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
-      <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
-      <button class="save hm-tab" data-weeks="52" style="padding:2px 12px;font-size:12px"><span class="l en">1yr</span><span class="l zh">一年</span></button>
-    </span>
-  </h2>
-  <div id="heatmap">loading…</div>
-  <div class="hm-legend">
-    <span><span class="l en">less</span><span class="l zh">少</span></span>
-    <span class="sw" style="background:#0B0F16;border:1px solid var(--border)"></span>
-    <span class="sw" style="background:#1e3a5f"></span>
-    <span class="sw" style="background:#2d5f94"></span>
-    <span class="sw" style="background:#3b82c4"></span>
-    <span class="sw" style="background:#5BA8FF"></span>
-    <span><span class="l en">more</span><span class="l zh">多</span></span>
+  <div style="display:flex; align-items:baseline; justify-content:space-between;">
+    <h2 style="cursor:pointer" onclick="var b=document.getElementById('ops-body'); b.style.display = b.style.display==='none' ? '' : 'none';"><span class="l en">▸ collection status</span><span class="l zh">▸ 采集状态</span></h2>
   </div>
-</section>
-<section>
-  <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
-  <div id="top-apps" class="muted">loading…</div>
+  <div id="ops-body" style="display:none">
+    <div class="cards">
+      <div class="card"><div class="label"><span class="l en">session uptime</span><span class="l zh">最近采集会话</span></div><div class="value" id="c-uptime">–</div></div>
+      <div class="card"><div class="label"><span class="l en">monitors enabled</span><span class="l zh">启用监控器</span></div><div class="value" id="c-monitors">–</div></div>
+      <div class="card"><div class="label"><span class="l en">db size</span><span class="l zh">数据库大小</span></div><div class="value" id="c-dbsize">–</div></div>
+      <div class="card"><div class="label"><span class="l en">records today</span><span class="l zh">今日记录条数</span></div><div class="value" id="c-today-events">–</div></div>
+    </div>
+  </div>
 </section>
 </div>
 
@@ -272,12 +233,36 @@
 </section>
 
 <section>
-  <h2><span class="l en">28-day trend — active minutes per day</span><span class="l zh">28 天趋势 — 每日活跃分钟</span></h2>
+  <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+    <span><span class="l en">activity heatmap (events per day)</span><span class="l zh">活跃度热力图（每日事件量）</span></span>
+    <span id="hm-range" style="display:inline-flex;gap:4px">
+      <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
+      <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
+      <button class="save hm-tab" data-weeks="52" style="padding:2px 12px;font-size:12px"><span class="l en">1yr</span><span class="l zh">一年</span></button>
+    </span>
+  </h2>
+  <div id="heatmap">loading…</div>
+  <div class="hm-legend">
+    <span><span class="l en">less</span><span class="l zh">少</span></span>
+    <span class="sw" style="background:#0B0F16;border:1px solid var(--border)"></span>
+    <span class="sw" style="background:#1e3a5f"></span>
+    <span class="sw" style="background:#2d5f94"></span>
+    <span class="sw" style="background:#3b82c4"></span>
+    <span class="sw" style="background:#5BA8FF"></span>
+    <span><span class="l en">more</span><span class="l zh">多</span></span>
+  </div>
+</section>
+<section>
+  <h2><span class="l en">28-day trend — keyboard/mouse minutes per day</span><span class="l zh">28 天趋势 — 每日键鼠输入分钟</span></h2>
   <div id="report-trend">loading…</div>
 </section>
 </div>
 
 <div id="view-apps" style="display:none">
+<section>
+  <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
+  <div id="top-apps" class="muted">loading…</div>
+</section>
 <section>
   <h2><span class="l en">hour by hour — which app you were in (pick a day)</span><span class="l zh">逐时一览 — 这天每个小时你在用什么（可选日期）</span></h2>
   <div style="margin-bottom:8px">
@@ -351,6 +336,18 @@
 </div>
 
 <div id="view-settings" style="display:none">
+
+<section>
+  <h2><span class="l en">this machine</span><span class="l zh">这台电脑</span></h2>
+  <div class="host-grid">
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">model</span><span class="l zh">型号</span></div><div id="h-model">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">cpu</span><span class="l zh">处理器</span></div><div id="h-cpu">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">gpu</span><span class="l zh">显卡</span></div><div id="h-gpu">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">memory</span><span class="l zh">内存</span></div><div id="h-mem">–</div></div>
+    <div class="host-item"><div class="muted" style="font-size:11px"><span class="l en">disk</span><span class="l zh">磁盘</span></div><div id="h-disk">–</div></div>
+    <div class="host-item" style="grid-column: 1 / -1"><div class="muted" style="font-size:11px"><span class="l en">disks (all)</span><span class="l zh">磁盘（全部）</span></div><div id="h-disks" style="white-space:normal">–</div></div>
+  </div>
+</section>
 <section>
   <h2><span class="l en">settings — monitors</span><span class="l zh">设置 — 监控器</span></h2>
   <div class="muted" style="margin-bottom:10px">
@@ -487,6 +484,13 @@ async function loadOverview() {
   document.getElementById("c-automation").textContent = dur(ah, amm);
   document.getElementById("c-first").textContent = o.first_activity || "–";
   document.getElementById("c-last").textContent = o.last_activity || "–";
+  const fd = o.fg_dwell_min || 0;
+  document.getElementById("c-fgdwell").textContent = dur(Math.floor(fd / 60), fd % 60);
+  document.getElementById("c-fgtop").textContent = o.fg_top || "–";
+  if (pm === 0 && (o.today_events || 0) < 50) {
+    document.getElementById("c-presence").textContent = zh ? "从今天开始积累" : "collecting…";
+    document.getElementById("c-presence").style.fontSize = "20px";
+  }
   document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
   document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;
@@ -495,23 +499,6 @@ async function loadOverview() {
   document.getElementById("c-mem").textContent = pct(o.mem_pct);
   document.getElementById("c-foreground").textContent = o.foreground_app || "–";
 
-  const h = o.host || {};
-  document.getElementById("h-model").textContent = h.model || "–";
-  document.getElementById("h-cpu").textContent = h.cpu || "–";
-  let gpuTxt = (h.gpus || []).join(" + ") || "–";
-  if (h.gpu_usage_pct != null && gpuTxt !== "–") gpuTxt += "（" + h.gpu_usage_pct + "%）";
-  document.getElementById("h-gpu").textContent = gpuTxt;
-  const mt = h.mem_total_gb, mu = h.mem_used_gb;
-  document.getElementById("h-mem").textContent =
-    (mu != null && mt) ? mu.toFixed(1) + " / " + mt + " GB (" + pct(o.mem_pct) + ")" : (mt ? mt + " GB" : "–");
-  const disks = h.disks || [];
-  const c = disks.find(x => x.drive === "C:") || disks[0];
-  document.getElementById("h-disk").textContent = c
-    ? (c.drive || "") + " " + (c.free_gb != null ? c.free_gb + " / " : "") + (c.total_gb != null ? c.total_gb + " GB" : "")
-    : "–";
-  document.getElementById("h-disks").textContent = disks
-    .map(x => (x.drive || "?") + " " + (x.free_gb != null ? x.free_gb + "/" + x.total_gb + "G" : x.total_gb + "G"))
-    .join("   ") || "–";
   const s = await jget("/api/summary");
   document.getElementById("c-active").textContent = s.active_minutes;
   document.getElementById("c-keys").textContent = s.keys.toLocaleString();
@@ -544,49 +531,35 @@ async function loadTimeline() {
   const maxEvents = Math.max(1, ...tl.buckets.map(b => b.apps.reduce((a, x) => a + x.events, 0)));
   const appColor = {};
   let next = 0;
-  el.innerHTML = tl.buckets.map(b => {
-    const total = b.apps.reduce((a, x) => a + x.events, 0);
-    const segs = b.apps.map(x => {
-      if (!(x.app in appColor)) { appColor[x.app] = PALETTE[next % PALETTE.length]; next++; }
-      const w = (x.events / maxEvents * 100).toFixed(2);
-      return '<span style="height:100%;min-width:1px;width:' + w + "%;background:" + appColor[x.app] +
-        '" title="' + esc(x.app) + ": " + x.events + '"></span>';
-    }).join("");
+  const zh = document.documentElement.lang === "zh";
+  const L = {
+    human: zh ? "在场" : "presence",
+    auto: zh ? "自动化" : "automation",
+    away: zh ? "无人" : "away"
+  };
+  el.innerHTML = '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
+    + '<span style="color:#5BA8FF">■</span> ' + L.human + '　'
+    + '<span style="color:#E0A24A">■</span> ' + L.auto + '　'
+    + '<span style="color:var(--border)">■</span> ' + L.away + '</div>'
+    + tl.buckets.map(b => {
+    // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节
+    const human = Math.min(60, b.human_min || 0);
+    const auto = Math.min(60 - human, b.auto_min || 0);
+    const away = 60 - human - auto;
+    const pct1 = (v) => (v / 60 * 100).toFixed(1);
+    const apps = b.apps.map(x => x.app + " x" + x.events).join(", ");
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
       '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13)) + "</span>" +
-      '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' + segs + "</span></div>";
+      '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
+        '<span style="width:' + pct1(human) + '%;background:#5BA8FF" title="' + L.human + ' ' + human + 'm"></span>' +
+        '<span style="width:' + pct1(auto) + '%;background:#E0A24A" title="' + L.auto + ' ' + auto + 'm"></span>' +
+        '<span style="width:' + pct1(away) + '%;background:#1a2230" title="' + L.away + '"></span>' +
+      '</span>' +
+      '<span style="width:34%;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(apps) + '">' + esc(apps) + '</span>' +
+      "</div>";
   }).join("");
 }
 /* ─── 24 小时柱状图（手绘 SVG） ─── */
-async function loadHours() {
-  const h = await jget("/api/hours?date=today");
-  const values = h.values;
-  const el = document.getElementById("hours-chart");
-  const W = 880, H = 180, padL = 36, padB = 22, padT = 8;
-  const innerW = W - padL - 8, innerH = H - padT - padB;
-  const max = Math.max(1, ...values);
-  const bw = innerW / 24;
-  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
-  for (let g = 0; g <= 4; g++) {
-    const y = padT + innerH - innerH * g / 4;
-    const v = Math.round(max * g / 4);
-    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
-      '" stroke="#232B38" stroke-width="1"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#93A1B3" font-size="11" text-anchor="end">' + v + "</text>";
-  }
-  values.forEach((v, hr) => {
-    const bh = v / max * innerH;
-    const x = padL + hr * bw + 2, y = padT + innerH - bh;
-    svg += '<rect x="' + x + '" y="' + y + '" width="' + (bw - 4) + '" height="' + Math.max(bh, v > 0 ? 2 : 0) +
-      '" rx="2" fill="#5BA8FF"><title>' + hr + ":00 — " + v + '</title></rect>';
-    if (hr % 3 === 0) {
-      svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
-        '" fill="#93A1B3" font-size="11" text-anchor="middle">' + hr + "</text>";
-    }
-  });
-  svg += "</svg>";
-  el.innerHTML = svg;
-}
 /* ─── 12 周热力图（7 行 × N 列 SVG 格子） ─── */
 function hmLevel(v, max) {
   if (v <= 0) return 0;
@@ -1073,7 +1046,30 @@ const MON_NAMES = {
   gpu: ["GPU", "GPU"],
 };
 let LAST_SETTINGS = null;
+
+async function loadHost() {
+  const o = await jget("/api/overview");
+  const h = o.host || {};
+  const h = o.host || {};
+  document.getElementById("h-model").textContent = h.model || "–";
+  document.getElementById("h-cpu").textContent = h.cpu || "–";
+  let gpuTxt = (h.gpus || []).join(" + ") || "–";
+  if (h.gpu_usage_pct != null && gpuTxt !== "–") gpuTxt += "（" + h.gpu_usage_pct + "%）";
+  document.getElementById("h-gpu").textContent = gpuTxt;
+  const mt = h.mem_total_gb, mu = h.mem_used_gb;
+  document.getElementById("h-mem").textContent =
+    (mu != null && mt) ? mu.toFixed(1) + " / " + mt + " GB (" + pct(o.mem_pct) + ")" : (mt ? mt + " GB" : "–");
+  const disks = h.disks || [];
+  const c = disks.find(x => x.drive === "C:") || disks[0];
+  document.getElementById("h-disk").textContent = c
+    ? (c.drive || "") + " " + (c.free_gb != null ? c.free_gb + " / " : "") + (c.total_gb != null ? c.total_gb + " GB" : "")
+    : "–";
+  document.getElementById("h-disks").textContent = disks
+    .map(x => (x.drive || "?") + " " + (x.free_gb != null ? x.free_gb + "/" + x.total_gb + "G" : x.total_gb + "G"))
+    .join("   ") || "–";
+}
 async function loadSettings() {
+  loadHost().catch(() => {});
   const s = await jget("/api/settings");
   LAST_SETTINGS = s;
   const enabled = new Set(s.enabled_monitors);
@@ -1136,7 +1132,7 @@ async function saveSettings() {
 let currentView = "overview";
 function showView(name) {
   currentView = name;
-  for (const v of ["overview", "activity", "apps", "report", "insights", "input", "anomalies", "settings"]) {
+  for (const v of ["overview", "apps", "report", "insights", "input", "anomalies", "settings"]) {
     document.getElementById("view-" + v).style.display = v === name ? "" : "none";
     document.getElementById("tab-" + v).classList.toggle("active", v === name);
   }
@@ -1144,9 +1140,8 @@ function showView(name) {
 }
 async function refreshView(name) {
   if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
-  else if (name === "activity") await Promise.all([loadHours(), loadHeatmap(), loadTopApps()]);
-  else if (name === "apps") await loadApps();
-  else if (name === "report") await loadReport();
+  else if (name === "apps") await Promise.all([loadApps(), loadTopApps()]);
+  else if (name === "report") await Promise.all([loadReport(), loadHeatmap()]);
   else if (name === "insights") await loadInsights();
   else if (name === "input") await loadInput();
   else if (name === "anomalies") await loadAnomalies();

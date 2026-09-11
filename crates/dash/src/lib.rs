@@ -125,6 +125,40 @@ pub fn api_timeline_at(
         .flatten()
         .collect();
 
+    // 三色分层（三指标模型）：每桶统计 人在场/自动化 的输入分钟数
+    let mut minute_kind: std::collections::HashMap<String, (u32, u32)> =
+        std::collections::HashMap::new();
+    let mut stmt2 = conn
+        .prepare(
+            "SELECT substr(datetime(timestamp, ?1), 1, 16) AS minute_bucket,
+                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0,
+                    MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0
+             FROM events
+             WHERE timestamp >= ?2 AND timestamp < ?3 AND event_action = 'input_agg'
+             GROUP BY minute_bucket",
+        )
+        .map_err(|e| e.to_string())?;
+    let mrows: Vec<(String, bool, bool)> = stmt2
+        .query_map(params![&off, start.to_rfc3339(), end.to_rfc3339()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    for (minute_bucket, human, auto) in mrows {
+        let hour_bucket = minute_bucket.replacen(' ', "T", 1)[..13].to_string();
+        let e = minute_kind.entry(hour_bucket).or_insert((0, 0));
+        if human {
+            e.0 += 1;
+        }
+        if auto {
+            e.1 += 1;
+        }
+    }
     // (本地小时桶 "YYYY-MM-DDTHH", [(app, cnt)])
     let mut by_bucket: std::collections::BTreeMap<String, Vec<(String, i64)>> =
         std::collections::BTreeMap::new();
@@ -140,7 +174,8 @@ pub fn api_timeline_at(
                 .into_iter()
                 .map(|(app, n)| json!({"app": app, "events": n}))
                 .collect();
-            json!({"hour": hour, "apps": list})
+            let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
+            json!({"hour": hour, "apps": list, "human_min": human, "auto_min": auto})
         })
         .collect();
     Ok(json!({"hours": hours, "generated_at": now.to_rfc3339(), "buckets": buckets}))
@@ -330,12 +365,39 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         )
     };
 
+    // 今日前台应用时长（窗口切换间隔推算，单段上限 30 分钟；三指标之三）
+    let mut fg_dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') FROM events          WHERE event_type = 'window' AND event_action = 'switch'            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+    ) {
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![&start, &end], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|v| v.flatten().collect())
+            .unwrap_or_default();
+        let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
+        for pair in rows.windows(2) {
+            if let (Some(a), Some(b)) = (parse(&pair[0].0), parse(&pair[1].0)) {
+                let secs = (b - a).num_seconds().min(1800);
+                *fg_dwell.entry(pair[0].1.clone()).or_insert(0) += secs;
+            }
+        }
+    }
+    let fg_top = fg_dwell
+        .iter()
+        .max_by_key(|(_, v)| **v)
+        .map(|(a, v)| (a.clone(), *v));
+    let fg_total_min: i64 = fg_dwell.values().sum::<i64>() / 60;
+
     json!({
         "host": host,
         "today": today,
         "today_events": today_events,
         "presence_minutes": presence_minutes,
         "automation_minutes": automation_minutes,
+        "fg_dwell_min": fg_total_min,
+        "fg_top": fg_top.map(|(a, _)| Value::from(a)).unwrap_or(Value::Null),
         "first_activity": first_presence,
         "last_activity": last_presence,
         "monitors_enabled": s.enabled_monitors.len(),
