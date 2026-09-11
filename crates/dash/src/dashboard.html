@@ -1052,7 +1052,6 @@ let LAST_SETTINGS = null;
 async function loadHost() {
   const o = await jget("/api/overview");
   const h = o.host || {};
-  const h = o.host || {};
   document.getElementById("h-model").textContent = h.model || "–";
   document.getElementById("h-cpu").textContent = h.cpu || "–";
   let gpuTxt = (h.gpus || []).join(" + ") || "–";
