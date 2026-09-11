@@ -152,6 +152,7 @@
     <div class="tab" id="tab-report" onclick="showView('report')"><span class="l en">Report</span><span class="l zh">报告</span></div>
     <div class="tab" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></div>
     <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
+    <div class="tab" id="tab-insights" onclick="showView('insights')"><span class="l en">Insights</span><span class="l zh">洞察</span></div>
     <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
     <div class="tab" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></div>
   </div>
@@ -338,6 +339,10 @@
 </section>
 </div>
 
+<div id="view-insights" style="display:none">
+  <div id="insights-list"></div>
+</div>
+
 <div id="view-anomalies" style="display:none">
 <section>
   <h2><span class="l en">anomalies — last 7 days</span><span class="l zh">异常 — 近 7 天</span></h2>
@@ -512,6 +517,24 @@ async function loadOverview() {
   document.getElementById("c-keys").textContent = s.keys.toLocaleString();
   document.getElementById("c-clicks").textContent = s.clicks.toLocaleString();
   document.getElementById("c-app").textContent = s.top_app || "–";
+}
+/* ─── 洞察页：从原始数据挖掘出的叙事式发现 ─── */
+async function loadInsights() {
+  const d = await jget("/api/insights");
+  const zh = document.documentElement.lang === "zh";
+  const el = document.getElementById("insights-list");
+  if (!d.insights || !d.insights.length) {
+    el.innerHTML = '<div class="card"><div class="value">–</div><div class="label"><span class="l en">Not enough data yet — insights appear after a day of collection</span><span class="l zh">数据还不够——采集满一天后这里会出现洞察</span></div></div>';
+    return;
+  }
+  el.innerHTML = d.insights.map(it => {
+    const title = zh ? it.title_zh : it.title_en;
+    const text = zh ? it.text_zh : it.text_en;
+    return '<div class="card" style="margin-bottom:12px;">'
+      + '<div class="label">' + esc(title) + '</div>'
+      + '<div style="font-size:16px; line-height:1.7; margin-top:6px;">' + esc(text) + '</div>'
+      + '</div>';
+  }).join("");
 }
 /* ─── 12 小时时间线（横向条） ─── */
 async function loadTimeline() {
@@ -1113,7 +1136,7 @@ async function saveSettings() {
 let currentView = "overview";
 function showView(name) {
   currentView = name;
-  for (const v of ["overview", "activity", "apps", "report", "input", "anomalies", "settings"]) {
+  for (const v of ["overview", "activity", "apps", "report", "insights", "input", "anomalies", "settings"]) {
     document.getElementById("view-" + v).style.display = v === name ? "" : "none";
     document.getElementById("tab-" + v).classList.toggle("active", v === name);
   }
@@ -1124,6 +1147,7 @@ async function refreshView(name) {
   else if (name === "activity") await Promise.all([loadHours(), loadHeatmap(), loadTopApps()]);
   else if (name === "apps") await loadApps();
   else if (name === "report") await loadReport();
+  else if (name === "insights") await loadInsights();
   else if (name === "input") await loadInput();
   else if (name === "anomalies") await loadAnomalies();
   else if (name === "settings") await loadSettings();

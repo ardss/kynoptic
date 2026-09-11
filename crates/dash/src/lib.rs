@@ -32,6 +32,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
+use chrono::Timelike;
 use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -698,6 +699,207 @@ pub fn api_input_at(
     }))
 }
 
+/// GET /api/insights — 从原始数据挖掘叙事式发现（审查用户理念：
+/// 数据是矿石，洞察才是金子）。全部基于已有键鼠/窗口事件，零新增采集。
+pub fn api_insights(conn: &Connection) -> Value {
+    // 窗口 = 6 天前零点 -> 现在（踩坑：local_day_range(date-6) 的 end 是
+    // "6 天前当天"的结束，会让整个查询窗口落在有数据之前）
+    let start = queries::local_day_range(&queries::date_offset_str(-6))
+        .map(|(s2, _)| s2)
+        .ok_or_else(|| json!({"insights": []}));
+    let start = match start {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let end = chrono::Local::now().to_rfc3339();
+    // 7 天窗口的人侧事件：timestamp、类型、应用
+    let mut acts: Vec<(chrono::DateTime<chrono::FixedOffset>, String)> = Vec::new();
+    let mut switches: Vec<(chrono::DateTime<chrono::FixedOffset>, String)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT timestamp, event_type, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE event_type IN ('window','keyboard','mouse')            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+    ) {
+        if let Ok(rows) = stmt.query_map(params![&start, &end], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }) {
+            for (ts, et, app) in rows.flatten() {
+                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                    if et == "window" {
+                        switches.push((t, app));
+                    } else {
+                        acts.push((t, app));
+                    }
+                }
+            }
+        }
+    }
+    let mut insights: Vec<Value> = Vec::new();
+    if acts.len() < 50 {
+        return json!({"insights": []});
+    }
+    let fmt_hm = |t: &chrono::DateTime<chrono::FixedOffset>| -> String {
+        t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    };
+    let fmt_day = |t: chrono::DateTime<chrono::FixedOffset>| -> String {
+        t.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string()
+    };
+
+    // 1) 最长连续在场段（输入间隔 <= 5 分钟算连续）
+    let mut best: (
+        f64,
+        Option<chrono::DateTime<chrono::FixedOffset>>,
+        Option<chrono::DateTime<chrono::FixedOffset>>,
+    ) = (0.0, None, None);
+    let mut run_start: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+    let mut prev: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+    for (t, _) in &acts {
+        if let (Some(p), Some(rs)) = (prev, run_start) {
+            if (*t - p).num_seconds() > 300 {
+                let run = (p - rs).num_seconds() as f64;
+                if run > best.0 {
+                    best = (run, Some(rs), Some(p));
+                }
+                run_start = Some(*t);
+            }
+        }
+        if run_start.is_none() {
+            run_start = Some(*t);
+        }
+        prev = Some(*t);
+    }
+    if let (Some(p), Some(rs)) = (prev, run_start) {
+        let run = (p - rs).num_seconds() as f64;
+        if run > best.0 {
+            best = (run, Some(rs), Some(p));
+        }
+    }
+    if best.0 > 600.0 {
+        let (rs, re) = (
+            best.1.map(fmt_day).unwrap_or_default(),
+            best.2.map(fmt_day).unwrap_or_default(),
+        );
+        insights.push(json!({
+            "title_zh": "最长连续专注",
+            "title_en": "Longest focus streak",
+            "text_zh": format!("近 7 天你最长的连续在场是 {:.0} 分钟（{} ~ {}），期间没有任何超过 5 分钟的离开。", best.0 / 60.0, rs, re),
+            "text_en": format!("Your longest continuous presence in the last 7 days was {:.0} minutes ({} ~ {}) with no gap over 5 minutes.", best.0 / 60.0, rs, re),
+        }));
+    }
+
+    // 2) 应用驻留 Top3（窗口切换间隔推算，单段上限 30 分钟）
+    let mut dwell: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for i in 0..switches.len() {
+        let (t, a) = &switches[i];
+        let nxt = switches.get(i + 1).map(|(t2, _)| *t2).unwrap_or(*t);
+        *dwell.entry(a.clone()).or_insert(0.0) += (nxt - *t).num_seconds().min(1800) as f64;
+    }
+    let mut top: Vec<(String, f64)> = dwell.into_iter().collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if top.len() >= 2 {
+        let names: Vec<String> = top
+            .iter()
+            .take(3)
+            .map(|(a, h)| format!("{} {:.1}h", a, h / 3600.0))
+            .collect();
+        insights.push(json!({
+            "title_zh": "应用驻留时长 Top3",
+            "title_en": "Top 3 apps by dwell time",
+            "text_zh": format!("按窗口驻留推算：{}", names.join("，")),
+            "text_en": format!("By window dwell: {}", names.join(", ")),
+        }));
+    }
+
+    // 3) 上下文切换峰值时段
+    let mut sw_hour: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (t, _) in &switches {
+        *sw_hour
+            .entry(t.with_timezone(&chrono::Local).hour())
+            .or_insert(0) += 1;
+    }
+    if let Some((h, n)) = sw_hour
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(h, n)| (*h, *n))
+    {
+        if n >= 20 {
+            insights.push(json!({
+                "title_zh": "最容易被打碎的时段",
+                "title_en": "Most fragmented hour",
+                "text_zh": format!("{:02}:00 前后是你切换窗口最频繁的时段（近 7 天 {} 次），注意力碎片化多发生在这里。", h, n),
+                "text_en": format!("Around {:02}:00 you switch windows the most ({} times in 7 days) — that is where your focus fragments.", h, n),
+            }));
+        }
+    }
+
+    // 4) 深夜活动占比
+    let night = acts
+        .iter()
+        .filter(|(t, _)| {
+            let h = t.with_timezone(&chrono::Local).hour();
+            h < 6
+        })
+        .count();
+    if night > 30 {
+        let pct = night as f64 / acts.len() as f64 * 100.0;
+        insights.push(json!({
+            "title_zh": "深夜活动",
+            "title_en": "Late-night activity",
+            "text_zh": format!("近 7 天有 {} 次键鼠输入发生在凌晨 0-6 点（占 {:.0}%）。", night, pct),
+            "text_en": format!("{} keyboard/mouse events in the last 7 days happened between 00:00-06:00 ({:.0}%).", night, pct),
+        }));
+    }
+
+    // 5) 黄金时段（输入最密集的连续 2 小时）
+    let mut in_hour: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (t, _) in &acts {
+        *in_hour
+            .entry(t.with_timezone(&chrono::Local).hour())
+            .or_insert(0) += 1;
+    }
+    let mut best2: (usize, u32) = (0, 0);
+    for h in 0..23u32 {
+        let sum = in_hour.get(&h).copied().unwrap_or(0)
+            + in_hour.get(&((h + 1) % 24)).copied().unwrap_or(0);
+        if sum > best2.0 {
+            best2 = (sum, h);
+        }
+    }
+    if best2.0 > 50 {
+        insights.push(json!({
+            "title_zh": "你的黄金时段",
+            "title_en": "Your golden hours",
+            "text_zh": format!("{:02}:00-{:02}:00 是你输入最密集的两小时——重要的活儿尽量放在这里。", best2.1, (best2.1 + 2) % 24),
+            "text_en": format!("{:02}:00-{:02}:00 is your densest input window — schedule what matters here.", best2.1, (best2.1 + 2) % 24),
+        }));
+    }
+
+    // 6) 节律（每天首次/最近在场，最多列 5 天）
+    let mut rhythm: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    for (t, _) in &acts {
+        let d = t.with_timezone(&chrono::Local).format("%m-%d").to_string();
+        let hm = fmt_hm(t);
+        rhythm.entry(d).or_insert((hm.clone(), hm));
+    }
+    if rhythm.len() >= 2 {
+        let items: Vec<String> = rhythm
+            .iter()
+            .rev()
+            .take(5)
+            .map(|(d, (f, l))| format!("{} {}~{}", d, f, l))
+            .collect();
+        insights.push(json!({
+            "title_zh": "你的作息节律",
+            "title_en": "Your daily rhythm",
+            "text_zh": format!("每天首次与最后输入：{}", items.join("；")),
+            "text_en": format!("First/last input per day: {}", items.join("; ")),
+        }));
+    }
+
+    json!({"insights": insights, "dbg": {"acts": acts.len(), "switches": switches.len(), "built": insights.len()}})
+}
+
 /// GET /api/report?date= — 单日报告：色带时间轴、类别占比、专注时段。
 ///
 /// dwell 分段：window/switch 事件间隔即上一应用的停留时长；单段上限 120 分钟
@@ -1167,6 +1369,7 @@ pub fn route_req(
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
+        ("GET", "/api/insights") => (200, "application/json", api_insights(conn).to_string()),
         ("GET", "/api/report") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
             let s = settings::load(db_path);
