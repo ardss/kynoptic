@@ -43,8 +43,10 @@ const WM_LBUTTONDBLCLK: u32 = 0x0203;
 /// 发给采集器属主线程的命令(main.rs 定义线程,这里只约定协议)。
 #[derive(Debug, Clone)]
 pub enum CollectorCmd {
-    /// 启动/重启采集(Resume 复用同一命令)
+    /// 启动/重启采集（设置变更触发；Paused 状态下会被忽略）
     Start,
+    /// 用户从托盘菜单恢复采集（Paused 状态下也生效）
+    Resume,
     /// 暂停:置停机旗标并 join writer(Collector::shutdown)
     Pause,
     /// 退出:优雅关停后属主线程返回
@@ -139,7 +141,7 @@ impl TrayCtx {
                     self.set_state(hwnd, TrayState::Paused);
                 }
                 TrayState::Paused | TrayState::Error => {
-                    let _ = self.cmd_tx.send(CollectorCmd::Start);
+                    let _ = self.cmd_tx.send(CollectorCmd::Resume);
                     self.set_state(hwnd, TrayState::Running);
                 }
             },

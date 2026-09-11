@@ -107,9 +107,19 @@ fn main() {
         .name("CollectorOwner".into())
         .spawn(move || {
             let mut collector: Option<kynoptic_core::collector::Collector> = None;
+            // Pause 状态记忆（审查 P2：设置保存触发的 Start 不能解除用户的
+            // 暂停——只有托盘菜单的 Resume 才解除）
+            let mut paused = false;
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    CollectorCmd::Start => {
+                    CollectorCmd::Start | CollectorCmd::Resume => {
+                        if matches!(cmd, CollectorCmd::Resume) {
+                            paused = false;
+                        }
+                        if paused {
+                            log::info!("Paused：设置变更已记录，恢复采集后生效");
+                            continue;
+                        }
                         // Resume/重启前先清掉上一实例(如有)
                         if let Some(c) = collector.as_mut() {
                             c.shutdown();
@@ -157,6 +167,7 @@ fn main() {
                         }
                     }
                     CollectorCmd::Pause => {
+                        paused = true;
                         if let Some(c) = collector.as_mut() {
                             // 置停机旗标 -> hook stop -> join writer -> 关 session
                             c.shutdown();
@@ -179,13 +190,25 @@ fn main() {
     let watch_db = parsed.db.clone();
     let watch_tx = cmd_tx.clone();
     let mut last_epoch = kynoptic_dash::settings_epoch();
+    // mtime 辅助触发（审查 P2：SETTINGS_EPOCH 是进程内原子量，跨进程写者
+    // 触发不了；顺带覆盖"保存成功但进程在 epoch+1 前崩溃"的极窄丢失窗口）
+    let watch_db_mtime = watch_db.clone();
+    let settings_mtime = move || {
+        std::fs::metadata(watch_db_mtime.with_file_name("settings.json"))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let mut last_mtime = settings_mtime();
     thread::Builder::new()
         .name("SettingsWatch".into())
         .spawn(move || loop {
             thread::sleep(std::time::Duration::from_millis(1000));
+            let m = settings_mtime();
             let e = kynoptic_dash::settings_epoch();
-            if e != last_epoch {
+            let mtime_changed = m != last_mtime;
+            if e != last_epoch || mtime_changed {
                 last_epoch = e;
+                last_mtime = m;
                 let st = kynoptic_dash::settings::load(&watch_db);
                 apply_autostart(st.autostart);
                 log::info!("设置已变更，自动重启采集器使其生效");

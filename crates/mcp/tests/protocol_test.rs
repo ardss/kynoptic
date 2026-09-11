@@ -94,12 +94,16 @@ fn roundtrip(db_path: &str, requests: &[Value]) -> Vec<Value> {
         input.push_str(&r.to_string());
         input.push('\n');
     }
-    let mut out: Vec<u8> = Vec::new();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     kynoptic_mcp::server::serve(
         BufReader::new(input.as_bytes()),
-        &mut out,
-        &McpServer::new(db_path),
+        out.clone(),
+        McpServer::new(db_path),
     );
+    let out = std::sync::Arc::try_unwrap(out)
+        .ok()
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default();
     String::from_utf8(out)
         .expect("输出应为 UTF-8")
         .lines()

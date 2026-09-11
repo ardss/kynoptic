@@ -95,7 +95,7 @@ harness in this repo (full methodology and raw numbers in
   per-key frequency counts (how many times each key was pressed), which are
   aggregate statistics, not content. Full per-key detail is off by default
   and can be enabled explicitly in settings. This boundary is the core of
-  what separates Kynoptic from spyware, and it is enforced in code, not policy.
+  what separates Kynoptic from spyware, and it is the default mode stores only counts; see the privacy note above.
 - Aggregates are derived caches; the raw event log is append-only.
 - Deleting anything is opt-in and off by default; schema migrations archive
   tables by renaming instead of dropping.

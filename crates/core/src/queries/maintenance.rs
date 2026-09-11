@@ -52,13 +52,18 @@ pub struct ExportRow {
 }
 
 /// 导出自 cutoff 以来全部事件（按 id 升序），用于 ctl export。
-pub fn export_events_since(conn: &Connection, cutoff: &str) -> Vec<ExportRow> {
-    let mut out = Vec::new();
+/// 流式导出（审查 P2：原实现把全表 collect 进 Vec，千万行级可达数 GB 内存
+/// 且 JSON 双倍峰值）。逐行回调，写一行丢一行。
+pub fn export_events_since_stream(
+    conn: &Connection,
+    cutoff: &str,
+    mut sink: impl FnMut(ExportRow),
+) {
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, timestamp, event_type, event_action, event_data, app_name, window_title, session_id
          FROM events WHERE timestamp >= ?1 ORDER BY id",
     ) else {
-        return out;
+        return;
     };
     let Ok(rows) = stmt.query_map(params![cutoff], |r| {
         Ok(ExportRow {
@@ -72,10 +77,15 @@ pub fn export_events_since(conn: &Connection, cutoff: &str) -> Vec<ExportRow> {
             session_id: r.get(7)?,
         })
     }) else {
-        return out;
+        return;
     };
     for row in rows.flatten() {
-        out.push(row);
+        sink(row);
     }
+}
+
+pub fn export_events_since(conn: &Connection, cutoff: &str) -> Vec<ExportRow> {
+    let mut out = Vec::new();
+    export_events_since_stream(conn, cutoff, |row| out.push(row));
     out
 }

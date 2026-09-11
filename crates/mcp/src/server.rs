@@ -21,6 +21,7 @@ use crate::state;
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// MCP server：持有数据库路径，逐请求开只读连接（v0.1 读多写零，开销可接受）。
+#[derive(Clone)]
 pub struct McpServer {
     pub db_path: String,
 }
@@ -245,33 +246,60 @@ fn tool_definitions() -> Vec<Value> {
 
 /// 逐行读取 JSON-RPC 消息并写出响应（换行分隔）。EOF 即退出。
 /// 单行解析失败回 -32700（不中断会话——坏行之后的消息照常处理）。
-pub fn serve<R: BufRead, W: Write>(reader: R, writer: &mut W, server: &McpServer) {
+pub fn serve<R: BufRead, W: Write + Send + 'static>(
+    reader: R,
+    writer: std::sync::Arc<std::sync::Mutex<W>>,
+    server: McpServer,
+) {
+    // 审查 P2：wait_for 最长 1800s，同步处理会把整个 server 卡死且客户端
+    // 断开后进程僵住。改为：每请求一线程（长请求不再阻塞读循环，stdin EOF
+    // 立即退出进程），响应经互斥锁串行写出。
+    fn respond<W: Write>(writer: &std::sync::Arc<std::sync::Mutex<W>>, resp: &str) {
+        if let Ok(mut gw) = writer.lock() {
+            let _ = writeln!(gw, "{resp}");
+            gw.flush().ok();
+        }
+    }
+    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else {
             // 非 UTF-8 字节：按 parse error 回应并继续会话（审查 P1：
             // 此前直接 break 静默退出，与畸形 JSON 的容错策略自相矛盾）
-            let resp = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error: invalid UTF-8\"}}";
-            let _ = writeln!(writer, "{resp}");
-            let _ = writer.flush();
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": "Parse error: invalid UTF-8" },
+            })
+            .to_string();
+            respond(&writer, &resp);
             continue;
         };
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => server.handle(&msg),
-            Err(e) => Some(json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32700, "message": format!("parse error: {e}") },
-            })),
-        };
-        if let Some(r) = response {
-            if writeln!(writer, "{r}").is_err() {
-                break; // 客户端已关闭 stdout
-            }
-            let _ = writer.flush();
-        }
+        let server = server.clone();
+        let writer = writer.clone();
+        threads.push(
+            std::thread::Builder::new()
+                .name("mcp-req".into())
+                .spawn(move || {
+                    let response = match serde_json::from_str::<Value>(&line) {
+                        Ok(msg) => server.handle(&msg),
+                        Err(e) => Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": null,
+                            "error": { "code": -32700, "message": format!("parse error: {e}") },
+                        })),
+                    };
+                    if let Some(r) = response {
+                        respond(&writer, &r.to_string());
+                    }
+                })
+                .expect("mcp-req spawn"),
+        );
+    }
+    for t in threads {
+        let _ = t.join();
     }
 }
 
@@ -282,8 +310,11 @@ pub fn serve_stdio() {
         .unwrap_or_else(|_| kynoptic_core::db::resolve_db_path().display().to_string());
     log::info!("kynoptic-mcp 启动，db={db_path}");
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    serve(stdin.lock(), &mut stdout.lock(), &McpServer::new(db_path));
+    serve(
+        stdin.lock(),
+        std::sync::Arc::new(std::sync::Mutex::new(std::io::stdout())),
+        McpServer::new(db_path),
+    );
 }
 
 #[cfg(test)]
@@ -357,14 +388,14 @@ mod tests {
 
     #[test]
     fn malformed_json_line_yields_parse_error() {
-        let mut out: Vec<u8> = Vec::new();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let input = "{not json}\n";
         serve(
             std::io::BufReader::new(input.as_bytes()),
-            &mut out,
-            &McpServer::new(":memory:"),
+            out.clone(),
+            McpServer::new(":memory:"),
         );
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v: Value = serde_json::from_slice(&out.lock().unwrap()).unwrap();
         assert_eq!(v["error"]["code"], json!(-32700));
     }
 

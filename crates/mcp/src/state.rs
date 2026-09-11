@@ -9,6 +9,10 @@
 //!   foreground_app ← window/switch，idle ← 最新事件距今秒数，apm ← 近 5 分钟计数）；
 //! - `get_timeline`：从 window/switch 事件现算时间段（agg 层暂空）；
 //! - `get_summary`：从 events 现算计数（与 ctl stats / analyzer 同口径）。
+//!
+//! 口径说明（审查 P2）：MCP 恒为 events 现算真值；dashboard 优先读
+//! agg_minute 派生缓存（同源 events 派生）。缓存重建/滞后期间两边可能
+//! 有暂时差异，以 MCP 现算为准。
 
 use chrono::{Local, Timelike, Utc};
 use rusqlite::{params, Connection, OpenFlags};
@@ -354,6 +358,22 @@ pub fn timeline(
         return Err("granularity 只允许 minute|hour".into());
     }
     let limit = clamp_limit(Some(limit));
+    // 审查 P2：to 传纯日期（YYYY-MM-DD）时按前缀比较会排除整天数据，
+    // 静默返回空。规范化：纯日期 from -> 当日 00:00Z，to -> 次日 00:00Z。
+    let norm = |v: &str, is_to: bool| -> String {
+        let b = v.as_bytes();
+        if b.len() == 10 && b[4] == b'-' && b[7] == b'-' {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+                let d = if is_to { d.succ_opt().unwrap_or(d) } else { d };
+                if let Some(t) = d.and_hms_opt(0, 0, 0) {
+                    return t.format("%Y-%m-%dT00:00:00+00:00").to_string();
+                }
+            }
+        }
+        v.to_string()
+    };
+    let from = norm(from, false);
+    let to = norm(to, true);
     let mut stmt = conn
         .prepare(
             "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') \
@@ -377,7 +397,7 @@ pub fn timeline(
         }
     }
 
-    let to_t = chrono::DateTime::parse_from_rfc3339(to).ok();
+    let to_t = chrono::DateTime::parse_from_rfc3339(&to).ok();
     let mut segs: Vec<(String, String, String)> = Vec::new(); // (app,start,end)
     for (i, (ts, app)) in rows.iter().enumerate() {
         let end = rows

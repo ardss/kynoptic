@@ -177,7 +177,9 @@ fn cmd_export(args: &[String]) -> Result<()> {
     }
     let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
     let conn = open_db(&resolve_db())?;
-    let rows = queries::export_events_since(&conn, &cutoff);
+    // 流式导出（审查 P2：不再把全表载入内存）
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+    let row_count = std::sync::Arc::new(AtomicUsize::new(0));
 
     if out.is_empty() {
         out = format!(
@@ -202,39 +204,66 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 "session_id",
             ])
             .map_err(map_csv_err)?;
-            for r in &rows {
+            let rc = row_count.clone();
+            queries::export_events_since_stream(&conn, &cutoff, |r| {
+                rc.fetch_add(1, AOrdering::Relaxed);
                 // 外部可控字段（app_name/window_title/event_data）做公式注入中和
-                w.write_record(&[
+                let _ = w.write_record(&[
                     r.id.to_string(),
                     r.timestamp.clone(),
                     r.event_type.clone(),
                     r.event_action.clone(),
-                    csv_cell(&r.event_data.clone().unwrap_or_default()),
-                    csv_cell(&r.app_name.clone().unwrap_or_default()),
-                    csv_cell(&r.window_title.clone().unwrap_or_default()),
+                    csv_cell(&r.event_data.unwrap_or_default()),
+                    csv_cell(&r.app_name.unwrap_or_default()),
+                    csv_cell(&r.window_title.unwrap_or_default()),
                     r.session_id.map(|x| x.to_string()).unwrap_or_default(),
-                ])
-                .map_err(map_csv_err)?;
-            }
+                ]);
+            });
             w.flush()?;
         }
         "json" => {
-            let arr: Vec<_> = rows.iter().map(|r| json!({
-                "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                "event_data": r.event_data, "app_name": r.app_name, "window_title": r.window_title, "session_id": r.session_id
-            })).collect();
-            std::fs::write(&out_path, serde_json::to_string_pretty(&arr)?)?;
-        }
-        "jsonl" => {
             use std::io::Write;
             let mut f = std::fs::File::create(&out_path)?;
-            for r in &rows {
+            let rc = row_count.clone();
+            let mut first = true;
+            writeln!(f, "[")?;
+            queries::export_events_since_stream(&conn, &cutoff, |r| {
+                let n = rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
                     "event_data": r.event_data, "app_name": r.app_name, "window_title": r.window_title, "session_id": r.session_id
                 });
-                writeln!(f, "{}", serde_json::to_string(&obj)?)?;
-            }
+                let line = serde_json::to_string_pretty(&obj).unwrap_or_default();
+                if n > 0 {
+                    writeln!(f, ",").ok();
+                }
+                // 缩进对齐首行
+                for (i2, l) in line.lines().enumerate() {
+                    if i2 == 0 {
+                        write!(f, "  {l}").ok();
+                    } else {
+                        writeln!(f).ok();
+                        write!(f, "  {l}").ok();
+                    }
+                }
+                first = false;
+                let _ = first;
+            });
+            writeln!(f).ok();
+            write!(f, "]").ok();
+        }
+        "jsonl" => {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&out_path)?;
+            let rc = row_count.clone();
+            queries::export_events_since_stream(&conn, &cutoff, |r| {
+                rc.fetch_add(1, AOrdering::Relaxed);
+                let obj = json!({
+                    "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
+                    "event_data": r.event_data, "app_name": r.app_name, "window_title": r.window_title, "session_id": r.session_id
+                });
+                let _ = writeln!(f, "{}", serde_json::to_string(&obj).unwrap_or_default());
+            });
         }
         other => {
             return Err(Error::InvalidData(format!(
@@ -242,7 +271,11 @@ fn cmd_export(args: &[String]) -> Result<()> {
             )))
         }
     }
-    println!("✓ 导出 {} 行 → {}", rows.len(), out_path.display());
+    println!(
+        "✓ 导出 {} 行 → {}",
+        row_count.load(AOrdering::Relaxed),
+        out_path.display()
+    );
     Ok(())
 }
 
