@@ -320,17 +320,17 @@ impl Drop for Collector {
             for h in &self.hooks {
                 h.stop();
             }
-            if self.settings.input_granularity == InputGranularity::Minute {
-                // 给聚合线程一个唤醒周期，让它的关停 flush 先入队；
-                // 若线程已死则这里兜底直写（尽量少丢）。
-                thread::sleep(Duration::from_millis(1100));
-                let events = input_agg::flush_partial(chrono::Local::now());
-                if !events.is_empty() {
-                    write_batch(&self.db, &events, &self.total_written);
-                }
-            }
             if let Some(handle) = self.writer_handle.take() {
+                // 先 join writer：通道里残留的秒级小快照全部落库后，
+                // 再直写部分分钟终值——直写必然后发生，不会被旧快照覆盖
+                // （审查 P1：先直写后 join 会让 writer 把终值覆盖回小值）
                 let _ = handle.join();
+                if self.settings.input_granularity == InputGranularity::Minute {
+                    let events = input_agg::flush_partial(chrono::Local::now());
+                    if !events.is_empty() {
+                        write_batch(&self.db, &events, &self.total_written);
+                    }
+                }
             }
             let total = self.total_written.load(Ordering::Relaxed) as i64;
             self.db.end_session(self.session_id, total, 0.0);
@@ -419,6 +419,12 @@ pub fn start_collection_custom(
             .spawn(move || loop {
                 thread::sleep(Duration::from_secs(1));
                 if sd_agg.load(Ordering::Acquire) {
+                    // 关停兜底（审查 P1：必须在这里入队而不是 shutdown 直写——
+                    // 本线程是最后一个生产者，入队晚于队列里残留的秒级小快照，
+                    // writer 按序落库即天然消除"小快照后写覆盖最终行"竞态）
+                    for e in input_agg::flush_partial(chrono::Local::now()) {
+                        send_event(&tx_agg, e);
+                    }
                     return;
                 }
                 for e in input_agg::drain(chrono::Local::now()) {
@@ -426,9 +432,6 @@ pub fn start_collection_custom(
                 }
             })
             .expect("InputAgg 聚合线程启动失败");
-        // 关停兜底在聚合线程内做：看到停机旗标后先把未满分钟的部分计数
-        // flush 入队再退出——与队列中残留的秒级快照保持单一顺序，消除
-        // "小快照后写覆盖最终行"的竞态（审查 P1）。
     }
 
     // Hook 不带 name()（EventHook trait 最小面），按启用集条件构建。

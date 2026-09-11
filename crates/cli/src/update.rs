@@ -35,6 +35,14 @@ fn e(x: self_update::errors::Error) -> crate::Error {
 }
 
 pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
+    // 自更新按 current_exe 文件名匹配资产（审查 P1）：watchdog/ctl 没有对应
+    // 资产，且即便有也只换一个文件造成三件套版本漂移。收敛到 kynoptic update。
+    if update_bin_name() != "kynoptic" {
+        return Err(crate::Error::InvalidData(
+            "请改用 kynoptic update 完成自更新（watchdog/ctl 随 kynoptic.exe 一并更新）"
+                .to_string(),
+        ));
+    }
     let exe = std::env::current_exe()
         .map_err(|e| crate::Error::InvalidData(format!("无法定位当前可执行文件: {e}")))?;
     let exe = exe.to_string_lossy().to_string();

@@ -169,6 +169,10 @@ impl MinuteKey {
 }
 
 static PENDING: Mutex<Option<(MinuteKey, MinuteCounters)>> = Mutex::new(None);
+/// 重启抑制：activate 后的当前剩余分钟内不发事件（审查 P1——重启后计数器
+/// 从零开始，同分钟秒级快照比库里已存终值小，UPSERT 会把大值覆盖回小值；
+/// 抑制到下次 rollover，代价是重启时起 ≤59s 键鼠不计数）。
+static SUPPRESS_FIRST_MINUTE: AtomicBool = AtomicBool::new(true);
 /// 秒级可见：drain 每秒被调用一次，把当前分钟累计值整体 UPSERT 覆盖到
 /// 数据库同一行（0005 迁移的部分唯一索引）。派生缓存行的原地覆盖不违反
 /// 原始数据只增铁律（铁律保护对象是 press/click 等原始事件）。
@@ -254,17 +258,20 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
     // 锁中毒不应静默清零输入统计（审查 P2）：取回内部数据继续
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     {
+        // 抑制旗只在"仍是 activate 时的那一分钟"生效；rolleover 分支自然解除。
+        let in_suppressed_minute = SUPPRESS_FIRST_MINUTE.load(Ordering::Acquire);
         match g.take() {
             Some((key, mut acc)) if key == cur => {
                 acc.add(drained);
                 // 秒级可见：只要本分钟有输入，就把累计值整行 UPSERT（下游幂等覆盖）
-                if !acc.is_empty() {
+                if !acc.is_empty() && !in_suppressed_minute {
                     out = events_for(key, &acc);
                 }
                 *g = Some((key, acc));
             }
             Some((key, acc)) => {
                 out = events_for(key, &acc);
+                SUPPRESS_FIRST_MINUTE.store(false, Ordering::Release);
                 *g = Some((cur, drained));
             }
             None => {
@@ -310,6 +317,7 @@ pub fn reset() {
 /// 进入 minute 聚合模式（仅 [`crate::collector::start_collection_with`] 调用）。
 pub(crate) fn activate() {
     set_minute_mode(true);
+    SUPPRESS_FIRST_MINUTE.store(true, Ordering::Release);
 }
 
 #[cfg(test)]

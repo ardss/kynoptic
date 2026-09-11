@@ -66,15 +66,22 @@ var
   CmdResult: Integer;
 begin
   Result := '';
-  Exec('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE', '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+  if not Exec('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE', '', SW_HIDE, ewWaitUntilTerminated, CmdResult) or (CmdResult <> 0) then
+    Log('Watchdog task DISABLE skipped/failed: ' + IntToStr(CmdResult));
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   CmdResult: Integer;
 begin
-  if CurStep = ssPostInstall then
-    Exec('schtasks', '/Change /TN "Kynoptic Watchdog" /ENABLE', '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+  if CurStep = ssPostInstall then begin
+    // 仅当本次勾选 autostart 才恢复任务（审查 P1：无条件 ENABLE 会复活
+    // 用户明确拒绝的功能——升级场景下旧任务已存在）
+    if WizardIsTaskSelected('autostart') then begin
+      if not Exec('schtasks', '/Change /TN "Kynoptic Watchdog" /ENABLE', '', SW_HIDE, ewWaitUntilTerminated, CmdResult) or (CmdResult <> 0) then
+        Log('Watchdog task ENABLE failed: ' + IntToStr(CmdResult));
+    end;
+  end;
 end;
 
 [UninstallRun]

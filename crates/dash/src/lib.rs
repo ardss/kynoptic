@@ -1170,12 +1170,23 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         "dashboard: http://127.0.0.1:{bound}  (db: {}, read-only; Ctrl+C 停止)",
         db_path.display()
     );
+    // 并发上限（审查 P2：无界 spawn + 每连接新建 SQLite 连接可被本地进程
+    // 耗尽线程/句柄）。超限直接 503 拒绝，不排队。
+    let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        if inflight.load(std::sync::atomic::Ordering::Relaxed) >= 64 {
+            let mut s = stream;
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+            let _ = http_simple(&mut s, 503, "text/plain", "too many connections");
+            continue;
+        }
         // 每连接一线程 + 5s 读写超时（审查 P0：旧实现单线程串行且无超时，
         // 一个半开连接/慢客户端就能挂死 accept 循环，整个面板假死）。
         // Connection 非 Sync，无法跨线程共享——每连接只读打开一次（本地低并发）。
         let db_owned = db_owned.clone();
+        let inflight = inflight.clone();
+        inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = std::thread::Builder::new()
             .name("dash-conn".into())
             .spawn(move || {
@@ -1184,6 +1195,7 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 if let Err(e) = handle_client(stream, &db_owned, bound) {
                     log::warn!("dashboard 连接处理失败: {e}");
                 }
+                inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
     }
     Ok(())
@@ -1243,12 +1255,14 @@ fn handle_client(mut stream: TcpStream, db_path: &Path, port: u16) -> std::io::R
     // 攻击请求到不了这里。Origin/Sec-Fetch-Site 双保险。
     let is_post = head.lines().next().unwrap_or_default().starts_with("POST");
     if is_post {
+        // 浏览器对 POST 请求恒发 Origin（同源 fetch 也带），要求必须存在且
+        // 回环——不给"Origin 缺失放行"留口子（审查 P2：防线不依赖 marker 单点）。
         let origin_ok = origin
             .as_deref()
             .map(|o| {
                 o == format!("http://127.0.0.1:{port}") || o == format!("http://localhost:{port}")
             })
-            .unwrap_or(true);
+            .unwrap_or(false);
         if !marker || !origin_ok || fetch_site.as_deref() == Some("cross-site") {
             return http_simple(
                 &mut stream,
@@ -1266,8 +1280,9 @@ fn handle_client(mut stream: TcpStream, db_path: &Path, port: u16) -> std::io::R
         }
         raw.extend_from_slice(&buf[..n]);
     }
-    // body 按字节层切分后再转字符串（审查 P2：lossy 替换会错位索引）。
-    let body = String::from_utf8_lossy(&raw[header_end.min(raw.len())..]).to_string();
+    // body 按字节层精确切分（审查 P2：lossy 会错位；pipelined 多发尾巴裁掉）。
+    let body_end = (header_end + content_length).min(raw.len());
+    let body = String::from_utf8_lossy(&raw[header_end.min(body_end)..body_end]).to_string();
     let request_line = head.lines().next().unwrap_or_default().to_string();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();

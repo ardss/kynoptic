@@ -1,3 +1,10 @@
+// ─── 参数语义约定（审查 P1 教训：同模块曾出现"同名参数两制"）──────────
+// 本模块 `*_in_range(conn, start, end)` 系列的 start/end 必须是 RFC3339
+// UTC 字符串（用 `local_day_range(date)` 生成，禁止直接传 "YYYY-MM-DD"——
+// events.timestamp 是 UTC 字符串，与本地日期裸比较会在 UTC+X 凌晨整段错位，
+// 参考 keys_clicks_today 的修复）。`keys_clicks_today(conn, date, _)` 的
+// date 恰恰是本地日期串（内部自行换算），两种签名不可混用。
+
 //! 今日 / 全量聚合计数（keys / clicks / active_minutes / sessions 等）。
 //!
 //! 供 dashboard summary 面板、tray 实时数据、snapshot 缓存等消费。

@@ -45,7 +45,7 @@ jobs:
           # {bin}-{version}-{target}.zip 命名匹配资产，缺它 kynoptic update 必失败）
           Compress-Archive -Path dist/kynoptic.exe -DestinationPath "dist/kynoptic-$ver-x86_64-pc-windows-msvc.zip"
           # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用）
-          $hashes = Get-ChildItem dist -File | Where-Object { $_.Name -notmatch 'SHA256|kynoptic-' + $ver + '-x86_64' } |
+          $hashes = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
             ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
           $sums = ($hashes -join "`n") + "`n"
           [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", $sums)

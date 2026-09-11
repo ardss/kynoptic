@@ -33,6 +33,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_input_agg_upsert",
         include_str!("migrations/0005_input_agg_upsert.sql"),
     ),
+    (
+        "0006_post_v5_repair",
+        include_str!("migrations/0006_post_v5_repair.sql"),
+    ),
 ];
 
 /// 0001 的内容单独导出：供 CLI 等外部工具对裸库做幂等初始化。
