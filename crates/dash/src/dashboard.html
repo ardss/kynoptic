@@ -223,7 +223,7 @@
 </section>
 
 <section>
-  <h2><span class="l en">category share — time per category</span><span class="l zh">类别占比 — 各类时间分布（规则可在 settings.json 自定义）</span></h2>
+  <h2><span class="l en">category share — time per category</span><span class="l zh">类别占比 — 各类时间分布</span></h2>
   <div id="report-cats"></div>
 </section>
 
@@ -478,6 +478,11 @@ async function loadStatus() {
     s.today + " · last event: " + last + " UTC · read-only · " + s.db_path;
 }
 function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
+function prettyApp(a) {
+  const t = String(a).replace(/\.exe$/i, "");
+  return (document.documentElement.lang === "zh" && t === "(unknown)") ? "(未知)" : t;
+}
+
 async function loadOverview() {
   const o = await jget("/api/overview");
   // 今日在电脑前：分钟 -> X 小时 Y 分钟
@@ -486,7 +491,10 @@ async function loadOverview() {
   const am = o.automation_minutes || 0;
   const ah = Math.floor(am / 60), amm = am % 60;
   const zh = document.documentElement.lang === "zh";
-  const dur = (h, m) => zh ? h + " 小时 " + m + " 分钟" : h + "h " + m + "m";
+  const dur = (h, m) => {
+    if (h === 0) return zh ? m + " 分钟" : m + "m";
+    return zh ? h + " 小时 " + m + " 分钟" : h + "h " + m + "m";
+  };
   document.getElementById("c-presence").textContent = dur(hh, mm);
   document.getElementById("c-automation").textContent = dur(ah, amm);
   document.getElementById("c-first").textContent = o.first_activity || "–";
@@ -549,8 +557,8 @@ async function loadTimeline() {
     const auto = Math.min(60 - human, b.auto_min || 0);
     const away = 60 - human - auto;
     const pct1 = (v) => (v / 60 * 100).toFixed(1);
-    const pretty = (a) => a.replace(/\.exe$/i, "");
-    const apps = b.apps.map(x => pretty(x.app) + " x" + x.events).join(", ");
+
+    const apps = b.apps.map(x => prettyApp(x.app) + " x" + x.events).join(", ");
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
       '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13)) + "</span>" +
       '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +

@@ -871,7 +871,7 @@ pub fn api_insights(conn: &Connection) -> Value {
     for i in 0..switches.len() {
         let (t, a) = &switches[i];
         let nxt = switches.get(i + 1).map(|(t2, _)| *t2).unwrap_or(*t);
-        *dwell.entry(a.clone()).or_insert(0.0) += (nxt - *t).num_seconds().min(1800) as f64;
+        *dwell.entry(a.clone()).or_insert(0.0) += (nxt - *t).num_seconds() as f64;
     }
     let mut top: Vec<(String, f64)> = dwell.into_iter().collect();
     top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -879,7 +879,7 @@ pub fn api_insights(conn: &Connection) -> Value {
         let names: Vec<String> = top
             .iter()
             .take(3)
-            .map(|(a, h)| format!("{} {:.1}h", a, h / 3600.0))
+            .map(|(a, h)| format!("{} {:.1}h", a.trim_end_matches(".exe"), h / 3600.0))
             .collect();
         insights.push(json!({
             "title_zh": "应用驻留时长 Top3",
