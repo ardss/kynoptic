@@ -864,9 +864,9 @@ async function loadApps() {
 }
 // 顶视图鼠标部件：[kind, x, y, w, h, label]，kind 对应 clicks 字段
 const MOUSE_PARTS = [
-  ["left", 212, 22, 66, 92, "L"],
-  ["right", 282, 22, 66, 92, "R"],
-  ["middle", 270, 26, 20, 34, "M"],
+  ["clicks_left", 212, 22, 66, 92, "L"],
+  ["clicks_right", 282, 22, 66, 92, "R"],
+  ["clicks_middle", 270, 26, 20, 34, "M"],
   ["scroll_ticks", 272, 64, 16, 26, ""],
   ["clicks_side1", 202, 96, 12, 34, "S1"],
   ["clicks_side2", 202, 138, 12, 34, "S2"],
@@ -918,6 +918,7 @@ function renderMouse(d) {
 }
 function labelName(kind) {
   const names = { left: "Left", right: "Right", middle: "Middle",
+    clicks_left: "Left", clicks_right: "Right", clicks_middle: "Middle",
     clicks_side1: "Side 1", clicks_side2: "Side 2", scroll_ticks: t("scrollTicks") };
   return names[kind] || kind;
 }
