@@ -549,7 +549,8 @@ async function loadTimeline() {
     const auto = Math.min(60 - human, b.auto_min || 0);
     const away = 60 - human - auto;
     const pct1 = (v) => (v / 60 * 100).toFixed(1);
-    const apps = b.apps.map(x => x.app + " x" + x.events).join(", ");
+    const pretty = (a) => a.replace(/\.exe$/i, "");
+    const apps = b.apps.map(x => pretty(x.app) + " x" + x.events).join(", ");
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
       '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13)) + "</span>" +
       '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +

@@ -105,7 +105,7 @@ pub fn api_timeline_at(
     let mut stmt = conn
         .prepare(
             "SELECT substr(datetime(timestamp, ?1), 1, 13) AS hour_bucket, \
-                    COALESCE(NULLIF(app_name, ''), window_title, '(unknown)') AS app, \
+                    COALESCE(NULLIF(app_name, ''), NULLIF(window_title, ''), '(unknown)') AS app, \
                     COUNT(*) AS cnt \
              FROM events \
              WHERE timestamp >= ?2 AND timestamp < ?3 \
@@ -370,7 +370,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     // 今日前台应用时长（窗口切换间隔推算，单段上限 30 分钟；三指标之三）
     let mut fg_dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') FROM events          WHERE event_type = 'window' AND event_action = 'switch'            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+        "SELECT timestamp, COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') FROM events          WHERE event_type = 'window' AND event_action = 'switch'            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
     ) {
         let rows: Vec<(String, String)> = stmt
             .query_map(params![&start, &end], |r| {
@@ -996,7 +996,7 @@ pub fn api_report_at(
         .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
     let mut stmt = conn
         .prepare(
-            "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') AS app, window_title              FROM events              WHERE event_type = 'window' AND event_action = 'switch'                AND timestamp >= ?1 AND timestamp < ?2              ORDER BY timestamp",
+            "SELECT timestamp, COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') AS app, window_title              FROM events              WHERE event_type = 'window' AND event_action = 'switch'                AND timestamp >= ?1 AND timestamp < ?2              ORDER BY timestamp",
         )
         .map_err(|e| e.to_string())?;
     let rows: Vec<(String, String, Option<String>)> = stmt
@@ -1157,7 +1157,7 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
         .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
     let mut stmt = conn
         .prepare(
-            "SELECT substr(datetime(timestamp, ?1), 12, 2) AS hh,                     COALESCE(NULLIF(app_name,''), window_title, '(unknown)') AS app,                     COUNT(*) AS cnt              FROM events              WHERE event_type = 'window' AND timestamp >= ?2 AND timestamp < ?3              GROUP BY hh, app",
+            "SELECT substr(datetime(timestamp, ?1), 12, 2) AS hh,                     COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') AS app,                     COUNT(*) AS cnt              FROM events              WHERE event_type = 'window' AND timestamp >= ?2 AND timestamp < ?3              GROUP BY hh, app",
         )
         .map_err(|e| e.to_string())?;
     let off = {
