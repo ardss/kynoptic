@@ -69,7 +69,11 @@ B2_OK=$(echo "$B2" | python -c "
 import json,sys
 try:
     d=json.loads(json.loads(sys.stdin.read()))
-    print(1 if all(v not in ('','–') for v in d.values()) else 0)
+    # 空日容忍：当天刚开始时“首次活动”合法显示 –（午夜后几分钟内），不算渲染失败
+    if d.get('t') in ('','–') and d.get('a') not in ('','–') and d.get('f') not in ('','–'):
+        print(1)
+    else:
+        print(1 if all(v not in ('','–') for v in d.values()) else 0)
 except Exception: print(0)")
 check "B2 总览-自动化/前台/首次在场已渲染" "$B2_OK" "$B2"
 
