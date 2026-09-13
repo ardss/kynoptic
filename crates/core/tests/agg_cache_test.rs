@@ -136,7 +136,7 @@ fn counts_include_input_agg_rows() {
     assert_eq!((k, c), (6, 4));
 
     // 增量聚合缓存维护（writer 线程在真实路径上做的同一件事）
-    db.update_agg(&events);
+    db.update_agg(&events, &(1..=events.len() as i64).collect::<Vec<i64>>());
     // 异常读取走 agg 缓存路径，数值与 events 现算一致
     let conn = db.reader();
     assert!(agg::has_minute_for_date(&conn, &today));
@@ -169,7 +169,7 @@ fn agg_maintenance_never_touches_raw_events() {
     db.insert_events(&events);
 
     let before = events_snapshot(db.reader().deref());
-    db.update_agg(&events);
+    db.update_agg(&events, &(1..=events.len() as i64).collect::<Vec<i64>>());
     db.rebuild_agg();
     db.rebuild_agg(); // 幂等
     let after = events_snapshot(db.reader().deref());
@@ -229,7 +229,7 @@ fn cached_results_match_legacy_computation() {
         .unwrap_or(0);
 
     // —— 建缓存后（agg 读路径）——
-    db.update_agg(&events);
+    db.update_agg(&events, &(1..=events.len() as i64).collect::<Vec<i64>>());
     let conn = db.reader();
     let cached_day = queries::day_totals(&conn, &today);
     let cached_late_night = queries::late_night_key_count(&conn, &today, 0);
@@ -311,7 +311,7 @@ fn app_daily_cache_matches_legacy_scan() {
     db.insert_events(&events);
 
     let legacy = queries::app_history_totals(db.reader().deref(), "code.exe", "2026-06-10");
-    db.update_agg(&events);
+    db.update_agg(&events, &(1..=events.len() as i64).collect::<Vec<i64>>());
     let cached = queries::app_history_totals(db.reader().deref(), "code.exe", "2026-06-10");
     assert_eq!(
         legacy, cached,

@@ -84,10 +84,11 @@ fn create_monitors_for(
 }
 
 fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
-    db.insert_events(batch);
+    // rowids 与 batch 一一对应（失败行为 0），供 agg 增量维护做幂等防护
+    let rowids = db.insert_events(batch);
     total_written.fetch_add(batch.len(), Ordering::Relaxed);
     // 聚合读缓存增量维护（派生数据；失败仅 log，不影响原始写入）
-    db.update_agg(batch);
+    db.update_agg(batch, &rowids);
 }
 
 fn writer_loop(
@@ -101,9 +102,12 @@ fn writer_loop(
 ) {
     use std::panic;
 
+    // batch 放在重启循环这一层（审查 P2）：inner panic 时 batch 里可能有
+    // 未落库事件，重启后先 flush 残余再继续，不让 panic 丢整批。
+    let mut batch: Vec<Event> = Vec::with_capacity(batch_size);
     loop {
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            writer_loop_inner(&rx, &db, batch_size, flush_interval, &total_written)
+            writer_loop_inner(&rx, &db, batch_size, flush_interval, &total_written, &mut batch)
         }));
         match result {
             Ok(Some(flush_count)) => {
@@ -112,6 +116,12 @@ fn writer_loop(
             }
             Ok(None) => continue,
             Err(e) => {
+                // 残余 batch 先落库（panic 可能发生在 flush 之前的任意点）
+                if !batch.is_empty() {
+                    log::warn!("Writer panic 后 flush 残余 batch {} 条", batch.len());
+                    write_batch(&db, &batch, &total_written);
+                    batch.clear();
+                }
                 log::error!("Writer 线程 panic: {:?}，1 秒后重启", e);
                 thread::sleep(Duration::from_secs(1));
             }
@@ -125,11 +135,11 @@ fn writer_loop_inner(
     batch_size: usize,
     flush_interval: Duration,
     total_written: &AtomicUsize,
+    batch: &mut Vec<Event>,
 ) -> Option<usize> {
     use crossbeam_channel::{RecvTimeoutError, TryRecvError};
     use std::time::Instant;
 
-    let mut batch: Vec<Event> = Vec::with_capacity(batch_size);
     let mut last_flush = Instant::now();
 
     loop {
@@ -420,19 +430,34 @@ pub fn start_collection_custom(
         agg_handle = Some(
             thread::Builder::new()
                 .name("InputAgg".into())
-                .spawn(move || loop {
-                    thread::sleep(Duration::from_secs(1));
-                    if sd_agg.load(Ordering::Acquire) {
-                        // 关停兜底（审查 P1：必须在这里入队而不是 shutdown 直写——
-                        // 本线程是最后一个生产者，入队晚于队列里残留的秒级小快照，
-                        // writer 按序落库即天然消除"小快照后写覆盖最终行"竞态）
-                        for e in input_agg::flush_partial(chrono::Local::now()) {
-                            send_event(&tx_agg, e);
+                .spawn(move || {
+                    // panic 防护（审查 P2）：drain/flush panic 不允许终结聚合
+                    // 线程——catch_unwind 包住单轮工作，Err 则延迟后重启循环。
+                    loop {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            thread::sleep(Duration::from_secs(1));
+                            if sd_agg.load(Ordering::Acquire) {
+                                // 关停兜底（审查 P1：必须在这里入队而不是 shutdown 直写——
+                                // 本线程是最后一个生产者，入队晚于队列里残留的秒级小快照，
+                                // writer 按序落库即天然消除"小快照后写覆盖最终行"竞态）
+                                for e in input_agg::flush_partial(chrono::Local::now()) {
+                                    send_event(&tx_agg, e);
+                                }
+                                return true;
+                            }
+                            for e in input_agg::drain(chrono::Local::now()) {
+                                send_event(&tx_agg, e);
+                            }
+                            false
+                        }));
+                        match result {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(e) => {
+                                log::error!("InputAgg 线程 panic: {:?}，1 秒后重启", e);
+                                thread::sleep(Duration::from_secs(1));
+                            }
                         }
-                        return;
-                    }
-                    for e in input_agg::drain(chrono::Local::now()) {
-                        send_event(&tx_agg, e);
                     }
                 })
                 .expect("InputAgg 聚合线程启动失败"),

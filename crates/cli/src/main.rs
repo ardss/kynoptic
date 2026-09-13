@@ -69,6 +69,7 @@ Subcommands:
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update                                      Self-update from GitHub releases
   watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
+  presence  [--days N]                      Daily presence/automation/foreground summary
 ";
 
 fn resolve_db() -> PathBuf {
@@ -964,20 +965,256 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// === presence ===
+
+/// 解析 `presence [--days N]` 参数。默认 1 天；N 非法或 < 1 报错（不静默兜底）。
+fn parse_presence_args(args: &[String]) -> Result<i64> {
+    let mut days: i64 = 1;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--days" => {
+                i += 1;
+                let raw = args.get(i).cloned().unwrap_or_default();
+                days = raw
+                    .parse()
+                    .map_err(|_| Error::InvalidData(format!("presence: 无效天数 {raw:?}")))?;
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "presence: 未知选项 {other:?}（支持 --days N）"
+                )))
+            }
+        }
+        i += 1;
+    }
+    if days < 1 {
+        return Err(Error::InvalidData("presence: 天数必须 >= 1".into()));
+    }
+    Ok(days)
+}
+
+/// 桥接计数：排序去重后的分钟序列里，相邻间隙 <= gap 分钟按"无输入阅读"
+/// 桥接成连续在场段，返回覆盖的分钟总数。与 dash 的 bridge_count 同逻辑。
+fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
+    if sorted_minutes.is_empty() {
+        return 0;
+    }
+    let mut total = 1i64;
+    let mut prev = sorted_minutes[0];
+    for &m in &sorted_minutes[1..] {
+        let step = (m - prev).min(gap + 1);
+        total += step.max(1);
+        prev = m;
+    }
+    total
+}
+
+// TODO: 与 dash 的实现（crates/dash/src/lib.rs api_overview）下沉到 core 收敛为单一实现
+/// 单日三指标（本地日界 [start, end)，RFC3339 字符串比较）：
+///   人在场 = 非注入输入分钟（keys - injected_keys > 0）+ <=bridge 分钟桥接
+///   自动化 = 有注入输入（injected_keys > 0）的分钟数
+///   前台   = window/switch 事件间隔推算的累计分钟（sum/60）
+fn presence_metrics(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    bridge_min: u32,
+) -> Result<(i64, i64, i64)> {
+    use chrono::Timelike;
+    let minute_of_day = |minute_str: &str| -> Option<i64> {
+        chrono::DateTime::parse_from_rfc3339(&format!("{}:00+00:00", minute_str))
+            .ok()
+            .map(|t| {
+                let l = t.with_timezone(&chrono::Local);
+                l.hour() as i64 * 60 + l.minute() as i64
+            })
+    };
+    let mut human: Vec<i64> = Vec::new();
+    let mut automation: Vec<i64> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT substr(timestamp,1,16), \
+                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)), \
+                MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0)) \
+             FROM events WHERE event_action = 'input_agg' AND json_valid(event_data) \
+               AND timestamp >= ?1 AND timestamp < ?2 \
+             GROUP BY substr(timestamp,1,16)",
+    ) {
+        let rows = stmt.query_map(params![start, end], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        for (minute_str, human_keys, injected) in rows.flatten() {
+            if human_keys > 0 {
+                if let Some(m) = minute_of_day(&minute_str) {
+                    human.push(m);
+                }
+            } else if injected > 0 {
+                if let Some(m) = minute_of_day(&minute_str) {
+                    automation.push(m);
+                }
+            }
+        }
+    }
+    // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT substr(timestamp,1,16) FROM events \
+          WHERE event_action IN ('press','click') \
+            AND timestamp >= ?1 AND timestamp < ?2",
+    ) {
+        let rows = stmt.query_map(params![start, end], |r| r.get::<_, String>(0))?;
+        for minute_str in rows.flatten() {
+            if let Some(m) = minute_of_day(&minute_str) {
+                human.push(m);
+            }
+        }
+    }
+    human.sort_unstable();
+    human.dedup();
+    automation.sort_unstable();
+    automation.dedup();
+    let presence = bridge_count(&human, (bridge_min.min(15)) as i64);
+
+    // 前台分钟：窗口切换间隔累计（与 dash api_overview 同口径）
+    let mut fg_secs: i64 = 0;
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT timestamp FROM events \
+          WHERE event_type = 'window' AND event_action = 'switch' \
+            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+    ) {
+        let rows = stmt.query_map(params![start, end], |r| r.get::<_, String>(0))?;
+        let stamps: Vec<String> = rows.flatten().collect();
+        let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
+        for pair in stamps.windows(2) {
+            if let (Some(a), Some(b)) = (parse(&pair[0]), parse(&pair[1])) {
+                fg_secs += (b - a).num_seconds();
+            }
+        }
+    }
+    Ok((presence, automation.len() as i64, fg_secs / 60))
+}
+
+/// `kynoptic presence [--days N]`：每日 人在场/自动化/前台 三行式摘要。
+/// 口径与 dashboard 三指标一致（见 presence_metrics 注释与 TODO）。
+fn cmd_presence(args: &[String]) -> Result<()> {
+    let days = parse_presence_args(args)?;
+    let bridge = kynoptic_dash::settings::load(&resolve_db()).presence_bridge_minutes;
+    let conn = open_db(&resolve_db())?;
+    println!("=== Presence last {days} day(s) (bridge <= {bridge} min) ===");
+    for offset in (1 - days)..=0 {
+        let date = queries::date_offset_str(offset);
+        let Some((start, end)) = queries::local_day_range(&date) else {
+            continue;
+        };
+        let (presence, automation, foreground) = presence_metrics(&conn, &start, &end, bridge)?;
+        println!("{date} presence:   {presence} min");
+        println!("{date} automation: {automation} min");
+        println!("{date} foreground: {foreground} min");
+    }
+    Ok(())
+}
+
 /// `kynoptic watchdog`：托盘看门狗（给计划任务每分钟调一次，`--once` 单次检查）。
 /// 探活 = 打开托盘的命名互斥体；托盘不在且非用户主动退出（无旗标）才拉起。
 /// 常驻模式（默认）每 15s 检查一轮；被杀/崩溃 -> 重新拉起 --minimized。
+/// P1 修复：除互斥体探活外还检查托盘心跳文件——进程活着但采集主循环挂死时
+/// 互斥体不释放，旧逻辑永远不会重启（4-8 小时无数据空洞的根因）。心跳缺失
+/// 或距今超过 180 秒且进程存在 -> kill 托盘，下一轮自动重新拉起。
+///
+/// 共享文件路径契约（见 crates/tray/src/paths.rs，两边必须同步修改）：
+///   退出旗标 = KYNOPTIC_EXIT_FLAG env > exe 同目录 tray-exit.flag
+///   心跳     = exe 同目录 kynoptic-heartbeat（RFC3339 时间戳，tray 每 30s touch）
+///   看门狗日志 = exe 同目录 watchdog.log
+const EXIT_FLAG_FILE: &str = "tray-exit.flag";
+const HEARTBEAT_FILE: &str = "kynoptic-heartbeat";
+const EXIT_FLAG_ENV: &str = "KYNOPTIC_EXIT_FLAG";
+const WATCHDOG_LOG_FILE: &str = "watchdog.log";
+/// 心跳最大年龄：tray 每 30s touch，180s ≈ 6 个周期未更新即判挂死
+const HEARTBEAT_MAX_AGE_SECS: i64 = 180;
+
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()))
+}
+
+/// 退出旗标路径：env 覆盖 > exe 同目录（与 tray 的 paths::resolve_exit_flag 同规则）
+fn exit_flag_path() -> PathBuf {
+    if let Ok(p) = std::env::var(EXIT_FLAG_ENV) {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    exe_dir()
+        .map(|d| d.join(EXIT_FLAG_FILE))
+        .unwrap_or_else(|| PathBuf::from(EXIT_FLAG_FILE))
+}
+
+/// 心跳文件路径：exe 同目录（与 tray 的 paths::resolve_heartbeat 同规则）
+fn heartbeat_path() -> PathBuf {
+    exe_dir()
+        .map(|d| d.join(HEARTBEAT_FILE))
+        .unwrap_or_else(|| PathBuf::from(HEARTBEAT_FILE))
+}
+
+/// 心跳新鲜度判定：内容应为 RFC3339 时间戳，返回距今秒数。
+/// 缺失/解析失败返回 None（调用方按"过期"处理）；时钟回拨按 0 处理。
+fn heartbeat_age_secs(now: chrono::DateTime<Utc>, content: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(content.trim())
+        .ok()
+        .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+}
+
+/// 心跳是否过期（缺失/不可解析/超龄都算过期）。
+fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
+    match content {
+        Some(c) => match heartbeat_age_secs(now, c) {
+            Some(age) => age > HEARTBEAT_MAX_AGE_SECS,
+            None => true,
+        },
+        None => true,
+    }
+}
+
+/// 追加一行看门狗日志到 exe 同目录 watchdog.log（尽力而为，失败忽略）。
+fn watchdog_log(msg: &str) {
+    let line = format!("[{}] {}\n", Utc::now().to_rfc3339(), msg);
+    eprint!("watchdog: {line}");
+    if let Some(dir) = exe_dir() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(WATCHDOG_LOG_FILE))
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// kill 托盘进程（心跳挂死时）。返回是否至少执行了一次 taskkill。
+#[cfg(target_os = "windows")]
+fn kill_tray() -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("taskkill")
+        .args(["/F", "/IM", "kynoptic-tray.exe", "/T"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    out.is_ok()
+}
+
 fn cmd_watchdog(args: &[String]) -> Result<()> {
-    let mut db_path = kynoptic_core::db::resolve_db_path();
     let mut once = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            // 历史兼容参数：旗标/心跳路径已统一为 exe 同目录（+env 覆盖），
+            // --db 不再参与旗标定位，保留仅为不破坏计划任务里的旧命令行。
             "--db" => {
-                let raw = it
-                    .next()
+                it.next()
                     .ok_or_else(|| Error::InvalidData("--db 需要路径".into()))?;
-                db_path = PathBuf::from(raw);
             }
             "--once" => once = true,
             other => return Err(Error::InvalidData(format!("watchdog 未知参数: {other}"))),
@@ -993,6 +1230,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             .encode_utf16()
             .chain([0])
             .collect();
+        let exit_flag = exit_flag_path();
         loop {
             let running = unsafe {
                 let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
@@ -1003,30 +1241,36 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     false
                 }
             };
-            if !running {
-                let flag = db_path
-                    .parent()
-                    .map(|p| p.join("tray-exit.flag"))
-                    .unwrap_or_else(|| PathBuf::from("tray-exit.flag"));
-                if !flag.exists() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        if let Some(dir) = exe.parent() {
-                            let tray = dir.join("kynoptic-tray.exe");
-                            if tray.exists() {
-                                use std::process::{Command, Stdio};
-                                const DETACHED_PROCESS: u32 = 0x0000_0008;
-                                if let Err(e) = Command::new(&tray)
-                                    .arg("--minimized")
-                                    .stdin(Stdio::null())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .creation_flags(DETACHED_PROCESS)
-                                    .spawn()
-                                {
-                                    eprintln!("watchdog: 拉起托盘失败: {e}");
-                                }
-                                log::info!("watchdog: 托盘不在且非用户退出,已拉起");
+            if running {
+                // 进程活着：检查心跳。缺失或超龄（默认 180s）说明采集主循环
+                // 挂死——kill 掉，下一轮 running=false 走正常拉起路径。
+                let hb_read = std::fs::read_to_string(heartbeat_path())
+                    .map(|s| s.trim().to_string())
+                    .ok();
+                if heartbeat_stale(Utc::now(), hb_read.as_deref()) {
+                    watchdog_log(&format!(
+                        "心跳缺失或超龄(>{HEARTBEAT_MAX_AGE_SECS}s), 判定采集挂死, kill kynoptic-tray 以重启"
+                    ));
+                    kill_tray();
+                }
+            } else if !exit_flag.exists() {
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        let tray = dir.join("kynoptic-tray.exe");
+                        if tray.exists() {
+                            use std::process::{Command, Stdio};
+                            const DETACHED_PROCESS: u32 = 0x0000_0008;
+                            if let Err(e) = Command::new(&tray)
+                                .arg("--minimized")
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .creation_flags(DETACHED_PROCESS)
+                                .spawn()
+                            {
+                                eprintln!("watchdog: 拉起托盘失败: {e}");
                             }
+                            watchdog_log("托盘不在且非用户退出,已拉起");
                         }
                     }
                 }
@@ -1075,6 +1319,7 @@ fn main() -> ExitCode {
         "dashboard" => dashboard::cmd_dashboard(&args[1..]),
         "update" => update::cmd_update(&args[1..]),
         "watchdog" => cmd_watchdog(&args[1..]),
+        "presence" => cmd_presence(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE);
             Ok(())
@@ -1190,5 +1435,160 @@ mod tests {
         let t = truncate_col(&long, 16);
         assert_eq!(t.chars().count(), 16);
         assert!(t.ends_with('…'));
+    }
+
+    // === watchdog 心跳与共享路径 ===
+
+    #[test]
+    fn heartbeat_age_parses_rfc3339_and_clamps_clock_skew() {
+        let now = Utc::now();
+        let fresh = now - Duration::seconds(30);
+        let age = heartbeat_age_secs(now, &fresh.to_rfc3339()).unwrap();
+        assert!(
+            (29..=30).contains(&age),
+            "30s 前的心跳 ≈ 30s 年龄（RFC3339 截断亚秒可差 1）: {age}"
+        );
+        // 时钟回拨（内容在未来）按 0 处理,不判负
+        let future = now + Duration::seconds(120);
+        assert_eq!(heartbeat_age_secs(now, &future.to_rfc3339()), Some(0));
+        // 首尾空白可容忍;坏内容 = None
+        assert_eq!(heartbeat_age_secs(now, "  not-a-time \n"), None);
+        assert_eq!(heartbeat_age_secs(now, ""), None);
+    }
+
+    #[test]
+    fn heartbeat_stale_missing_or_old_or_garbage() {
+        let now = Utc::now();
+        // 缺失 = 过期
+        assert!(heartbeat_stale(now, None));
+        // 垃圾内容 = 过期
+        assert!(heartbeat_stale(now, Some("garbage")));
+        // 新鲜（阈值内）不过期
+        let recent = (now - Duration::seconds(HEARTBEAT_MAX_AGE_SECS - 1)).to_rfc3339();
+        assert!(!heartbeat_stale(now, Some(&recent)));
+        // 恰好等于阈值不算过期,超过 1 秒过期
+        let exact = (now - Duration::seconds(HEARTBEAT_MAX_AGE_SECS)).to_rfc3339();
+        assert!(!heartbeat_stale(now, Some(&exact)));
+        let old = (now - Duration::seconds(HEARTBEAT_MAX_AGE_SECS + 1)).to_rfc3339();
+        assert!(heartbeat_stale(now, Some(&old)));
+    }
+
+    // env 是进程全局的:两个用到 exit_flag_path 的用例共用一把锁串行化
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn shared_paths_match_tray_contract_filenames() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // 与 crates/tray/src/paths.rs 的契约:文件名必须一致
+        assert_eq!(EXIT_FLAG_FILE, "tray-exit.flag");
+        assert_eq!(HEARTBEAT_FILE, "kynoptic-heartbeat");
+        assert_eq!(EXIT_FLAG_ENV, "KYNOPTIC_EXIT_FLAG");
+        // 解析规则:exe 同目录(文件名锚定)
+        assert_eq!(exit_flag_path().file_name().unwrap(), "tray-exit.flag");
+        assert_eq!(heartbeat_path().file_name().unwrap(), "kynoptic-heartbeat");
+    }
+
+    #[test]
+    fn exit_flag_env_override_matches_tray() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var(EXIT_FLAG_ENV, r"C:\tmp\ctl-flag");
+        let p = exit_flag_path();
+        std::env::remove_var(EXIT_FLAG_ENV);
+        assert_eq!(p, PathBuf::from(r"C:\tmp\ctl-flag"));
+    }
+
+    // === presence ===
+
+    #[test]
+    fn presence_args_default_one_day_and_validate() {
+        assert_eq!(parse_presence_args(&[]).unwrap(), 1);
+        let a: Vec<String> = ["--days", "7"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_presence_args(&a).unwrap(), 7);
+        for bad in [
+            vec!["--days".to_string(), "abc".to_string()],
+            vec!["--days".to_string(), "0".to_string()],
+            vec!["--days".to_string(), "-1".to_string()],
+            vec!["--days".to_string()],
+            vec!["--gpu".to_string()],
+        ] {
+            assert!(parse_presence_args(&bad).is_err(), "{bad:?} 应报错");
+        }
+    }
+
+    #[test]
+    fn bridge_count_bridges_small_gaps_only() {
+        assert_eq!(bridge_count(&[], 2), 0);
+        assert_eq!(bridge_count(&[10], 2), 1);
+        // 10,11,12 连续;12->15 与 15->18 间隙均为 3,各按 cap(bridge+1)=3 补步长
+        assert_eq!(bridge_count(&[10, 11, 12, 15, 18], 2), 9);
+        // 间隙 4（缺 3 分钟）同样按 cap=3 补: 1 + 3 = 4
+        assert_eq!(bridge_count(&[10, 14], 2), 4);
+        // 连续分钟逐 1 累计
+        assert_eq!(bridge_count(&[10, 11, 12, 13], 2), 4);
+    }
+
+    /// 建最小 events 表并插入测试数据（本地日:今天）。
+    fn setup_presence_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, event_type TEXT, \
+             event_action TEXT, event_data TEXT, app_name TEXT, window_title TEXT, session_id INTEGER);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_event(conn: &Connection, ts: &str, etype: &str, action: &str, data: &str) {
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![ts, etype, action, data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn presence_metrics_counts_human_automation_foreground() {
+        let conn = setup_presence_db();
+        // 10:00 人工输入（keys=10, injected=0）-> 在场
+        insert_event(&conn, "2026-09-13T10:00:30+08:00", "keyboard", "input_agg", r#"{"keys":10}"#);
+        // 10:07 全注入 -> 自动化
+        insert_event(&conn, "2026-09-13T10:07:00+08:00", "keyboard", "input_agg", r#"{"keys":5,"injected_keys":5}"#);
+        // 混合分钟（human=8>0）-> 在场,不算自动化
+        insert_event(&conn, "2026-09-13T10:08:00+08:00", "keyboard", "input_agg", r#"{"keys":10,"injected_keys":2}"#);
+        // 窗口切换:10:00 -> 11:00 = 60 分钟前台
+        insert_event(&conn, "2026-09-13T10:00:00+08:00", "window", "switch", "");
+        insert_event(&conn, "2026-09-13T11:00:00+08:00", "window", "switch", "");
+        let (start, end) = queries::local_day_range("2026-09-13").unwrap();
+        let (p, a, f) = presence_metrics(&conn, &start, &end, 2).unwrap();
+        assert_eq!(a, 1, "注入分钟数 = 1");
+        // 大间隙按 dash 同款公式只补 bridge+1 步长（cap 后为 3）: 1 + 3 = 4
+        assert_eq!(p, 4, "两个在场分钟 + 间隙按 bridge 上限补步长（与 dash 口径一致）");
+        assert_eq!(f, 60, "前台 = 一次切换间隔 60 分钟");
+    }
+
+    #[test]
+    fn presence_metrics_bridges_adjacent_human_minutes() {
+        let conn = setup_presence_db();
+        for m in ["10:00", "10:01", "10:04", "10:05"] {
+            insert_event(
+                &conn,
+                &format!("2026-09-13T{m}:30+08:00"),
+                "keyboard",
+                "input_agg",
+                r#"{"keys":3}"#,
+            );
+        }
+        let (start, end) = queries::local_day_range("2026-09-13").unwrap();
+        let (p, a, _) = presence_metrics(&conn, &start, &end, 2).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(p, 6, "10:00-10:01 + 桥接 10:02-10:03 + 10:04-10:05 = 6 分钟");
+    }
+
+    #[test]
+    fn presence_metrics_empty_day_is_zero() {
+        let conn = setup_presence_db();
+        let (start, end) = queries::local_day_range("2026-09-13").unwrap();
+        assert_eq!(presence_metrics(&conn, &start, &end, 2).unwrap(), (0, 0, 0));
     }
 }

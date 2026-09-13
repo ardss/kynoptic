@@ -29,33 +29,32 @@ impl Database {
     /// 2. 任意一条失败 → ROLLBACK 整个事务
     /// 3. 重试一次（去掉失败行 + 可能不冲突的 schema 漂移）
     /// 4. 仍失败则降级为逐条单独事务，确保成功行不丢
-    pub fn insert_events(&self, events: &[Event]) {
+    ///
+    /// 返回与 `events` 一一对应的 rowid（写入失败的行记 0，供 agg 增量维护
+    /// 的 max_event_rowid 幂等防护使用）。
+    pub fn insert_events(&self, events: &[Event]) -> Vec<i64> {
         if events.is_empty() {
-            return;
+            return Vec::new();
         }
 
-        // 第一次尝试：单事务整批
+        // 第一次尝试：单事务整批（事务内任一条失败即整体 Err → 降级逐条）
         match self.insert_events_tx(events) {
-            Ok(n) => {
-                if n != events.len() {
-                    log::warn!("首次插入 {} / {} 成功，触发单条重试", n, events.len());
-                    self.insert_events_one_by_one(events);
-                }
-            }
+            Ok(rowids) => rowids,
             Err(e) => {
                 log::error!("批量插入失败，降级为逐条: {e}");
-                self.insert_events_one_by_one(events);
+                self.insert_events_one_by_one(events)
             }
         }
     }
 
-    fn insert_events_tx(&self, events: &[Event]) -> rusqlite::Result<usize> {
+    fn insert_events_tx(&self, events: &[Event]) -> rusqlite::Result<Vec<i64>> {
         let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
             return Err(rusqlite::Error::ExecuteReturnedResults);
         };
         let tx = conn.unchecked_transaction()?;
         // prepare_cached 复用 prepared statement 计划，避免每行重新 prepare/finalize
         // （原 tx.execute 每行都 prepare 一次，批量 300 条 = 300 次 prepare）。
+        let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
         {
             let mut stmt = tx.prepare_cached(INSERT_SQL)?;
             let mut agg_stmt = tx.prepare_cached(UPSERT_INPUT_AGG_SQL)?;
@@ -74,13 +73,15 @@ impl Database {
                         e.window_title,
                         e.session_id,
                     ])?;
+                rowids.push(if is_agg { 0 } else { tx.last_insert_rowid() });
             }
         }
         tx.commit()?;
-        Ok(events.len())
+        Ok(rowids)
     }
 
-    fn insert_events_one_by_one(&self, events: &[Event]) {
+    fn insert_events_one_by_one(&self, events: &[Event]) -> Vec<i64> {
+        let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
         for e in events {
             let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
                 continue;
@@ -108,19 +109,23 @@ impl Database {
                     e.window_title,
                     e.session_id,
                 ])?;
+                rowids.push(if is_agg { 0 } else { tx.last_insert_rowid() });
                 Ok(())
             })();
             match result {
                 Ok(_) => {
                     if let Err(c) = tx.commit() {
                         log::warn!("单条提交失败: {c}");
+                        rowids.push(0);
                     }
                 }
                 Err(err) => {
                     log::warn!("单条事件写入失败（已跳过）: {err}");
+                    rowids.push(0);
                 }
             }
         }
+        rowids
     }
 
     /// 清理超过保留天数的事件

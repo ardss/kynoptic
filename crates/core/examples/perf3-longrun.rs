@@ -113,9 +113,10 @@ fn make_event(i: usize, base_ts: chrono::DateTime<chrono::Utc>) -> Event {
 }
 
 fn flush_batch(db: &Database, batch: &[Event], written: &AtomicUsize) {
-    db.insert_events(batch);
+    let rowids = db.insert_events(batch);
     written.fetch_add(batch.len(), Ordering::Relaxed);
-    db.update_agg(batch); // 真实 writer 路径含 agg 增量维护
+    // 真实 writer 路径含 agg 增量维护（rowids 供幂等防护）
+    db.update_agg(batch, &rowids);
 }
 
 fn main() {
@@ -143,7 +144,7 @@ fn main() {
         .collect();
     let time_update_agg = |db: &Database, batch: &[Event]| -> f64 {
         let t = Instant::now();
-        db.update_agg(batch);
+        db.update_agg(batch, &(1..=batch.len() as i64).collect::<Vec<i64>>());
         t.elapsed().as_secs_f64() * 1000.0
     };
     let mut runs_empty = Vec::new();

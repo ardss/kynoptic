@@ -77,6 +77,42 @@ pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, 
     }))
 }
 
+/// 三指标统一口径的分钟分类（overview 与 timeline 共用同一 SQL/判定）：
+/// human = 真实键鼠（keys-injected_keys + clicks-injected_clicks）> 0；
+/// auto  = 注入输入（injected_keys + injected_clicks）> 0；
+/// 混合分钟两者同时为真（同时计入 presence 与 automation）。
+/// 返回 (本地分钟桶 "YYYY-MM-DD HH:MM", human, auto)。
+fn minute_classification(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    off: &str,
+) -> std::result::Result<Vec<(String, bool, bool)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(datetime(timestamp, ?1), 1, 16) AS minute_bucket, \
+                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0, \
+                    MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0 \
+             FROM events \
+             WHERE timestamp >= ?2 AND timestamp < ?3 AND event_action = 'input_agg' \
+               AND json_valid(event_data) \
+             GROUP BY minute_bucket",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, bool, bool)> = stmt
+        .query_map(params![off, start, end], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    Ok(rows)
+}
+
 /// 单小时桶内的应用事件分布，top 5 + 其余归并 other。
 fn top5_with_other(mut apps: Vec<(String, i64)>) -> Vec<(String, i64)> {
     apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -125,30 +161,11 @@ pub fn api_timeline_at(
         .flatten()
         .collect();
 
-    // 三色分层（三指标模型）：每桶统计 人在场/自动化 的输入分钟数
+    // 三色分层（三指标模型）：每桶统计 人在场/自动化 的输入分钟数。
+    // 与 overview 共用 minute_classification 同一 SQL/口径。
     let mut minute_kind: std::collections::HashMap<String, (u32, u32)> =
         std::collections::HashMap::new();
-    let mut stmt2 = conn
-        .prepare(
-            "SELECT substr(datetime(timestamp, ?1), 1, 16) AS minute_bucket,
-                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0,
-                    MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0
-             FROM events
-             WHERE timestamp >= ?2 AND timestamp < ?3 AND event_action = 'input_agg'
-             GROUP BY minute_bucket",
-        )
-        .map_err(|e| e.to_string())?;
-    let mrows: Vec<(String, bool, bool)> = stmt2
-        .query_map(params![&off, start.to_rfc3339(), end.to_rfc3339()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, bool>(2)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .collect();
+    let mrows = minute_classification(conn, &start.to_rfc3339(), &end.to_rfc3339(), &off)?;
     for (minute_bucket, human, auto) in mrows {
         let hour_bucket = minute_bucket.replacen(' ', "T", 1)[..13].to_string();
         let e = minute_kind.entry(hour_bucket).or_insert((0, 0));
@@ -167,22 +184,38 @@ pub fn api_timeline_at(
         let bucket = bucket.replacen(' ', "T", 1);
         by_bucket.entry(bucket).or_default().push((app, cnt));
     }
-    let buckets: Vec<Value> = by_bucket
-        .into_iter()
-        .map(|(hour, apps)| {
-            let list: Vec<Value> = top5_with_other(apps)
-                .into_iter()
-                .map(|(app, n)| json!({"app": app, "events": n}))
-                .collect();
-            let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
-            json!({"hour": hour, "apps": list, "human_min": human, "auto_min": auto})
-        })
-        .collect();
-    Ok(json!({"hours": hours, "generated_at": now.to_rfc3339(), "buckets": buckets}))
+    // 补零桶：固定返回窗口内全部本地小时，无数据小时 human/auto 全 0，
+    // 前端可区分"没开机"与"开机没碰"。
+    let mut buckets: Vec<Value> = Vec::new();
+    let mut cur = start.with_timezone(&Local);
+    let end_local = end.with_timezone(&Local);
+    while cur < end_local {
+        let hour = cur.format("%Y-%m-%dT%H").to_string();
+        let apps = by_bucket.remove(&hour).unwrap_or_default();
+        let list: Vec<Value> = top5_with_other(apps)
+            .into_iter()
+            .map(|(app, n)| json!({"app": app, "events": n}))
+            .collect();
+        let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
+        buckets.push(json!({"hour": hour, "apps": list, "human_min": human, "auto_min": auto}));
+        cur += chrono::Duration::hours(1);
+    }
+    // DST 口径说明：本地换算用的是响应生成时刻的偏移（见 local_offset_modifier_at），
+    // 跨夏令时的历史小时桶可能有 ±1 小时偏移；把偏移随响应返回供前端标注。
+    let offset_secs = now.with_timezone(&Local).offset().local_minus_utc();
+    Ok(json!({
+        "hours": hours,
+        "generated_at": now.to_rfc3339(),
+        "local_offset_seconds": offset_secs,
+        "local_offset_note": "本地小时桶按响应生成时刻的 UTC 偏移换算；跨 DST 的历史小时桶可能有 ±1 小时偏移 / Local hour buckets use the UTC offset at generation time; DST transitions may shift historical buckets by ±1h.",
+        "buckets": buckets,
+    }))
 }
 
 /// 指定时刻的本地偏移修饰符（与 `queries::local_offset_modifier` 同口径，
 /// 但允许测试注入时刻；当前时刻下两者一致）。
+/// DST 隐患（审查 P2）：这里用单一偏移换算整段历史查询；跨夏令时的桶
+/// 可能偏 ±1 小时。timeline 响应已带 local_offset_seconds/note 说明口径。
 fn local_offset_modifier_at(now: DateTime<Utc>) -> String {
     let secs = now.with_timezone(&Local).offset().local_minus_utc() as i64;
     format!(
@@ -192,9 +225,32 @@ fn local_offset_modifier_at(now: DateTime<Utc>) -> String {
     )
 }
 
-/// GET /api/anomalies?days= — 复用 MCP get_anomalies 的同一检测入口。
+/// 异常 kind -> 英文模板（前端 message_en 备用文案）。
+fn anomaly_message_en(kind: &str) -> String {
+    match kind {
+        "late_night" => "Late-night activity: input detected after 23:00".into(),
+        "apm_burst" => "APM burst: input rate spiked well above your baseline".into(),
+        "marathon" => "Marathon session: long continuous activity without breaks".into(),
+        "new_app_surge" => "App usage surge: an app spiked above its daily average".into(),
+        other => format!("Anomaly detected: {other}"),
+    }
+}
+
+/// GET /api/anomalies?days= — 复用 MCP get_anomalies 的同一检测入口，
+/// 每条附加 message_en（按 kind 映射英文模板，kind 不识别时给通用文案）。
 pub fn api_anomalies(conn: &Connection, days: u32) -> Value {
-    kynoptic_mcp::state::anomalies(conn, days as usize, 100)
+    let mut v = kynoptic_mcp::state::anomalies(conn, days as usize, 100);
+    if let Some(arr) = v.get_mut("anomalies").and_then(Value::as_array_mut) {
+        for a in arr {
+            let kind = a
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            a["message_en"] = Value::String(anomaly_message_en(&kind));
+        }
+    }
+    v
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
@@ -222,14 +278,6 @@ fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
         prev = m;
     }
     total
-}
-
-/// "YYYY-MM-DDTHH:MM"（UTC 分钟串）-> 本地 "HH:MM"
-fn minute_hhmm(minute_str: &str) -> Value {
-    chrono::DateTime::parse_from_rfc3339(&format!("{}:00+00:00", minute_str))
-        .ok()
-        .map(|t| Value::from(t.with_timezone(&chrono::Local).format("%H:%M").to_string()))
-        .unwrap_or(Value::Null)
 }
 
 pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
@@ -288,68 +336,80 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         h
     };
 
-    // 三指标模型（审查用户需求+语义审计）：
-    //   人在场 = 过滤注入后的真实键鼠分钟（相邻分钟间隙 <=2 分钟按"无输入阅读"桥接）
-    //   自动化活动 = 有注入输入（LLKHF/LLMHF_INJECTED，如 SendKeys/自动化）的分钟数
+    // 三指标模型（审查用户需求+语义审计；口径与 timeline 统一，共用
+    // minute_classification 同一 SQL）：
+    //   人在场 = 真实键鼠分钟（相邻分钟间隙 <= presence_bridge 分钟按"无输入阅读"桥接）
+    //   自动化 = 有注入输入的分钟数
+    //   口径统一（修复三指标矛盾）：纯人分钟计入 presence；纯自动化计入 automation；
+    //   混合分钟同时计入两者（mixed_minutes 单独返回）。判定规则：
+    //   human = keys-injected_keys + clicks-injected_clicks > 0；
+    //   auto  = injected_keys + injected_clicks > 0。
     //   窗口切换不计时长（可能是自动化开窗），只用于前台应用归类
-    let (presence_minutes, automation_minutes, first_presence, last_presence) = {
+    let (presence_minutes, automation_minutes, mixed_minutes, first_presence, last_presence) = {
         let mut human: Vec<i64> = Vec::new();
         let mut automation: Vec<i64> = Vec::new();
-        let mut first_ts: Option<String> = None;
-        let mut last_ts: Option<String> = None;
-        let minute_of_day = |minute_str: &str| -> Option<i64> {
-            chrono::DateTime::parse_from_rfc3339(&format!("{}:00+00:00", minute_str))
+        let mut mixed: i64 = 0;
+        let mut first_min: Option<String> = None;
+        let mut last_min: Option<String> = None;
+        // 本地分钟桶 "YYYY-MM-DD HH:MM" -> 当日第几分钟
+        let minute_of_day = |mb: &str| -> Option<i64> {
+            chrono::NaiveDateTime::parse_from_str(mb, "%Y-%m-%d %H:%M")
                 .ok()
-                .map(|t| {
-                    use chrono::Timelike;
-                    let l = t.with_timezone(&chrono::Local);
-                    l.hour() as i64 * 60 + l.minute() as i64
-                })
+                .map(|t| i64::from(t.hour()) * 60 + i64::from(t.minute()))
         };
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT substr(timestamp,1,16), MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)), MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0))              FROM events WHERE event_action = 'input_agg' AND json_valid(event_data)                AND timestamp >= ?1 AND timestamp < ?2              GROUP BY substr(timestamp,1,16)",
-        ) {
-            let rows = stmt.query_map(params![&start, &end], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            });
-            if let Ok(rows) = rows {
-                for (minute_str, human_keys, injected) in rows.flatten() {
-                    let mod_ = minute_of_day(&minute_str);
-                    if human_keys > 0 {
-                        if let Some(m) = mod_ {
-                            human.push(m);
-                        }
-                        if first_ts.is_none() {
-                            first_ts = Some(minute_str.clone());
-                        }
-                        last_ts = Some(minute_str);
-                    } else if injected > 0 {
-                        if let Some(m) = mod_ {
-                            automation.push(m);
-                        }
+        let fmt_hm = |mb: &str| -> Value {
+            chrono::NaiveDateTime::parse_from_str(mb, "%Y-%m-%d %H:%M")
+                .map(|t| Value::from(t.format("%H:%M").to_string()))
+                .unwrap_or(Value::Null)
+        };
+        let off = local_offset_modifier_at(Utc::now());
+        if let Ok(mrows) = minute_classification(conn, &start, &end, &off) {
+            for (mb, human_hit, auto_hit) in mrows {
+                let mod_ = minute_of_day(&mb);
+                if human_hit {
+                    if let Some(m) = mod_ {
+                        human.push(m);
+                    }
+                    if first_min.is_none() {
+                        first_min = Some(mb.clone());
+                    }
+                    last_min = Some(mb.clone());
+                }
+                if auto_hit {
+                    if let Some(m) = mod_ {
+                        automation.push(m);
+                    }
+                    if human_hit {
+                        mixed += 1;
                     }
                 }
             }
         }
-        // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算
+        // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算。
+        // 这里 substr 出的是 UTC 分钟串 "YYYY-MM-DDTHH:MM"，需转本地再取当日分钟。
+        let minute_of_day_utc = |minute_str: &str| -> Option<i64> {
+            use chrono::TimeZone;
+            chrono::NaiveDateTime::parse_from_str(minute_str, "%Y-%m-%dT%H:%M")
+                .ok()
+                .map(|t| {
+                    let l = Local.from_utc_datetime(&t);
+                    i64::from(l.hour()) * 60 + i64::from(l.minute())
+                })
+        };
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT substr(timestamp,1,16) FROM events              WHERE event_action IN ('press','click')                AND timestamp >= ?1 AND timestamp < ?2",
         ) {
             let rows = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0));
             if let Ok(rows) = rows {
                 for minute_str in rows.flatten() {
-                    if let Some(m) = minute_of_day(&minute_str) {
+                    if let Some(m) = minute_of_day_utc(&minute_str) {
                         human.push(m);
                     }
                 }
             }
         }
-        // 桥接：排序去重后，相邻在场分钟间隙 <=2 分钟（即缺失 1-2 分钟）按
-        // "无输入阅读"计入在场。跑段累计覆盖分钟数。
+        // 桥接：排序去重后，相邻在场分钟间隙 <= 桥接阈值（缺失 1-(bridge-1) 分钟）
+        // 按"无输入阅读"计入在场。跑段累计覆盖分钟数。
         human.sort_unstable();
         human.dedup();
         automation.sort_unstable();
@@ -357,13 +417,12 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         // 桥接阈值可配置（审查 DeepSeek：默认 2 分钟，用户可在设置页调 0-15）
         let bridge = (s.presence_bridge_minutes.min(15)) as i64;
         let presence = bridge_count(&human, bridge);
-        let first_presence = first_ts.as_deref().map(minute_hhmm).unwrap_or(Value::Null);
-        let last_presence = last_ts.as_deref().map(minute_hhmm).unwrap_or(Value::Null);
         (
             presence,
             automation.len() as i64,
-            first_presence,
-            last_presence,
+            mixed,
+            first_min.as_deref().map(fmt_hm).unwrap_or(Value::Null),
+            last_min.as_deref().map(fmt_hm).unwrap_or(Value::Null),
         )
     };
 
@@ -391,6 +450,11 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         .max_by_key(|(_, v)| **v)
         .map(|(a, v)| (a.clone(), *v));
     let fg_total_min: i64 = fg_dwell.values().sum::<i64>() / 60;
+    // "机器替人值班"指标：有前台窗口但无任何输入（含桥接）的分钟数。
+    // 暂无分钟级前台采样，取保守近似：fg_dwell_min - (presence + automation)，
+    // 负值截 0（宁可低估不夸大）。口径随响应返回。
+    let unattended_fg_minutes =
+        fg_total_min.saturating_sub(presence_minutes + automation_minutes);
 
     json!({
         "host": host,
@@ -398,6 +462,10 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "today_events": today_events,
         "presence_minutes": presence_minutes,
         "automation_minutes": automation_minutes,
+        "mixed_minutes": mixed_minutes,
+        "metrics_note": "口径：纯人分钟计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
+        "unattended_fg_minutes": unattended_fg_minutes,
+        "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes)，负值截 0（暂无分钟级前台采样）",
         "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,
         "fg_top": fg_top.map(|(a, _)| Value::from(a)).unwrap_or(Value::Null),
@@ -780,7 +848,11 @@ pub fn api_input_at(
 
 /// GET /api/insights — 从原始数据挖掘叙事式发现（审查用户理念：
 /// 数据是矿石，洞察才是金子）。全部基于已有键鼠/窗口事件，零新增采集。
-pub fn api_insights(conn: &Connection) -> Value {
+/// `bridge_minutes`：连续性间隙阈值（分钟），读 settings 的 presence_bridge，
+/// 与 overview/report 的"连续性"口径一致。
+pub fn api_insights(conn: &Connection, bridge_minutes: u32) -> Value {
+    let bridge_minutes = bridge_minutes.clamp(0, 15);
+    let gap_secs = i64::from(bridge_minutes) * 60;
     // 窗口 = 6 天前零点 -> 现在（踩坑：local_day_range(date-6) 的 end 是
     // "6 天前当天"的结束，会让整个查询窗口落在有数据之前）
     let start = queries::local_day_range(&queries::date_offset_str(-6))
@@ -824,7 +896,8 @@ pub fn api_insights(conn: &Connection) -> Value {
             .to_string()
     };
 
-    // 1) 最长连续在场段（输入间隔 <= 5 分钟算连续）
+    // 1) 最长连续在场段（输入间隔 <= presence_bridge 分钟算连续，口径与
+    //    overview/report 一致）
     let mut best: (
         f64,
         Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -834,7 +907,7 @@ pub fn api_insights(conn: &Connection) -> Value {
     let mut prev: Option<chrono::DateTime<chrono::FixedOffset>> = None;
     for (t, _) in &acts {
         if let (Some(p), Some(rs)) = (prev, run_start) {
-            if (*t - p).num_seconds() > 300 {
+            if (*t - p).num_seconds() > gap_secs {
                 let run = (p - rs).num_seconds() as f64;
                 if run > best.0 {
                     best = (run, Some(rs), Some(p));
@@ -861,8 +934,8 @@ pub fn api_insights(conn: &Connection) -> Value {
         insights.push(json!({
             "title_zh": "最长连续专注",
             "title_en": "Longest focus streak",
-            "text_zh": format!("近 7 天你最长的连续在场是 {:.0} 分钟（{} ~ {}），期间没有任何超过 5 分钟的离开。", best.0 / 60.0, rs, re),
-            "text_en": format!("Your longest continuous presence in the last 7 days was {:.0} minutes ({} ~ {}) with no gap over 5 minutes.", best.0 / 60.0, rs, re),
+            "text_zh": format!("近 7 天你最长的连续在场是 {:.0} 分钟（{} ~ {}），期间没有任何超过 {} 分钟的离开。", best.0 / 60.0, rs, re, bridge_minutes),
+            "text_en": format!("Your longest continuous presence in the last 7 days was {:.0} minutes ({} ~ {}) with no gap over {} minutes.", best.0 / 60.0, rs, re, bridge_minutes),
         }));
     }
 
@@ -953,26 +1026,35 @@ pub fn api_insights(conn: &Connection) -> Value {
         }));
     }
 
-    // 6) 节律（每天首次/最近在场，最多列 5 天）
+    // 6) 节律（每天首次/最近在场，最多列 5 天）。
+    //    修复跨日 bug：or_insert 只在首次插入，之前"最后输入"从未被更新，
+    //    单事件日会显示"00:00~00:00"。现在每日末位持续更新；首末相同的
+    //    日期（当天仅一条输入）明确标注，双语输出。
     let mut rhythm: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
     for (t, _) in &acts {
         let d = t.with_timezone(&chrono::Local).format("%m-%d").to_string();
         let hm = fmt_hm(t);
-        rhythm.entry(d).or_insert((hm.clone(), hm));
+        let e = rhythm.entry(d).or_insert_with(|| (hm.clone(), hm.clone()));
+        e.1 = hm;
     }
     if rhythm.len() >= 2 {
-        let items: Vec<String> = rhythm
-            .iter()
-            .rev()
-            .take(5)
-            .map(|(d, (f, l))| format!("{} {}~{}", d, f, l))
-            .collect();
+        let mut items_zh: Vec<String> = Vec::new();
+        let mut items_en: Vec<String> = Vec::new();
+        for (d, (f, l)) in rhythm.iter().rev().take(5) {
+            if f == l {
+                items_zh.push(format!("{d} 仅一条输入记录（{f}）"));
+                items_en.push(format!("{d} single input event ({f})"));
+            } else {
+                items_zh.push(format!("{d} {f}~{l}"));
+                items_en.push(format!("{d} {f}~{l}"));
+            }
+        }
         insights.push(json!({
             "title_zh": "你的作息节律",
             "title_en": "Your daily rhythm",
-            "text_zh": format!("每天首次与最后输入：{}", items.join("；")),
-            "text_en": format!("First/last input per day: {}", items.join("; ")),
+            "text_zh": format!("每天首次与最后输入：{}", items_zh.join("；")),
+            "text_en": format!("First/last input per day: {}", items_en.join("; ")),
         }));
     }
 
@@ -982,7 +1064,7 @@ pub fn api_insights(conn: &Connection) -> Value {
 /// GET /api/report?date= — 单日报告：色带时间轴、类别占比、专注时段。
 ///
 /// dwell 分段：window/switch 事件间隔即上一应用的停留时长（不封顶）。
-/// 专注块：间隔 ≤5 分钟的连续活动且总长 ≥20 分钟。
+/// 专注块：间隔 <= presence_bridge 分钟（settings，默认 2，0-15）的连续活动且总长 >=20 分钟。
 pub fn api_report_at(
     conn: &Connection,
     date: &str,
@@ -1064,11 +1146,13 @@ pub fn api_report_at(
         .map(|(name, min)| json!({"category": name, "minutes": min}))
         .collect();
 
-    // 4) 专注块：相邻段间隙 ≤5min 合并，总长 ≥20min
+    // 4) 专注块：相邻段间隙 <= presence_bridge 分钟（读 settings，全站
+    //    "连续性"口径一致）合并，总长 >=20min
+    let bridge_min = s.presence_bridge_minutes.min(15) as usize;
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     for (_, a, b) in &segs {
         if let Some(last) = blocks.last_mut() {
-            if a.saturating_sub(last.1) <= 5 {
+            if a.saturating_sub(last.1) <= bridge_min {
                 last.1 = (*b).max(last.1);
                 continue;
             }
@@ -1119,7 +1203,9 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
         .unwrap_or_default();
     let daily: Vec<Value> = rows
         .iter()
-        .map(|(d, k, c, m)| json!({"date": d, "keys": k, "clicks": c, "active_minutes": m}))
+        .map(|(d, k, c, m)| {
+            json!({"date": d, "keys": k, "clicks": c, "active_minutes": m, "presence_minutes": m})
+        })
         .collect();
     let sum7 = |offset: usize| -> (i64, i64, i64) {
         let n = rows.len();
@@ -1135,14 +1221,15 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
     // 前端显示"上周数据不足，已跳过对比"而非误导性增长率
     let last_week_days = rows.len().saturating_sub(7).min(7);
     let last_week = if last_week_days >= 3 {
-        json!({"keys": k0, "clicks": c0, "active_minutes": m0})
+        json!({"keys": k0, "clicks": c0, "active_minutes": m0, "presence_minutes": m0})
     } else {
         json!(null)
     };
     json!({
         "daily": daily,
-        "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1},
+        "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1, "presence_minutes": m1},
         "last_week": last_week,
+        "presence_minutes_note": "presence_minutes 与 active_minutes 同值的别名（口径：每日有键鼠输入的分钟数，来自 daily_agg 派生缓存）；旧字段保留兼容 / alias of active_minutes, kept for compatibility",
     })
 }
 
@@ -1465,7 +1552,17 @@ pub fn route_req(
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
-        ("GET", "/api/insights") => (200, "application/json", api_insights(conn).to_string()),
+        ("GET", "/api/insights") => {
+            // 连续性间隙阈值读 settings（presence_bridge，0-15 分钟），与
+            // overview/report 的"连续性"口径全站一致
+            let s = settings::load(db_path);
+            let bridge = s.presence_bridge_minutes.min(15);
+            (
+                200,
+                "application/json",
+                api_insights(conn, bridge).to_string(),
+            )
+        }
         ("GET", "/api/report") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
             let s = settings::load(db_path);
@@ -1586,20 +1683,29 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         let db_owned = db_owned.clone();
         let inflight_inner = inflight.clone();
         inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if std::thread::Builder::new()
+        // 名额守卫：Drop 时归还。handle_client panic 或提前 return 都不会
+        // 泄漏名额（审查 P2：原来 fetch_sub 在闭包尾部，panic 即泄漏，
+        // 累计 64 次后面板永久 503）。
+        struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let guard = InflightGuard(&inflight);
+        let spawned = std::thread::Builder::new()
             .name("dash-conn".into())
             .spawn(move || {
+                let _guard = InflightGuard(&inflight_inner);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
                 if let Err(e) = handle_client(stream, &db_owned, bound) {
                     log::warn!("dashboard 连接处理失败: {e}");
                 }
-                inflight_inner.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            })
-            .is_err()
-        {
-            // spawn 失败必须归还名额，否则累计 64 次后面板永久 503（审查 P2）
-            inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        if spawned.is_err() {
+            // spawn 失败：guard 立即 Drop 归还名额，否则累计 64 次后永久 503
+            drop(guard);
         }
     }
     Ok(())

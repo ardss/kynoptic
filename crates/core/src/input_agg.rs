@@ -14,7 +14,7 @@
 //! 原始数据神圣性：minute 模式只是**生成侧**的折叠，不删除、不改写任何已落库
 //! 数据；切回 raw 即恢复逐事件存储。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Local, Timelike, Utc};
@@ -56,15 +56,43 @@ static INJECTED_CLICKS: AtomicU64 = AtomicU64::new(0);
 static MOVES: AtomicU64 = AtomicU64::new(0);
 static MOVE_DIST_PX: AtomicU64 = AtomicU64::new(0);
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
-// 上一采样点（计算移动距离用）
-static PREV_X: AtomicI32 = AtomicI32::new(0);
-static PREV_Y: AtomicI32 = AtomicI32::new(0);
-static PREV_VALID: AtomicBool = AtomicBool::new(false);
+/// 键盘专属样本数（只随 key 事件增长；鼠标移动/滚轮不计入）。
+/// keyboard 行的 samples 语义（审查 P2：此前输出全输入样本数，混入鼠标
+/// 移动会把 agg 的 input_keys.count 抬高）。
+static KEY_SAMPLES: AtomicU64 = AtomicU64::new(0);
+// 上一采样点（计算移动距离用）：(x, y, valid) 打包进单个 AtomicU64，
+// 布局 x:21bit<<43 | y:21bit<<22 | valid:1bit<<0（带符号 21bit，偏置 2^20；
+// 坐标超出 ±2^20 时置 invalid——读回 None，与"上一点无效则跳过距离"一致，
+// 且消除 (PREV_X, PREV_Y, PREV_VALID) 三个原子各自 swap 的撕裂窗口）。
+static PREV_POS: AtomicU64 = AtomicU64::new(0);
+
+const POS_BIAS: i64 = 1 << 20;
+const POS_MASK: u64 = (1 << 21) - 1;
+
+fn pack_pos(x: i32, y: i32) -> u64 {
+    let xi = x as i64 + POS_BIAS;
+    let yi = y as i64 + POS_BIAS;
+    if (0..=(POS_MASK as i64)).contains(&xi) && (0..=(POS_MASK as i64)).contains(&yi) {
+        ((xi as u64) << 43) | ((yi as u64) << 22) | 1
+    } else {
+        0 // 超范围：置无效
+    }
+}
+
+fn unpack_pos(v: u64) -> Option<(i32, i32)> {
+    if v & 1 == 0 {
+        return None;
+    }
+    let x = ((v >> 43) & POS_MASK) as i64 - POS_BIAS;
+    let y = ((v >> 22) & POS_MASK) as i64 - POS_BIAS;
+    Some((x as i32, y as i32))
+}
 
 /// 键盘按下（press 计 1；release 不计，与 raw 形态的计数口径一致）。
 pub fn record_key() {
     KEYS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    KEY_SAMPLES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// 键盘按下并带 vk code（minute 模式热力图路径）。
@@ -73,6 +101,7 @@ pub fn record_key() {
 pub fn record_key_vk(vk: u32, injected: bool) {
     KEYS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    KEY_SAMPLES.fetch_add(1, Ordering::Relaxed);
     if injected {
         INJECTED_KEYS.fetch_add(1, Ordering::Relaxed);
     }
@@ -101,13 +130,12 @@ pub fn record_scroll(ticks: u64) {
 
 /// 鼠标移动（每事件记录：不做节流——原子计数无洪泛风险，且距离统计更准确）。
 pub fn record_move(x: i32, y: i32) {
-    let px = PREV_X.swap(x, Ordering::Relaxed);
-    let py = PREV_Y.swap(y, Ordering::Relaxed);
-    if PREV_VALID.load(Ordering::Relaxed) {
+    // 单原子打包交换：读回的即"上一点"，无撕裂
+    let prev = unpack_pos(PREV_POS.swap(pack_pos(x, y), Ordering::Relaxed));
+    if let Some((px, py)) = prev {
         let d = (x - px).unsigned_abs() as u64 + (y - py).unsigned_abs() as u64;
         MOVE_DIST_PX.fetch_add(d, Ordering::Relaxed);
     }
-    PREV_VALID.store(true, Ordering::Relaxed);
     MOVES.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
 }
@@ -117,6 +145,8 @@ pub fn record_move(x: i32, y: i32) {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct MinuteCounters {
     keys: u64,
+    /// 键盘专属样本数（<= samples；keyboard 行 samples 的输出值）
+    keys_samples: u64,
     clicks: u64,
     scroll_ticks: u64,
     moves: u64,
@@ -142,6 +172,7 @@ impl MinuteCounters {
 
     fn add(&mut self, o: MinuteCounters) {
         self.keys += o.keys;
+        self.keys_samples += o.keys_samples;
         self.clicks += o.clicks;
         self.injected_keys += o.injected_keys;
         self.injected_clicks += o.injected_clicks;
@@ -202,6 +233,7 @@ fn drain_atomics() -> MinuteCounters {
         .collect();
     MinuteCounters {
         keys: KEYS.swap(0, Ordering::Relaxed),
+        keys_samples: KEY_SAMPLES.swap(0, Ordering::Relaxed),
         clicks: CLICKS.swap(0, Ordering::Relaxed),
         scroll_ticks: SCROLL_TICKS.swap(0, Ordering::Relaxed),
         moves: MOVES.swap(0, Ordering::Relaxed),
@@ -234,7 +266,9 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
                 .collect();
         let mut kd = serde_json::json!({
             "keys": c.keys,
-            "samples": c.samples,
+            // 键盘专属样本数（审查 P2：不再混入鼠标/滚轮样本）
+            "samples": c.keys_samples,
+            "keys_samples": c.keys_samples,
             "vk": vk_map,
         });
         if c.injected_keys > 0 {
@@ -298,7 +332,11 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
                 *g = Some((key, acc));
             }
             Some((key, acc)) => {
-                // rollover：被抑制分钟攒的计数**直接丢弃**——它们是重启后
+                // rollover：抑制判定必须针对**被折叠的分钟 key**（审查 P1：
+                // 旧实现比较 sup == cur，rollover 时被折叠的是上一分钟，
+                // 抑制永不命中 → 重启后被抑制分钟的计数照常写出）。
+                let suppressing = matches!(&*sup, Some(k) if *k == key);
+                // 被抑制分钟攒的计数**直接丢弃**——它们是重启后
                 // 的小值，写出去会把库里上一会话的大终值覆盖回小值
                 if !suppressing {
                     out = events_for(key, &acc);
@@ -318,15 +356,15 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
 pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
     let drained = drain_atomics();
     let cur = MinuteKey::of(now_local);
-    // 抑制分钟内：残留计数直接丢弃（小值覆盖大终值的口子，二轮审查 P1）
-    {
-        let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(sup.as_ref(), Some(k) if *k == cur) {
-            *sup = None;
-            return Vec::new();
-        }
-    }
+    // 统一锁获取顺序：先 PENDING 再 SUPPRESS（与 drain 一致，审查 P2：
+    // 两函数顺序相反构成潜在死锁对）。
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
+    // 抑制分钟内：残留计数直接丢弃（小值覆盖大终值的口子，二轮审查 P1）
+    if matches!(sup.as_ref(), Some(k) if *k == cur) {
+        *sup = None;
+        return Vec::new();
+    }
     let (key, mut acc) = match g.take() {
         Some((k, a)) => (k, a),
         None => (cur, MinuteCounters::default()),
@@ -349,9 +387,8 @@ pub fn reset() {
     }
     INJECTED_KEYS.store(0, Ordering::Relaxed);
     INJECTED_CLICKS.store(0, Ordering::Relaxed);
-    PREV_VALID.store(false, Ordering::Relaxed);
-    PREV_X.store(0, Ordering::Relaxed);
-    PREV_Y.store(0, Ordering::Relaxed);
+    KEY_SAMPLES.store(0, Ordering::Relaxed);
+    PREV_POS.store(0, Ordering::Relaxed);
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     *g = None;
 }
@@ -393,6 +430,95 @@ mod tests {
                     .unwrap_or(0)
             })
             .sum()
+    }
+
+    #[test]
+    fn suppress_minute_survives_rollover() {
+        let _g = guard();
+        reset();
+        activate(); // 抑制当前分钟（重启抑制路径）
+        let t0 = MinuteKey::of(chrono::Local::now()).start_local;
+        record_key();
+        record_key();
+        record_click_button(0, false);
+        // 同分钟 drain：抑制中，不产出
+        let evts = drain(t0);
+        assert!(evts.is_empty(), "抑制分钟内的秒级 drain 不应产出事件");
+        // 推进到下一分钟：被抑制分钟的累计必须整体丢弃（P1：判定针对被折叠 key）
+        let t1 = MinuteKey::of(t0 + chrono::Duration::minutes(1)).start_local;
+        let evts = drain(t1);
+        assert!(
+            evts.is_empty(),
+            "被抑制分钟的事件不得在 rollover 时产出"
+        );
+        // 抑制已解除：下一分钟正常计数并产出
+        record_key();
+        let t2 = MinuteKey::of(t1 + chrono::Duration::minutes(1)).start_local;
+        assert!(drain(t2).is_empty(), "建桶不产出");
+        let evts = drain(MinuteKey::of(t2 + chrono::Duration::minutes(1)).start_local);
+        assert_eq!(counter_of(&evts, EventType::Keyboard, "keys"), 1);
+    }
+
+    #[test]
+    fn keyboard_row_samples_are_keyboard_only() {
+        let _g = guard();
+        reset();
+        record_key();
+        record_key();
+        record_move(0, 0); // 鼠标样本：不得计入 keyboard 行 samples
+        record_scroll(1);
+        let evts = drain(local_min(2026, 6, 15, 10, 30)); // 建桶
+        assert!(evts.is_empty());
+        let evts = flush_partial(local_min(2026, 6, 15, 10, 30));
+        let kb = evts
+            .iter()
+            .find(|e| e.event_type == EventType::Keyboard)
+            .expect("keyboard row");
+        let d = kb.event_data.as_ref().unwrap();
+        assert_eq!(d.get("keys_samples").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            d.get("samples").and_then(|v| v.as_u64()),
+            Some(2),
+            "keyboard 行 samples = 键盘专属样本数"
+        );
+        let ms = evts
+            .iter()
+            .find(|e| e.event_type == EventType::Mouse)
+            .expect("mouse row");
+        assert_eq!(
+            ms.event_data
+                .as_ref()
+                .unwrap()
+                .get("samples")
+                .and_then(|v| v.as_u64()),
+            Some(4),
+            "mouse 行 samples 仍为全输入样本数"
+        );
+    }
+
+    #[test]
+    fn prev_pos_packing_no_tear_and_range_guard() {
+        // 打包/解包往返
+        assert_eq!(unpack_pos(pack_pos(1920, 1080)), Some((1920, 1080)));
+        assert_eq!(unpack_pos(pack_pos(-1920, -1080)), Some((-1920, -1080)));
+        assert_eq!(unpack_pos(pack_pos(0, 0)), Some((0, 0)));
+        // 超出 ±2^20：置无效
+        assert_eq!(unpack_pos(pack_pos(i32::MAX, 0)), None);
+        assert_eq!(unpack_pos(pack_pos(0, i32::MIN)), None);
+        assert_eq!(unpack_pos(0), None);
+
+        // record_move 语义：超范围点被置无效，使下一次距离计算跳过
+        let _g = guard();
+        reset();
+        record_move(i32::MAX, 0); // 超范围：写 prev 时置无效
+        record_move(3, 4); // 上一有效点已失效：距离不计
+        record_move(3, 4); // 0
+        record_move(6, 8); // 3+4=7
+        let evts = drain(local_min(2026, 6, 15, 10, 30));
+        assert!(evts.is_empty());
+        let evts = flush_partial(local_min(2026, 6, 15, 10, 30));
+        assert_eq!(counter_of(&evts, EventType::Mouse, "moves"), 4);
+        assert_eq!(counter_of(&evts, EventType::Mouse, "move_distance_px"), 7);
     }
 
     #[test]

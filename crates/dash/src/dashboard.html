@@ -11,7 +11,7 @@
     --bg: #0A0E14; --panel: #10151E; --panel-2: #161D28;
     --border: #232B38; --border-soft: #1A2130;
     /* 文字 */
-    --fg: #E4EBF4; --dim: #93A1B3; --faint: #5C6B80;
+    --fg: #E4EBF4; --dim: #93A1B3; --faint: #7A8AA0;
     /* 语义色 */
     --brand: #5BA8FF; --accent-ink: #06121F;
     --ok: #43D6A0; --warn: #F5B454; --bad: #FF6B6B;
@@ -77,6 +77,8 @@
                  margin-top: 4px; letter-spacing: -0.01em;
                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .card .value.small { font-size: 15px; font-weight: 400; }
+  /* 空状态字号：用 class 切换而不是 inline fontSize（离开空状态后可恢复） */
+  .card .value.empty-note { font-size: 20px; }
   /* 区块 */
   section { background: var(--panel); border: 1px solid var(--border-soft);
             border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px; }
@@ -88,7 +90,10 @@
   ul.anomalies li { padding: 6px 0; border-bottom: 1px dashed var(--border-soft);
                     font-family: var(--font-data); font-size: 13px; }
   ul.anomalies li:last-child { border-bottom: none; }
-  .sev-info { color: var(--brand); } .sev-warn { color: var(--warn); } .sev-critical { color: var(--bad); }
+  /* sev-alert：最高级别，比 critical 更醒目（实底色块 + 加粗） */
+  .sev-alert { color: #fff; background: var(--bad); border-radius: 3px; padding: 0 6px; font-weight: 700; }
+  .sev-critical { color: var(--bad); font-weight: 700; }
+  .sev-warn { color: var(--warn); } .sev-info { color: var(--brand); }
   footer { color: var(--faint); font-size: 12px; border-top: 1px solid var(--border-soft);
            padding-top: 14px; margin-top: 8px; }
   .err { color: var(--bad); }
@@ -146,14 +151,14 @@
   <h1>kynoptic dashboard</h1>
   <button class="lang-toggle" id="lang-btn" onclick="toggleLang()">中文</button>
   <div class="muted" id="status-line">loading…</div>
-  <div class="tabs">
-    <div class="tab active" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></div>
-    <div class="tab" id="tab-report" onclick="showView('report')"><span class="l en">Report</span><span class="l zh">报告</span></div>
-    <div class="tab" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></div>
-    <div class="tab" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></div>
-    <div class="tab" id="tab-insights" onclick="showView('insights')"><span class="l en">Insights</span><span class="l zh">洞察</span></div>
-    <div class="tab" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></div>
-    <div class="tab" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></div>
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-report" onclick="showView('report')"><span class="l en">Report</span><span class="l zh">报告</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights" onclick="showView('insights')"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
 </header>
 
@@ -179,7 +184,15 @@
     <div class="label"><span class="l en">foreground app time today</span><span class="l zh">今日前台应用时长</span></div>
     <div class="value" style="font-size:34px;" id="c-fgdwell">–</div>
     <div style="font-size:12px; color:var(--dim);">
+      <span id="c-fgdwell-note"></span>
       <span class="l en">top</span><span class="l zh">最长驻留</span>: <span id="c-fgtop">–</span>
+    </div>
+  </div>
+  <div class="card" id="card-unattended" style="display:none">
+    <div class="label"><span class="l en">machine unattended today</span><span class="l zh">今日机器值班（无人）</span></div>
+    <div class="value" style="font-size:34px; color:var(--dim);" id="c-unattended">–</div>
+    <div style="font-size:12px; color:var(--dim);">
+      <span class="l en">window dwell minus human presence</span><span class="l zh">前台驻留减去人在场</span>
     </div>
   </div>
 </div>
@@ -191,7 +204,7 @@
 
 <section>
   <div style="display:flex; align-items:baseline; justify-content:space-between;">
-    <h2 style="cursor:pointer" onclick="var b=document.getElementById('ops-body'); b.style.display = b.style.display==='none' ? '' : 'none';"><span class="l en">▸ collection status</span><span class="l zh">▸ 采集状态</span></h2>
+    <h2 style="cursor:pointer"><button type="button" id="ops-toggle" aria-expanded="false" aria-controls="ops-body" onclick="toggleOps()" style="background:none;border:none;padding:0 0 0 10px;border-left:2px solid var(--brand);color:inherit;font:inherit;font-weight:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer;"><span class="l en">▸ collection status</span><span class="l zh">▸ 采集状态</span></button></h2>
   </div>
   <div id="ops-body" style="display:none">
     <div class="cards">
@@ -376,10 +389,12 @@
     <input type="checkbox" id="set-autostart">
     <label for="set-autostart"><span class="l en">start kynoptic on login</span><span class="l zh">开机自启动 kynoptic（托盘常驻）</span></label>
   </div>
+</section>
+<section>
   <h2><span class="l en">settings — input privacy</span><span class="l zh">设置 — 输入隐私</span></h2>
   <div class="mon-row" style="display:flex;align-items:center;gap:8px">
-    <label for="set-bridge" style="white-space:nowrap"><span class="l en">presence reading-bridge (minutes, 0-15):</span><span class="l zh">人在场阅读桥接（分钟，0-15）：</span></label>
-    <input type="number" id="set-bridge" min="0" max="15" style="width:64px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
+    <label for="set-bridge" style="white-space:nowrap"><span class="l en">presence reading-grace (minutes, 0-15):</span><span class="l zh">人在场无输入宽限分钟（0-15）：</span></label>
+    <input type="number" id="set-bridge" min="0" max="15" style="width:64px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
     <span class="muted" style="font-size:11px"><span class="l en">gaps of ≤N minutes without input still count as presence (reading)</span><span class="l zh">连续 N 分钟内无键鼠输入仍按"读屏"计入在场</span></span>
   </div>
   <div class="mon-row">
@@ -399,8 +414,8 @@
 </div>
 
 <div class="muted" style="font-size:12px;margin:6px 0 14px">
-  <span class="l en">auto-refresh every 5s. per-key/mouse aggregates land within ~10-20s (minute buckets).</span>
-  <span class="l zh">数据每 5 秒自动刷新；键鼠聚合约 10-20 秒内可见（按分钟桶追加）。</span>
+  <span class="l en">auto-refresh every 30s (paused while hidden; full re-render on the overview tab only). per-key/mouse aggregates land within ~10-20s (minute buckets).</span>
+  <span class="l zh">数据每 30 秒自动刷新（后台隐藏时暂停；仅运行信息页全量重渲染）；键鼠聚合约 10-20 秒内可见（按分钟桶追加）。</span>
 </div>
 <footer>
   <span class="l en">All data is local. This page reads your kynoptic.db on this machine only.<br>
@@ -423,7 +438,14 @@ const T = {
         withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change",
         unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window).",
         restoredHint: "reset to defaults on screen — click save to apply.",
-        beforeData: "no data before" },
+        beforeData: "no data before",
+        fgdwellNote: "estimated from window dwell; includes unattended time / 按窗口驻留推算，含人不在场时段",
+        noEventsYet: "(no events yet)", lastEvent: "last event:", readOnly: "read-only",
+        disconnected: "disconnected — retrying…",
+        weekInsufficient: "not enough data for last week — comparison skipped",
+        focusSuspect: " [likely includes away/idle]",
+        retry: "retry", loadFailed: "load failed: ",
+        colApp: "app", colEvents: "events (count)" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
@@ -431,7 +453,14 @@ const T = {
         withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",
         unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
         restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
-        beforeData: "该日期早于数据起点" }
+        beforeData: "该日期早于数据起点",
+        fgdwellNote: "按窗口驻留推算，含人不在场时段 / window dwell, includes unattended time",
+        noEventsYet: "（尚无事件）", lastEvent: "最近事件：", readOnly: "只读",
+        disconnected: "连接断开，正在重试…",
+        weekInsufficient: "上周数据不足，已跳过对比",
+        focusSuspect: "（疑似含离开/挂机）",
+        retry: "重试", loadFailed: "加载失败：",
+        colApp: "应用", colEvents: "事件数" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -458,6 +487,14 @@ function fmtUptime(sec) {
   if (h > 0) return h + "h " + m + "m";
   return m + "m";
 }
+/* 统一时长口径：入参分钟，输出按当前语言格式化（收敛所有时长显示） */
+function fmtDuration(minutes) {
+  const m = Math.max(0, Math.round(minutes || 0));
+  const h = Math.floor(m / 60), mm = m % 60;
+  const zh = document.documentElement.lang === "zh";
+  if (h === 0) return zh ? mm + " 分钟" : mm + "m";
+  return zh ? h + " 小时 " + mm + " 分钟" : h + "h " + mm + "m";
+}
 /* ─── i18n 切换 ─── */
 function applyLang(lang) {
   document.documentElement.lang = lang;
@@ -473,9 +510,11 @@ function toggleLang() {
 /* ─── 状态行 / Overview ─── */
 async function loadStatus() {
   const s = await jget("/api/status");
-  const last = s.last_event_ts ? s.last_event_ts.replace("T", " ") : "(no events yet)";
+  const last = s.last_event_ts
+    ? s.last_event_ts.replace("T", " ")
+    : t("noEventsYet");
   document.getElementById("status-line").textContent =
-    s.today + " · last event: " + last + " UTC · read-only · " + s.db_path;
+    s.today + " · " + t("lastEvent") + " " + last + " UTC · " + t("readOnly") + " · " + s.db_path;
 }
 function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
 function prettyApp(a) {
@@ -487,24 +526,32 @@ async function loadOverview() {
   const o = await jget("/api/overview");
   // 今日在电脑前：分钟 -> X 小时 Y 分钟
   const pm = o.presence_minutes || 0;
-  const hh = Math.floor(pm / 60), mm = pm % 60;
   const am = o.automation_minutes || 0;
   const ah = Math.floor(am / 60), amm = am % 60;
   const zh = document.documentElement.lang === "zh";
-  const dur = (h, m) => {
-    if (h === 0) return zh ? m + " 分钟" : m + "m";
-    return zh ? h + " 小时 " + m + " 分钟" : h + "h " + m + "m";
-  };
-  document.getElementById("c-presence").textContent = dur(hh, mm);
-  document.getElementById("c-automation").textContent = dur(ah, amm);
+  document.getElementById("c-presence").textContent = fmtDuration(pm);
+  document.getElementById("c-automation").textContent = fmtDuration(ah * 60 + amm);
   document.getElementById("c-first").textContent = o.first_activity || "–";
   document.getElementById("c-last").textContent = o.last_activity || "–";
   const fd = o.fg_dwell_min || 0;
-  document.getElementById("c-fgdwell").textContent = dur(Math.floor(fd / 60), fd % 60);
+  document.getElementById("c-fgdwell").textContent = fmtDuration(fd);
+  document.getElementById("c-fgdwell-note").textContent = t("fgdwellNote") + ". ";
   document.getElementById("c-fgtop").textContent = o.fg_top || "–";
+  // 后端正在加 unattended_fg_minutes：防御性判空，字段存在才显示第四卡
+  const um = o.unattended_fg_minutes;
+  const uCard = document.getElementById("card-unattended");
+  if (typeof um === "number" && isFinite(um)) {
+    uCard.style.display = "";
+    document.getElementById("c-unattended").textContent = fmtDuration(um);
+  } else {
+    uCard.style.display = "none";
+  }
+  const cp = document.getElementById("c-presence");
   if (pm === 0 && (o.today_events || 0) < 50) {
-    document.getElementById("c-presence").textContent = zh ? "从今天开始积累" : "collecting…";
-    document.getElementById("c-presence").style.fontSize = "20px";
+    cp.textContent = zh ? "从今天开始积累" : "collecting…";
+    cp.classList.add("empty-note");
+  } else {
+    cp.classList.remove("empty-note");
   }
   document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
@@ -547,10 +594,12 @@ async function loadTimeline() {
     auto: zh ? "自动化" : "automation",
     away: zh ? "无人" : "away"
   };
+  /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
+  const TL_COLORS = { human: "#5BA8FF", auto: "#E0A24A", away: "#1a2230" };
   el.innerHTML = '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
-    + '<span style="color:#5BA8FF">■</span> ' + L.human + '　'
-    + '<span style="color:#E0A24A">■</span> ' + L.auto + '　'
-    + '<span style="color:var(--border)">■</span> ' + L.away + '</div>'
+    + '<span style="color:' + TL_COLORS.human + '">■</span> ' + L.human + '　'
+    + '<span style="color:' + TL_COLORS.auto + '">■</span> ' + L.auto + '　'
+    + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
     + tl.buckets.map(b => {
     // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节
     const human = Math.min(60, b.human_min || 0);
@@ -560,11 +609,11 @@ async function loadTimeline() {
 
     const apps = b.apps.map(x => prettyApp(x.app) + " x" + x.events).join(", ");
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
-      '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13)) + "</span>" +
+      '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13).replace("T", " ")) + "</span>" +
       '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
-        '<span style="width:' + pct1(human) + '%;background:#5BA8FF" title="' + L.human + ' ' + human + 'm"></span>' +
-        '<span style="width:' + pct1(auto) + '%;background:#E0A24A" title="' + L.auto + ' ' + auto + 'm"></span>' +
-        '<span style="width:' + pct1(away) + '%;background:#1a2230" title="' + L.away + '"></span>' +
+        '<span style="width:' + pct1(human) + '%;background:' + TL_COLORS.human + '" title="' + L.human + ' ' + human + 'm"></span>' +
+        '<span style="width:' + pct1(auto) + '%;background:' + TL_COLORS.auto + '" title="' + L.auto + ' ' + auto + 'm"></span>' +
+        '<span style="width:' + pct1(away) + '%;background:' + TL_COLORS.away + '" title="' + L.away + '"></span>' +
       '</span>' +
       '<span style="width:34%;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(apps) + '">' + esc(apps) + '</span>' +
       "</div>";
@@ -613,7 +662,7 @@ async function loadHeatmap() {
     const level = hmLevel(d.value, max);
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
-      (level === 0 ? "#232B38" : "none") + '"><title>' + d.date + " — " + d.value + '</title></rect>';
+      (level === 0 ? "#232B38" : "none") + '"><title>' + d.date + " — " + d.value + " min</title></rect>";
   });
   svg += "</svg>";
   el.innerHTML = svg;
@@ -624,7 +673,11 @@ async function loadTopApps() {
   const el = document.getElementById("top-apps");
   if (!a.apps.length) { el.textContent = t("noData"); return; }
   const max = Math.max(...a.apps.map(x => x.count));
-  el.innerHTML = a.apps.map(x =>
+  el.innerHTML =
+    '<div class="app-row" style="font-size:11px;color:var(--faint)">' +
+    '<span class="app-label">' + t("colApp") + '</span><span class="app-track"></span>' +
+    '<span class="app-count">' + t("colEvents") + "</span></div>" +
+    a.apps.map(x =>
     '<div class="app-row">' +
     '<span class="app-label" title="' + esc(x.app) + '">' + esc(x.app) + "</span>" +
     '<span class="app-track"><span class="app-bar" style="width:' + (x.count / max * 100).toFixed(2) + '%"></span></span>' +
@@ -688,7 +741,7 @@ function renderKeyboard(freq) {
       t.setAttribute("text-anchor", "middle");
       t.setAttribute("dominant-baseline", "middle");
       t.setAttribute("font-size", "11");
-      t.setAttribute("fill", v ? "#E4EBF4" : "#5C6B80");
+      t.setAttribute("fill", v ? "#E4EBF4" : "#7A8AA0");
       t.textContent = label;
       const title = document.createElementNS(ns, "title");
       title.textContent = label + ": " + (freq[vk] || 0).toLocaleString();
@@ -699,12 +752,9 @@ function renderKeyboard(freq) {
 // 24h × Top 应用堆叠条（选定日期）+ 近 14 天每日 Top3
 // ─── 报告页：色带时间轴 / 类别占比 / 专注块 / 目标 / 趋势 ───
 const CAT_COLORS = { "开发":"#5BA8FF", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#E06C75",
-  "文档":"#C678DD", "设计":"#56B6C2", "其他":"#5C6B80" };
+  "文档":"#C678DD", "设计":"#56B6C2", "其他":"#7A8AA0" };
 function catColor(name) { return CAT_COLORS[name] || "#888"; }
-function fmtMin(m) {
-  const h = Math.floor(m / 60), mm = m % 60;
-  return (h ? h + "h" : "") + (mm || !h ? mm + "m" : "");
-}
+function fmtMin(m) { return fmtDuration(m); } /* 收敛到 fmtDuration */
 function dayOffset(n) {
   const d = new Date(Date.now() - n * 86400000);
   document.getElementById("report-date").value =
@@ -767,7 +817,9 @@ async function loadReport() {
   document.getElementById("report-focus").textContent = (d.focus || []).length
     ? d.focus.map(function (f) {
         const hm = m => Math.floor(m / 60) + ":" + String(m % 60).padStart(2, "0");
-        return hm(f.start_min) + "–" + hm(f.end_min) + " (" + fmtMin(f.minutes) + ")";
+        // 超过 4 小时的"专注块"大概率是挂机未检测到离开，如实标注
+        return hm(f.start_min) + "–" + hm(f.end_min) + " (" + fmtMin(f.minutes) + ")" +
+          (f.minutes > 240 ? t("focusSuspect") : "");
       }).join("   ·   ")
     : t("noData");
   const st = await jget("/api/settings");
@@ -781,7 +833,7 @@ async function loadReport() {
   document.getElementById("r-week").innerHTML = lw
     ? fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
       " (" + ((lw.active_minutes || 0) ? ((tw.active_minutes || 0) >= (lw.active_minutes || 0) ? "▲ +" : "▼ ") + Math.round(((tw.active_minutes || 0) - (lw.active_minutes || 0)) / (lw.active_minutes || 0) * 100) + "%" : "–") + ")</span>"
-    : "<span class='muted'>上周数据不足，已跳过对比</span>";
+    : "<span class='muted'>" + t("weekInsufficient") + "</span>";
   const tmax = Math.max(1, ...(tr.daily || []).map(x => x.active_minutes || 0));
   const el = document.getElementById("report-trend");
   if (!(tr.daily || []).length) { el.innerHTML = '<span class="muted">' + t("noData") + "</span>"; }
@@ -904,14 +956,14 @@ function renderMouse(d) {
     if (label) {
       const lx = kind.startsWith("clicks_side") ? x - 8 : x + w / 2;
       s += '<text x="' + lx + '" y="' + (y + h / 2 + 4) +
-        '" fill="#5C6B80" font-size="12" text-anchor="middle"' +
+        '" fill="#7A8AA0" font-size="12" text-anchor="middle"' +
         (kind.startsWith("clicks_side") ? "" : ' clip-path="url(#mbody)"') + '>' + label + "</text>";
     }
   }
-  s += '<text x="350" y="60" fill="#5C6B80" font-size="12">L ' + (d.clicks_left || 0).toLocaleString() +
+  s += '<text x="350" y="60" fill="#7A8AA0" font-size="12">L ' + (d.clicks_left || 0).toLocaleString() +
     ' · R ' + (d.clicks_right || 0).toLocaleString() +
     ' · M ' + (d.clicks_middle || 0).toLocaleString() + "</text>";
-  s += '<text x="350" y="82" fill="#5C6B80" font-size="12">S1 ' + (d.clicks_side1 || 0).toLocaleString() +
+  s += '<text x="350" y="82" fill="#7A8AA0" font-size="12">S1 ' + (d.clicks_side1 || 0).toLocaleString() +
     ' · S2 ' + (d.clicks_side2 || 0).toLocaleString() +
     ' · ' + t("scrollTicks") + ' ' + (d.scroll_ticks || 0).toLocaleString() + "</text>";
   svg.innerHTML = s;
@@ -1028,9 +1080,21 @@ async function loadAnomalies() {
   const a = await jget("/api/anomalies?days=7");
   const el = document.getElementById("anomalies");
   if (!a.anomalies.length) { el.innerHTML = '<li class="muted">' + t("noAnomalies") + "</li>"; return; }
-  el.innerHTML = a.anomalies.map(x =>
-    '<li><span class="sev-' + esc(x.severity) + '">[' + esc(x.severity) + "]</span> " +
-    esc(x.date) + " · " + esc(x.kind) + " — " + esc(x.message) + "</li>").join("");
+  // 严重级别排序：alert 最高，排最前
+  const SEV_ORDER = { alert: 0, critical: 1, warn: 2, info: 3 };
+  const items = (a.anomalies || []).slice().sort((x, y) =>
+    (SEV_ORDER[x.severity] ?? 9) - (SEV_ORDER[y.severity] ?? 9));
+  el.innerHTML = items.map(x => {
+    const when = x.at || x.date;
+    // 本地化显示时刻；解析失败时原样回退
+    let whenTxt = when;
+    if (when) {
+      const d = new Date(when);
+      if (!isNaN(d.getTime())) whenTxt = d.toLocaleString();
+    }
+    return '<li><span class="sev-' + esc(x.severity) + '">[' + esc(x.severity) + "]</span> " +
+      esc(whenTxt) + " · " + esc(x.kind) + " — " + esc(x.message_en || x.message) + "</li>";
+  }).join("");
 }
 /* ─── Settings ─── */
 function settingsMsg(text, ok) {
@@ -1065,13 +1129,13 @@ async function loadHost() {
   document.getElementById("h-model").textContent = h.model || "–";
   document.getElementById("h-cpu").textContent = h.cpu || "–";
   let gpuTxt = (h.gpus || []).join(" + ") || "–";
-  if (h.gpu_usage_pct != null && gpuTxt !== "–") gpuTxt += "（" + h.gpu_usage_pct + "%）";
+  if (h.gpu_usage_pct != null && gpuTxt !== "–") gpuTxt += " (" + h.gpu_usage_pct + "%)";
   document.getElementById("h-gpu").textContent = gpuTxt;
   const mt = h.mem_total_gb, mu = h.mem_used_gb;
   document.getElementById("h-mem").textContent =
     (mu != null && mt) ? mu.toFixed(1) + " / " + mt + " GB (" + pct(o.mem_pct) + ")" : (mt ? mt + " GB" : "–");
   const disks = h.disks || [];
-  const c = disks.find(x => x.drive === "C:") || disks[0];
+  const c = disks.find(x => String(x.drive || "").startsWith("C")) || disks[0];
   document.getElementById("h-disk").textContent = c
     ? (c.drive || "") + " " + (c.free_gb != null ? c.free_gb + " / " : "") + (c.total_gb != null ? c.total_gb + " GB" : "")
     : "–";
@@ -1143,13 +1207,51 @@ async function saveSettings() {
 }
 /* ─── 视图切换与轮询 ─── */
 let currentView = "overview";
+/* 错误挂点：显示在当前视图容器内，带重试按钮（不再写进隐藏的设置页） */
+function showViewError(name, msg) {
+  const v = document.getElementById("view-" + name);
+  if (!v) return;
+  let el = document.getElementById("view-error-" + name);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "view-error-" + name;
+    el.className = "err";
+    el.style.cssText = "margin:0 0 14px;display:flex;align-items:center;gap:10px";
+    v.prepend(el);
+  }
+  el.textContent = t("loadFailed") + msg;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "save";
+  btn.style.cssText = "background:var(--panel-2);color:var(--fg);border:1px solid var(--border);font-weight:400;padding:3px 12px";
+  btn.textContent = t("retry");
+  btn.onclick = function () {
+    el.remove();
+    refreshView(name).catch(e2 => showViewError(name, e2.message));
+  };
+  el.appendChild(btn);
+}
+function clearViewError(name) {
+  const el = document.getElementById("view-error-" + name);
+  if (el) el.remove();
+}
+/* 采集状态折叠：键盘可达（button + aria-expanded） */
+function toggleOps() {
+  const b = document.getElementById("ops-body");
+  const willShow = b.style.display === "none";
+  b.style.display = willShow ? "" : "none";
+  document.getElementById("ops-toggle").setAttribute("aria-expanded", willShow ? "true" : "false");
+}
 function showView(name) {
   currentView = name;
   for (const v of ["overview", "apps", "report", "insights", "input", "anomalies", "settings"]) {
     document.getElementById("view-" + v).style.display = v === name ? "" : "none";
-    document.getElementById("tab-" + v).classList.toggle("active", v === name);
+    const tab = document.getElementById("tab-" + v);
+    tab.classList.toggle("active", v === name);
+    tab.setAttribute("aria-selected", v === name ? "true" : "false");
   }
-  refreshView(name).catch(e => settingsMsg(e.message, false));
+  clearViewError(name);
+  refreshView(name).catch(e => showViewError(name, e.message));
 }
 async function refreshView(name) {
   if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
@@ -1178,22 +1280,27 @@ for (const id of ["report-date", "apps-date"]) {
   const el = document.getElementById(id);
   if (el && !el.value) el.value = TODAY_STR;
 }
-refreshAll().catch(e => {
-  const el = document.createElement("div");
-  el.className = "err";
-  el.textContent = "load failed: " + e.message;
-  document.body.prepend(el);
-});
-// 设置页不参与 10s 轮询：轮询重渲染会用服务器状态覆盖未保存的勾选。
+refreshAll().catch(e => showViewError(currentView, e.message));
+// 30s 轮询：document.hidden 或当前视图非 overview 时跳过重渲染（只更新状态行），
+// 避免全量重渲染摧毁悬停状态、并在后台标签页浪费请求。
+// 设置页不参与轮询：轮询重渲染会用服务器状态覆盖未保存的勾选。
 // 只在进入页签和保存成功时（loadSettings/saveSettings 内部）重新加载。
 setInterval(() => {
+  if (document.hidden) return;
   if (currentView === "settings") return;
+  if (currentView !== "overview") {
+    loadStatus().catch(() => markDisconnected());
+    return;
+  }
   refreshAll().catch(() => {
-    // 审查 P1：轮询失败不能静默停在旧数据，给出可见的断连提示
-    const el = document.getElementById("status-line");
-    if (el) { el.textContent = "LDisconnected - retrying"; el.style.color = "#e06c6c"; }
+    // 轮询失败不能静默停在旧数据，给出可见的断连提示
+    markDisconnected();
   });
-}, 5000);
+}, 30000);
+function markDisconnected() {
+  const el = document.getElementById("status-line");
+  if (el) { el.textContent = t("disconnected"); el.style.color = "#e06c6c"; }
+}
 </script>
 </body>
 </html>

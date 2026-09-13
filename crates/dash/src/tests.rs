@@ -77,7 +77,12 @@ fn timeline_buckets_by_local_hour_with_top5_and_other() {
         .with_timezone(&Utc);
     let v = api_timeline_at(&conn, 12, now).unwrap();
     let buckets = v["buckets"].as_array().unwrap();
-    assert_eq!(buckets.len(), 2, "只含有数据的桶: {v}");
+    // 补零桶：固定返回窗口内全部 12 个本地小时（无数据小时 human/auto 全 0）
+    assert_eq!(buckets.len(), 12, "12 小时窗口全量补零: {v}");
+    assert_eq!(buckets[0]["hour"], json!("2026-09-09T00"));
+    assert_eq!(buckets[0]["human_min"], json!(0));
+    assert_eq!(buckets[0]["auto_min"], json!(0));
+    assert_eq!(buckets[0]["apps"].as_array().unwrap().len(), 0);
     let b10 = buckets
         .iter()
         .find(|b| b["hour"].as_str().unwrap().ends_with("T10"))
@@ -104,7 +109,15 @@ fn timeline_hours_clamped_and_range_excludes_old_events() {
     insert(&conn, &old, "keyboard", "press", None);
     let v = api_timeline_at(&conn, 9999, now).unwrap();
     assert_eq!(v["hours"], json!(48));
-    assert_eq!(v["buckets"].as_array().unwrap().len(), 0);
+    // 补零桶：即使整窗无数据也固定返回 48 个本地小时，全 0
+    let buckets = v["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 48, "补零后恒为 48 桶: {v}");
+    assert!(buckets
+        .iter()
+        .all(|b| b["human_min"] == json!(0) && b["auto_min"] == json!(0)));
+    // DST 口径说明字段
+    assert!(v["local_offset_seconds"].is_number());
+    assert!(v["local_offset_note"].as_str().unwrap().contains("DST"));
 }
 
 // === anomalies（与 MCP 同入口） ===
@@ -487,4 +500,91 @@ fn loopback_host_whitelist() {
     assert!(!loopback_host_ok("", 8422));
     assert!(!loopback_host_ok("192.168.1.5:8422", 8422));
     assert!(!loopback_host_ok("127.0.0.2:8422", 8422));
+}
+
+// === 三指标口径统一（mixed_minutes / unattended_fg） ===
+
+fn insert_input_agg(conn: &Connection, ts: &str, data: &str) {
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data) VALUES (?1, 'keyboard', 'input_agg', ?2)",
+        params![ts, data],
+    )
+    .unwrap();
+}
+
+#[test]
+fn overview_counts_mixed_minutes_for_both_presence_and_automation() {
+    let conn = mem_conn();
+    let today = queries::today_local_str();
+    let (start, _) = queries::local_day_range(&today).unwrap();
+    let t0 = chrono::DateTime::parse_from_rfc3339(&start).unwrap();
+    let t1 = (t0 + chrono::Duration::minutes(1)).to_rfc3339();
+    let t2 = (t0 + chrono::Duration::minutes(2)).to_rfc3339();
+    // 纯人分钟 / 混合分钟 / 纯自动化分钟
+    insert_input_agg(&conn, &start, r#"{"keys": 10}"#);
+    insert_input_agg(&conn, &t1, r#"{"keys": 10, "injected_keys": 5}"#);
+    insert_input_agg(&conn, &t2, r#"{"injected_keys": 7}"#);
+    let v = api_overview(&conn, Path::new("definitely-missing.db"));
+    // 混合分钟同时计入两者：presence=2（m0+m1），automation=2（m1+m2），mixed=1
+    assert_eq!(v["presence_minutes"], json!(2), "{v}");
+    assert_eq!(v["automation_minutes"], json!(2), "{v}");
+    assert_eq!(v["mixed_minutes"], json!(1), "{v}");
+    assert!(v["unattended_fg_minutes"].is_number());
+    assert!(v["metrics_note"].as_str().unwrap().contains("mixed"));
+}
+
+// === insights：节律卡（首末输入 + 单事件日标注） ===
+
+#[test]
+fn insights_rhythm_updates_last_and_marks_single_event_day() {
+    let conn = mem_conn();
+    // 昨天两批输入（首 09:00 / 末 17:00），今天仅一条
+    for _ in 0..51 {
+        insert(&conn, &local_ts(-1, 9, 0), "keyboard", "press", None);
+    }
+    for _ in 0..3 {
+        insert(&conn, &local_ts(-1, 17, 0), "keyboard", "press", None);
+    }
+    insert(&conn, &local_ts(0, 22, 30), "keyboard", "press", None);
+    let v = api_insights(&conn, 2);
+    let rhythm = v["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title_en"] == json!("Your daily rhythm"))
+        .expect("节律卡应存在");
+    let zh = rhythm["text_zh"].as_str().unwrap();
+    let en = rhythm["text_en"].as_str().unwrap();
+    assert!(zh.contains("17:00"), "最后输入应被更新而非停在首条: {zh}");
+    assert!(zh.contains("仅一条输入记录"), "单事件日应标注: {zh}");
+    assert!(en.contains("single input event"), "en 侧同步: {en}");
+}
+
+// === anomalies：message_en 映射 ===
+
+#[test]
+fn anomalies_message_en_covers_all_kinds() {
+    assert!(anomaly_message_en("late_night").contains("Late-night"));
+    assert!(anomaly_message_en("apm_burst").contains("APM"));
+    assert!(anomaly_message_en("marathon").contains("Marathon"));
+    assert!(anomaly_message_en("new_app_surge").contains("surge"));
+    assert!(anomaly_message_en("unknown_kind").contains("unknown_kind"));
+}
+
+// === trends：presence_minutes 别名 ===
+
+#[test]
+fn trends_presence_minutes_alias_matches_active_minutes() {
+    let conn = mem_conn();
+    conn.execute(
+        "INSERT INTO daily_agg (date, keys, clicks, active_minutes) VALUES ('2026-09-08', 10, 2, 45)",
+        [],
+    )
+    .unwrap();
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
+    let v = api_trends_at(&conn, today);
+    let d = &v["daily"].as_array().unwrap()[0];
+    assert_eq!(d["active_minutes"], json!(45));
+    assert_eq!(d["presence_minutes"], json!(45), "别名同值: {d}");
+    assert!(v["presence_minutes_note"].as_str().unwrap().contains("alias"));
 }

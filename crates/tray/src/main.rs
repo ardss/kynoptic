@@ -26,6 +26,7 @@
 
 mod args;
 mod icons;
+mod paths;
 mod state;
 mod tray;
 
@@ -53,20 +54,54 @@ fn main() {
             // 只在句柄非空时才看 GetLastError:创建成功的新互斥体不重置
             // last error,残留的 ERROR_ALREADY_EXISTS 会造成误判秒退。
             let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-            if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            // fail-closed(审查 P2):CreateMutexW 返回 NULL 说明互斥体没建起来,
+            // 若继续跑,watchdog 的 OpenMutexW 探活失效 + 双 collector 可能并发
+            // 写同一 SQLite。报错退出(stderr + 日志文件)而不是静默继续。
+            if h.is_null() {
+                let msg = format!(
+                    "[{}] kynoptic-tray: CreateMutexW 失败(GetLastError={}),拒绝启动以防双 collector 并发写库\n",
+                    chrono::Utc::now().to_rfc3339(),
+                    GetLastError()
+                );
+                eprint!("{msg}");
+                let log_path = std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|d| d.join("tray-error.log")));
+                if let Some(p) = log_path {
+                    let _ = std::fs::write(&p, &msg);
+                }
+                std::process::exit(1);
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
                 eprintln!("kynoptic-tray: 已有实例在运行,退出");
                 return;
             }
         }
     }
 
-    // 启动即清"用户主动退出"旗标:之后 watchdog 才有拉起依据
+    // 启动即清"用户主动退出"旗标:之后 watchdog 才有拉起依据。
+    // 路径规则与 watchdog 统一:--flag 覆盖 > KYNOPTIC_EXIT_FLAG > exe 同目录
+    // (契约见 paths.rs 模块注释;watchdog 侧在 crates/cli/src/main.rs)。
     let exit_flag = parsed
-        .db
-        .parent()
-        .map(|p| p.join("tray-exit.flag"))
-        .unwrap_or_else(|| std::path::PathBuf::from("tray-exit.flag"));
+        .exit_flag
+        .clone()
+        .unwrap_or_else(paths::resolve_exit_flag);
     let _ = std::fs::remove_file(&exit_flag);
+
+    // 采集心跳:每 30s touch exe 同目录心跳文件(RFC3339 时间戳)。
+    // watchdog 除互斥体探活外还会检查心跳新鲜度——进程活着但采集主循环挂死
+    // 时,心跳停止,watchdog 据此 kill 并重启(4-8 小时空洞的根因修复)。
+    // 写失败静默忽略:心跳缺失只是退化为旧的探活行为,不影响采集本身。
+    {
+        let hb = paths::resolve_heartbeat();
+        thread::Builder::new()
+            .name("Heartbeat".into())
+            .spawn(move || loop {
+                let _ = std::fs::write(&hb, chrono::Utc::now().to_rfc3339());
+                thread::sleep(std::time::Duration::from_secs(30));
+            })
+            .expect("心跳线程启动失败");
+    }
 
     // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘。
     // 健壮性:全新首装时本线程先于采集器跑,数据库文件还不存在,只读打开

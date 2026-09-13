@@ -32,21 +32,31 @@ use rusqlite::{params, Connection};
 use crate::types::{Event, EventAction, EventType};
 
 /// 本地分钟桶聚合行的写入（增量与重建共用）。
+///
+/// max_event_rowid 幂等防护（审查 P2）：每行记录已累计到的最大 events.id。
+/// 增量写入带该事件的 rowid，rowid <= 已记录值的重复投递（如 backfill_chunk
+/// 重算已包含该事件后的迟到增量）被 WHERE 守卫整体跳过，同事件不重复累计。
+/// 重建/回填路径写入桶内 MAX(events.id)，保证重算后的迟到增量也能被识别。
 const UPSERT_MINUTE: &str = "
-INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT(date, hour, minute, bucket_id) DO UPDATE SET
     sum_value = COALESCE(sum_value, 0) + excluded.sum_value,
-    count_value = COALESCE(count_value, 0) + excluded.count_value
+    count_value = COALESCE(count_value, 0) + excluded.count_value,
+    max_event_rowid = excluded.max_event_rowid
+    WHERE excluded.max_event_rowid > COALESCE(agg_minute.max_event_rowid, 0)
 ";
 
 /// input_agg 专用：事件携带的是"本分钟累计快照"，同分钟桶必须覆盖而非累加。
+/// MAX 覆盖天然幂等（同 events 行原地 UPSERT，rowid 不变、值单调不减），
+/// max_event_rowid 仅作单调推进，不需要守卫。
 const UPSERT_MINUTE_SNAPSHOT: &str = "
-INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT(date, hour, minute, bucket_id) DO UPDATE SET
     sum_value = MAX(COALESCE(sum_value, 0), excluded.sum_value),
-    count_value = MAX(COALESCE(count_value, 0), excluded.count_value)
+    count_value = MAX(COALESCE(count_value, 0), excluded.count_value),
+    max_event_rowid = MAX(COALESCE(agg_minute.max_event_rowid, 0), excluded.max_event_rowid)
 ";
 
 const UPSERT_DAILY_APP: &str = "
@@ -57,7 +67,10 @@ ON CONFLICT(date, bucket_id) DO UPDATE SET
 ";
 
 /// 单个事件对聚合缓存的增量贡献（本地时区分钟桶）。
-fn apply_event(conn: &Connection, e: &Event) -> rusqlite::Result<()> {
+///
+/// `rowid` = 该事件在 events 表的 rowid（落库时分配；未知传 0 → 增量行被
+/// 守卫跳过，快照行仅更新计数快照）。
+fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite::Result<()> {
     let ts = match chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
         Ok(t) => t,
         Err(_) => return Ok(()), // 时间戳不可解析：跳过（不阻塞整批）
@@ -70,11 +83,13 @@ fn apply_event(conn: &Connection, e: &Event) -> rusqlite::Result<()> {
     match (e.event_type, e.event_action) {
         (EventType::Keyboard, EventAction::InputAgg) => {
             let keys = json_counter(e, "keys");
-            let samples = json_counter(e, "samples");
+            // 键盘专属样本数优先（input_agg.rs 新增字段）；旧行回退 samples
+            let ks = json_counter(e, "keys_samples");
+            let samples = if ks > 0 { ks } else { json_counter(e, "samples") };
             if keys > 0 {
                 conn.execute(
                     UPSERT_MINUTE_SNAPSHOT,
-                    params![date, hour, minute, "input_keys", keys, samples],
+                    params![date, hour, minute, "input_keys", keys, samples, rowid],
                 )?;
             }
         }
@@ -86,32 +101,32 @@ fn apply_event(conn: &Connection, e: &Event) -> rusqlite::Result<()> {
             if clicks > 0 {
                 conn.execute(
                     UPSERT_MINUTE_SNAPSHOT,
-                    params![date, hour, minute, "input_clicks", clicks, samples],
+                    params![date, hour, minute, "input_clicks", clicks, samples, rowid],
                 )?;
             }
             if moves > 0 || dist > 0 {
                 conn.execute(
                     UPSERT_MINUTE_SNAPSHOT,
-                    params![date, hour, minute, "input_moves", dist, moves],
+                    params![date, hour, minute, "input_moves", dist, moves, rowid],
                 )?;
             }
         }
         (EventType::Keyboard, EventAction::Press) => {
             conn.execute(
                 UPSERT_MINUTE,
-                params![date, hour, minute, "input_keys", 1, 1],
+                params![date, hour, minute, "input_keys", 1, 1, rowid],
             )?;
         }
         (EventType::Mouse, EventAction::Click) => {
             conn.execute(
                 UPSERT_MINUTE,
-                params![date, hour, minute, "input_clicks", 1, 1],
+                params![date, hour, minute, "input_clicks", 1, 1, rowid],
             )?;
         }
         (EventType::Window, EventAction::Switch) => {
             conn.execute(
                 UPSERT_MINUTE,
-                params![date, hour, minute, "window_switches", 1, 1],
+                params![date, hour, minute, "window_switches", 1, 1, rowid],
             )?;
             if let Some(app) = e.app_name.as_deref() {
                 conn.execute(UPSERT_DAILY_APP, params![date, app, 1])?;
@@ -133,18 +148,24 @@ fn json_counter(e: &Event, key: &str) -> i64 {
 impl super::Database {
     /// 增量维护聚合缓存：对一批刚落库的事件做 agg_minute / agg_daily UPSERT。
     ///
+    /// `rowids` 与 `events` 一一对应（由 [`super::Database::insert_events`]
+    /// 返回的 events 表 rowid；写入失败的行为 0）。rowid 用于 agg_minute 行的
+    /// max_event_rowid 幂等防护：同事件重复投递（如分块回填重算后迟到的增量）
+    /// 不会重复累计。
+    ///
     /// 由 writer 线程在每次 flush 后调用。失败仅 log（缓存可由 backfill 重建，
     /// 不影响原始写入）。
     ///
     /// perf3（2026-09-09）：整批包进**一个事务**——旧实现每条 UPSERT 独立隐式
     /// 提交，实测 ~383µs/事件被提交开销主导（perf3-longrun P1：300 事件/批
     /// ~115ms）；单事务后每批一次提交，突发写入吞吐提升一个数量级。
-    pub fn update_agg(&self, events: &[Event]) {
+    pub fn update_agg(&self, events: &[Event], rowids: &[i64]) {
         self.with_writer(
             |conn| match conn.unchecked_transaction() {
                 Ok(tx) => {
-                    for e in events {
-                        if let Err(err) = apply_event(&tx, e) {
+                    for (i, e) in events.iter().enumerate() {
+                        let rowid = rowids.get(i).copied().unwrap_or(0);
+                        if let Err(err) = apply_event(&tx, e, rowid) {
                             log::warn!("agg 缓存增量更新失败（跳过单条）: {err}");
                         }
                     }
@@ -185,11 +206,12 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
     // 共享同一 CTE 扫描）。
     // input_agg 行的计数从 event_data JSON 提取；raw 行按行计数。
     conn.execute_batch(&format!(
-        "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value)
+        "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid)
          WITH m AS (
            SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d,
                   CAST(substr(datetime(timestamp, '{off}'), 12, 2) AS INTEGER) AS h,
                   CAST(substr(datetime(timestamp, '{off}'), 15, 2) AS INTEGER) AS mi,
+                  MAX(id) AS maxid,
                   SUM({keys_row}) AS keys,
                   SUM({clicks_row}) AS clicks,
                   SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
@@ -202,22 +224,22 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
                            WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cclicks,
                   SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cmoves,
+                           THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END) AS cmoves,
                   SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches
            FROM events
            WHERE event_type IN ('keyboard','mouse','window')
            GROUP BY d, h, mi
          ),
          b AS (
-           SELECT d, h, mi, 'input_keys' AS bk, keys AS s, ckeys AS c FROM m WHERE keys > 0
+           SELECT d, h, mi, 'input_keys' AS bk, keys AS s, ckeys AS c, maxid FROM m WHERE keys > 0
            UNION ALL
-           SELECT d, h, mi, 'input_clicks', clicks, cclicks FROM m WHERE clicks > 0
+           SELECT d, h, mi, 'input_clicks', clicks, cclicks, maxid FROM m WHERE clicks > 0
            UNION ALL
-           SELECT d, h, mi, 'input_moves', dist, cmoves FROM m WHERE dist > 0 OR cmoves > 0
+           SELECT d, h, mi, 'input_moves', dist, cmoves, maxid FROM m WHERE dist > 0 OR cmoves > 0
            UNION ALL
-           SELECT d, h, mi, 'window_switches', switches, switches FROM m WHERE switches > 0
+           SELECT d, h, mi, 'window_switches', switches, switches, maxid FROM m WHERE switches > 0
          )
-         SELECT d, h, mi, bk, s, c FROM b;
+         SELECT d, h, mi, bk, s, c, maxid FROM b;
 
          INSERT INTO agg_daily (date, bucket_id, sum_value, count_value)
          SELECT substr(datetime(timestamp, '{off}'), 1, 10),
@@ -328,7 +350,8 @@ fn local_day_bounds(date: &str) -> Option<(String, String)> {
 /// 重算单个本地 (date, hour) 块的 agg_minute 行 + （若是该日最后一小时）
 /// 该日 agg_daily app 行。单事务原子：并发 writer 的增量 upsert 要么整体在
 /// 事务前提交（被 DELETE 抹掉后由重算覆盖——重算扫描包含该事件），要么在
-/// 事务后提交（增量叠加到重算结果上）。两种交错均正确。
+/// 事务后提交（该事件 rowid <= 桶的 max_event_rowid，被 UPSERT_MINUTE 的
+/// WHERE 守卫跳过，不重复累计）。两种交错均正确。
 fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()> {
     let Some((start, end)) = hour_bounds(date, hour) else {
         return Ok(());
@@ -342,9 +365,10 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
             params![date, hour],
         )?;
         conn.execute_batch(&format!(
-            "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value)
+            "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid)
              WITH m AS (
                SELECT CAST(substr(datetime(timestamp, '{off}'), 15, 2) AS INTEGER) AS mi,
+                      MAX(id) AS maxid,
                       SUM({keys_row}) AS keys,
                       SUM({clicks_row}) AS clicks,
                       SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
@@ -357,7 +381,7 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                                WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                                THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cclicks,
                       SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cmoves,
+                               THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END) AS cmoves,
                       SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches
                FROM events
                WHERE event_type IN ('keyboard','mouse','window')
@@ -365,15 +389,15 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                GROUP BY mi
              ),
              b AS (
-               SELECT mi, 'input_keys' AS bk, keys AS s, ckeys AS c FROM m WHERE keys > 0
+               SELECT mi, 'input_keys' AS bk, keys AS s, ckeys AS c, maxid FROM m WHERE keys > 0
                UNION ALL
-               SELECT mi, 'input_clicks', clicks, cclicks FROM m WHERE clicks > 0
+               SELECT mi, 'input_clicks', clicks, cclicks, maxid FROM m WHERE clicks > 0
                UNION ALL
-               SELECT mi, 'input_moves', dist, cmoves FROM m WHERE dist > 0 OR cmoves > 0
+               SELECT mi, 'input_moves', dist, cmoves, maxid FROM m WHERE dist > 0 OR cmoves > 0
                UNION ALL
-               SELECT mi, 'window_switches', switches, switches FROM m WHERE switches > 0
+               SELECT mi, 'window_switches', switches, switches, maxid FROM m WHERE switches > 0
              )
-             SELECT '{date}', {hour}, mi, bk, s, c FROM b;",
+             SELECT '{date}', {hour}, mi, bk, s, c, maxid FROM b;",
             off = off,
             keys_row = crate::queries::KEYS_ROW_EXPR,
             clicks_row = crate::queries::CLICKS_ROW_EXPR,
@@ -718,8 +742,8 @@ mod tests {
             .data(serde_json::json!({"keys": 5, "samples": 5}));
         e3.timestamp = "2026-06-15T02:31:00+00:00".into();
 
-        for ev in [&e, &e2, &e3] {
-            apply_event(&c, ev).unwrap();
+        for (i, ev) in [&e, &e2, &e3].iter().enumerate() {
+            apply_event(&c, ev, i as i64 + 1).unwrap();
             ins(
                 &c,
                 &ev.timestamp,
@@ -735,6 +759,135 @@ mod tests {
         let rebuilt = any_local_minute_row(&c, "input_keys");
         assert_eq!(incremental, rebuilt, "增量维护必须与全量重建等价");
         assert_eq!(incremental, 6);
+    }
+
+    /// 审查 P1 回归：mouse input_agg 行同时带 samples 与 moves 时，
+    /// input_moves 的 count 必须是 $.moves 而非 $.samples，
+    /// 且增量维护与 rebuild_all / backfill_all 逐行一致。
+    #[test]
+    fn moves_count_uses_moves_field_not_samples() {
+        let c = conn();
+        // 事件 JSON：clicks/samples/moves/move_distance_px 并存
+        let e = Event::new(EventAction::InputAgg, EventType::Mouse)
+            .data(serde_json::json!({
+                "clicks": 3, "samples": 20, "moves": 10, "move_distance_px": 500,
+            }));
+        let mut e = e;
+        e.timestamp = "2026-06-15T02:30:00+00:00".into();
+        ins(
+            &c,
+            &e.timestamp,
+            "mouse",
+            "input_agg",
+            None,
+            Some(r#"{"clicks":3,"samples":20,"moves":10,"move_distance_px":500}"#),
+        );
+        apply_event(&c, &e, 1).unwrap();
+
+        // 增量结果：input_moves sum=500 count=10（不是 20）
+        let (sum, cnt): (f64, i64) = c
+            .query_row(
+                "SELECT COALESCE(sum_value,0), COALESCE(count_value,0) FROM agg_minute WHERE bucket_id='input_moves'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((sum as i64, cnt), (500, 10), "count 必须取 $.moves");
+        // input_clicks 的 count 仍是 samples
+        let ccnt: i64 = c
+            .query_row(
+                "SELECT COALESCE(count_value,0) FROM agg_minute WHERE bucket_id='input_clicks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ccnt, 20);
+
+        let fingerprint = |c: &Connection| -> String {
+            let mut stmt = c
+                .prepare(
+                    "SELECT bucket_id||'|'||COALESCE(sum_value,0)||'|'||COALESCE(count_value,0)
+                     FROM agg_minute ORDER BY bucket_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        let incremental_fp = fingerprint(&c);
+
+        rebuild_all(&c).unwrap();
+        assert_eq!(
+            incremental_fp,
+            fingerprint(&c),
+            "samples/moves 并存时增量与 rebuild 必须逐行一致"
+        );
+        c.execute("DELETE FROM agg_minute", []).unwrap();
+        backfill_all(&c).unwrap();
+        assert_eq!(
+            incremental_fp,
+            fingerprint(&c),
+            "samples/moves 并存时增量与 backfill 必须逐行一致"
+        );
+    }
+
+    /// 审查 P2 回归：max_event_rowid 幂等防护——同事件重复投递（如分块回填
+    /// 重算已包含该事件后迟到的增量 upsert）不得重复累计。
+    #[test]
+    fn incremental_upsert_is_idempotent_via_max_event_rowid() {
+        let c = conn();
+        let e = Event::new(EventAction::Press, EventType::Keyboard);
+        let mut e = e;
+        e.timestamp = "2026-06-15T02:30:10+00:00".into();
+        ins(&c, &e.timestamp, "keyboard", "press", None, None);
+        apply_event(&c, &e, 1).unwrap();
+        // 同一事件（rowid 1）再次投递：被守卫跳过
+        apply_event(&c, &e, 1).unwrap();
+        let cnt: i64 = c
+            .query_row(
+                "SELECT COALESCE(count_value,0) FROM agg_minute WHERE bucket_id='input_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "同事件重复投递不重复累计");
+
+        // backfill 重算（包含该事件）后，迟到增量（rowid 1）也不重复
+        backfill_all(&c).unwrap();
+        let rebuilt: i64 = c
+            .query_row(
+                "SELECT COALESCE(count_value,0) FROM agg_minute WHERE bucket_id='input_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt, 1);
+        apply_event(&c, &e, 1).unwrap();
+        let after: i64 = c
+            .query_row(
+                "SELECT COALESCE(count_value,0) FROM agg_minute WHERE bucket_id='input_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "重算后的迟到增量被 max_event_rowid 守卫跳过");
+
+        // 新事件（rowid 更大）正常累计
+        let e2 = Event::new(EventAction::Press, EventType::Keyboard);
+        let mut e2 = e2;
+        e2.timestamp = "2026-06-15T02:30:20+00:00".into();
+        ins(&c, &e2.timestamp, "keyboard", "press", None, None);
+        apply_event(&c, &e2, 2).unwrap();
+        let after2: i64 = c
+            .query_row(
+                "SELECT COALESCE(count_value,0) FROM agg_minute WHERE bucket_id='input_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after2, 2);
     }
 }
 
@@ -881,7 +1034,7 @@ mod perf3_tests {
         let mut e = Event::new(EventAction::Press, EventType::Keyboard);
         e.timestamp = "2026-06-15T02:31:20+00:00".into();
         ins(&c, &e.timestamp, "keyboard", "press", None, None);
-        apply_event(&c, &e).unwrap();
+        apply_event(&c, &e, 2).unwrap();
 
         // 已完成块计数 = 重建结果
         rebuild_all(&c).unwrap();
