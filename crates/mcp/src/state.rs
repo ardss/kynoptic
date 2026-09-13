@@ -376,7 +376,7 @@ pub fn timeline(
     let to = norm(to, true);
     let mut stmt = conn
         .prepare(
-            "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') \
+            "SELECT timestamp, COALESCE(NULLIF(app_name,''), '(unknown)') \
              FROM events \
              WHERE event_type='window' AND event_action='switch' \
                AND timestamp >= ?1 AND timestamp < ?2 \
@@ -788,6 +788,31 @@ mod tests {
             20
         )
         .is_err());
+    }
+
+    // 审查 P0：app_name 为空时不得回退 window_title——工具面承诺时间线
+    // 不含窗口标题全文，泄露即违约。空名必须记 (unknown)。
+    #[test]
+    fn timeline_does_not_leak_window_title_when_app_name_empty() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1, 'window', 'switch', NULL, '', 'Secret Document Title', NULL)",
+            params!["2026-09-09T01:00:00+00:00"],
+        )
+        .unwrap();
+        let (v, _) = timeline(
+            &conn,
+            "2026-09-09T00:00:00+00:00",
+            "2026-09-09T02:00:00+00:00",
+            "minute",
+            20,
+        )
+        .unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["app"], json!("(unknown)"));
+        let out = v.to_string();
+        assert!(!out.contains("Secret Document Title"), "标题泄露: {out}");
     }
 
     #[test]

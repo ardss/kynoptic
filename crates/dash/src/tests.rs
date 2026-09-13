@@ -144,6 +144,8 @@ fn status_reflects_last_event_ts() {
     assert_eq!(v["today"], json!(queries::today_local_str()));
     assert_eq!(v["read_only"], json!(true));
     assert_eq!(v["bind"], json!("127.0.0.1"));
+    // 审查 P2：db_path 只回文件名，不暴露全路径
+    assert_eq!(v["db_path"], json!("x.db"));
 }
 
 // === overview ===
@@ -337,6 +339,8 @@ fn settings_get_returns_registry_and_defaults() {
     assert_eq!(v["enabled_monitors"].as_array().unwrap().len(), 14);
     assert!(v["autostart"].is_boolean());
     assert!(monitors[0]["sensitivity"].is_string());
+    // 隐私默认：每键频次采集默认关闭
+    assert_eq!(v["vk_frequency_enabled"], json!(false));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -399,6 +403,56 @@ fn settings_post_rejects_unknown_id_and_bad_input() {
     let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["enabled_monitors"].as_array().unwrap().len(), 14);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn settings_post_vk_frequency_bool_and_audit_log() {
+    let dir = tmpdir("vk-audit");
+    let db = dir.join("kyn.db");
+    let audit = dir.join("settings-audit.log");
+    // vk_frequency_enabled 类型错 → 400
+    let (code, _, _) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"vk_frequency_enabled":"on"}"#,
+        &db,
+    );
+    assert_eq!(code, 400);
+    // 实际变更 → 200 + GET 回读 true + 审计行（旧→新，无 categories 全文）
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"vk_frequency_enabled":true}"#,
+        &db,
+    );
+    assert_eq!(code, 200, "{out}");
+    let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["vk_frequency_enabled"], json!(true));
+    let log = std::fs::read_to_string(&audit).unwrap();
+    assert_eq!(log.lines().count(), 1, "一次实际变更一行审计: {log}");
+    let line = log.lines().next().unwrap();
+    assert!(line.contains("vk_frequency_enabled"), "{log}");
+    assert!(line.contains("[false,true]"), "旧值→新值: {log}");
+    assert!(!line.contains("pattern"), "不得落 categories 全文: {log}");
+    assert!(line.len() <= 512 + 1, "单行截断 512 字节: {log}");
+    // RFC3339 时间戳前缀
+    let ts = line.split('\t').next().unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(ts).is_ok(), "{log}");
+    // 无实际变更的 POST 不追加审计行
+    let (code, _, _) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"vk_frequency_enabled":true}"#,
+        &db,
+    );
+    assert_eq!(code, 200);
+    let log = std::fs::read_to_string(&audit).unwrap();
+    assert_eq!(log.lines().count(), 1, "无变更不写审计: {log}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -587,4 +641,155 @@ fn trends_presence_minutes_alias_matches_active_minutes() {
     assert_eq!(d["active_minutes"], json!(45));
     assert_eq!(d["presence_minutes"], json!(45), "别名同值: {d}");
     assert!(v["presence_minutes_note"].as_str().unwrap().contains("alias"));
+}
+
+// === 真 socket 测试（审查清单 A5）：真实 TcpListener + 真实 TCP 连接 ===
+//
+// route_req 之上的网络层行为：并发、8KB+ 头 431、缺 Host 4xx、垃圾字节
+// 断连不 panic。serve 阻塞运行在临时线程，端口用「先 bind :0 探测空闲再
+// 交给 serve」的方式取得（窗口极小，重试连接兜底）。
+
+mod socket_tests {
+    use super::super::serve;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// 建一个已初始化的临时 DB 文件，返回路径（serve 只读打开它）
+    fn temp_db(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-dash-sock-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("kyn.db");
+        let _db = kynoptic_core::db::Database::open(db.to_str().unwrap()).unwrap();
+        drop(_db); // 归还全部连接后再交给 serve
+        db
+    }
+
+    fn free_port() -> u16 {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// 起真实 serve 线程，返回 (端口, 临时目录)
+    fn start_server(tag: &str) -> (u16, PathBuf) {
+        let db = temp_db(tag);
+        let dir = db.parent().unwrap().to_path_buf();
+        let port = free_port();
+        let db_for_thread = db.clone();
+        std::thread::Builder::new()
+            .name("e2e-serve".into())
+            .spawn(move || {
+                let _ = serve(&db_for_thread, port, true);
+            })
+            .unwrap();
+        // 重试连接直到监听就绪（最多 ~5s）
+        let mut last_err = None;
+        for _ in 0..100 {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => {
+                    drop(s);
+                    return (port, dir);
+                }
+                Err(e) => last_err = Some(e),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("serve 未在 5s 内开始监听 {port}: {last_err:?}");
+    }
+
+    fn get(port: u16, raw_request: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(raw_request.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf); // Connection: close → 读到 EOF
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[test]
+    fn twenty_concurrent_connections_all_get_200() {
+        let (port, dir) = start_server("conc");
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            handles.push(std::thread::spawn(move || {
+                let resp = get(port, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+                resp.starts_with("HTTP/1.1 200 ")
+            }));
+        }
+        let all_ok = handles.into_iter().all(|h| h.join().unwrap());
+        assert!(all_ok, "20 个并发连接必须全部得到 200");
+        // serve 线程仍持只读连接，Windows 上目录删除是尽力而为
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_headers_get_431() {
+        let (port, dir) = start_server("big");
+        // >8KiB 且不带头终止符 → 431 Request Header Fields Too Large
+        let big = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: {}\r\n",
+            "A".repeat(9000)
+        );
+        let resp = get(port, &big);
+        assert!(
+            resp.starts_with("HTTP/1.1 431 "),
+            "8KB+ 头应返回 431，实际: {resp}"
+        );
+        // 服务必须存活：随后正常请求仍 200
+        let resp = get(port, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 200 "));
+        // serve 线程仍持只读连接，Windows 上目录删除是尽力而为
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_host_header_rejected_with_4xx() {
+        let (port, dir) = start_server("nohost");
+        let resp = get(port, "GET /api/status HTTP/1.1\r\n\r\n");
+        let code: u16 = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            (400..500).contains(&code),
+            "缺 Host（DNS rebinding 防线）必须 4xx，实际: {resp}"
+        );
+        // serve 线程仍持只读连接，Windows 上目录删除是尽力而为
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn garbage_bytes_close_connection_without_killing_server() {
+        let (port, dir) = start_server("garbage");
+        // 垃圾字节：连接应被关闭（EOF/错误），服务不得 panic
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0xff, 0x13, 0x37])
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let _ = s.read(&mut buf); // EOF 或错误都算"连接被关闭"
+        drop(s);
+        // 半个请求后挂断：同样不应影响后续连接
+        let mut s2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s2.write_all(b"GET / HT").unwrap();
+        drop(s2);
+        // 服务存活：正常请求仍 200
+        let resp = get(port, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "垃圾字节后服务必须存活: {resp}"
+        );
+        // serve 线程仍持只读连接，Windows 上目录删除是尽力而为
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -41,6 +41,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0007_agg_minute_max_rowid",
         include_str!("migrations/0007_agg_minute_max_rowid.sql"),
     ),
+    (
+        "0008_events_action_idx",
+        include_str!("migrations/0008_events_action_idx.sql"),
+    ),
 ];
 
 /// 0001 的内容单独导出：供 CLI 等外部工具对裸库做幂等初始化。

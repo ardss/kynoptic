@@ -13,6 +13,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # P2: 缓存 cargo 依赖/构建产物，加速发版构建
+      - uses: Swatinem/rust-cache@v2
+      # P0: 版本双源校验——tag 与 crates/cli/Cargo.toml 的 version 不一致直接失败
+      - name: Verify tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $tagVer = $env:GITHUB_REF_NAME.TrimStart("v")
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $cargoVer = ($meta.packages | Where-Object { $_.name -eq "kynoptic" }).version
+          if ($cargoVer -ne $tagVer) {
+            Write-Error "tag v$tagVer 与 Cargo.toml 版本 $cargoVer 不一致，终止发版"
+            exit 1
+          }
+          Write-Host "version check ok: v$tagVer == $cargoVer"
       - name: Build release
         run: cargo build --release -p kynoptic -p kynoptic-tray
       - name: Install Inno Setup
@@ -25,7 +39,9 @@ jobs:
       - name: Fetch Chinese language file for Inno Setup
         shell: pwsh
         run: |
-          $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl"
+          # pin 到 issrc release tag is-6_7_3 的具体 commit（4adf37ed7f3fd2bd11c6836ba056e3de170fbabf），
+          # 避免上游 main 漂移破坏构建。升级 isl 时必须手动更新这里的 commit pin。
+          $url = "https://raw.githubusercontent.com/jrsoftware/issrc/4adf37ed7f3fd2bd11c6836ba056e3de170fbabf/Files/Languages/Unofficial/ChineseSimplified.isl"
           Invoke-WebRequest -Uri $url -OutFile "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
       - name: Stage assets
         shell: pwsh
@@ -41,10 +57,12 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath "dist/Kynoptic-Portable-$ver.zip"
           # 安装器（Inno Setup，双语向导）
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=$ver kynoptic.iss
-          # 自更新专用压缩包（self_update github 后端按
-          # {bin}-{version}-{target}.zip 命名匹配资产，缺它 kynoptic update 必失败）
-          Compress-Archive -Path dist/kynoptic.exe -DestinationPath "dist/kynoptic-$ver-x86_64-pc-windows-msvc.zip"
-          # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用）
+          # 自更新专用压缩包（历史资产命名 {bin}-{version}-{target}.zip）。
+          # P0：必须包含三件套（kynoptic.exe / kynoptic-tray.exe / kynoptic-watchdog.exe），
+          # 只换主 exe 会造成三件套版本漂移。
+          Compress-Archive -Path dist/kynoptic.exe, dist/kynoptic-tray.exe, dist/kynoptic-watchdog.exe `
+            -DestinationPath "dist/kynoptic-$ver-x86_64-pc-windows-msvc.zip"
+          # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用；覆盖全部 dist 文件，含三件套与自更新 zip）
           $hashes = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
             ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
           $sums = ($hashes -join "`n") + "`n"

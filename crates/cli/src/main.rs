@@ -54,7 +54,7 @@ const USAGE: &str = "kynoptic-ctl <subcommand> [options]
 Subcommands:
   collect   [--db PATH] [--all]             Run the collector (Ctrl+C to stop)
   stats     [--date YYYY-MM-DD] [--days N]   Show summary stats
-  export    [--days N] [--format csv|json|jsonl] [--out PATH]
+  export    [--days N] [--format csv|json|jsonl] [--out PATH] [--raw]
   report    [--date YYYY-MM-DD] [--save PATH]   Generate Markdown report
   db        [stats|cleanup [N]|vacuum|checkpoint]   DB maintenance
   analyze   [--date YYYY-MM-DD]                Focus/fragment/anomaly report
@@ -157,6 +157,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
     let mut days: i64 = 7;
     let mut format = "csv".to_string();
     let mut out = String::new();
+    let mut raw = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -172,24 +173,43 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 i += 1;
                 out = args.get(i).cloned().unwrap_or_default();
             }
+            // --raw：保留 window_title 原文（默认脱敏：剥离含 http 片段的 URL 查询串）
+            "--raw" => raw = true,
             _ => {}
         }
         i += 1;
     }
+    let db_path = resolve_db();
     let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
-    let conn = open_db(&resolve_db())?;
+    let conn = open_db(&db_path)?;
     // 流式导出（审查 P2：不再把全表载入内存）
     use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
     let row_count = std::sync::Arc::new(AtomicUsize::new(0));
 
     if out.is_empty() {
-        out = format!(
-            "kynoptic_export_{}.{}",
-            Utc::now().format("%Y%m%d_%H%M%S"),
-            ext(&format)
-        );
+        // 缺省写到 db 同目录 exports/ 子目录（自动创建），不再落 CWD。
+        let dir = default_export_dir(&db_path);
+        std::fs::create_dir_all(&dir)?;
+        out = dir
+            .join(format!(
+                "kynoptic_export_{}.{}",
+                Utc::now().format("%Y%m%d_%H%M%S"),
+                ext(&format)
+            ))
+            .to_string_lossy()
+            .into_owned();
     }
     let out_path = PathBuf::from(&out);
+
+    // window_title 默认脱敏（--raw 保留原文）
+    let title_out = |t: &Option<String>| -> String {
+        let t = t.clone().unwrap_or_default();
+        if raw {
+            t
+        } else {
+            sanitize_window_title(&t)
+        }
+    };
 
     match format.as_str() {
         "csv" => {
@@ -216,7 +236,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
                     r.event_action.clone(),
                     csv_cell(&r.event_data.unwrap_or_default()),
                     csv_cell(&r.app_name.unwrap_or_default()),
-                    csv_cell(&r.window_title.unwrap_or_default()),
+                    csv_cell(&title_out(&r.window_title)),
                     r.session_id.map(|x| x.to_string()).unwrap_or_default(),
                 ]);
             });
@@ -232,7 +252,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 let n = rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                    "event_data": r.event_data, "app_name": r.app_name, "window_title": r.window_title, "session_id": r.session_id
+                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_out(&r.window_title), "session_id": r.session_id
                 });
                 let line = serde_json::to_string_pretty(&obj).unwrap_or_default();
                 if n > 0 {
@@ -261,7 +281,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                    "event_data": r.event_data, "app_name": r.app_name, "window_title": r.window_title, "session_id": r.session_id
+                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_out(&r.window_title), "session_id": r.session_id
                 });
                 let _ = writeln!(f, "{}", serde_json::to_string(&obj).unwrap_or_default());
             });
@@ -280,12 +300,54 @@ fn cmd_export(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 导出缺省目录：db 同目录的 exports/ 子目录（db 无父目录时落 cwd 的 exports/）。
+fn default_export_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|d| d.join("exports"))
+        .unwrap_or_else(|| PathBuf::from("exports"))
+}
+
+/// URL 查询串剥离（默认脱敏）：仅处理含 "http" 的片段，去掉第一个 `?`
+/// 及其后的全部内容（查询串常带 token/session id 等敏感参数）。
+fn sanitize_url_query(token: &str) -> String {
+    if token.contains("http") {
+        match token.find('?') {
+            Some(i) => token[..i].to_string(),
+            None => token.to_string(),
+        }
+    } else {
+        token.to_string()
+    }
+}
+
+/// window_title 默认脱敏：按空白分片，只对含 http 的片段剥查询串，
+/// 其余片段原样保留。
+fn sanitize_window_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .map(sanitize_url_query)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn ext(f: &str) -> &'static str {
     match f {
         "json" => "json",
         "jsonl" => "jsonl",
         _ => "csv",
     }
+}
+
+/// Markdown 表格单元格转义：`|` 会破坏列结构，换行会破坏行结构。
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+/// 终端输出过滤 C0 控制字符（保留 \n）：防止窗口标题里的控制符
+/// 污染终端/伪造输出。
+fn strip_c0(s: &str) -> String {
+    s.chars().filter(|&c| c == '\n' || c >= '\u{20}').collect()
 }
 
 // === report ===
@@ -341,7 +403,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
                 s.duration_min,
                 s.key_count,
                 s.click_count,
-                s.app_name.clone().unwrap_or_else(|| "—".into())
+                md_cell(&s.app_name.clone().unwrap_or_else(|| "—".into()))
             ));
         }
         md.push('\n');
@@ -500,7 +562,7 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
             s.duration_min,
             s.key_count,
             s.click_count,
-            s.app_name
+            s.app_name.as_deref().map(strip_c0)
         );
     }
     println!(
@@ -511,7 +573,12 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
     );
     println!("anomalies:      {}", anomalies.len());
     for a in &anomalies {
-        println!("  [{}] {} - {}", a.severity, a.kind, a.message);
+        println!(
+            "  [{}] {} - {}",
+            a.severity,
+            a.kind,
+            strip_c0(&a.message)
+        );
     }
     Ok(())
 }
@@ -941,12 +1008,16 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         enabled.len()
     );
     let input_counts_only = crate::settings::load(std::path::Path::new(&db_path)).input_counts_only;
+    let vk_frequency_enabled =
+        crate::settings::load(std::path::Path::new(&db_path)).vk_frequency_enabled;
     let csettings = collector::CollectorSettings {
         input_granularity: if input_counts_only {
             collector::InputGranularity::Minute
         } else {
             collector::InputGranularity::Raw
         },
+        // vk 频次开关：settings.json → CollectorSettings → input_agg::set_vk_enabled
+        vk_frequency_enabled,
         ..collector::CollectorSettings::default()
     };
     let mut c = collector::start_collection_custom(&enabled, csettings, &db_path);
@@ -1130,6 +1201,20 @@ const EXIT_FLAG_ENV: &str = "KYNOPTIC_EXIT_FLAG";
 const WATCHDOG_LOG_FILE: &str = "watchdog.log";
 /// 心跳最大年龄：tray 每 30s touch，180s ≈ 6 个周期未更新即判挂死
 const HEARTBEAT_MAX_AGE_SECS: i64 = 180;
+/// 看门狗状态文件（exe 同目录，记录连续拉起失败计数与退避窗口）
+const WATCHDOG_STATE_FILE: &str = "watchdog-state.json";
+/// watchdog.log 轮转后缀（覆盖式改名 watchdog.log.old）
+const WATCHDOG_LOG_OLD_SUFFIX: &str = ".old";
+/// watchdog.log 轮转阈值：1MB
+const WATCHDOG_LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// 拉起观察窗：拉起后 90 秒内心跳未被刷新即记一次失败
+const SPAWN_GRACE_SECS: i64 = 90;
+/// 连续失败达到该次数后进入指数退避
+const FAILURE_THRESHOLD: u32 = 3;
+/// 指数退避档位：2min → 8min → 30min（封顶）
+const BACKOFF_STEPS_SECS: [i64; 3] = [120, 480, 1800];
+/// 睡眠唤醒守卫：心跳超龄后先等 40s 复查，仍超龄才 kill
+const STALE_RECHECK_WAIT_SECS: u64 = 40;
 
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()))
@@ -1174,19 +1259,163 @@ fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
 }
 
 /// 追加一行看门狗日志到 exe 同目录 watchdog.log（尽力而为，失败忽略）。
+/// 写入前做大小轮转（P1）：超过 1MB 时改名为 watchdog.log.old（覆盖式），
+/// 再建新文件——日志永不无限增长，也保留最近一份历史。
 fn watchdog_log(msg: &str) {
     let line = format!("[{}] {}\n", Utc::now().to_rfc3339(), msg);
     eprint!("watchdog: {line}");
     if let Some(dir) = exe_dir() {
+        let log_path = dir.join(WATCHDOG_LOG_FILE);
+        rotate_log_if_needed(&log_path);
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(WATCHDOG_LOG_FILE))
+            .open(&log_path)
         {
             let _ = f.write_all(line.as_bytes());
         }
     }
+}
+
+/// 轮转判定（纯函数，单测覆盖）：当前大小超过阈值即需要轮转。
+fn needs_log_rotation(size: u64) -> bool {
+    size > WATCHDOG_LOG_MAX_BYTES
+}
+
+/// 轮转目标路径（纯函数）：watchdog.log → watchdog.log.old
+fn rotated_log_path(log_path: &Path) -> PathBuf {
+    let mut name = log_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(WATCHDOG_LOG_OLD_SUFFIX);
+    log_path.with_file_name(name)
+}
+
+/// 大小超阈值时执行轮转（改名覆盖 .old，失败忽略——日志是尽力而为语义）。
+fn rotate_log_if_needed(log_path: &Path) {
+    let size = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    if needs_log_rotation(size) {
+        let _ = std::fs::rename(log_path, rotated_log_path(log_path));
+    }
+}
+
+// ─── 看门狗状态机（退避/失败计数）──—
+
+/// 持久化状态（exe 同目录 watchdog-state.json）：跨看门狗进程重启保留
+/// 失败计数与退避窗口，防止"杀看门狗再启"绕过熔断。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct WatchdogState {
+    /// 连续拉起失败次数（心跳恢复/拉起成功即清零）
+    #[serde(default)]
+    consecutive_failures: u32,
+    /// 最近一次拉起的 unix 秒（0 = 无进行中的拉起）
+    #[serde(default)]
+    last_spawn_epoch: i64,
+    /// 拉起那一刻心跳文件的 mtime（判定拉起后心跳是否被刷新过）
+    #[serde(default)]
+    heartbeat_at_spawn_epoch: i64,
+    /// 熔断退避截止时刻的 unix 秒（0 = 不在退避中）
+    #[serde(default)]
+    backoff_until_epoch: i64,
+}
+
+fn watchdog_state_path() -> PathBuf {
+    exe_dir()
+        .map(|d| d.join(WATCHDOG_STATE_FILE))
+        .unwrap_or_else(|| PathBuf::from(WATCHDOG_STATE_FILE))
+}
+
+/// 读状态；文件缺失/损坏一律回退缺省（计数丢失可接受，不能因此拒绝工作）。
+fn load_watchdog_state() -> WatchdogState {
+    std::fs::read_to_string(watchdog_state_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_watchdog_state(st: &WatchdogState) {
+    if let Ok(json) = serde_json::to_string(st) {
+        let _ = std::fs::write(watchdog_state_path(), json);
+    }
+}
+
+/// 心跳文件的 mtime（unix 秒；缺失/不可得返回 0）。用 mtime 而非内容时间戳，
+/// 避免系统睡眠导致内容时钟与真实经过时间脱节。
+fn heartbeat_mtime_epoch() -> i64 {
+    std::fs::metadata(heartbeat_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 上一次拉起的结局判定（纯函数，单测覆盖）。
+enum SpawnOutcome {
+    /// 观察窗（90s）未到，暂不下结论
+    Pending,
+    /// 心跳在拉起后被刷新过（托盘确实跑起来过）
+    Recovered,
+    /// 观察窗已过且心跳从未刷新（典型：托盘启动即崩）——记一次失败
+    Failed,
+}
+
+fn judge_spawn_outcome(
+    last_spawn_epoch: i64,
+    now_epoch: i64,
+    hb_mtime_epoch: i64,
+    hb_at_spawn_epoch: i64,
+) -> SpawnOutcome {
+    if last_spawn_epoch == 0 {
+        return SpawnOutcome::Recovered; // 无进行中的拉起
+    }
+    if now_epoch - last_spawn_epoch < SPAWN_GRACE_SECS {
+        return SpawnOutcome::Pending;
+    }
+    if hb_mtime_epoch > hb_at_spawn_epoch {
+        SpawnOutcome::Recovered
+    } else {
+        SpawnOutcome::Failed
+    }
+}
+
+/// 指数退避时长（纯函数）：失败次数未达阈值不退避（0）；达到后按档位
+/// 2min → 8min → 30min 封顶。
+fn backoff_delay_secs(consecutive_failures: u32) -> i64 {
+    if consecutive_failures < FAILURE_THRESHOLD {
+        return 0;
+    }
+    let idx = ((consecutive_failures - FAILURE_THRESHOLD) as usize)
+        .min(BACKOFF_STEPS_SECS.len() - 1);
+    BACKOFF_STEPS_SECS[idx]
+}
+
+/// 是否允许拉起（纯函数）：不在退避中，或退避窗已过。
+enum SpawnDecision {
+    Spawn,
+    /// 熔断中，剩余秒数
+    SkipBackoff(i64),
+}
+
+fn spawn_decision(
+    consecutive_failures: u32,
+    backoff_until_epoch: i64,
+    now_epoch: i64,
+) -> SpawnDecision {
+    if backoff_delay_secs(consecutive_failures) == 0 || now_epoch >= backoff_until_epoch {
+        SpawnDecision::Spawn
+    } else {
+        SpawnDecision::SkipBackoff(backoff_until_epoch - now_epoch)
+    }
+}
+
+/// 睡眠唤醒守卫的复查判定（纯函数）：首次发现超龄后等待
+/// STALE_RECHECK_WAIT_SECS 再复查。复查时年龄回落（心跳被重新 touch）或
+/// 已回到阈值内 = 刚从睡眠唤醒的假象，放行；年龄继续增长且仍超龄才 kill。
+fn recheck_should_kill(age_first_secs: i64, age_recheck_secs: i64) -> bool {
+    age_recheck_secs > age_first_secs && age_recheck_secs > HEARTBEAT_MAX_AGE_SECS
 }
 
 /// kill 托盘进程（心跳挂死时）。返回是否至少执行了一次 taskkill。
@@ -1231,7 +1460,9 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             .chain([0])
             .collect();
         let exit_flag = exit_flag_path();
+        let mut state = load_watchdog_state();
         loop {
+            let now_epoch = Utc::now().timestamp();
             let running = unsafe {
                 let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
                 if !h.is_null() {
@@ -1243,34 +1474,132 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             };
             if running {
                 // 进程活着：检查心跳。缺失或超龄（默认 180s）说明采集主循环
-                // 挂死——kill 掉，下一轮 running=false 走正常拉起路径。
+                // 可能挂死——但先做睡眠唤醒守卫（P1：系统睡眠期间心跳自然
+                // 超龄，直接 kill 属误杀），40s 复查仍超龄才 kill。
                 let hb_read = std::fs::read_to_string(heartbeat_path())
                     .map(|s| s.trim().to_string())
                     .ok();
+                let hb_age_first = hb_read
+                    .as_deref()
+                    .and_then(|c| heartbeat_age_secs(Utc::now(), c));
                 if heartbeat_stale(Utc::now(), hb_read.as_deref()) {
+                    // 睡眠唤醒守卫：等待 40s 后复查（纯函数 recheck_should_kill）
                     watchdog_log(&format!(
-                        "心跳缺失或超龄(>{HEARTBEAT_MAX_AGE_SECS}s), 判定采集挂死, kill kynoptic-tray 以重启"
+                        "心跳缺失或超龄(>{HEARTBEAT_MAX_AGE_SECS}s), 疑似睡眠唤醒/挂死, {STALE_RECHECK_WAIT_SECS}s 后复查"
                     ));
-                    kill_tray();
+                    std::thread::sleep(std::time::Duration::from_secs(STALE_RECHECK_WAIT_SECS));
+                    let still_running = unsafe {
+                        let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+                        if !h.is_null() {
+                            windows_sys::Win32::Foundation::CloseHandle(h);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if still_running {
+                        let hb_recheck = std::fs::read_to_string(heartbeat_path())
+                            .map(|s| s.trim().to_string())
+                            .ok();
+                        let hb_age_recheck = hb_recheck
+                            .as_deref()
+                            .and_then(|c| heartbeat_age_secs(Utc::now(), c))
+                            // 复查时心跳文件消失按"更糟"处理
+                            .unwrap_or(i64::MAX);
+                        let age_first = hb_age_first.unwrap_or(i64::MAX);
+                        if recheck_should_kill(age_first, hb_age_recheck) {
+                            watchdog_log(&format!(
+                                "复查仍超龄(首次 {age_first}s → 复查 {hb_age_recheck}s), 判定采集挂死, kill kynoptic-tray 以重启"
+                            ));
+                            kill_tray();
+                        } else {
+                            watchdog_log(&format!(
+                                "复查时心跳已刷新(首次 {age_first}s → 复查 {hb_age_recheck}s), 放行(睡眠唤醒假象)"
+                            ));
+                        }
+                    } else {
+                        watchdog_log("复查期间托盘已退出, 交由下一轮拉起路径处理");
+                    }
+                } else {
+                    // 心跳健康：熔断计数清零（P1：手动启动托盘成功即恢复拉起）
+                    if state.consecutive_failures != 0
+                        || state.last_spawn_epoch != 0
+                        || state.backoff_until_epoch != 0
+                    {
+                        state = WatchdogState::default();
+                        save_watchdog_state(&state);
+                        watchdog_log("心跳恢复正常, 连续失败计数与退避已清零");
+                    }
                 }
             } else if !exit_flag.exists() {
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Some(dir) = exe.parent() {
-                        let tray = dir.join("kynoptic-tray.exe");
-                        if tray.exists() {
-                            use std::process::{Command, Stdio};
-                            const DETACHED_PROCESS: u32 = 0x0000_0008;
-                            if let Err(e) = Command::new(&tray)
-                                .arg("--minimized")
-                                .stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .creation_flags(DETACHED_PROCESS)
-                                .spawn()
-                            {
-                                eprintln!("watchdog: 拉起托盘失败: {e}");
+                // 先结算上一轮拉起的结局（观察窗 90s）
+                match judge_spawn_outcome(
+                    state.last_spawn_epoch,
+                    now_epoch,
+                    heartbeat_mtime_epoch(),
+                    state.heartbeat_at_spawn_epoch,
+                ) {
+                    SpawnOutcome::Pending => {}
+                    SpawnOutcome::Recovered => {
+                        // 心跳被刷新过 = 上轮拉起成功运行过；结束观察窗
+                        state.last_spawn_epoch = 0;
+                    }
+                    SpawnOutcome::Failed => {
+                        state.consecutive_failures += 1;
+                        state.last_spawn_epoch = 0;
+                        let delay = backoff_delay_secs(state.consecutive_failures);
+                        state.backoff_until_epoch = now_epoch + delay;
+                        save_watchdog_state(&state);
+                        watchdog_log(&format!(
+                            "拉起后 {SPAWN_GRACE_SECS}s 内心跳未刷新, 连续失败 #{}（{}）",
+                            state.consecutive_failures,
+                            if delay > 0 {
+                                format!("进入指数退避 {delay}s")
+                            } else {
+                                "未达退避阈值".to_string()
                             }
-                            watchdog_log("托盘不在且非用户退出,已拉起");
+                        ));
+                    }
+                }
+                match spawn_decision(
+                    state.consecutive_failures,
+                    state.backoff_until_epoch,
+                    now_epoch,
+                ) {
+                    SpawnDecision::SkipBackoff(remaining) => {
+                        watchdog_log(&format!(
+                            "连续失败 {} 次, 熔断退避中, 约 {}s 后重试拉起",
+                            state.consecutive_failures, remaining
+                        ));
+                    }
+                    SpawnDecision::Spawn => {
+                        if let Ok(exe) = std::env::current_exe() {
+                            if let Some(dir) = exe.parent() {
+                                let tray = dir.join("kynoptic-tray.exe");
+                                if tray.exists() {
+                                    use std::process::{Command, Stdio};
+                                    const DETACHED_PROCESS: u32 = 0x0000_0008;
+                                    match Command::new(&tray)
+                                        .arg("--minimized")
+                                        .stdin(Stdio::null())
+                                        .stdout(Stdio::null())
+                                        .stderr(Stdio::null())
+                                        .creation_flags(DETACHED_PROCESS)
+                                        .spawn()
+                                    {
+                                        Ok(_) => {
+                                            state.last_spawn_epoch = now_epoch;
+                                            state.heartbeat_at_spawn_epoch =
+                                                heartbeat_mtime_epoch();
+                                            save_watchdog_state(&state);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("watchdog: 拉起托盘失败: {e}");
+                                        }
+                                    }
+                                    watchdog_log("托盘不在且非用户退出,已拉起");
+                                }
+                            }
                         }
                     }
                 }
@@ -1590,5 +1919,185 @@ mod tests {
         let conn = setup_presence_db();
         let (start, end) = queries::local_day_range("2026-09-13").unwrap();
         assert_eq!(presence_metrics(&conn, &start, &end, 2).unwrap(), (0, 0, 0));
+    }
+
+    // === watchdog 指数退避状态机 ===
+
+    #[test]
+    fn backoff_delay_steps_and_cap() {
+        assert_eq!(backoff_delay_secs(0), 0, "未达阈值不退避");
+        assert_eq!(backoff_delay_secs(1), 0);
+        assert_eq!(backoff_delay_secs(2), 0);
+        assert_eq!(backoff_delay_secs(3), 120, "3 连败 → 2min");
+        assert_eq!(backoff_delay_secs(4), 480, "4 连败 → 8min");
+        assert_eq!(backoff_delay_secs(5), 1800, "5 连败 → 30min");
+        assert_eq!(backoff_delay_secs(6), 1800, "封顶 30min");
+        assert_eq!(backoff_delay_secs(99), 1800, "封顶 30min");
+    }
+
+    #[test]
+    fn judge_spawn_outcome_pending_recovered_failed() {
+        let hb_at_spawn = 1000;
+        // 无进行中的拉起 → Recovered（无观察窗）
+        assert!(matches!(
+            judge_spawn_outcome(0, 2000, 0, 0),
+            SpawnOutcome::Recovered
+        ));
+        // 观察窗未到 → Pending（即使心跳没刷新也不下结论）
+        assert!(matches!(
+            judge_spawn_outcome(2000, 2000 + SPAWN_GRACE_SECS - 1, 1000, hb_at_spawn),
+            SpawnOutcome::Pending
+        ));
+        // 观察窗已过 + 心跳被刷新过 → Recovered（托盘跑起来过）
+        assert!(matches!(
+            judge_spawn_outcome(2000, 2000 + SPAWN_GRACE_SECS, 1001, hb_at_spawn),
+            SpawnOutcome::Recovered
+        ));
+        // 观察窗已过 + 心跳从未刷新（mtime 未变/文件缺失）→ Failed
+        assert!(matches!(
+            judge_spawn_outcome(2000, 2000 + SPAWN_GRACE_SECS, hb_at_spawn, hb_at_spawn),
+            SpawnOutcome::Failed
+        ));
+        assert!(matches!(
+            judge_spawn_outcome(2000, 3000, 0, hb_at_spawn),
+            SpawnOutcome::Failed
+        ));
+    }
+
+    #[test]
+    fn spawn_decision_skips_only_during_backoff_window() {
+        // 未达阈值：任何时候都允许拉起
+        assert!(matches!(
+            spawn_decision(2, 5000, 1000),
+            SpawnDecision::Spawn
+        ));
+        // 达到阈值、窗口未过：跳过并给出剩余秒数
+        match spawn_decision(3, 5000, 3000) {
+            SpawnDecision::SkipBackoff(remaining) => assert_eq!(remaining, 2000),
+            _ => panic!("退避窗口内应跳过拉起"),
+        }
+        // 退避中但 now==until：放行
+        assert!(matches!(
+            spawn_decision(3, 5000, 5000),
+            SpawnDecision::Spawn
+        ));
+        // 窗口已过：放行
+        assert!(matches!(
+            spawn_decision(5, 5000, 5001),
+            SpawnDecision::Spawn
+        ));
+    }
+
+    #[test]
+    fn watchdog_state_serializes_roundtrip_and_defaults_on_garbage() {
+        let st = WatchdogState {
+            consecutive_failures: 4,
+            last_spawn_epoch: 123,
+            heartbeat_at_spawn_epoch: 100,
+            backoff_until_epoch: 9999,
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        let back: WatchdogState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.consecutive_failures, 4);
+        assert_eq!(back.backoff_until_epoch, 9999);
+        // 损坏/缺字段：serde default 兜底 + 顶层回退缺省
+        let partial: WatchdogState =
+            serde_json::from_str(r#"{"consecutive_failures":2}"#).unwrap();
+        assert_eq!(partial.consecutive_failures, 2);
+        assert_eq!(partial.last_spawn_epoch, 0);
+        assert!(serde_json::from_str::<WatchdogState>("garbage").is_err());
+    }
+
+    // === watchdog 睡眠唤醒守卫 ===
+
+    #[test]
+    fn recheck_guard_spares_refreshed_heartbeat() {
+        // 复查时年龄回落（心跳被重新 touch）→ 放行
+        assert!(!recheck_should_kill(200, 35));
+        // 复查时年龄回到阈值内 → 放行
+        assert!(!recheck_should_kill(200, HEARTBEAT_MAX_AGE_SECS));
+        // 复查时年龄仍在增长（首次 + 等待窗）且超龄 → kill
+        assert!(recheck_should_kill(200, 240));
+        // 复查时心跳文件消失（i64::MAX）→ kill
+        assert!(recheck_should_kill(200, i64::MAX));
+    }
+
+    // === watchdog.log 轮转 ===
+
+    #[test]
+    fn log_rotation_threshold_and_path() {
+        assert!(!needs_log_rotation(0));
+        assert!(!needs_log_rotation(WATCHDOG_LOG_MAX_BYTES));
+        assert!(needs_log_rotation(WATCHDOG_LOG_MAX_BYTES + 1));
+        let p = Path::new(r"C:\apps\watchdog.log");
+        assert_eq!(
+            rotated_log_path(p),
+            PathBuf::from(r"C:\apps\watchdog.log.old")
+        );
+        assert_eq!(rotated_log_path(Path::new("watchdog.log")), PathBuf::from("watchdog.log.old"));
+    }
+
+    // === export 脱敏与缺省目录 ===
+
+    #[test]
+    fn sanitize_window_title_strips_query_only_for_http_fragments() {
+        // 含 http 的片段：剥掉 ? 及之后
+        assert_eq!(
+            sanitize_window_title("登录 - https://example.com/login?token=abc&session=x"),
+            "登录 - https://example.com/login"
+        );
+        // 无 ? 的 URL 原样保留
+        assert_eq!(
+            sanitize_window_title("https://example.com/home"),
+            "https://example.com/home"
+        );
+        // 不含 http 的片段即使有 ? 也不动
+        assert_eq!(
+            sanitize_window_title("文件?草稿.txt - 记事本"),
+            "文件?草稿.txt - 记事本"
+        );
+        // 混合片段：只处理含 http 的
+        assert_eq!(
+            sanitize_window_title("报表 v2 https://a.io/x?y=1 done"),
+            "报表 v2 https://a.io/x done"
+        );
+    }
+
+    #[test]
+    fn default_export_dir_is_db_sibling_exports() {
+        assert_eq!(
+            default_export_dir(Path::new("C:/data/kynoptic.db")),
+            PathBuf::from("C:/data/exports")
+        );
+        assert_eq!(
+            default_export_dir(Path::new("kynoptic.db")),
+            PathBuf::from("exports")
+        );
+    }
+
+    // === report / analyze 输出整形 ===
+
+    #[test]
+    fn md_cell_escapes_pipe_and_newline() {
+        assert_eq!(md_cell("IDE"), "IDE");
+        assert_eq!(md_cell("a|b"), "a\\|b");
+        assert_eq!(md_cell("line1\nline2"), "line1 line2");
+        assert_eq!(md_cell("a\r\nb|c"), "a  b\\|c");
+    }
+
+    #[test]
+    fn strip_c0_keeps_newline_drops_other_controls() {
+        assert_eq!(strip_c0("plain"), "plain");
+        assert_eq!(strip_c0("a\nb"), "a\nb");
+        assert_eq!(strip_c0("a\u{1b}[31mb"), "a[31mb");
+        assert_eq!(strip_c0("a\u{7}b\u{0}c"), "abc");
+        assert_eq!(strip_c0("a\u{9}b"), "ab", "制表符属 C0,一并滤除");
+    }
+
+    #[test]
+    fn csv_cell_neutralizes_formula_prefix() {
+        assert_eq!(csv_cell("=cmd|' /C calc'!A0"), "'=cmd|' /C calc'!A0");
+        assert_eq!(csv_cell("@SUM"), "'@SUM");
+        assert_eq!(csv_cell("普通标题"), "普通标题");
     }
 }

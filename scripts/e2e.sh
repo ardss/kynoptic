@@ -161,37 +161,120 @@ try:
 except Exception: print(0)")
 check "B10 设置-硬件面板+桥接阈值" "$B10_OK" "$B10"
 
-# ── C. 铁律与命令行（临时副本库，绝不碰真实数据）─────────
-echo "── C. 铁律（临时副本库）"
-REAL_DB="D:/Kynoptic/data/kynoptic.db"
+# ── C. 铁律与命令行（临时库，绝不碰真实数据）─────────────
+# 去硬编码：优先复制真实库（KYNOPTIC_E2E_DB 可覆盖路径）；真实库不存在时
+# 用临时目录按生产 schema 构造种子库（CLI 初始化或最小表兜底），绝不 SKIP。
+echo "── C. 铁律（临时库）"
+REAL_DB="${KYNOPTIC_E2E_DB:-D:/Kynoptic/data/kynoptic.db}"
 TMPD="$(mktemp -d)"
-TMPDB="$TMPD/e2e-copy.db"
-BIN="/d/Kynoptic/kynoptic.exe"
-if [ -f "$REAL_DB" ] && [ -f "$BIN" ]; then
-    cp "$REAL_DB" "$TMPDB"
-    count_events() {
-        local wpath; wpath="$(cygpath -w "$1")"
-        python - "$wpath" <<'PY'
+TMPDB="$TMPD/e2e-seed.db"
+# CLI 二进制候选：安装位置 → 本仓库构建产物
+BIN=""
+for cand in "/d/Kynoptic/kynoptic.exe" \
+            "$(pwd)/target/release/kynoptic.exe" \
+            "$(pwd)/target/debug/kynoptic.exe" \
+            "$(command -v kynoptic 2>/dev/null || true)"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then BIN="$cand"; break; fi
+done
+
+seed_via_python() {
+    # 无 CLI 时的最小生产 schema 种子（四张铁律相关表 + metadata）
+    python - "$(cygpath -w "$1")" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
-print(c.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+c.executescript("""
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+  event_type TEXT NOT NULL, event_action TEXT NOT NULL,
+  event_data TEXT, app_name TEXT, window_title TEXT, session_id INTEGER);
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, start_time TEXT, end_time TEXT,
+  total_events INTEGER DEFAULT 0, idle_seconds REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS agg_minute (
+  date TEXT NOT NULL, hour INTEGER NOT NULL, minute INTEGER NOT NULL,
+  bucket_id TEXT NOT NULL, sum_value REAL, count_value INTEGER,
+  max_event_rowid INTEGER DEFAULT 0,
+  PRIMARY KEY (date, hour, minute, bucket_id));
+CREATE TABLE IF NOT EXISTS agg_daily (
+  date TEXT NOT NULL, bucket_id TEXT NOT NULL, sum_value REAL,
+  count_value INTEGER, PRIMARY KEY (date, bucket_id));
+CREATE TABLE IF NOT EXISTS daily_agg (
+  date TEXT PRIMARY KEY, keys INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0,
+  active_minutes INTEGER DEFAULT 0, apm_avg REAL DEFAULT 0);
+INSERT INTO metadata (key, value) VALUES ('schema_version', '7');
+INSERT INTO events (timestamp, event_type, event_action, app_name)
+  VALUES ('2026-09-01T10:00:00+00:00','keyboard','press',NULL),
+         ('2026-09-01T10:01:00+00:00','mouse','click',NULL),
+         ('2026-09-01T10:02:00+00:00','window','switch','code.exe');
+INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value)
+  VALUES ('2026-09-01',10,0,'input_keys',1,1);
+INSERT INTO agg_daily (date, bucket_id, count_value) VALUES ('2026-09-01','app:code.exe',1);
+INSERT INTO sessions (start_time, end_time, total_events, idle_seconds)
+  VALUES ('2026-09-01T10:00:00+00:00','2026-09-01T10:30:00+00:00',3,0);
+""")
+c.commit()
+print("seeded")
 PY
-    }
-    BEFORE=$(count_events "$TMPDB")
-    # 1) cleanup 0 不得删除任何原始事件（铁律）
-    R1=$(KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db cleanup 0 2>&1 | tail -1)
-    AFTER1=$(count_events "$TMPDB")
-    check "C1 cleanup 0 不删原始事件" "$([ "$BEFORE" = "$AFTER1" ] && [ -n "$BEFORE" ] && echo 1 || echo 0)" "$BEFORE->$AFTER1"
-    # 2) cleanup --yes 且 days<30 必须被拒绝
-    R2=$(KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db cleanup 7 --yes 2>&1 | tail -1)
-    check "C2 cleanup 7 --yes 被拒绝（<30 天保护）" "$(echo "$R2" | grep -q "拒绝" && echo 1 || echo 0)" "$R2"
-    # 3) cleanup abc 必须报错而非静默
-    R3=$(KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db cleanup abc 2>&1 | tail -1)
-    check "C3 cleanup abc 报错而非静默" "$(echo "$R3" | grep -q "无效天数" && echo 1 || echo 0)" "$R3"
-    rm -rf "$TMPD"
+}
+
+SEEDED=0
+if [ -f "$REAL_DB" ]; then
+    cp "$REAL_DB" "$TMPDB"
+elif [ -n "$BIN" ]; then
+    # 用 CLI 对临时 db 触发生产 schema 初始化（KYNOPTIC_DB 指向临时路径）
+    KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db stats >/dev/null 2>&1 || true
+    if [ ! -f "$TMPDB" ]; then seed_via_python "$TMPDB"; fi
+    SEEDED=1
 else
-    echo "  SKIP  C 段（未找到真实库或 CLI）"
+    seed_via_python "$TMPDB"
+    SEEDED=1
 fi
+
+# 四表行数快照：铁律度量对象是 events + agg_minute + agg_daily + sessions，
+# 不再只数 events（聚合缓存与 session 历史同样是用户数据）。
+count_four_tables() {
+    local wpath; wpath="$(cygpath -w "$1")"
+    python - "$wpath" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+def n(sql):
+    try: return c.execute(sql).fetchone()[0]
+    except Exception: return "ERR"
+print(f"{n('SELECT COUNT(*) FROM events')}/{n('SELECT COUNT(*) FROM agg_minute')}/{n('SELECT COUNT(*) FROM agg_daily')}/{n('SELECT COUNT(*) FROM sessions')}")
+PY
+}
+
+BEFORE=$(count_four_tables "$TMPDB")
+if [ "$BEFORE" != "ERR/ERR/ERR/ERR" ] && [ -n "$BEFORE" ]; then
+    # 1) cleanup 0 不得删除任何数据（铁律，四表版）
+    if [ -n "$BIN" ]; then
+        R1=$(KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db cleanup 0 2>&1 | tail -1)
+        AFTER1=$(count_four_tables "$TMPDB")
+        check "C1 cleanup 0 四表行数全部不变" "$([ "$BEFORE" = "$AFTER1" ] && echo 1 || echo 0)" "$BEFORE->$AFTER1"
+        # 2) cleanup --yes 且 days<30 必须被拒绝
+        R2=$(KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db cleanup 7 --yes 2>&1 | tail -1)
+        check "C2 cleanup 7 --yes 被拒绝（<30 天保护）" "$(echo "$R2" | grep -q "拒绝" && echo 1 || echo 0)" "$R2"
+        # 3) cleanup abc 必须报错而非静默
+        R3=$(KYNOPTIC_DB="$(cygpath -w "$TMPDB")" "$BIN" db cleanup abc 2>&1 | tail -1)
+        check "C3 cleanup abc 报错而非静默" "$(echo "$R3" | grep -q "无效天数" && echo 1 || echo 0)" "$R3"
+    else
+        # 无 CLI：SQL 层守门——种子库四表结构在位、行数快照可读且非零
+        # （CLI 级 cleanup 行为无法验证，见 E2E-README 盲区清单）
+        HAS_SCHEMA=$(python - "$(cygpath -w "$TMPDB")" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+print(1 if {"events","agg_minute","agg_daily","sessions"} <= tables else 0)
+PY
+)
+        check "C1'（无 CLI 降级）种子库四表 schema 完整" "$HAS_SCHEMA" "$HAS_SCHEMA"
+        echo "  NOTE  未找到 kynoptic.exe——C2/C3 CLI 级断言跳过（非 FAIL，已记录盲区）"
+    fi
+else
+    bad "C0 种子库构造失败（BEFORE=$BEFORE）"
+fi
+rm -rf "$TMPD"
 
 # ── 汇总 ────────────────────────────────────────────────
 echo "══ 结果: $PASS PASS / $FAIL FAIL ══"

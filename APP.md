@@ -1,5 +1,20 @@
 # Kynoptic App (v0.1)
 
+> **TL;DR (English)** — Kynoptic is a local-first Windows activity awareness
+> layer: a Rust workspace (`core` collectors + SQLite storage
+> with numbered-SQL migrations, `cli`, and an `mcp` server; the dashboard and
+> tray shell live in their own crates). 40 monitors cover the system, 14 are
+> enabled by default (12 polling
+> monitors + 2 low-level input hooks; pure Win32, the few shell-out probes are
+> being replaced by native APIs). Input is recorded as per-minute counts only —
+> never key contents — with injected (LLKHF_INJECTED) events separated from
+> human presence, and the raw event log is append-only: cleanup is opt-in and
+> aggregates are rebuildable derived caches. The dashboard exposes a
+> three-metric model (human presence / automation / foreground dwell) over a
+> local-only HTTP API, and an MCP server lets a local AI assistant ask the same
+> questions without any data leaving the machine.
+> **Full document in Chinese below.**
+
 Kynoptic 的本机感知层（采集器 + CLI + MCP 工具面）Rust workspace，位于仓库 `crates/` 下。网页（`index.html` 等）与本目录无关。
 
 ## Workspace 布局

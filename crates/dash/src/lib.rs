@@ -31,6 +31,7 @@ pub mod settings;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::Timelike;
 use chrono::{DateTime, Local, Utc};
@@ -254,11 +255,15 @@ pub fn api_anomalies(conn: &Connection, days: u32) -> Value {
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
+/// db_path 只返回文件名（审查 P2：全路径暴露安装目录/用户名等本机拓扑）。
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     json!({
         "today": queries::today_local_str(),
         "last_event_ts": queries::latest_event_ts(conn),
-        "db_path": db_path.display().to_string(),
+        "db_path": db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
         "bind": "127.0.0.1",
         "read_only": true,
     })
@@ -1378,17 +1383,19 @@ fn settings_payload(s: &AppSettings) -> Value {
         "dashboard_port": s.dashboard_port,
         "daily_goal_minutes": s.daily_goal_minutes,
         "presence_bridge_minutes": s.presence_bridge_minutes,
+        "vk_frequency_enabled": s.vk_frequency_enabled,
         "categories": s.categories,
         "monitors": monitors,
     })
 }
 
 /// POST /api/settings — 接受 `enabled_monitors` / `autostart` / `dashboard_port`
-/// / `input_counts_only` 任一子集；监控器 id 必须全部在注册表内，否则 400。
-/// 写盘后返回新设置。
+/// / `input_counts_only` / `vk_frequency_enabled` 任一子集；监控器 id 必须全部在
+/// 注册表内，否则 400。写盘后返回新设置；实际变更追加审计行到 settings-audit.log。
 pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
     let req: Value = serde_json::from_str(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
     let mut next = settings::load(db_path);
+    let prev = next.clone();
     if let Some(v) = req.get("enabled_monitors") {
         let ids: Vec<String> = v
             .as_array()
@@ -1407,6 +1414,9 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     if let Some(v) = req.get("input_counts_only") {
         next.input_counts_only = v.as_bool().ok_or("input_counts_only 应为布尔值")?;
+    }
+    if let Some(v) = req.get("vk_frequency_enabled") {
+        next.vk_frequency_enabled = v.as_bool().ok_or("vk_frequency_enabled 应为布尔值")?;
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;
@@ -1451,8 +1461,94 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         next.dashboard_port = port as u16;
     }
     settings::save(db_path, &next).map_err(|e| format!("写设置失败: {e}"))?;
+    if prev != next {
+        append_settings_audit(db_path, &settings_audit_summary(&prev, &next));
+    }
     SETTINGS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(settings_payload(&next))
+}
+
+/// POST /api/settings 审计行：RFC3339 时间 + 变更字段摘要（JSON），一行一条。
+/// 事件边界（任一字段被改）本身就是隐私敏感事件，必须留痕。
+fn append_settings_audit(db_path: &Path, summary: &str) {
+    let dir = match db_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let line = format!("{}\t{}\n", Utc::now().to_rfc3339(), summary);
+    // 截断 512 字节（按 UTF-8 字符边界，避免切碎多字节字符）
+    let line: String = if line.len() > 512 {
+        let mut end = 512;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n", &line[..end])
+    } else {
+        line
+    };
+    // 审计失败不影响主流程：设置已保存，日志尽力而为
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("settings-audit.log"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if let Err(e) = result {
+        log::warn!("settings-audit.log 写入失败（不影响设置保存）: {e}");
+    }
+}
+
+/// 变更摘要 JSON：只含被改字段的 旧值→新值；categories 不落全文（规则可能
+/// 覆盖敏感应用名），只记条数变化。
+fn settings_audit_summary(old: &AppSettings, new: &AppSettings) -> String {
+    let mut d = serde_json::Map::new();
+    if old.enabled_monitors != new.enabled_monitors {
+        d.insert(
+            "enabled_monitors".into(),
+            json!([old.enabled_monitors.len(), new.enabled_monitors.len()]),
+        );
+    }
+    for (k, a, b) in [
+        ("autostart", old.autostart, new.autostart),
+        (
+            "input_counts_only",
+            old.input_counts_only,
+            new.input_counts_only,
+        ),
+        (
+            "vk_frequency_enabled",
+            old.vk_frequency_enabled,
+            new.vk_frequency_enabled,
+        ),
+    ] {
+        if a != b {
+            d.insert(k.into(), json!([a, b]));
+        }
+    }
+    if old.dashboard_port != new.dashboard_port {
+        d.insert(
+            "dashboard_port".into(),
+            json!([old.dashboard_port, new.dashboard_port]),
+        );
+    }
+    if old.daily_goal_minutes != new.daily_goal_minutes {
+        d.insert(
+            "daily_goal_minutes".into(),
+            json!([old.daily_goal_minutes, new.daily_goal_minutes]),
+        );
+    }
+    if old.presence_bridge_minutes != new.presence_bridge_minutes {
+        d.insert(
+            "presence_bridge_minutes".into(),
+            json!([old.presence_bridge_minutes, new.presence_bridge_minutes]),
+        );
+    }
+    if old.categories != new.categories {
+        d.insert(
+            "categories".into(),
+            json!([old.categories.len(), new.categories.len()]),
+        );
+    }
+    Value::Object(d).to_string()
 }
 
 // ─── 路由表 ─────────────────────────────────────────────────────────────────
@@ -1648,8 +1744,24 @@ fn open_read_only(db_path: &Path) -> Result<Connection> {
 /// 端口 0 = 随机空闲端口（实际端口经 log 输出）。
 pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
     let _ = readonly;
-    // 预检 DB 可打开（保留原有报错路径）；实际服务每连接各自只读打开
-    let _conn = open_read_only(db_path)?;
+    // 预检 DB 可打开（保留原有报错路径）。常驻只读连接：冷缓存（页/索引加载）
+    // 只付一次，之后请求复用（审查 P2：每请求新建连接冷 126ms vs 热 12ms）。
+    // Connection 非 Sync，包 Mutex 跨线程共享；busy_timeout 2s——写侧是
+    // 另一进程（tray 采集器），遇库锁最多等 2s。打开失败不致命：shared=None，
+    // 每请求回退"临时新开只读连接"的旧路径保证可用性。
+    let shared: Option<Arc<std::sync::Mutex<Connection>>> = {
+        let _precheck = open_read_only(db_path)?;
+        match open_read_only(db_path) {
+            Ok(conn) => {
+                let _ = conn.execute_batch("PRAGMA busy_timeout=2000;");
+                Some(Arc::new(std::sync::Mutex::new(conn)))
+            }
+            Err(e) => {
+                log::warn!("dashboard 常驻只读连接打开失败，回退每请求新开连接: {e}");
+                None
+            }
+        }
+    };
     #[allow(unused_variables)]
     let db_owned = db_path.to_path_buf();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
@@ -1679,7 +1791,8 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         }
         // 每连接一线程 + 5s 读写超时（审查 P0：旧实现单线程串行且无超时，
         // 一个半开连接/慢客户端就能挂死 accept 循环，整个面板假死）。
-        // Connection 非 Sync，无法跨线程共享——每连接只读打开一次（本地低并发）。
+        // 复用常驻只读连接（Connection 非 Sync，经 Mutex 共享）。
+        let shared_inner = shared.clone();
         let db_owned = db_owned.clone();
         let inflight_inner = inflight.clone();
         inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1701,7 +1814,7 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 let _guard = InflightGuard(&inflight_inner);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-                if let Err(e) = handle_client(stream, &db_owned, bound) {
+                if let Err(e) = handle_client(stream, shared_inner.as_ref(), &db_owned, bound) {
                     log::warn!("dashboard 连接处理失败: {e}");
                 }
             });
@@ -1722,7 +1835,15 @@ fn loopback_host_ok(host: &str, port: u16) -> bool {
 }
 
 /// 读请求行 → 校验 → route → 写响应。任何失败都静默断开（无日志面需求）。
-fn handle_client(mut stream: TcpStream, db_path: &Path, port: u16) -> std::io::Result<()> {
+///
+/// `shared`：serve 预开的常驻只读连接（Mutex 共享，busy_timeout 2s）。
+/// 锁不可用/中毒时回退本次请求临时新开只读连接，保证可用性。
+fn handle_client(
+    mut stream: TcpStream,
+    shared: Option<&Arc<std::sync::Mutex<Connection>>>,
+    db_path: &Path,
+    port: u16,
+) -> std::io::Result<()> {
     // 读请求行 + 头部（字节层解析；上限 8 KiB，超限 431，审查 P2）。
     let mut buf = [0u8; 4096];
     let mut raw = Vec::new();
@@ -1800,10 +1921,27 @@ fn handle_client(mut stream: TcpStream, db_path: &Path, port: u16) -> std::io::R
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or("/").to_string();
 
-    let conn = open_read_only(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let (status, ctype, body) = route_req(&conn, &method, &path, &body, db_path);
+    // 优先复用常驻只读连接；拿不到锁或未预开时回退临时连接（旧路径）。
+    let shared_guard = shared.and_then(|c| c.lock().ok());
+    let tmp_conn;
+    let conn: &Connection = match shared_guard.as_ref() {
+        Some(g) => g,
+        None => {
+            tmp_conn =
+                open_read_only(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
+            &tmp_conn
+        }
+    };
+    let (status, ctype, body) = route_req(conn, &method, &path, &body, db_path);
     http_simple(&mut stream, status, ctype, &body)
 }
+
+/// 统一安全响应头（审查 P1：所有响应必带）。CSP 按 dashboard.html 现状收窄：
+/// 单文件内联 script/style（'unsafe-inline'），favicon 为 data: URI，无外链资源。
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\n\
+X-Frame-Options: DENY\r\n\
+Cache-Control: no-store\r\n\
+Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:\r\n";
 
 fn http_simple(
     stream: &mut TcpStream,
@@ -1818,11 +1956,12 @@ fn http_simple(
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }

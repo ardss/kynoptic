@@ -1,12 +1,16 @@
-//! 监控器全集（40 个）：14 个默认启用（纯 windows-sys、零子进程）+
+//! 监控器全集（40 个）：14 个默认启用（纯原生 API、零子进程）+
 //! 26 个已恢复但默认关闭（R8 ②/③ 级，含隐私开关或 PS 子进程，可配置启用）。
 //!
 //! 默认开关的单一事实源是 [`crate::registry`]（`MONITOR_REGISTRY`），
 //! `crates/core/config/monitors.json` 模板由测试保证与之一致。
 //!
-//! ## 默认启用（14，全部原生、零 PowerShell）
+//! ## 默认启用（14，全部原生、零子进程）
 //! 轮询型（12）：system / window / idle / session / battery / network /
 //! device / process / audio / brightness / wifi / power_plan
+//! ——其中 wifi 用 Native WiFi API（WlanOpenHandle/WlanQueryInterface），
+//! power_plan 用 PowerGetActiveScheme（powrprof），二者历史上曾 spawn
+//! netsh/powercfg 子进程（2026-09 P0 修复后已移除），"零子进程"声明自此
+//! 对默认启用集严格成立。
 //! 事件驱动 Hook（2）：keyboard_hook / mouse_hook
 //!
 //! ## 已恢复、默认关闭（26）

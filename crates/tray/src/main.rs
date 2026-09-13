@@ -185,6 +185,10 @@ fn main() {
                         };
                         let cs = kynoptic_core::collector::CollectorSettings {
                             input_granularity: granularity,
+                            // vk 频次开关：settings.json 的 vk_frequency_enabled
+                            // （serde 默认 false）→ CollectorSettings → core 的
+                            // input_agg::set_vk_enabled（collector 内部接线）。
+                            vk_frequency_enabled: app_settings.vk_frequency_enabled,
                             ..kynoptic_core::collector::CollectorSettings::default()
                         };
                         let db_str = owner_db.to_string_lossy().into_owned();
@@ -251,6 +255,31 @@ fn main() {
             }
         })
         .expect("设置监听线程启动失败");
+
+    // P1：settings.json 丢失不能静默。旧路径下文件消失（误删/重装残留清理）
+    // 时 load() 无声回退 14 监控器缺省，用户"全开配置"凭空丢失且毫无痕迹。
+    // 这里显式告警并立即用 Default 写出一份 settings.json：文件在场、可编辑、
+    // 下次设置页打开不再是"隐形缺省"。写失败仅告警（不阻塞托盘启动）。
+    // 文件存在但解析失败仍走 dash::load 内的 .corrupt.bak 留档逻辑，不在此处理。
+    {
+        let sp = kynoptic_dash::settings::settings_path(&parsed.db);
+        if !sp.exists() {
+            log::warn!(
+                "settings.json 不存在({})，使用默认值；已尝试写出默认设置文件",
+                sp.display()
+            );
+            eprintln!(
+                "kynoptic-tray: settings.json 不存在({})，使用默认值",
+                sp.display()
+            );
+            if let Err(e) =
+                kynoptic_dash::settings::save(&parsed.db, &kynoptic_dash::settings::AppSettings::default())
+            {
+                log::warn!("写出默认 settings.json 失败: {e}");
+                eprintln!("kynoptic-tray: 写出默认 settings.json 失败: {e}");
+            }
+        }
+    }
 
     // 启动时按当前设置同步一次自启动。
     // 审查 P1：settings.json 与注册表 Run 键不一致时（典型：安装器刚写好

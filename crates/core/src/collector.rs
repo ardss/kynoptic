@@ -26,11 +26,26 @@ pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
     }
 }
 
-fn log_dropped_events() {
+/// 丢弃计数的唯一消费方：看门狗线程每 WATCHDOG_INTERVAL_SECS 秒 swap 一次。
+///
+/// 审查 P2：旧实现在 writer 收到事件时打日志——writer 正常但通道被挤爆时
+/// 能看到，可一旦写库卡死（事件堆积、writer 无事件可收），丢弃就完全静默。
+/// 独立看门狗线程保证无论 writer 状态如何，增量都会周期性暴露。
+fn log_dropped_events_watchdog() {
     let dropped = DROPPED_EVENTS.swap(0, Ordering::Relaxed);
     if dropped > 0 {
-        log::warn!("通道已满，丢弃了 {} 个事件", dropped);
+        log::warn!("通道已满，过去 {} 秒丢弃了 {} 个事件", 60, dropped);
     }
+}
+
+/// flush 决策（纯函数，便于测试）。
+///
+/// P0 写放大修复：本批是否含 InputAgg 事件**不再**参与决策。InputAgg 每秒
+/// 入队一次，旧实现"见 Agg 即提交"把提交节奏拉高到每秒一次事务（每次约 38KB
+/// WAL 页写）。UPSERT 是整行覆盖语义（0005 迁移），跟随常规批量节奏（batch 满
+/// 或 flush_interval 到期）不会丢数——后写覆盖先写，终值正确。
+fn should_flush(batch_len: usize, elapsed_since_flush: Duration, batch_size: usize, flush_interval: Duration) -> bool {
+    batch_len >= batch_size || (batch_len > 0 && elapsed_since_flush >= flush_interval)
 }
 
 fn rand_jitter() -> f64 {
@@ -66,6 +81,16 @@ pub struct CollectorSettings {
     /// writer 小批 flush 间隔秒数（默认 30s）。数值是"落库最大延迟"与
     /// "每提交 WAL 页开销主导的磁盘足迹"之间的权衡，仍在校准中。
     pub write_flush_interval_secs: u64,
+    /// per-key（VK）键频记录开关（默认 false，隐私默认关闭）。
+    ///
+    /// true 时 input_agg 的 keyboard 行带 `vk` 频次 map（WhatPulse 式热力图
+    /// 数据源）；false 时只累计 keys 总数，`vk` map 输出为空。关闭理由：
+    /// per-key 频次配合窗口标题可对密码输入模式做统计推断。
+    ///
+    /// 接线点（由 tray/CLI 侧代理完成）：设置界面 / CLI flag 读写此字段，
+    /// 字段名 `vk_frequency_enabled`，经 `CollectorSettings` 传入
+    /// `start_collection_with` / `start_collection_custom` 即生效。
+    pub vk_frequency_enabled: bool,
 }
 
 impl Default for CollectorSettings {
@@ -73,6 +98,7 @@ impl Default for CollectorSettings {
         Self {
             input_granularity: InputGranularity::default(),
             write_flush_interval_secs: constants::WRITE_FLUSH_INTERVAL_SECS,
+            vk_frequency_enabled: false,
         }
     }
 }
@@ -162,19 +188,15 @@ fn writer_loop_inner(
             }
         }
 
-        log_dropped_events();
-
-        // 秒级可见：本批含 input_agg 聚合事件（每秒一次的累计 UPSERT）时立即提交，
-        // 不等缓冲窗口；该写入是单行覆盖，代价可忽略。
-        let has_agg = batch
-            .iter()
-            .any(|e| e.event_action == crate::types::EventAction::InputAgg);
-
+        // flush 决策只看 batch 满与时间窗；InputAgg 不再触发即时提交（见
+        // should_flush 文档）。
         let now = Instant::now();
-        if batch.len() >= batch_size
-            || has_agg
-            || (!batch.is_empty() && now.duration_since(last_flush) >= flush_interval)
-        {
+        if should_flush(
+            batch.len(),
+            now.duration_since(last_flush),
+            batch_size,
+            flush_interval,
+        ) {
             write_batch(db, &batch, total_written);
             batch.clear();
             last_flush = now;
@@ -253,11 +275,15 @@ fn run_monitor(
         let wait = Duration::from_secs_f64(base * jitter_factor);
 
         let deadline = std::time::Instant::now() + wait;
+        // 电池修复（审查 P0）：旧实现 200ms 切片轮询 deadline，12 个监控线程
+        // × 5 次/秒 = 70+ 次无谓唤醒。改为按剩余时长整段 sleep（上限 1 秒），
+        // 关停语义仍保证：shutdown 置位后线程最多 1 秒内检查到旗标退出。
         while std::time::Instant::now() < deadline {
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
-            thread::sleep(Duration::from_millis(200));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            thread::sleep(remaining.min(Duration::from_secs(1)));
         }
     }
 }
@@ -421,6 +447,9 @@ pub fn start_collection_custom(
     // 输入粒度：minute 模式下 Hook 回调退化为原子计数，由独立聚合线程每秒
     // drain 并按分钟折叠成 input_agg 事件入队（见 input_agg 模块文档）。
     input_agg::reset();
+    // per-key 频次隐私开关（默认 false）：必须在 activate/reset 之后、Hook
+    // 启动之前设置，保证本会话从第一个键事件起口径一致。
+    input_agg::set_vk_enabled(settings.vk_frequency_enabled);
     let minute_mode = settings.input_granularity == InputGranularity::Minute;
     let mut agg_handle: Option<thread::JoinHandle<()>> = None;
     if minute_mode {
@@ -515,6 +544,21 @@ pub fn start_collection_custom(
         })
         .expect("维护线程启动失败");
 
+    // 丢弃事件看门狗（审查 P2）：writer 侧日志只在"还在正常收事件"时可见，
+    // 写库卡死导致通道持续满载时会完全静默。独立线程每 60 秒读一次全局
+    // DROPPED_EVENTS，增量 >0 即告警——与 writer 状态解耦。
+    let sd_watch = shutdown.clone();
+    thread::Builder::new()
+        .name("DropWatchdog".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(60));
+            if sd_watch.load(Ordering::Acquire) {
+                return;
+            }
+            log_dropped_events_watchdog();
+        })
+        .expect("丢弃看门狗线程启动失败");
+
     Collector {
         db,
         session_id,
@@ -524,5 +568,34 @@ pub fn start_collection_custom(
         hooks,
         settings,
         shutdown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_flush_on_batch_full_or_interval() {
+        let interval = Duration::from_secs(30);
+        // batch 满 → flush
+        assert!(should_flush(300, Duration::from_secs(0), 300, interval));
+        // 未满 + 未到期 → 不 flush
+        assert!(!should_flush(5, Duration::from_secs(3), 300, interval));
+        // 未满但到期 → flush
+        assert!(should_flush(5, Duration::from_secs(30), 300, interval));
+        // 空 batch 永不 flush
+        assert!(!should_flush(0, Duration::from_secs(60), 300, interval));
+    }
+
+    /// P0 写放大回归测试：InputAgg 事件每秒入队一次，flush 决策不得因其
+    /// 存在而提前（旧实现"见 Agg 即提交"→ 每秒一次事务提交，~38KB WAL/次）。
+    #[test]
+    fn input_agg_events_do_not_trigger_immediate_flush() {
+        // 决策函数签名不含事件内容：含 InputAgg 的小 batch 与其他小 batch
+        // 判定完全一致——未满 batch 且未到 flush 窗口时不 flush。
+        let interval = Duration::from_secs(30);
+        assert!(!should_flush(1, Duration::from_secs(1), 300, interval));
+        assert!(!should_flush(60, Duration::from_secs(10), 300, interval));
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::types::*;
 use serde_json::json;
+use std::cell::Cell;
 use std::mem::{size_of, zeroed};
 use std::time::Duration;
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
@@ -20,6 +21,10 @@ pub struct DeviceMonitor {
     pub enable_disk_io: bool,
     /// 上次输入设备拓扑（Raw Input 枚举，仅变化时写行）
     last_input_topology: std::sync::Mutex<Option<Vec<crate::raw_input_devices::InputDeviceInfo>>>,
+    /// 上次落库的硬件快照（P1 写放大修复：memory/disks/disk_io 全同则跳过）
+    prev_snapshot: std::sync::Mutex<Option<(MemInfo, Vec<DiskItem>, Option<DiskIo>)>>,
+    /// 上次落库时间（低频心跳：每 10 分钟强制写一行证明存活）
+    last_emitted: Cell<Option<std::time::Instant>>,
 }
 
 impl Monitor for DeviceMonitor {
@@ -49,16 +54,39 @@ impl Monitor for DeviceMonitor {
                 *g = Some(input_devices.clone());
             }
         }
+        let memory = collect_memory();
+        let disks = collect_disk();
+        let disk_io = if self.enable_disk_io {
+            collect_disk_io()
+        } else {
+            None
+        };
         let snapshot = DeviceSnapshot {
-            memory: collect_memory(),
-            disks: collect_disk(),
-            disk_io: if self.enable_disk_io {
-                collect_disk_io()
-            } else {
-                None
-            },
+            memory: memory.clone(),
+            disks: disks.clone(),
+            disk_io: disk_io.clone(),
             input_devices: if changed { Some(input_devices) } else { None },
         };
+
+        // P1 写放大修复（与 network 的"值变化才产事件"对齐）：硬件快照逐项
+        // 比对，全同则跳过落库；但保留 10 分钟低频心跳证明监控器存活。
+        const HEARTBEAT_SECS: u64 = 600;
+        let heartbeat_due = self
+            .last_emitted
+            .get()
+            .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_SECS))
+            .unwrap_or(true);
+        let mut unchanged = false;
+        if let Ok(mut g) = self.prev_snapshot.lock() {
+            if g.as_ref() == Some(&(memory.clone(), disks.clone(), disk_io.clone())) {
+                unchanged = true;
+            }
+            *g = Some((memory, disks, disk_io));
+        }
+        if unchanged && !changed && !heartbeat_due {
+            return;
+        }
+        self.last_emitted.set(Some(std::time::Instant::now()));
         // 直接序列化 struct —— 字段名（memory/disks/disk_io 及其子字段）单一来源，
         // 不再手写 json! 宏。disk_io 为 None 时 skip_serializing_if 自动省略。
         let data = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
@@ -74,7 +102,7 @@ impl Monitor for DeviceMonitor {
 // 重命名任意字段 → 契约测试失败 + 前端类型需同步更新。
 
 /// 内存状态（heartbeat.device_snapshot.memory）
-#[derive(serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 struct MemInfo {
     total_gb: u64,
     available_gb: u64,
@@ -82,7 +110,7 @@ struct MemInfo {
 }
 
 /// 单个磁盘（device_snapshot.disks 元素）
-#[derive(serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 struct DiskItem {
     drive: String,
     total_gb: u64,
@@ -91,7 +119,7 @@ struct DiskItem {
 }
 
 /// 磁盘 I/O 速率（device_snapshot.disk_io）
-#[derive(serde::Serialize, Default)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Default)]
 struct DiskIo {
     read_bytes_per_sec: f64,
     write_bytes_per_sec: f64,

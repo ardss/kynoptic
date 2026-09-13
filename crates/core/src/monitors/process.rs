@@ -36,15 +36,45 @@ const SKIP_PROCESSES: &[&str] = &[
 ];
 
 pub struct ProcessMonitor {
-    prev_top_key: Cell<Option<String>>,
+    prev_fingerprint: Cell<Option<String>>,
+    /// 上次实际落库时间（低频心跳用：即使指纹未变也周期性强制写一行，
+    /// 证明采集线程还活着）
+    last_emitted: Cell<Option<std::time::Instant>>,
 }
 
 impl Default for ProcessMonitor {
     fn default() -> Self {
         Self {
-            prev_top_key: Cell::new(None),
+            prev_fingerprint: Cell::new(None),
+            last_emitted: Cell::new(None),
         }
     }
+}
+
+/// CPU% 容差：EMA 平滑值几乎每个采样点都微变，±1.5% 内视为同一桶（写放大
+/// 修复：旧实现每 30s 全量落库，event_data 约 2-4KB，主项 ~8MB/天）。
+const CPU_TOLERANCE_PCT: f64 = 1.5;
+/// 心跳强制落库间隔：指纹未变也每 10 分钟写一行，证明监控器存活。
+const HEARTBEAT_SECS: u64 = 600;
+
+/// CPU% 分桶：按容差 1.5% 取整桶号。
+fn cpu_bucket(v: f64) -> i32 {
+    (v / CPU_TOLERANCE_PCT).round() as i32
+}
+
+/// 快照变化指纹（纯函数，可测）：进程数 + top 条目的 pid/CPU 桶/整数 MB 内存。
+/// 任一超出容差的变化都会改变指纹；EMA 微抖动（<1.5%）不改变。
+fn snapshot_fingerprint(s: &ProcessSnapshot) -> String {
+    let mut parts: Vec<String> = vec![format!("n={}", s.total_count)];
+    for p in s.top_cpu.iter().chain(s.top_mem.iter()) {
+        parts.push(format!(
+            "{}:{}:{}",
+            p.pid,
+            cpu_bucket(p.cpu_percent),
+            p.memory_mb.round() as i64
+        ));
+    }
+    parts.join("|")
 }
 
 impl Monitor for ProcessMonitor {
@@ -57,26 +87,26 @@ impl Monitor for ProcessMonitor {
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
         let snapshot = collect_processes();
+        let key = snapshot_fingerprint(&snapshot);
 
-        // 用 top 进程名拼接作为变化指纹
-        let key: String = snapshot
-            .top_cpu
-            .iter()
-            .map(|p| format!("{}:{:.0}", p.name, p.cpu_percent))
-            .chain(
-                snapshot
-                    .top_mem
-                    .iter()
-                    .map(|p| format!("{}:{:.0}", p.name, p.memory_mb)),
-            )
-            .collect();
+        let unchanged = self
+            .prev_fingerprint
+            .take()
+            .as_ref()
+            .map(|prev| prev == &key)
+            .unwrap_or(false);
+        let heartbeat_due = self
+            .last_emitted
+            .get()
+            .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_SECS))
+            .unwrap_or(true);
 
-        let prev_key = self.prev_top_key.take();
-        if prev_key.as_ref() == Some(&key) {
-            self.prev_top_key.set(prev_key);
+        if unchanged && !heartbeat_due {
+            self.prev_fingerprint.set(Some(key));
             return;
         }
-        self.prev_top_key.set(Some(key));
+        self.prev_fingerprint.set(Some(key));
+        self.last_emitted.set(Some(std::time::Instant::now()));
 
         // 直接序列化 ProcessSnapshot struct —— 字段名（top_cpu/top_mem/total_count）
         // 与 struct 定义单一来源，不再手写 json! 宏。前端按此键名读取。
@@ -303,6 +333,38 @@ fn query_cpu_percent_map() -> HashMap<u32, f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_snapshot_fingerprint_tolerance() {
+        let mk = |cpu: f64, mem: f64, total: usize| ProcessSnapshot {
+            top_cpu: vec![ProcessInfo {
+                pid: 1,
+                name: "a.exe".into(),
+                cpu_percent: cpu,
+                memory_mb: mem,
+            }],
+            top_mem: vec![],
+            total_count: total,
+        };
+        // EMA 微抖动（<1.5% 容差 + 内存 <0.5MB 抖动）→ 指纹不变 → 跳过落库
+        assert_eq!(
+            snapshot_fingerprint(&mk(10.0, 100.0, 200)),
+            snapshot_fingerprint(&mk(10.9, 100.3, 200))
+        );
+        // CPU 变化超容差 / 内存超 1MB / 进程数变化 → 指纹变化 → 落库
+        assert_ne!(
+            snapshot_fingerprint(&mk(10.0, 100.0, 200)),
+            snapshot_fingerprint(&mk(12.5, 100.0, 200))
+        );
+        assert_ne!(
+            snapshot_fingerprint(&mk(10.0, 100.0, 200)),
+            snapshot_fingerprint(&mk(10.0, 102.0, 200))
+        );
+        assert_ne!(
+            snapshot_fingerprint(&mk(10.0, 100.0, 200)),
+            snapshot_fingerprint(&mk(10.0, 100.0, 201))
+        );
+    }
 
     /// 契约测试：ProcessSnapshot 序列化后的 JSON 键名必须与前端 ProcessView/api.ts 读取的一致。
     /// 这是 process 数据的「字段名单一来源」——改 struct 字段名会同时改 JSON，

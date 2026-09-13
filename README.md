@@ -17,8 +17,35 @@ or MCP.
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![License](https://img.shields.io/badge/license-Apache--2.0-green) ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 - Website: <https://kynoptic.com>
-- Status: v0.1, in active development toward a September 14 launch. API surface
-  may still change.
+- Status: v0.1, in active development. API surface may still change.
+
+## Computer activity ≠ human activity
+
+A machine being busy is not the same as a person being present. Kynoptic keeps
+the two apart instead of blending them into one "activity" number: input events
+flagged by Windows as injected (LLKHF_INJECTED — sent by scripts, macros, or AI
+agents) are filtered out of the human metric and counted separately, so an
+automation script hammering the keyboard never inflates your "time at the
+computer".
+
+The dashboard is built on three metrics:
+
+- **Human presence** — minutes with real (non-injected) keyboard/mouse input.
+- **Automation** — minutes where the only input was injected (scripts, agents).
+- **Foreground dwell** — minutes an application held the foreground window,
+  regardless of input.
+
+Comparing them answers the question raw activity logs can't: was *someone*
+there? The overview card does exactly that arithmetic:
+
+<!-- TODO before launch: replace with real screenshot at assets/dashboard-hero.png -->
+<!-- ![Kynoptic dashboard overview](assets/dashboard-hero.png) -->
+
+> Example from a real day: foreground dwell **20h 1m** vs human presence
+> **10h 14m** → **9h 39m** of "unattended" foreground time — hours the machine
+> looked busy while no human was interacting with it (builds, sync jobs,
+> idle-logged-in apps). Raw activity counters would have reported all of it as
+> "usage"; Kynoptic shows you which part was a person.
 
 ## How it works
 
@@ -37,6 +64,15 @@ or MCP.
   any data leaving the machine.
 
 ## Quick start
+
+**Option 1 — Installer (recommended, under 1 minute, no toolchain):**
+
+Download [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)
+from the latest release, run it, and launch Kynoptic from the Start menu.
+Collection starts automatically and the dashboard opens at
+`http://127.0.0.1:8422` in your browser.
+
+**Option 2 — Build from source:**
 
 Requirements: Windows 10/11 and a Rust toolchain (stable, MSVC target).
 
@@ -82,7 +118,7 @@ harness in this repo (full methodology and raw numbers in
 | Idle CPU (whole collector, default monitors) | 0.41% of one core (p95 1.56%) |
 | Resident memory (steady state) | ~16.5 MB |
 | Startup to first sample | ~238 ms (median) |
-| Storage cost | 336 bytes/event raw (default config) |
+| Storage cost | 336 bytes/event in raw mode; the default minute-granularity input mode is ~2.3x smaller |
 | Query p95 on a 1M-event database | < 50 ms for all tools (anomalies ~30 ms, via aggregate caches) |
 | Large legacy database open (1M rows, backfill pending) | ~8 ms (backfill runs chunked in background) |
 

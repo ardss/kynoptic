@@ -71,6 +71,11 @@ pub struct AppSettings {
     /// "无输入阅读"计入在场（审查 DeepSeek：2 分钟拍脑袋试点改为可配置）。
     #[serde(default = "default_presence_bridge_minutes")]
     pub presence_bridge_minutes: u32,
+    /// 每键频次采集开关（隐私默认关闭）：true = 键盘 input_agg 事件附带
+    /// per-key `vk` 频次 map；false（默认）= 不采集每键频次，只存每分钟计数。
+    /// core 侧开关与 tray 接线由对应模块消费本字段。
+    #[serde(default)]
+    pub vk_frequency_enabled: bool,
     /// 窗口分类规则（正则 token，匹配顺序即优先级，未命中 → 其他）。
     #[serde(default = "default_categories")]
     pub categories: Vec<CategoryRule>,
@@ -108,6 +113,7 @@ impl Default for AppSettings {
             input_counts_only: true,
             daily_goal_minutes: 480,
             presence_bridge_minutes: 2,
+            vk_frequency_enabled: false,
             categories: default_categories(),
         }
     }
@@ -254,6 +260,7 @@ mod tests {
             input_counts_only: true,
             daily_goal_minutes: 480,
             presence_bridge_minutes: 2,
+            vk_frequency_enabled: false,
             categories: default_categories(),
         };
         save(&db, &s).unwrap();

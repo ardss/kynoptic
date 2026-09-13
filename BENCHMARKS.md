@@ -15,8 +15,14 @@
 | 构建 | `cargo build --release`（opt-level=3, lto=true, strip=true） |
 
 > 注（2026-09-09 monitors 恢复）：上游 26 个被裁监控器已恢复进仓库但**全部默认
-> 关闭**，默认启用集合精确等于 v0.1 的 14 个（见 CODE_NOTES.md §9），因此本文件
+> 关闭**，默认启用集合精确等于 v0.1 的 14 个（= **12 个轮询 monitor + 2 个底层
+> 输入 hook**，下文"12 monitor + 2 hook"与 README 的"默认启用 14 个"是同一口径，
+> 见 CODE_NOTES.md §9），因此本文件
 > 所有数字的前提（默认监控集 + 默认集内无 PowerShell 子进程（netsh/powercfg 系统工具进程仍在，见下方注））不变，无需重测。
+>
+> 注（WiFi/电源子进程）：`wifi` 与 `power_plan` 两个默认启用的 monitor 目前
+> 仍经 netsh/powercfg 子进程采集（见 §1 前提）；原生 WiFi/电源 API
+> （native WiFi/p power APIs）正在落地，落地后本文件相应数字需重测。
 
 ## 复现命令
 
@@ -38,7 +44,8 @@ cargo run --release -p kynoptic-core --example perf-hook
 
 ## 1. 空载开销（IDLE OVERHEAD）
 
-方法：`perf-idle` 在本进程内启动完整采集器（12 monitor + 2 hook + writer），
+方法：`perf-idle` 在本进程内启动完整采集器（**12 个轮询 monitor + 2 个底层
+hook** + writer，即默认启用的 14 个监控器），
 每 1s 用 GetProcessTimes / GetProcessMemoryInfo / GetProcessIoCounters 采样，
 首 10s 预热不计入；600s 窗口、591 个样本。
 
@@ -71,13 +78,20 @@ checkpoint，VACUUM 全程经 WAL 重写会把 WAL 再撑大一倍——旧数�
 | 指标 | 旧测（WAL 未截断虚高） | 重测（2026-09-09） |
 |---|---|---|
 | maintenance 后 DB（主文件+WAL） | 45.5 MB（含 ~12MB WAL 虚高） | **33.6 MB** |
-| **每事件字节（raw 默认）** | ~~455 B/event~~ | **336 B/event** |
+| **每事件字节（raw 形态测得）** | ~~455 B/event~~ | **336 B/event** |
 | 写吞吐（300/批真实写路径） | 42,071 events/s | 13.7k~24.6k events/s（机器噪声大，非记录指标） |
 
-### 分钟粒度输入聚合（opt-in 信息对照，非默认）
+> 口径注（2026-09 默认粒度变更）：输入采集默认粒度已切换为 **minute**
+> （`input_counts_only` 默认 **true**，键盘/鼠标折叠为每分钟计数行）；
+> 上表 336 B/event 是 **raw 形态**（逐事件一行）下的测得值，保留作为对照
+> 上界。默认 minute 形态的行数/字节显著更低（见下节，合成负载下
+> rows 2.5x fewer / bytes 2.3x smaller）。
 
-`input_granularity="minute"`（默认 **raw**，原始数据不动）把 keyboard/mouse
-折叠为每分钟每桶一行 `input_agg` 计数行。同一 100k 合成工作负载
+### 分钟粒度输入聚合（默认形态对照）
+
+默认粒度为 **minute**（`input_counts_only` 默认 true）：keyboard/mouse
+折叠为每分钟每桶一行 `input_agg` 计数行；`input_granularity="raw"`
+（逐事件一行，原始数据不动）降级为 opt-out 对照形态。同一 100k 合成工作负载
 （perf-write 附带 phase）：
 
 ```json
@@ -88,8 +102,7 @@ checkpoint，VACUUM 全程经 WAL 重写会把 WAL 再撑大一倍——旧数�
 
 注意：该合成负载把 100k 事件压在 ~2 分钟内（1ms 间隔），行数坍缩被低估；
 真实人手密度（~10-30 输入事件/分钟）下约坍缩到 ≤2 行/分钟。
-此为 opt-in 形态的信息数字，**不构成默认行为声明**（原始数据神圣：
-raw 路径字节形态与上表一致）。
+raw 对照形态的字节形态与上表一致（原始数据神圣：raw 路径永不改动）。
 
 ### 空载日外推（perf-idle 600s 窗口）
 
@@ -160,7 +173,7 @@ app 占满 1M 行）远比真实使用极端，真实多应用负载下只会更
 
 ## 4. 启动延迟（STARTUP）
 
-方法：`perf-startup` spawn 子进程，读其 stderr 直到 12 个 monitor 全部
+方法：`perf-startup` spawn 子进程，读其 stderr 直到 12 个轮询 monitor 全部
 输出「首次采集完成」，10 次取中位数。
 
 | 指标 | 实测 | 目标 | 结论 |
