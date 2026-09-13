@@ -523,8 +523,9 @@ pub fn start_collection_custom(
     thread::Builder::new()
         .name("Maintenance".into())
         .spawn(move || {
-            // 每小时刷新 daily_agg 派生缓存（图表与实时卡片不能互相矛盾）；
-            // 每 DAILY_AGG_REFRESH_SECS×24 做一次全量维护（清理/回填等重活）。
+            // 每 DAILY_AGG_REFRESH_SECS（600s = 10 分钟）刷新一次 daily_agg
+            // 派生缓存（图表与实时卡片不能互相矛盾）；
+            // 每 MAINTENANCE_INTERVAL_SECS 做一次全量维护（清理/回填等重活）。
             let mut ticks: u64 = 0;
             loop {
                 thread::sleep(Duration::from_secs(constants::DAILY_AGG_REFRESH_SECS));

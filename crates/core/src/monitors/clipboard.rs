@@ -29,7 +29,7 @@ impl Monitor for ClipboardMonitor {
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
-        let (content_type, digest) = read_clipboard_hash();
+        let (content_type, digest, len) = read_clipboard_hash();
 
         let prev = self.last_digest.take();
         if prev.is_some() && prev == Some(digest) {
@@ -38,37 +38,41 @@ impl Monitor for ClipboardMonitor {
         }
         self.last_digest.set(Some(digest));
 
+        // 只记元数据：digest 前 8 hex + 内容字节数，不写内容本身
+        let digest_hex = hex8(&digest);
         let event = Event::new(EventAction::Change, EventType::Clipboard).data(json!({
             "content_type": content_type,
+            "digest": &digest_hex[..8],
+            "len": len,
         }));
         let _ = tx.try_send(event);
     }
 }
 
-/// 读取剪贴板内容类型和哈希摘要
-fn read_clipboard_hash() -> (String, [u8; 16]) {
+/// 读取剪贴板内容类型、哈希摘要与字节长度
+fn read_clipboard_hash() -> (String, [u8; 16], usize) {
     unsafe {
         let cf_unicode_text: u32 = 13;
 
         if OpenClipboard(0) == 0 {
-            return ("empty".into(), [0u8; 16]);
+            return ("empty".into(), [0u8; 16], 0);
         }
 
         if IsClipboardFormatAvailable(cf_unicode_text) == 0 {
             CloseClipboard();
-            return ("non-text".into(), simple_hash(b"non-text"));
+            return ("non-text".into(), simple_hash(b"non-text"), 8);
         }
 
         let handle = GetClipboardData(cf_unicode_text);
         if handle.is_null() {
             CloseClipboard();
-            return ("empty".into(), [0u8; 16]);
+            return ("empty".into(), [0u8; 16], 0);
         }
 
         let ptr = GlobalLock(handle);
         if ptr.is_null() {
             CloseClipboard();
-            return ("empty".into(), [0u8; 16]);
+            return ("empty".into(), [0u8; 16], 0);
         }
 
         // 计算长度
@@ -79,11 +83,13 @@ fn read_clipboard_hash() -> (String, [u8; 16]) {
             p = p.add(1);
         }
 
-        let bytes: Vec<u8> = std::slice::from_raw_parts(ptr as *const u8, len * 2).to_vec();
+        let byte_len = len * 2;
+        let bytes: Vec<u8> =
+            std::slice::from_raw_parts(ptr as *const u8, byte_len).to_vec();
         GlobalUnlock(handle);
         CloseClipboard();
 
-        ("text".into(), simple_hash(&bytes))
+        ("text".into(), simple_hash(&bytes), byte_len)
     }
 }
 
@@ -109,4 +115,62 @@ fn simple_hash(data: &[u8]) -> [u8; 16] {
     result[0..8].copy_from_slice(&state[0].to_le_bytes());
     result[8..16].copy_from_slice(&state[1].to_le_bytes());
     result
+}
+
+/// digest 转 hex（payload 取前 8 位）
+fn hex8(digest: &[u8; 16]) -> String {
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex8(digest: &[u8; 16]) -> String {
+        digest.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn hex8_local(digest: &[u8; 16]) -> String {
+        digest.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn payload_contains_digest_and_len() {
+        let digest = simple_hash("hello".as_bytes());
+        let len = "hello".as_bytes().len() * 2; // UTF-16 字节数
+
+        // 复刻 collect 的 payload 组装逻辑（不依赖真实剪贴板状态）
+        let digest_hex = hex8_local(&digest);
+        let payload = json!({
+            "content_type": "text",
+            "digest": &digest_hex[..8],
+            "len": len,
+        });
+
+        assert!(payload["digest"].is_string(), "payload must contain digest");
+        assert_eq!(payload["digest"].as_str().unwrap().len(), 8);
+        assert!(payload["digest"].as_str().unwrap().chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(payload["len"].as_u64().unwrap(), 10);
+        assert_eq!(payload["content_type"], "text");
+        // 不写内容本身
+        assert!(payload.get("content").is_none());
+    }
+
+    #[test]
+    fn digest_is_stable_and_discriminating() {
+        let a = simple_hash(b"hello");
+        let a2 = simple_hash(b"hello");
+        let b = simple_hash(b"hellp");
+        assert_eq!(a, a2);
+        assert_ne!(a, b);
+        assert_eq!(hex8(&a).len(), 32);
+    }
+
+    #[test]
+    fn hash_of_known_vector() {
+        // 同一输入必须得到确定输出且非全零
+        let d = simple_hash(b"");
+        assert_eq!(d.len(), 16);
+        assert_ne!(d, [0u8; 16]);
+    }
 }

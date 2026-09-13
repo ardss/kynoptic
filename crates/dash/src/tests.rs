@@ -75,7 +75,7 @@ fn timeline_buckets_by_local_hour_with_top5_and_other() {
     let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 12, 0))
         .unwrap()
         .with_timezone(&Utc);
-    let v = api_timeline_at(&conn, 12, now).unwrap();
+    let v = api_timeline_at(&conn, 12, now, 2).unwrap();
     let buckets = v["buckets"].as_array().unwrap();
     // 补零桶：固定返回窗口内全部 12 个本地小时（无数据小时 human/auto 全 0）
     assert_eq!(buckets.len(), 12, "12 小时窗口全量补零: {v}");
@@ -107,7 +107,7 @@ fn timeline_hours_clamped_and_range_excludes_old_events() {
     // 远超 48h 前的事件不应出现
     let old = (now - chrono::Duration::hours(100)).to_rfc3339();
     insert(&conn, &old, "keyboard", "press", None);
-    let v = api_timeline_at(&conn, 9999, now).unwrap();
+    let v = api_timeline_at(&conn, 9999, now, 2).unwrap();
     assert_eq!(v["hours"], json!(48));
     // 补零桶：即使整窗无数据也固定返回 48 个本地小时，全 0
     let buckets = v["buckets"].as_array().unwrap();
@@ -457,6 +457,70 @@ fn settings_post_vk_frequency_bool_and_audit_log() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// === settings：并发保存风暴（故障注入场景 6） ===
+
+/// 4 线程各 save 50 次不同 daily_goal_minutes。断言：
+/// 1. 全部 POST 200（route 层 SETTINGS_WRITE 串行化读-改-写）；
+/// 2. 风暴期间任何一次成功读取的 settings.json 都是合法 JSON（原子替换生效，
+///    读者永远看不到半截文件）；
+/// 3. 终值是某次写入的值，且能反序列化为合法 AppSettings。
+#[test]
+fn settings_concurrent_save_storm_always_valid_json() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tmpdir("save-storm");
+    let db = std::sync::Arc::new(dir.join("kyn.db"));
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+    // 读者线程：风暴期间持续读取，任何成功读到的内容必须是完整合法 JSON
+    let reader_stop = stop.clone();
+    let reader_db = db.clone();
+    let reader = std::thread::spawn(move || {
+        let mut reads = 0usize;
+        let path = settings::settings_path(&reader_db);
+        while !reader_stop.load(Ordering::Relaxed) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                reads += 1;
+                assert!(
+                    serde_json::from_str::<Value>(&text).is_ok(),
+                    "并发写期间读到非法 JSON: {text}"
+                );
+            }
+        }
+        reads
+    });
+
+    let mut handles = Vec::new();
+    for t in 0..4u32 {
+        let db = db.clone();
+        handles.push(std::thread::spawn(move || {
+            let conn = mem_conn();
+            for i in 0..50u32 {
+                let goal = 60 + (t * 50 + i) % 1300; // 合法域 0..=1440 内各线程不同值
+                let body = format!(r#"{{"daily_goal_minutes":{goal}}}"#);
+                let (code, _, out) = route_req(&conn, "POST", "/api/settings", &body, &db);
+                assert_eq!(code, 200, "线程 {t} 第 {i} 次保存失败: {out}");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    let reads = reader.join().unwrap();
+    assert!(reads > 0, "读者线程必须至少完成一次读取");
+
+    // 终值：合法 JSON + 是写入集内的值 + 反序列化为 AppSettings
+    let text = std::fs::read_to_string(settings::settings_path(&db)).unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let goal = v["daily_goal_minutes"].as_u64().unwrap();
+    assert!(
+        (60..=1359).contains(&goal),
+        "终值必须是某次写入的值: {goal}"
+    );
+    assert!(settings::try_load(&db).is_some(), "终值必须是合法 AppSettings");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // === 路由表 ===
 
 #[test]
@@ -626,10 +690,10 @@ fn anomalies_message_en_covers_all_kinds() {
     assert!(anomaly_message_en("unknown_kind").contains("unknown_kind"));
 }
 
-// === trends：presence_minutes 别名 ===
+// === trends：presence_minutes 假别名已移除（第四口径修复） ===
 
 #[test]
-fn trends_presence_minutes_alias_matches_active_minutes() {
+fn trends_no_presence_alias_and_notes_raw_metric() {
     let conn = mem_conn();
     conn.execute(
         "INSERT INTO daily_agg (date, keys, clicks, active_minutes) VALUES ('2026-09-08', 10, 2, 45)",
@@ -640,8 +704,13 @@ fn trends_presence_minutes_alias_matches_active_minutes() {
     let v = api_trends_at(&conn, today);
     let d = &v["daily"].as_array().unwrap()[0];
     assert_eq!(d["active_minutes"], json!(45));
-    assert_eq!(d["presence_minutes"], json!(45), "别名同值: {d}");
-    assert!(v["presence_minutes_note"].as_str().unwrap().contains("alias"));
+    // 假别名彻底移除：active_minutes 是 raw 输入口径，不得冒充"人在场"
+    assert!(d.get("presence_minutes").is_none(), "trends 不得再有 presence_minutes 假别名: {d}");
+    assert!(v["this_week"].get("presence_minutes").is_none());
+    // note 字段说明口径并指向权威入口
+    let note = v["note"].as_str().unwrap();
+    assert!(note.contains("active_minutes"), "{note}");
+    assert!(note.contains("/api/overview"), "{note}");
 }
 
 // === 真 socket 测试（审查清单 A5）：真实 TcpListener + 真实 TCP 连接 ===
@@ -766,6 +835,105 @@ mod socket_tests {
             "缺 Host（DNS rebinding 防线）必须 4xx，实际: {resp}"
         );
         // serve 线程仍持只读连接，Windows 上目录删除是尽力而为
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 故障注入场景 4 加严：100 并发 + 30 个恶意慢速（slowloris：只发半个请求，
+    // 占满服务端 5s read_timeout 的连接名额）。并发上限 64，因此 30 个慢速占位
+    // 期间必然有部分正常请求按设计收到 503；断言：
+    //   1. 全部 70 个正常请求在 10 秒内得到确定的 HTTP 响应（200 或 503，不悬挂）；
+    //   2. 至少部分正常请求被真正服务（200）且服务存活；
+    //   3. 慢速客户端断开、名额归还（Drop 守卫）后，连续请求不再出现 503。
+    #[test]
+    fn hundred_concurrent_with_slowloris_no_hang_and_quota_recovers() {
+        let (port, dir) = start_server("stress100");
+        // 30 个恶意慢速：发半个请求后挂住（服务端读超时 5s 才释放名额）
+        let mut slow = Vec::new();
+        for _ in 0..30 {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(b"GET /api/status HT").unwrap();
+            slow.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(300)); // 让慢速先占满名额
+
+        let started = std::time::Instant::now();
+        let retried = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..70)
+            .map(|_| {
+                let retried = retried.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        s.write_all(b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                            .unwrap();
+                        let mut buf = Vec::new();
+                        let _ = s.read_to_end(&mut buf);
+                        let resp = String::from_utf8_lossy(&buf).to_string();
+                        let code: u16 = resp
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|c| c.parse().ok())
+                            .unwrap_or(0);
+                        if code != 0 {
+                            return resp;
+                        }
+                        // 100 并发风暴下 Windows 回环偶发连接被截断（RST）：
+                        // 在 10s 截止前重试，截断次数记录供报告
+                        retried.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "10 秒内未得到完整 HTTP 响应（悬挂）: {resp}"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                })
+            })
+            .collect();
+        let mut codes = Vec::new();
+        for h in handles {
+            let resp = h.join().unwrap();
+            let code: u16 = resp
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            assert!(
+                code != 0,
+                "10 秒内必须得到完整 HTTP 响应（不悬挂）: {resp}"
+            );
+            codes.push(code);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "70 个正常请求必须在 10 秒内全部完成"
+        );
+        assert_eq!(codes.iter().filter(|&&c| c == 200).count() as i64
+            + codes.iter().filter(|&&c| c == 503).count() as i64,
+            70,
+            "每个响应必须是 200 或设计内 503: {codes:?}");
+        let served = codes.iter().filter(|&&c| c == 200).count();
+        assert!(served > 0, "至少部分正常请求应被服务（200）: {codes:?}");
+        eprintln!(
+            "DBG slowloris: served200={served} rejected503={} connTruncatedRetries={}",
+            70 - served,
+            retried.load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // 释放慢速客户端，等服务端 5s 读超时回收名额（InflightGuard Drop 归还）
+        drop(slow);
+        std::thread::sleep(Duration::from_millis(6500));
+        // 名额归零：连续请求全部 200，不再 503
+        for _ in 0..30 {
+            let resp = get(port, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            assert!(
+                resp.starts_with("HTTP/1.1 200 "),
+                "名额归还后不应再 503（服务必须存活）: {resp}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

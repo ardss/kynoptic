@@ -128,6 +128,7 @@
   button.save[style*="background:#2A3442"]:hover { border-color: var(--brand); color: var(--brand); }
   :is(button, .tab, input, .lang-toggle):focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
   #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: var(--bad); }
+  #settings-msg { transition: opacity .6s ease; }
   .host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
   .host-item > div:last-child { font-family: var(--font-data); font-size: 14px; margin-top: 2px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -143,6 +144,8 @@
                color: var(--faint); font-size: 12px; }
   .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px;
         margin: 0 2px; vertical-align: -1px; }
+  /* 时间线全零小时：斜纹空块 */
+  .tl-idle { background: repeating-linear-gradient(45deg, #141a24 0 6px, #1a2230 6px 12px); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -192,7 +195,7 @@
     <div class="label"><span class="l en">machine unattended today</span><span class="l zh">今日机器值班（无人）</span></div>
     <div class="value" style="font-size:34px; color:var(--dim);" id="c-unattended">–</div>
     <div style="font-size:12px; color:var(--dim);">
-      <span class="l en">window dwell minus human presence</span><span class="l zh">前台驻留减去人在场</span>
+      <span class="l en">window dwell minus human and automation input</span><span class="l zh">前台驻留减去人在场与自动化</span>
     </div>
   </div>
 </div>
@@ -402,13 +405,18 @@
     <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended; per-key detail off)</span>
     <span class="l zh">仅按分钟计数保存键盘/鼠标输入（推荐；不记录逐键明细）</span></label>
   </div>
+  <div class="mon-row">
+    <input type="checkbox" id="set-vkfreq">
+    <label for="set-vkfreq"><span class="l en">per-key frequency (keyboard distribution detail)</span>
+    <span class="l zh">逐键频次（键盘分布明细）</span></label>
+  </div>
   <div class="muted"><span class="l en">takes effect automatically after save.</span><span class="l zh">保存后自动生效。</span></div>
 </section>
 <section>
   <div class="settings-actions">
     <button class="save" style="background:#2A3442" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
   <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
-    <span id="settings-msg"></span>
+    <span id="settings-msg" aria-live="polite"></span>
   </div>
 </section>
 </div>
@@ -439,11 +447,12 @@ const T = {
         unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window).",
         restoredHint: "reset to defaults on screen — click save to apply.",
         beforeData: "no data before",
-        fgdwellNote: "estimated from window dwell; includes unattended time / 按窗口驻留推算，含人不在场时段",
+        fgdwellNote: "estimated from window dwell; includes unattended time",
         noEventsYet: "(no events yet)", lastEvent: "last event:", readOnly: "read-only",
+        hourIdle: "no events",
+        focusOmitted: "blocks over 4h omitted — they may include away/idle periods (see timeline)",
         disconnected: "disconnected — retrying…",
         weekInsufficient: "not enough data for last week — comparison skipped",
-        focusSuspect: " [likely includes away/idle]",
         retry: "retry", loadFailed: "load failed: ",
         colApp: "app", colEvents: "events (count)" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
@@ -454,11 +463,12 @@ const T = {
         unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
         restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
         beforeData: "该日期早于数据起点",
-        fgdwellNote: "按窗口驻留推算，含人不在场时段 / window dwell, includes unattended time",
+        fgdwellNote: "按窗口驻留推算，含人不在场时段",
         noEventsYet: "（尚无事件）", lastEvent: "最近事件：", readOnly: "只读",
+        hourIdle: "无事件",
+        focusOmitted: "存在超长块，可能包含离开/挂机时段（详见时间线）",
         disconnected: "连接断开，正在重试…",
         weekInsufficient: "上周数据不足，已跳过对比",
-        focusSuspect: "（疑似含离开/挂机）",
         retry: "重试", loadFailed: "加载失败：",
         colApp: "应用", colEvents: "事件数" }
 };
@@ -487,12 +497,13 @@ function fmtUptime(sec) {
   if (h > 0) return h + "h " + m + "m";
   return m + "m";
 }
-/* 统一时长口径：入参分钟，输出按当前语言格式化（收敛所有时长显示） */
+/* 统一时长口径：入参分钟，输出按当前语言格式化（Y=0 时省略分钟） */
 function fmtDuration(minutes) {
   const m = Math.max(0, Math.round(minutes || 0));
   const h = Math.floor(m / 60), mm = m % 60;
   const zh = document.documentElement.lang === "zh";
   if (h === 0) return zh ? mm + " 分钟" : mm + "m";
+  if (mm === 0) return zh ? h + " 小时" : h + "h";
   return zh ? h + " 小时 " + mm + " 分钟" : h + "h " + mm + "m";
 }
 /* ─── i18n 切换 ─── */
@@ -510,11 +521,18 @@ function toggleLang() {
 /* ─── 状态行 / Overview ─── */
 async function loadStatus() {
   const s = await jget("/api/status");
-  const last = s.last_event_ts
-    ? s.last_event_ts.replace("T", " ")
-    : t("noEventsYet");
-  document.getElementById("status-line").textContent =
-    s.today + " · " + t("lastEvent") + " " + last + " UTC · " + t("readOnly") + " · " + s.db_path;
+  const el = document.getElementById("status-line");
+  if (!s.last_event_ts) {
+    el.textContent = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + s.db_path;
+    el.title = "";
+    return;
+  }
+  // 状态行显示本地时间；tooltip 保留 UTC 原文
+  const utcRaw = s.last_event_ts.replace("T", " ") + " UTC";
+  const d = new Date(s.last_event_ts);
+  const shown = isNaN(d.getTime()) ? utcRaw : d.toLocaleString();
+  el.textContent = s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + s.db_path;
+  el.title = t("lastEvent") + " " + utcRaw;
 }
 function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
 function prettyApp(a) {
@@ -604,16 +622,27 @@ async function loadTimeline() {
     // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节
     const human = Math.min(60, b.human_min || 0);
     const auto = Math.min(60 - human, b.auto_min || 0);
-    const away = 60 - human - auto;
+    const away = Math.max(0, 60 - human - auto);
     const pct1 = (v) => (v / 60 * 100).toFixed(1);
+    const evCount = (b.apps || []).reduce((a, x) => a + (x.events || 0), 0);
 
     const apps = b.apps.map(x => prettyApp(x.app) + " x" + x.events).join(", ");
+    // 全零小时：无任何事件，渲染为斜纹灰块，tooltip 说明"无事件"
+    if (evCount === 0 && human === 0 && auto === 0) {
+      return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
+        '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13).replace("T", " ")) + "</span>" +
+        '<span style="flex:1;display:flex;height:16px;border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
+        '<span class="tl-idle" style="width:100%" title="' + esc(t("hourIdle")) + '"></span>' +
+        '</span>' +
+        '<span style="width:34%;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(apps) + '">' + esc(apps) + '</span>' +
+        "</div>";
+    }
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
       '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13).replace("T", " ")) + "</span>" +
       '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
-        '<span style="width:' + pct1(human) + '%;background:' + TL_COLORS.human + '" title="' + L.human + ' ' + human + 'm"></span>' +
-        '<span style="width:' + pct1(auto) + '%;background:' + TL_COLORS.auto + '" title="' + L.auto + ' ' + auto + 'm"></span>' +
-        '<span style="width:' + pct1(away) + '%;background:' + TL_COLORS.away + '" title="' + L.away + '"></span>' +
+        '<span style="width:' + pct1(human) + '%;background:' + TL_COLORS.human + '" title="' + L.human + " " + fmtDuration(human) + '"></span>' +
+        '<span style="width:' + pct1(auto) + '%;background:' + TL_COLORS.auto + '" title="' + L.auto + " " + fmtDuration(auto) + '"></span>' +
+        '<span style="width:' + pct1(away) + '%;background:' + TL_COLORS.away + '" title="' + L.away + " " + fmtDuration(away) + '"></span>' +
       '</span>' +
       '<span style="width:34%;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(apps) + '">' + esc(apps) + '</span>' +
       "</div>";
@@ -660,9 +689,10 @@ async function loadHeatmap() {
     const col = Math.floor(i / 7), row = i % 7;
     const x = 40 + col * (cell + gap), y = row * (cell + gap);
     const level = hmLevel(d.value, max);
+    const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
-      (level === 0 ? "#232B38" : "none") + '"><title>' + d.date + " — " + d.value + " min</title></rect>";
+      (level === 0 ? "#232B38" : "none") + '"><title>' + d.date + " — " + d.value + unit + "</title></rect>";
   });
   svg += "</svg>";
   el.innerHTML = svg;
@@ -753,7 +783,16 @@ function renderKeyboard(freq) {
 // ─── 报告页：色带时间轴 / 类别占比 / 专注块 / 目标 / 趋势 ───
 const CAT_COLORS = { "开发":"#5BA8FF", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#E06C75",
   "文档":"#C678DD", "设计":"#56B6C2", "其他":"#7A8AA0" };
+/* 类别中英映射：键为后端中文类别名，按当前语言显示 */
+const CAT_NAMES = { "开发": ["Development", "开发"], "浏览": ["Browsing", "浏览"],
+  "通讯": ["Communication", "通讯"], "娱乐": ["Entertainment", "娱乐"],
+  "文档": ["Documents", "文档"], "设计": ["Design", "设计"], "其他": ["Other", "其他"] };
 function catColor(name) { return CAT_COLORS[name] || "#888"; }
+function catLabel(name) {
+  const n = CAT_NAMES[name];
+  if (!n) return name;
+  return document.documentElement.lang === "en" ? n[0] : n[1];
+}
 function fmtMin(m) { return fmtDuration(m); } /* 收敛到 fmtDuration */
 function dayOffset(n) {
   const d = new Date(Date.now() - n * 86400000);
@@ -790,7 +829,7 @@ async function loadReport() {
     const hm = m => Math.floor(m / 60) + ":" + String(m % 60).padStart(2, "0");
     svg += '<rect x="' + px(seg.start_min) + '" y="' + (y + rowH - 13) + '" width="' +
       Math.max(px(seg.end_min) - px(seg.start_min), 1.5) + '" height="12" rx="3" fill="' +
-      catColor(seg.category) + '"><title>' + esc(seg.app) + " · " + esc(seg.category) +
+      catColor(seg.category) + '"><title>' + esc(seg.app) + " · " + esc(catLabel(seg.category)) +
       " · " + hm(seg.start_min) + "–" + hm(seg.end_min) + '</title></rect>';
   }
   svg += "</svg>";
@@ -805,22 +844,27 @@ async function loadReport() {
   }
   document.getElementById("report-legend").innerHTML =
     [...new Set(segs.map(x => x.category))].map(c =>
-      '<span style="margin-right:14px"><span class="sw" style="background:' + catColor(c) + '"></span>' + esc(c) + "</span>").join("");
+      '<span style="margin-right:14px"><span class="sw" style="background:' + catColor(c) + '"></span>' + esc(catLabel(c)) + "</span>").join("");
   const cats = (d.categories || []).sort((a, b) => b.minutes - a.minutes);
   const cmax = Math.max(1, ...cats.map(c => c.minutes));
   document.getElementById("report-cats").innerHTML = cats.length
-    ? cats.map(c => '<div class="mon-row"><span class="muted" style="width:56px">' + esc(c.category) +
+    ? cats.map(c => '<div class="mon-row"><span class="muted" style="width:56px">' + esc(catLabel(c.category)) +
       '</span><span class="app-track"><span class="app-bar" style="width:' +
       (c.minutes / cmax * 100).toFixed(2) + "%;background:" + catColor(c.category) + '"></span></span>' +
       '<span class="app-count">' + fmtMin(c.minutes) + "</span></div>").join("")
     : '<span class="muted">' + t("noData") + "</span>";
-  document.getElementById("report-focus").textContent = (d.focus || []).length
-    ? d.focus.map(function (f) {
+  const focusAll = d.focus || [];
+  // 超过 4 小时的"专注块"大概率是挂机未检测到离开：不再展示，改为一行说明
+  const focusShown = focusAll.filter(f => f.minutes <= 240);
+  const focusOmitted = focusAll.length - focusShown.length;
+  document.getElementById("report-focus").innerHTML = focusAll.length
+    ? focusShown.map(function (f) {
         const hm = m => Math.floor(m / 60) + ":" + String(m % 60).padStart(2, "0");
-        // 超过 4 小时的"专注块"大概率是挂机未检测到离开，如实标注
-        return hm(f.start_min) + "–" + hm(f.end_min) + " (" + fmtMin(f.minutes) + ")" +
-          (f.minutes > 240 ? t("focusSuspect") : "");
-      }).join("   ·   ")
+        return hm(f.start_min) + "–" + hm(f.end_min) + " (" + fmtMin(f.minutes) + ")";
+      }).join("   ·   ") +
+      (focusOmitted
+        ? '<div class="muted" style="font-size:12px;margin-top:6px">' + esc(t("focusOmitted")) + " (" + focusOmitted + ")</div>"
+        : "")
     : t("noData");
   const st = await jget("/api/settings");
   const tr = await jget("/api/trends");
@@ -1080,10 +1124,12 @@ async function loadAnomalies() {
   const a = await jget("/api/anomalies?days=7");
   const el = document.getElementById("anomalies");
   if (!a.anomalies.length) { el.innerHTML = '<li class="muted">' + t("noAnomalies") + "</li>"; return; }
-  // 严重级别排序：alert 最高，排最前
+  // 严重级别排序：alert 最高，排最前；同级别内按时刻先后
   const SEV_ORDER = { alert: 0, critical: 1, warn: 2, info: 3 };
+  const isEn = document.documentElement.lang === "en";
   const items = (a.anomalies || []).slice().sort((x, y) =>
-    (SEV_ORDER[x.severity] ?? 9) - (SEV_ORDER[y.severity] ?? 9));
+    ((SEV_ORDER[x.severity] ?? 9) - (SEV_ORDER[y.severity] ?? 9)) ||
+    (x.at || "").localeCompare(y.at || ""));
   el.innerHTML = items.map(x => {
     const when = x.at || x.date;
     // 本地化显示时刻；解析失败时原样回退
@@ -1092,15 +1138,27 @@ async function loadAnomalies() {
       const d = new Date(when);
       if (!isNaN(d.getTime())) whenTxt = d.toLocaleString();
     }
+    // 按当前界面语言取文案，不无条件优先英文
+    const msg = isEn ? (x.message_en || x.message) : (x.message || x.message_en);
     return '<li><span class="sev-' + esc(x.severity) + '">[' + esc(x.severity) + "]</span> " +
-      esc(whenTxt) + " · " + esc(x.kind) + " — " + esc(x.message_en || x.message) + "</li>";
+      esc(whenTxt) + " · " + esc(x.kind) + " — " + esc(msg) + "</li>";
   }).join("");
 }
 /* ─── Settings ─── */
+let settingsFadeTimer = null;
 function settingsMsg(text, ok) {
   const el = document.getElementById("settings-msg");
+  if (settingsFadeTimer) { clearTimeout(settingsFadeTimer); settingsFadeTimer = null; }
   el.textContent = text;
   el.className = ok ? "ok" : "bad";
+  el.style.opacity = "1";
+  if (ok && text) {
+    // 保存成功 3 秒后淡出（仅透明过渡，不清空文本，读屏仍可感知）
+    settingsFadeTimer = setTimeout(function () {
+      el.style.opacity = "0";
+      settingsFadeTimer = null;
+    }, 3000);
+  }
 }
 // 监控器双语名 + 新 loadSettings + restoreDefaults（替换原 loadSettings 整函数）
 const MON_NAMES = {
@@ -1166,6 +1224,7 @@ async function loadSettings() {
   document.getElementById("set-autostart").checked = s.autostart;
   document.getElementById("set-bridge").value = (s.presence_bridge_minutes ?? 2);
   document.getElementById("set-counts").checked = s.input_counts_only;
+  document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
   settingsMsg("", true);
 }
 // 恢复默认勾选（仅改界面，需再点保存）
@@ -1187,6 +1246,7 @@ async function saveSettings() {
       enabled_monitors: enabled_monitors,
       autostart: document.getElementById("set-autostart").checked,
       input_counts_only: document.getElementById("set-counts").checked,
+      vk_frequency_enabled: document.getElementById("set-vkfreq").checked,
       presence_bridge_minutes: Math.max(0, Math.min(15, parseInt(document.getElementById("set-bridge").value || "2", 10) || 0))
     };
     const r = await fetch("/api/settings", {

@@ -1124,107 +1124,34 @@ fn parse_presence_args(args: &[String]) -> Result<i64> {
     Ok(days)
 }
 
-/// 桥接计数：排序去重后的分钟序列里，相邻间隙 <= gap 分钟按"无输入阅读"
-/// 桥接成连续在场段，返回覆盖的分钟总数。与 dash 的 bridge_count 同逻辑。
-fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
-    if sorted_minutes.is_empty() {
-        return 0;
-    }
-    let mut total = 1i64;
-    let mut prev = sorted_minutes[0];
-    for &m in &sorted_minutes[1..] {
-        let step = (m - prev).min(gap + 1);
-        total += step.max(1);
-        prev = m;
-    }
-    total
-}
+// bridge_count 与三指标判定已下沉到 kynoptic-core（queries::bridge_count /
+// queries::classify_minutes）——dash（overview/timeline）与 cli presence 共用
+// 同一权威实现（剔注入、含点击、混合分钟双计、桥接读 settings）。
 
-// TODO: 与 dash 的实现（crates/dash/src/lib.rs api_overview）下沉到 core 收敛为单一实现
-/// 单日三指标（本地日界 [start, end)，RFC3339 字符串比较）：
-///   人在场 = 非注入输入分钟（keys - injected_keys > 0）+ <=bridge 分钟桥接
-///   自动化 = 有注入输入（injected_keys > 0）的分钟数
-///   前台   = window/switch 事件间隔推算的累计分钟（sum/60）
-fn presence_metrics(
-    conn: &Connection,
-    start: &str,
-    end: &str,
-    bridge_min: u32,
-) -> Result<(i64, i64, i64)> {
-    use chrono::Timelike;
-    let minute_of_day = |minute_str: &str| -> Option<i64> {
-        chrono::DateTime::parse_from_rfc3339(&format!("{}:00+00:00", minute_str))
-            .ok()
-            .map(|t| {
-                let l = t.with_timezone(&chrono::Local);
-                l.hour() as i64 * 60 + l.minute() as i64
-            })
-    };
-    let mut human: Vec<i64> = Vec::new();
-    let mut automation: Vec<i64> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT substr(timestamp,1,16), \
-                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)), \
-                MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0)) \
-             FROM events WHERE event_action = 'input_agg' AND json_valid(event_data) \
-               AND timestamp >= ?1 AND timestamp < ?2 \
-             GROUP BY substr(timestamp,1,16)",
-    ) {
-        let rows = stmt.query_map(params![start, end], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-        })?;
-        for (minute_str, human_keys, injected) in rows.flatten() {
-            if human_keys > 0 {
-                if let Some(m) = minute_of_day(&minute_str) {
-                    human.push(m);
-                }
-            } else if injected > 0 {
-                if let Some(m) = minute_of_day(&minute_str) {
-                    automation.push(m);
-                }
-            }
-        }
-    }
-    // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT substr(timestamp,1,16) FROM events \
-          WHERE event_action IN ('press','click') \
-            AND timestamp >= ?1 AND timestamp < ?2",
-    ) {
-        let rows = stmt.query_map(params![start, end], |r| r.get::<_, String>(0))?;
-        for minute_str in rows.flatten() {
-            if let Some(m) = minute_of_day(&minute_str) {
-                human.push(m);
-            }
-        }
-    }
-    human.sort_unstable();
-    human.dedup();
-    automation.sort_unstable();
-    automation.dedup();
-    let presence = bridge_count(&human, (bridge_min.min(15)) as i64);
-
-    // 前台分钟：窗口切换间隔累计（与 dash api_overview 同口径）
+/// 前台分钟：窗口切换间隔累计（与 dash api_overview 同口径，不封顶）。
+fn foreground_minutes(conn: &Connection, start: &str, end: &str) -> i64 {
     let mut fg_secs: i64 = 0;
     if let Ok(mut stmt) = conn.prepare(
         "SELECT timestamp FROM events \
           WHERE event_type = 'window' AND event_action = 'switch' \
             AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
     ) {
-        let rows = stmt.query_map(params![start, end], |r| r.get::<_, String>(0))?;
-        let stamps: Vec<String> = rows.flatten().collect();
-        let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
-        for pair in stamps.windows(2) {
-            if let (Some(a), Some(b)) = (parse(&pair[0]), parse(&pair[1])) {
-                fg_secs += (b - a).num_seconds();
+        if let Ok(rows) = stmt.query_map(params![start, end], |r| r.get::<_, String>(0)) {
+            let stamps: Vec<String> = rows.flatten().collect();
+            let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
+            for pair in stamps.windows(2) {
+                if let (Some(a), Some(b)) = (parse(&pair[0]), parse(&pair[1])) {
+                    fg_secs += (b - a).num_seconds();
+                }
             }
         }
     }
-    Ok((presence, automation.len() as i64, fg_secs / 60))
+    fg_secs / 60
 }
 
 /// `kynoptic presence [--days N]`：每日 人在场/自动化/前台 三行式摘要。
-/// 口径与 dashboard 三指标一致（见 presence_metrics 注释与 TODO）。
+/// 口径与 dashboard 三指标一致：三指标统一走 core 权威实现
+/// queries::classify_minutes（与 dash overview/timeline 同一实现，无本地副本）。
 fn cmd_presence(args: &[String]) -> Result<()> {
     let days = parse_presence_args(args)?;
     let bridge = kynoptic_dash::settings::load(&resolve_db()).presence_bridge_minutes;
@@ -1235,9 +1162,11 @@ fn cmd_presence(args: &[String]) -> Result<()> {
         let Some((start, end)) = queries::local_day_range(&date) else {
             continue;
         };
-        let (presence, automation, foreground) = presence_metrics(&conn, &start, &end, bridge)?;
-        println!("{date} presence:   {presence} min");
-        println!("{date} automation: {automation} min");
+        let day = queries::classify_minutes(&conn, &date, bridge);
+        let foreground = foreground_minutes(&conn, &start, &end);
+        println!("{date} presence:   {} min", day.presence_minutes);
+        println!("{date} automation: {} min", day.automation_minutes);
+        println!("{date} mixed:      {} min", day.mixed_minutes);
         println!("{date} foreground: {foreground} min");
     }
     Ok(())
@@ -1950,6 +1879,8 @@ mod tests {
 
     #[test]
     fn bridge_count_bridges_small_gaps_only() {
+        // 权威实现已下沉 core（dash/cli 共用），这里直接测 core 版本
+        let bridge_count = queries::bridge_count;
         assert_eq!(bridge_count(&[], 2), 0);
         assert_eq!(bridge_count(&[10], 2), 1);
         // 10,11,12 连续;12->15 与 15->18 间隙均为 3,各按 cap(bridge+1)=3 补步长
@@ -1987,16 +1918,18 @@ mod tests {
         insert_event(&conn, "2026-09-13T10:00:30+08:00", "keyboard", "input_agg", r#"{"keys":10}"#);
         // 10:07 全注入 -> 自动化
         insert_event(&conn, "2026-09-13T10:07:00+08:00", "keyboard", "input_agg", r#"{"keys":5,"injected_keys":5}"#);
-        // 混合分钟（human=8>0）-> 在场,不算自动化
+        // 混合分钟（human=8>0 且 injected=2>0）-> 同时计入在场与自动化
         insert_event(&conn, "2026-09-13T10:08:00+08:00", "keyboard", "input_agg", r#"{"keys":10,"injected_keys":2}"#);
         // 窗口切换:10:00 -> 11:00 = 60 分钟前台
         insert_event(&conn, "2026-09-13T10:00:00+08:00", "window", "switch", "");
         insert_event(&conn, "2026-09-13T11:00:00+08:00", "window", "switch", "");
         let (start, end) = queries::local_day_range("2026-09-13").unwrap();
-        let (p, a, f) = presence_metrics(&conn, &start, &end, 2).unwrap();
-        assert_eq!(a, 1, "注入分钟数 = 1");
+        let day = queries::classify_minutes(&conn, "2026-09-13", 2);
+        let f = foreground_minutes(&conn, &start, &end);
+        assert_eq!(day.automation_minutes, 2, "注入分钟 10:07 + 混合分钟 10:08 = 2");
+        assert_eq!(day.mixed_minutes, 1, "混合分钟双计，单独返回");
         // 大间隙按 dash 同款公式只补 bridge+1 步长（cap 后为 3）: 1 + 3 = 4
-        assert_eq!(p, 4, "两个在场分钟 + 间隙按 bridge 上限补步长（与 dash 口径一致）");
+        assert_eq!(day.presence_minutes, 4, "两个在场分钟 + 间隙按 bridge 上限补步长（与 dash 口径一致）");
         assert_eq!(f, 60, "前台 = 一次切换间隔 60 分钟");
     }
 
@@ -2012,17 +1945,20 @@ mod tests {
                 r#"{"keys":3}"#,
             );
         }
-        let (start, end) = queries::local_day_range("2026-09-13").unwrap();
-        let (p, a, _) = presence_metrics(&conn, &start, &end, 2).unwrap();
-        assert_eq!(a, 0);
-        assert_eq!(p, 6, "10:00-10:01 + 桥接 10:02-10:03 + 10:04-10:05 = 6 分钟");
+        let day = queries::classify_minutes(&conn, "2026-09-13", 2);
+        assert_eq!(day.automation_minutes, 0);
+        assert_eq!(day.presence_minutes, 6, "10:00-10:01 + 桥接 10:02-10:03 + 10:04-10:05 = 6 分钟");
     }
 
     #[test]
     fn presence_metrics_empty_day_is_zero() {
         let conn = setup_presence_db();
         let (start, end) = queries::local_day_range("2026-09-13").unwrap();
-        assert_eq!(presence_metrics(&conn, &start, &end, 2).unwrap(), (0, 0, 0));
+        let day = queries::classify_minutes(&conn, "2026-09-13", 2);
+        assert_eq!(
+            (day.presence_minutes, day.automation_minutes, foreground_minutes(&conn, &start, &end)),
+            (0, 0, 0)
+        );
     }
 
     // === watchdog 指数退避状态机 ===

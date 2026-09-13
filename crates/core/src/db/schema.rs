@@ -45,6 +45,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0008_events_action_idx",
         include_str!("migrations/0008_events_action_idx.sql"),
     ),
+    (
+        "0009_events_action_ts",
+        include_str!("migrations/0009_events_action_ts.sql"),
+    ),
 ];
 
 /// 0001 的内容单独导出：供 CLI 等外部工具对裸库做幂等初始化。

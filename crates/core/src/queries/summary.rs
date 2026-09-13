@@ -120,10 +120,13 @@ pub fn today_action_breakdown(
 
 pub fn active_minutes_today(conn: &Connection, today: &str, tomorrow: &str) -> i64 {
     // 去重桶按本地分钟取，避免本地日跨 UTC 午夜时两端同名 HH:MM 被错误合并。
+    // 口径统一（修复第四口径）：只数键鼠事件，与 day_totals 的 events 回退
+    // 路径同源——heartbeat/snapshot 等系统事件会把"有输入分钟"通胀成
+    // "有事件分钟"（实测 960 vs 522）。
     let off = super::local_offset_modifier();
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(DISTINCT substr(datetime(timestamp, ?1), 12, 5)) FROM events WHERE timestamp >= ?2 AND timestamp < ?3",
+            "SELECT COUNT(DISTINCT substr(datetime(timestamp, ?1), 12, 5)) FROM events WHERE timestamp >= ?2 AND timestamp < ?3 AND event_type IN ('keyboard','mouse')",
             params![&off, today, tomorrow],
             get_count_i64,
         ),

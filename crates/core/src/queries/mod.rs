@@ -27,6 +27,7 @@ use rusqlite::Row;
 mod charts;
 mod history;
 mod maintenance;
+mod presence;
 mod summary;
 
 // ─── 共享 helper（子模块通过 super:: 引用） ──────────────────────────────────
@@ -186,6 +187,7 @@ pub struct DayTotals {
 pub use charts::*;
 pub use history::*;
 pub use maintenance::*;
+pub use presence::*;
 pub use summary::*;
 
 // longest_active_streak 是纯算法（无 SQL/Connection），物理上住在 crate::time。

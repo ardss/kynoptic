@@ -78,41 +78,10 @@ pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, 
     }))
 }
 
-/// 三指标统一口径的分钟分类（overview 与 timeline 共用同一 SQL/判定）：
-/// human = 真实键鼠（keys-injected_keys + clicks-injected_clicks）> 0；
-/// auto  = 注入输入（injected_keys + injected_clicks）> 0；
-/// 混合分钟两者同时为真（同时计入 presence 与 automation）。
-/// 返回 (本地分钟桶 "YYYY-MM-DD HH:MM", human, auto)。
-fn minute_classification(
-    conn: &Connection,
-    start: &str,
-    end: &str,
-    off: &str,
-) -> std::result::Result<Vec<(String, bool, bool)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT substr(datetime(timestamp, ?1), 1, 16) AS minute_bucket, \
-                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0, \
-                    MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0 \
-             FROM events \
-             WHERE timestamp >= ?2 AND timestamp < ?3 AND event_action = 'input_agg' \
-               AND json_valid(event_data) \
-             GROUP BY minute_bucket",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, bool, bool)> = stmt
-        .query_map(params![off, start, end], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, bool>(2)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .collect();
-    Ok(rows)
-}
+// 分钟分类 / 桥接 / 单日三指标已下沉到 kynoptic-core（queries::minute_classification
+// / queries::bridge_count / queries::classify_minutes）——overview、timeline 与
+// cli presence 共用同一权威实现（人在场口径：剔注入、含点击、混合分钟双计、
+// 桥接读 settings），本 crate 不再持有副本。
 
 /// 单小时桶内的应用事件分布，top 5 + 其余归并 other。
 fn top5_with_other(mut apps: Vec<(String, i64)>) -> Vec<(String, i64)> {
@@ -128,10 +97,16 @@ fn top5_with_other(mut apps: Vec<(String, i64)>) -> Vec<(String, i64)> {
 
 /// GET /api/timeline?hours= — 近 `hours` 本地小时的事件分布，按小时桶。
 /// `now` 注入以便硬件无关测试。只含有数据的桶，桶内应用 top5 + other。
+///
+/// human_min 口径（与 overview presence 一致，权威实现 queries::minute_classification
+/// + queries::bridge_count）：`human_min` = 桥接后分钟数（向后兼容页面显示的字段名），
+/// `human_min_unbridged` = 未桥接的原始人在场分钟数，
+/// `human_min_bridged` = 桥接后分钟数（与 human_min 同值，显式字段）。
 pub fn api_timeline_at(
     conn: &Connection,
     hours: u32,
     now: DateTime<Utc>,
+    bridge_min: u32,
 ) -> std::result::Result<Value, String> {
     let hours = hours.clamp(1, 48);
     // 边界按 UTC 计算后直接用于 WHERE（timestamp 列为 UTC RFC3339）
@@ -163,17 +138,28 @@ pub fn api_timeline_at(
         .collect();
 
     // 三色分层（三指标模型）：每桶统计 人在场/自动化 的输入分钟数。
-    // 与 overview 共用 minute_classification 同一 SQL/口径。
+    // 与 overview 共用 queries::minute_classification 同一 SQL/口径（core 权威实现）。
+    // 每桶另存人在场分钟（当日分钟坐标）供桥接计算。
     let mut minute_kind: std::collections::HashMap<String, (u32, u32)> =
         std::collections::HashMap::new();
-    let mrows = minute_classification(conn, &start.to_rfc3339(), &end.to_rfc3339(), &off)?;
+    let mut human_min_of: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    let mrows = queries::minute_classification(conn, &start.to_rfc3339(), &end.to_rfc3339(), &off)?;
     for (minute_bucket, human, auto) in mrows {
         let hour_bucket = minute_bucket.replacen(' ', "T", 1)[..13].to_string();
-        let e = minute_kind.entry(hour_bucket).or_insert((0, 0));
         if human {
+            // 本地分钟桶 "YYYY-MM-DD HH:MM" -> 当日第几分钟（同一本地日内比较）
+            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&minute_bucket, "%Y-%m-%d %H:%M") {
+                human_min_of
+                    .entry(hour_bucket.clone())
+                    .or_default()
+                    .push(i64::from(t.hour()) * 60 + i64::from(t.minute()));
+            }
+            let e = minute_kind.entry(hour_bucket.clone()).or_insert((0, 0));
             e.0 += 1;
         }
         if auto {
+            let e = minute_kind.entry(hour_bucket).or_insert((0, 0));
             e.1 += 1;
         }
     }
@@ -198,7 +184,27 @@ pub fn api_timeline_at(
             .map(|(app, n)| json!({"app": app, "events": n}))
             .collect();
         let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
-        buckets.push(json!({"hour": hour, "apps": list, "human_min": human, "auto_min": auto}));
+        let unbridged = human as i64;
+        // 桥接：同一小时内的人在场分钟排序后按 bridge 阈值桥接（与 overview
+        // presence 同一权威口径 queries::bridge_count，阈值读 settings）。
+        let bridged = human_min_of
+            .get(&hour)
+            .map(|mins| {
+                let mut sorted = mins.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                queries::bridge_count(&sorted, i64::from(bridge_min.min(15)))
+            })
+            .unwrap_or(0);
+        buckets.push(json!({
+            "hour": hour,
+            "apps": list,
+            // human_min = 桥接后分钟数（字段名向后兼容页面显示）
+            "human_min": bridged,
+            "human_min_unbridged": unbridged,
+            "human_min_bridged": bridged,
+            "auto_min": auto,
+        }));
         cur += chrono::Duration::hours(1);
     }
     // DST 口径说明：本地换算用的是响应生成时刻的偏移（见 local_offset_modifier_at），
@@ -269,21 +275,7 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     })
 }
 
-/// 相邻在场分钟间隙 <= gap 分钟按在场桥接，返回桥接后的总在场分钟数
-/// （经典 afk 模型：活动重置计时器，短间隙是"读屏不敲键"）
-fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
-    if sorted_minutes.is_empty() {
-        return 0;
-    }
-    let mut total = 1i64;
-    let mut prev = sorted_minutes[0];
-    for &m in &sorted_minutes[1..] {
-        let step = (m - prev).min(gap + 1);
-        total += step.max(1);
-        prev = m;
-    }
-    total
-}
+// bridge_count 已下沉到 kynoptic-core（queries::bridge_count），dash/cli 共用。
 
 pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     let today = queries::today_local_str();
@@ -341,97 +333,24 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         h
     };
 
-    // 三指标模型（审查用户需求+语义审计；口径与 timeline 统一，共用
-    // minute_classification 同一 SQL）：
-    //   人在场 = 真实键鼠分钟（相邻分钟间隙 <= presence_bridge 分钟按"无输入阅读"桥接）
-    //   自动化 = 有注入输入的分钟数
-    //   口径统一（修复三指标矛盾）：纯人分钟计入 presence；纯自动化计入 automation；
-    //   混合分钟同时计入两者（mixed_minutes 单独返回）。判定规则：
-    //   human = keys-injected_keys + clicks-injected_clicks > 0；
-    //   auto  = injected_keys + injected_clicks > 0。
-    //   窗口切换不计时长（可能是自动化开窗），只用于前台应用归类
-    let (presence_minutes, automation_minutes, mixed_minutes, first_presence, last_presence) = {
-        let mut human: Vec<i64> = Vec::new();
-        let mut automation: Vec<i64> = Vec::new();
-        let mut mixed: i64 = 0;
-        let mut first_min: Option<String> = None;
-        let mut last_min: Option<String> = None;
-        // 本地分钟桶 "YYYY-MM-DD HH:MM" -> 当日第几分钟
-        let minute_of_day = |mb: &str| -> Option<i64> {
-            chrono::NaiveDateTime::parse_from_str(mb, "%Y-%m-%d %H:%M")
-                .ok()
-                .map(|t| i64::from(t.hour()) * 60 + i64::from(t.minute()))
-        };
-        let fmt_hm = |mb: &str| -> Value {
-            chrono::NaiveDateTime::parse_from_str(mb, "%Y-%m-%d %H:%M")
-                .map(|t| Value::from(t.format("%H:%M").to_string()))
-                .unwrap_or(Value::Null)
-        };
-        let off = local_offset_modifier_at(Utc::now());
-        if let Ok(mrows) = minute_classification(conn, &start, &end, &off) {
-            for (mb, human_hit, auto_hit) in mrows {
-                let mod_ = minute_of_day(&mb);
-                if human_hit {
-                    if let Some(m) = mod_ {
-                        human.push(m);
-                    }
-                    if first_min.is_none() {
-                        first_min = Some(mb.clone());
-                    }
-                    last_min = Some(mb.clone());
-                }
-                if auto_hit {
-                    if let Some(m) = mod_ {
-                        automation.push(m);
-                    }
-                    if human_hit {
-                        mixed += 1;
-                    }
-                }
-            }
-        }
-        // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算。
-        // 这里 substr 出的是 UTC 分钟串 "YYYY-MM-DDTHH:MM"，需转本地再取当日分钟。
-        let minute_of_day_utc = |minute_str: &str| -> Option<i64> {
-            use chrono::TimeZone;
-            chrono::NaiveDateTime::parse_from_str(minute_str, "%Y-%m-%dT%H:%M")
-                .ok()
-                .map(|t| {
-                    let l = Local.from_utc_datetime(&t);
-                    i64::from(l.hour()) * 60 + i64::from(l.minute())
-                })
-        };
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT DISTINCT substr(timestamp,1,16) FROM events              WHERE event_action IN ('press','click')                AND timestamp >= ?1 AND timestamp < ?2",
-        ) {
-            let rows = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0));
-            if let Ok(rows) = rows {
-                for minute_str in rows.flatten() {
-                    if let Some(m) = minute_of_day_utc(&minute_str) {
-                        human.push(m);
-                    }
-                }
-            }
-        }
-        // 桥接：排序去重后，相邻在场分钟间隙 <= 桥接阈值（缺失 1-(bridge-1) 分钟）
-        // 按"无输入阅读"计入在场。跑段累计覆盖分钟数。
-        human.sort_unstable();
-        human.dedup();
-        automation.sort_unstable();
-        automation.dedup();
-        // 桥接阈值可配置（审查 DeepSeek：默认 2 分钟，用户可在设置页调 0-15）
-        let bridge = (s.presence_bridge_minutes.min(15)) as i64;
-        let presence = bridge_count(&human, bridge);
-        (
-            presence,
-            automation.len() as i64,
-            mixed,
-            first_min.as_deref().map(fmt_hm).unwrap_or(Value::Null),
-            last_min.as_deref().map(fmt_hm).unwrap_or(Value::Null),
-        )
-    };
+    // 三指标模型：权威口径已下沉到 kynoptic-core（queries::classify_minutes，
+    // 单一实现；判定 human = keys-injected_keys + clicks-injected_clicks > 0，
+    // auto = injected_keys + injected_clicks > 0，混合分钟双计，桥接读 settings）。
+    // 窗口切换不计时长（可能是自动化开窗），只用于前台应用归类。
+    let presence_day = queries::classify_minutes(conn, &today, s.presence_bridge_minutes);
+    let presence_minutes = presence_day.presence_minutes;
+    let automation_minutes = presence_day.automation_minutes;
+    let mixed_minutes = presence_day.mixed_minutes;
+    let first_presence = presence_day
+        .first_activity
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let last_presence = presence_day
+        .last_activity
+        .map(Value::from)
+        .unwrap_or(Value::Null);
 
-    // 今日前台应用时长（窗口切换间隔推算，单段上限 30 分钟；三指标之三）
+    // 今日前台应用时长（窗口切换间隔推算；不封顶：连续 N 小时就是 N 小时）
     let mut fg_dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT timestamp, COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') FROM events          WHERE event_type = 'window' AND event_action = 'switch'            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
@@ -852,10 +771,44 @@ pub fn api_input_at(
 }
 
 /// GET /api/insights — 从原始数据挖掘叙事式发现（审查用户理念：
+/// insights 缓存命中计数（api_insights / insights_cache_hits 共享）。
+static INSIGHTS_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 数据是矿石，洞察才是金子）。全部基于已有键鼠/窗口事件，零新增采集。
 /// `bridge_minutes`：连续性间隙阈值（分钟），读 settings 的 presence_bridge，
 /// 与 overview/report 的"连续性"口径一致。
+///
+/// 60 秒 TTL 缓存（审查 P2：单次全量重算 ~34ms，每次面板刷新都付）。
+/// 结果与 `bridge_minutes` 一起缓存；命中时不触碰数据库，响应内容不变。
+/// 命中计数经 [`insights_cache_hits`] 暴露，供测试与观测。
 pub fn api_insights(conn: &Connection, bridge_minutes: u32) -> Value {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, u32, Value)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(60);
+    {
+        let g = CACHE.lock().ok();
+        if let Some(c) = g.as_ref().and_then(|g| g.as_ref()) {
+            if c.1 == bridge_minutes && c.0.elapsed() < TTL {
+                INSIGHTS_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return c.2.clone();
+            }
+        }
+    }
+    let v = insights_compute(conn, bridge_minutes);
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((Instant::now(), bridge_minutes, v.clone()));
+    }
+    v
+}
+
+/// 测试/观测用：api_insights 缓存命中次数。
+pub fn insights_cache_hits() -> u64 {
+    INSIGHTS_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// insights 的实际计算（无缓存）。见 [`api_insights`]。
+fn insights_compute(conn: &Connection, bridge_minutes: u32) -> Value {
     let bridge_minutes = bridge_minutes.clamp(0, 15);
     let gap_secs = i64::from(bridge_minutes) * 60;
     // 窗口 = 6 天前零点 -> 现在（踩坑：local_day_range(date-6) 的 end 是
@@ -1208,9 +1161,7 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
         .unwrap_or_default();
     let daily: Vec<Value> = rows
         .iter()
-        .map(|(d, k, c, m)| {
-            json!({"date": d, "keys": k, "clicks": c, "active_minutes": m, "presence_minutes": m})
-        })
+        .map(|(d, k, c, m)| json!({"date": d, "keys": k, "clicks": c, "active_minutes": m}))
         .collect();
     let sum7 = |offset: usize| -> (i64, i64, i64) {
         let n = rows.len();
@@ -1226,15 +1177,18 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
     // 前端显示"上周数据不足，已跳过对比"而非误导性增长率
     let last_week_days = rows.len().saturating_sub(7).min(7);
     let last_week = if last_week_days >= 3 {
-        json!({"keys": k0, "clicks": c0, "active_minutes": m0, "presence_minutes": m0})
+        json!({"keys": k0, "clicks": c0, "active_minutes": m0})
     } else {
         json!(null)
     };
     json!({
         "daily": daily,
-        "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1, "presence_minutes": m1},
+        "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1},
         "last_week": last_week,
-        "presence_minutes_note": "presence_minutes 与 active_minutes 同值的别名（口径：每日有键鼠输入的分钟数，来自 daily_agg 派生缓存）；旧字段保留兼容 / alias of active_minutes, kept for compatibility",
+        // 修复"人在场"假别名（第四口径）：曾经的 presence_minutes = active_minutes
+        // 冒充在场（含注入、不桥接）。active_minutes 是 raw 输入口径（daily_agg
+        // 派生缓存）；真正的"人在场"权威口径请看 /api/overview。
+        "note": "active_minutes 为 raw 输入分钟口径（每日有键鼠输入的分钟数，来自 daily_agg 派生缓存，不剔注入、不桥接）；人在场（human presence）请看 /api/overview / active_minutes is the raw input-minute metric (from the daily_agg cache, not injected-filtered, not bridged); for human presence see /api/overview",
     })
 }
 
@@ -1587,7 +1541,9 @@ pub fn route_req(
             let hours = qval("hours")
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(12);
-            match api_timeline_at(conn, hours, Utc::now()) {
+            // 桥接阈值读 settings（与 overview presence 同一口径源）
+            let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
+            match api_timeline_at(conn, hours, Utc::now(), bridge) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
             }
@@ -1812,6 +1768,9 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
             .name("dash-conn".into())
             .spawn(move || {
                 let _guard = InflightGuard(&inflight_inner);
+                // TCP_NODELAY（审查：偶发 5-20s 长尾候选因素——小 HTTP 响应
+                // 遭 Nagle+延迟 ACK 相互等待）。
+                let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
                 if let Err(e) = handle_client(stream, shared_inner.as_ref(), &db_owned, bound) {
@@ -1964,6 +1923,35 @@ fn http_simple(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+#[cfg(test)]
+mod insights_cache_test {
+    use super::*;
+
+    /// api_insights 60 秒 TTL 缓存：第二次调用命中缓存（计数 +1）且结果一致。
+    /// bridge_minutes 用 3/4，避开 tests.rs 用例的 2，防止共享缓存串台。
+    #[test]
+    fn insights_cache_hits_on_second_call() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+        let _ = kynoptic_core::db::run_migrations(&conn);
+        for _ in 0..51 {
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,'keyboard','press',NULL,NULL,NULL,NULL)",
+                params!["2026-06-15T09:00:00+00:00"],
+            )
+            .unwrap();
+        }
+        let before = insights_cache_hits();
+        let v1 = api_insights(&conn, 3);
+        let v2 = api_insights(&conn, 3);
+        assert_eq!(v1, v2, "两次调用结果应一致");
+        assert_eq!(insights_cache_hits(), before + 1, "第二次调用应命中缓存");
+        // bridge 变了则不命中旧缓存（重算，计数不变）
+        let _ = api_insights(&conn, 4);
+        assert_eq!(insights_cache_hits(), before + 1);
+    }
 }
 
 #[cfg(test)]
