@@ -1692,7 +1692,9 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        let guard = InflightGuard(&inflight);
+        // 名额只在闭包内归还（guard 语义：任何退出路径都 fetch_sub）。
+        // 不可在 accept 循环里再建一个守卫——它在每轮迭代末 Drop，
+        // 等于每个连接归还两次，计数下溢后永久 503。
         let spawned = std::thread::Builder::new()
             .name("dash-conn".into())
             .spawn(move || {
@@ -1704,8 +1706,8 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 }
             });
         if spawned.is_err() {
-            // spawn 失败：guard 立即 Drop 归还名额，否则累计 64 次后永久 503
-            drop(guard);
+            // spawn 失败：闭包从未运行，直接归还名额
+            inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     Ok(())
