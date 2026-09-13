@@ -207,7 +207,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_timeline",
-            "description": "应用/窗口时间线段落（前台应用占用段，仅返回应用名 app_name，空名记为 (unknown)；不含窗口标题全文）",
+            "description": "应用/窗口时间线段落（前台应用占用段，返回应用名，应用名为空时回退返回窗口标题（本地数据完整优先），两者皆空记为 (unknown)）",
             "inputSchema": {
                 "type": "object",
                 "properties": {

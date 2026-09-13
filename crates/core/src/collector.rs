@@ -81,11 +81,11 @@ pub struct CollectorSettings {
     /// writer 小批 flush 间隔秒数（默认 30s）。数值是"落库最大延迟"与
     /// "每提交 WAL 页开销主导的磁盘足迹"之间的权衡，仍在校准中。
     pub write_flush_interval_secs: u64,
-    /// per-key（VK）键频记录开关（默认 false，隐私默认关闭）。
+    /// per-key（VK）键频记录开关（默认 true：本地数据完整优先）。
     ///
-    /// true 时 input_agg 的 keyboard 行带 `vk` 频次 map（WhatPulse 式热力图
-    /// 数据源）；false 时只累计 keys 总数，`vk` map 输出为空。关闭理由：
-    /// per-key 频次配合窗口标题可对密码输入模式做统计推断。
+    /// true（默认）时 input_agg 的 keyboard 行带 `vk` 频次 map（WhatPulse 式
+    /// 热力图数据源，只存每键次数不存内容）；false 为显式 opt-out，只累计
+    /// keys 总数，`vk` map 输出为空。
     ///
     /// 接线点（由 tray/CLI 侧代理完成）：设置界面 / CLI flag 读写此字段，
     /// 字段名 `vk_frequency_enabled`，经 `CollectorSettings` 传入
@@ -98,7 +98,7 @@ impl Default for CollectorSettings {
         Self {
             input_granularity: InputGranularity::default(),
             write_flush_interval_secs: constants::WRITE_FLUSH_INTERVAL_SECS,
-            vk_frequency_enabled: false,
+            vk_frequency_enabled: true,
         }
     }
 }
@@ -447,7 +447,7 @@ pub fn start_collection_custom(
     // 输入粒度：minute 模式下 Hook 回调退化为原子计数，由独立聚合线程每秒
     // drain 并按分钟折叠成 input_agg 事件入队（见 input_agg 模块文档）。
     input_agg::reset();
-    // per-key 频次隐私开关（默认 false）：必须在 activate/reset 之后、Hook
+    // per-key 频次开关（默认 true）：必须在 activate/reset 之后、Hook
     // 启动之前设置，保证本会话从第一个键事件起口径一致。
     input_agg::set_vk_enabled(settings.vk_frequency_enabled);
     let minute_mode = settings.input_granularity == InputGranularity::Minute;

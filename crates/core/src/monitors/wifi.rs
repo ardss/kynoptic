@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::NetworkManagement::WiFi::{
-    wlan_intf_opcode_current_connection, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
-    WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+    wlan_intf_opcode_current_connection, wlan_interface_state_connected, WlanCloseHandle,
+    WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
+    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
 };
 
 pub struct WifiMonitor {
@@ -108,23 +109,30 @@ fn query_wifi_native() -> Option<WifiInfo> {
                 ) == ERROR_SUCCESS as u32
                     && !data.is_null()
                 {
+                    // P1 修复：查询成功不等于已连接。旧实现只要 WlanQueryInterface
+                    // 返回成功就硬编码 "connected"，接口断开时也报连接态（SSID
+                    // 残留上次的）。必须检查 attrs.isState。
                     let attrs = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
-                    let assoc = &attrs.wlanAssociationAttributes;
-                    let ssid_len = assoc.dot11Ssid.uSSIDLength as usize;
-                    let ssid: String = String::from_utf8_lossy(
-                        &assoc.dot11Ssid.ucSSID[..ssid_len.min(32)],
-                    )
-                    .into_owned();
-                    // wlanSignalQuality 为 0-100 的信号强度百分比
-                    result = Some(WifiInfo {
-                        state: "connected".to_string(),
-                        ssid,
-                        signal: format!("{}%", assoc.wlanSignalQuality),
-                        speed: String::new(),
-                    });
+                    if attrs.isState == wlan_interface_state_connected {
+                        let assoc = &attrs.wlanAssociationAttributes;
+                        let ssid_len = assoc.dot11Ssid.uSSIDLength as usize;
+                        let ssid: String = String::from_utf8_lossy(
+                            &assoc.dot11Ssid.ucSSID[..ssid_len.min(32)],
+                        )
+                        .into_owned();
+                        // wlanSignalQuality 为 0-100 的信号强度百分比
+                        result = Some(WifiInfo {
+                            state: "connected".to_string(),
+                            ssid,
+                            signal: format!("{}%", assoc.wlanSignalQuality),
+                            speed: String::new(),
+                        });
+                        WlanFreeMemory(data as *const _);
+                        connected = true;
+                        break; // 取第一个已连接接口即可
+                    }
+                    // 未连接的接口：释放后继续看下一个接口（多网卡场景）
                     WlanFreeMemory(data as *const _);
-                    connected = true;
-                    break; // 取第一个已连接接口即可
                 }
             }
             WlanFreeMemory(list as *const _);
@@ -218,5 +226,13 @@ There is 1 interface on the system:
     fn parse_wifi_empty() {
         let info = parse_wifi_interfaces("");
         assert_eq!(info, WifiInfo::default());
+    }
+
+    /// P1 修复的语义锚点：isState==1(wlan_interface_state_connected) 才算
+    /// 已连接。防止常量值被误改导致 connected/disconnected 判断反转。
+    #[test]
+    fn connected_state_constant_is_1() {
+        assert_eq!(wlan_interface_state_connected, 1);
+        assert_ne!(wlan_interface_state_connected, 3); // 3 = disconnected
     }
 }

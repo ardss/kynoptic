@@ -339,8 +339,8 @@ fn settings_get_returns_registry_and_defaults() {
     assert_eq!(v["enabled_monitors"].as_array().unwrap().len(), 14);
     assert!(v["autostart"].is_boolean());
     assert!(monitors[0]["sensitivity"].is_string());
-    // 隐私默认：每键频次采集默认关闭
-    assert_eq!(v["vk_frequency_enabled"], json!(false));
+    // 本地数据完整优先：每键频次采集默认开启
+    assert_eq!(v["vk_frequency_enabled"], json!(true));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -420,23 +420,24 @@ fn settings_post_vk_frequency_bool_and_audit_log() {
         &db,
     );
     assert_eq!(code, 400);
-    // 实际变更 → 200 + GET 回读 true + 审计行（旧→新，无 categories 全文）
+    // 实际变更（默认 true → 显式 opt-out false）→ 200 + GET 回读 false + 审计行
+    // （旧→新，无 categories 全文）
     let (code, _, out) = route_req(
         &mem_conn(),
         "POST",
         "/api/settings",
-        r#"{"vk_frequency_enabled":true}"#,
+        r#"{"vk_frequency_enabled":false}"#,
         &db,
     );
     assert_eq!(code, 200, "{out}");
     let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
     let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["vk_frequency_enabled"], json!(true));
+    assert_eq!(v["vk_frequency_enabled"], json!(false));
     let log = std::fs::read_to_string(&audit).unwrap();
     assert_eq!(log.lines().count(), 1, "一次实际变更一行审计: {log}");
     let line = log.lines().next().unwrap();
     assert!(line.contains("vk_frequency_enabled"), "{log}");
-    assert!(line.contains("[false,true]"), "旧值→新值: {log}");
+    assert!(line.contains("[true,false]"), "旧值→新值: {log}");
     assert!(!line.contains("pattern"), "不得落 categories 全文: {log}");
     assert!(line.len() <= 512 + 1, "单行截断 512 字节: {log}");
     // RFC3339 时间戳前缀
@@ -447,7 +448,7 @@ fn settings_post_vk_frequency_bool_and_audit_log() {
         &mem_conn(),
         "POST",
         "/api/settings",
-        r#"{"vk_frequency_enabled":true}"#,
+        r#"{"vk_frequency_enabled":false}"#,
         &db,
     );
     assert_eq!(code, 200);

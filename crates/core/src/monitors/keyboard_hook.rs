@@ -88,6 +88,13 @@ extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 
+/// 取出静态槽位中的 Sender（取出即从槽位移走，drop 时通道断开）。
+/// stop() 与测试共用：channel Disconnected 是 collector writer join 的唯一
+/// 退出条件（见 collector::writer_loop），所以关停必须让 sender 真正 drop。
+fn take_kb_tx() -> Option<Sender<Event>> {
+    KB_TX.lock().ok().and_then(|mut g| g.take())
+}
+
 pub struct KeyboardHook;
 
 impl Default for KeyboardHook {
@@ -142,5 +149,43 @@ impl EventHook for KeyboardHook {
                 PostThreadMessageW(tid, WM_QUIT, 0, 0);
             }
         }
+        // P0 关停挂死修复：仅 PostThreadMessageW(WM_QUIT) 只结束 hook 线程，
+        // 静态槽里的 Sender 若不 drop，channel 永不 Disconnected，collector
+        // writer 的 join 会永久阻塞（writer 只认通道断开）。取出并 drop。
+        // 顺序安全：先 Post 再 take，回调里短命 clone 的发送走 send_event 的
+        // Disconnected 分支，不会报错。
+        let _ = take_kb_tx();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// stop 的核心语义：静态槽位中的 Sender 被 take 走并 drop 后，通道必须
+    /// 进入 Disconnected（recv 返回断开、send 返回错误）。用注入的 channel
+    /// 直接驱动 take_kb_tx 的生命周期，不依赖真实 Win32 hook。
+    #[test]
+    fn stop_takes_sender_and_disconnects_channel() {
+        let (tx, rx) = crossbeam_channel::bounded::<Event>(1);
+        if let Ok(mut g) = KB_TX.lock() {
+            *g = Some(tx.clone());
+        }
+
+        // 模拟 stop() 的取回动作
+        let taken = take_kb_tx();
+        assert!(taken.is_some(), "stop 必须能取回槽位中的 Sender");
+        assert!(
+            KB_TX.lock().unwrap().is_none(),
+            "stop 后静态槽位必须为空（可重启语义不变）"
+        );
+
+        // 所有 Sender clone 全部 drop 后，接收端必须看到 Disconnected
+        drop(taken);
+        drop(tx);
+        assert!(
+            matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)),
+            "sender drop 后通道必须 Disconnected，否则 writer join 永久阻塞"
+        );
     }
 }

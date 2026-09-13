@@ -54,7 +54,7 @@ const USAGE: &str = "kynoptic-ctl <subcommand> [options]
 Subcommands:
   collect   [--db PATH] [--all]             Run the collector (Ctrl+C to stop)
   stats     [--date YYYY-MM-DD] [--days N]   Show summary stats
-  export    [--days N] [--format csv|json|jsonl] [--out PATH] [--raw]
+  export    [--days N] [--format csv|json|jsonl] [--out PATH] [--redact]
   report    [--date YYYY-MM-DD] [--save PATH]   Generate Markdown report
   db        [stats|cleanup [N]|vacuum|checkpoint]   DB maintenance
   analyze   [--date YYYY-MM-DD]                Focus/fragment/anomaly report
@@ -70,11 +70,55 @@ Subcommands:
   update                                      Self-update from GitHub releases
   watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary
+
+Global options (all subcommands unless noted):
+  --db PATH   Explicit db path, overrides the default resolution. When absent, \
+the resolved default path is printed to stderr as \"using db: <path>\". \
+(dashboard keeps its own --db handling)
 ";
 
+/// 全局 --db 覆盖（审查 P2 修复）：main 里从参数摘出后写入，resolve_db()
+/// 优先使用。缺 --db 时所有子命令都会静默落到 resolve_db_path() 的默认推导，
+/// 曾实测裸跑 `export` 解析到 target/release/data 下陈旧库、导出 0 行不报错。
+static DB_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn set_db_override(p: PathBuf) {
+    if let Ok(mut g) = DB_OVERRIDE.lock() {
+        *g = Some(p);
+    }
+}
+
+/// 从参数中摘出 `--db <PATH>`（成对消费，允许多次出现取最后一次）。
+/// dashboard 子命令自带 --db 解析，main 里对它跳过本函数。
+fn extract_global_db(args: &mut Vec<String>) -> Result<()> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--db" {
+            let val = args
+                .get(i + 1)
+                .cloned()
+                .ok_or_else(|| Error::InvalidData("--db 需要路径".into()))?;
+            args.drain(i..=i + 1);
+            set_db_override(PathBuf::from(val));
+            // 不 i += 1：继续检查同一位置（防 "--db --db x" 之类的畸形输入死循环也无所谓，drain 已消费）
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_db() -> PathBuf {
+    // 显式 --db 优先
+    if let Some(p) = DB_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        return p;
+    }
     // 复用 core 的统一路径解析逻辑，与主应用保持一致（exe 同级优先，cwd 兜底）。
-    kynoptic_core::db::resolve_db_path()
+    let p = kynoptic_core::db::resolve_db_path();
+    // 静默变可见：走默认推导时把实际使用的库路径打到 stderr，防止"操作了
+    // 陈旧库却以为在操作生产库"类误判（审查 P2 实测案例）。
+    eprintln!("using db: {}", p.display());
+    p
 }
 
 fn open_db(path: &Path) -> Result<Connection> {
@@ -157,7 +201,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
     let mut days: i64 = 7;
     let mut format = "csv".to_string();
     let mut out = String::new();
-    let mut raw = false;
+    let mut redact = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -173,8 +217,11 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 i += 1;
                 out = args.get(i).cloned().unwrap_or_default();
             }
-            // --raw：保留 window_title 原文（默认脱敏：剥离含 http 片段的 URL 查询串）
-            "--raw" => raw = true,
+            // --redact（opt-in）：剥离含 http 片段的 URL 查询串。默认输出
+            // window_title 完整原文——本地数据完整优先，导出即备份原文。
+            "--redact" => redact = true,
+            // 历史兼容：旧 --raw 语义（保留原文）即现在的默认行为，接受但不做事
+            "--raw" => {}
             _ => {}
         }
         i += 1;
@@ -201,13 +248,13 @@ fn cmd_export(args: &[String]) -> Result<()> {
     }
     let out_path = PathBuf::from(&out);
 
-    // window_title 默认脱敏（--raw 保留原文）
+    // window_title 默认输出原文（本地数据完整优先）；--redact 显式开启才剥查询串
     let title_out = |t: &Option<String>| -> String {
         let t = t.clone().unwrap_or_default();
-        if raw {
-            t
-        } else {
+        if redact {
             sanitize_window_title(&t)
+        } else {
+            t
         }
     };
 
@@ -308,7 +355,7 @@ fn default_export_dir(db_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("exports"))
 }
 
-/// URL 查询串剥离（默认脱敏）：仅处理含 "http" 的片段，去掉第一个 `?`
+/// URL 查询串剥离（--redact 时启用）：仅处理含 "http" 的片段，去掉第一个 `?`
 /// 及其后的全部内容（查询串常带 token/session id 等敏感参数）。
 fn sanitize_url_query(token: &str) -> String {
     if token.contains("http") {
@@ -321,8 +368,8 @@ fn sanitize_url_query(token: &str) -> String {
     }
 }
 
-/// window_title 默认脱敏：按空白分片，只对含 http 的片段剥查询串，
-/// 其余片段原样保留。
+/// window_title 脱敏（--redact opt-in）：按空白分片，只对含 http 的片段剥
+/// 查询串，其余片段原样保留。
 fn sanitize_window_title(title: &str) -> String {
     title
         .split_whitespace()
@@ -485,6 +532,18 @@ fn cmd_db(args: &[String]) -> Result<()> {
                 }
             }
             let days = days_arg.unwrap_or(90);
+            // 铁律（e2e C1）：cleanup 0 不得删除任何东西。retention = 0 的语义是
+            // "永不清理"，与 core 侧 DEFAULT_RETENTION_DAYS=0 及 Database::maintenance()
+            // 的日常路径同源（见 crates/core/tests/cleanup_law_test.rs：retention 0
+            // 时 maintenance 后各表行数不变）。旧实现 days=0 仍会执行
+            // delete_closed_sessions_before(now)，把全部已关闭 sessions 删光
+            // （实测 57 → 2）。days<=0（含负数，cutoff 会落到未来更危险）一律 no-op。
+            if days <= 0 {
+                println!(
+                    "✓ cleanup {days}: 保留天数 0 表示永不清理, 未删除任何数据"
+                );
+                return Ok(());
+            }
             if with_events && days < 30 {
                 return Err(Error::InvalidData(
                     "删除原始事件被拒绝: 天数必须 >= 30 且显式带 --yes".into(),
@@ -1337,7 +1396,16 @@ fn load_watchdog_state() -> WatchdogState {
 
 fn save_watchdog_state(st: &WatchdogState) {
     if let Ok(json) = serde_json::to_string(st) {
-        let _ = std::fs::write(watchdog_state_path(), json);
+        let path = watchdog_state_path();
+        // P1 原子写修复：先写 .tmp 再 rename 原子替换。旧实现直接 fs::write
+        // 覆盖，进程被杀/断电时可能留下半截 JSON——load 侧虽有缺省兜底，
+        // 但失败计数/退避窗口会凭空清零，熔断可被"写坏状态文件"绕过。
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            return;
+        }
+        // 原子替换失败（tmp 写失败/rename 失败）兜底：尽力直接写（尽力而为语义不变）
+        let _ = std::fs::write(&path, json);
     }
 }
 
@@ -1631,31 +1699,42 @@ fn csv_cell(v: &str) -> String {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
-    let result: Result<()> = match sub {
-        "collect" => cmd_collect(&args[1..]),
-        "stats" => cmd_stats(&args[1..]),
-        "export" => cmd_export(&args[1..]),
-        "report" => cmd_report(&args[1..]),
-        "db" => cmd_db(&args[1..]),
-        "analyze" => cmd_analyze(&args[1..]),
-        "ghost" => cmd_ghost(),
-        "autostart" => cmd_autostart(&args[1..]),
-        "migrate" => cmd_migrate(&args[1..]),
-        "now" => cmd_now(&args[1..]),
-        "query" => cmd_query(&args[1..]),
-        "mcp" => cmd_mcp(),
-        "probe" => cmd_probe(&args[1..]),
-        "dashboard" => dashboard::cmd_dashboard(&args[1..]),
-        "update" => update::cmd_update(&args[1..]),
-        "watchdog" => cmd_watchdog(&args[1..]),
-        "presence" => cmd_presence(&args[1..]),
-        "help" | "-h" | "--help" => {
-            print!("{}", USAGE);
-            Ok(())
-        }
-        other => Err(Error::InvalidData(format!(
-            "未知子命令: {other}\n\n{USAGE}"
-        ))),
+    // 全局 --db（审查 P2）：所有子命令可用，摘出后写入 DB_OVERRIDE 覆盖
+    // resolve_db()。dashboard 自带 --db 解析，保持原样跳过。
+    let mut rest: Vec<String> = args.iter().skip(1).cloned().collect();
+    let db_parsed = if sub == "dashboard" {
+        Ok(())
+    } else {
+        extract_global_db(&mut rest)
+    };
+    let result: Result<()> = match db_parsed {
+        Err(e) => Err(e),
+        Ok(()) => match sub {
+            "collect" => cmd_collect(&rest),
+            "stats" => cmd_stats(&rest),
+            "export" => cmd_export(&rest),
+            "report" => cmd_report(&rest),
+            "db" => cmd_db(&rest),
+            "analyze" => cmd_analyze(&rest),
+            "ghost" => cmd_ghost(),
+            "autostart" => cmd_autostart(&rest),
+            "migrate" => cmd_migrate(&rest),
+            "now" => cmd_now(&rest),
+            "query" => cmd_query(&rest),
+            "mcp" => cmd_mcp(),
+            "probe" => cmd_probe(&rest),
+            "dashboard" => dashboard::cmd_dashboard(&rest),
+            "update" => update::cmd_update(&rest),
+            "watchdog" => cmd_watchdog(&rest),
+            "presence" => cmd_presence(&rest),
+            "help" | "-h" | "--help" => {
+                print!("{}", USAGE);
+                Ok(())
+            }
+            other => Err(Error::InvalidData(format!(
+                "未知子命令: {other}\n\n{USAGE}"
+            ))),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1669,6 +1748,31 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === 全局 --db ===
+
+    #[test]
+    fn extract_global_db_consumes_pair_and_sets_override() {
+        let mut a: Vec<String> = ["--days", "3", "--db", "x/y.db", "--json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        extract_global_db(&mut a).unwrap();
+        assert_eq!(
+            a,
+            vec!["--days".to_string(), "3".to_string(), "--json".to_string()]
+        );
+        assert_eq!(
+            DB_OVERRIDE.lock().unwrap().as_ref(),
+            Some(&PathBuf::from("x/y.db")),
+            "--db 值必须写入全局覆盖"
+        );
+        // 缺路径：报错，不静默
+        let mut b: Vec<String> = vec!["--db".to_string()];
+        assert!(extract_global_db(&mut b).is_err());
+        // 清理全局状态，避免影响其他用例
+        *DB_OVERRIDE.lock().unwrap() = None;
+    }
 
     // === parse_when ===
 
@@ -2037,8 +2141,10 @@ mod tests {
         assert_eq!(rotated_log_path(Path::new("watchdog.log")), PathBuf::from("watchdog.log.old"));
     }
 
-    // === export 脱敏与缺省目录 ===
+    // === export 脱敏（--redact opt-in）与缺省目录 ===
 
+    // 默认导出 window_title 原文（不脱敏）；sanitize_window_title 仅在显式
+    // --redact 时被调用。本测试锁定 opt-in 脱敏函数本身的语义。
     #[test]
     fn sanitize_window_title_strips_query_only_for_http_fragments() {
         // 含 http 的片段：剥掉 ? 及之后

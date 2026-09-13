@@ -129,9 +129,12 @@ harness in this repo (full methodology and raw numbers in
 - **Keyboard and mouse are stored as per-minute counts only — never key
   contents, key order, or timing.** The dashboard keyboard heatmap uses
   per-key frequency counts (how many times each key was pressed), which are
-  aggregate statistics, not content. Full per-key detail is off by default
-  and can be enabled explicitly in settings. This boundary is the core of
-  what separates Kynoptic from spyware, and it is the default mode stores only counts; see the privacy note above.
+  aggregate statistics, not content. Per-key frequency is **on by default**
+  (local data completeness first) and can be disabled explicitly in settings
+  as an opt-out. Export writes `window_title` verbatim by default; pass
+  `--redact` to strip URL query strings from titles. Privacy hardening is
+  always available as a switch, but never at the cost of silently dropping
+  local data — if you share exports outside the machine, you own the risk.
 - Aggregates are derived caches; the raw event log is append-only.
 - Deleting anything is opt-in and off by default; schema migrations archive
   tables by renaming instead of dropping.

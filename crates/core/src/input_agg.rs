@@ -25,13 +25,13 @@ use crate::types::{Event, EventAction, EventType};
 
 static MINUTE_MODE: AtomicBool = AtomicBool::new(false);
 
-/// per-key（VK）键频记录开关（隐私默认关闭）。
+/// per-key（VK）键频记录开关（默认开启：本地数据完整优先）。
 ///
-/// 默认 false：record_key_vk 只更新 keys 总数等计数，不写 per-key 原子表。
-/// 关闭理由：per-key 频次配合窗口标题可对密码输入模式做统计推断（P1 隐私）。
-/// 需要键盘热力图的用户经 [`crate::collector::CollectorSettings::vk_frequency_enabled`]
-/// 显式开启（tray/CLI 接线由对应侧完成）。
-static VK_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 默认 true：record_key_vk 同时累计 per-key 原子表（WhatPulse 式键盘热力图
+/// 数据源）。只存"每个键按了多少次"，不存内容、顺序、时间戳。
+/// 对隐私敏感的用户可经 [`crate::collector::CollectorSettings::vk_frequency_enabled`]
+/// 显式关闭（tray/CLI 接线由对应侧完成）——是 opt-out，不是 opt-in。
+static VK_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// 开/关 per-key 键频记录。采集器启动时按设置调用一次；
 /// 运行中切换也安全（关停即刻停止累计，已累计值会在下轮 drain 清零）。
@@ -124,8 +124,8 @@ pub fn record_key_vk(vk: u32, injected: bool) {
     if injected {
         INJECTED_KEYS.fetch_add(1, Ordering::Relaxed);
     }
-    // 隐私开关（默认关）：per-key 频次只在显式 opt-in 后累计。keys 总数、
-    // samples、injected 计数不受影响——APM/活跃分钟等计数语义完整保留。
+    // per-key 开关（默认开）：显式 opt-out 后不累计。keys 总数、samples、
+    // injected 计数不受开关影响——APM/活跃分钟等计数语义完整保留。
     if vk_enabled() && (vk as usize) < 256 {
         VK[vk as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -399,9 +399,9 @@ pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
 /// 重置全部聚合状态（采集器启动/重启时调用，避免跨会话串数）。
 pub fn reset() {
     set_minute_mode(false);
-    // per-key 开关一并复位（隐私默认关闭；采集器启动路径 reset 后会按
-    // CollectorSettings.vk_frequency_enabled 重新设置）
-    set_vk_enabled(false);
+    // per-key 开关一并复位到默认开启（本地数据完整优先）；采集器启动路径
+    // reset 后会按 CollectorSettings.vk_frequency_enabled 重新设置
+    set_vk_enabled(true);
     drain_atomics();
     for c in VK.iter() {
         c.store(0, Ordering::Relaxed);
@@ -630,8 +630,8 @@ mod tests {
     fn per_key_and_button_counts_roll_up() {
         let _g = guard();
         reset();
-        // per-key 频次默认关闭（隐私），本测试断言其开启路径，须显式开启
-        set_vk_enabled(true);
+        // per-key 频次默认开启（reset 后即为 true），无需显式设置
+        assert!(vk_enabled(), "per-key 频次默认必须开启");
         record_key_vk(65, false); // A
         record_key_vk(65, false);
         record_key_vk(66, false); // B
@@ -670,13 +670,14 @@ mod tests {
         assert_eq!(d.get("clicks_right").and_then(|v| v.as_u64()), Some(0));
     }
 
-    /// P1 隐私：per-key 频次默认必须关闭——keys 总数照常累计（计数语义不
-    /// 变），但 vk map 输出为空。开启路径见 per_key_and_button_counts_roll_up。
+    /// opt-out 路径：显式关闭后 keys 总数照常累计（计数语义不变），
+    /// 但 vk map 输出为空。默认开启路径见 per_key_and_button_counts_roll_up。
     #[test]
-    fn vk_frequency_disabled_by_default() {
+    fn vk_frequency_empty_when_explicitly_disabled() {
         let _g = guard();
-        reset(); // reset 保证回到默认关闭
-        assert!(!vk_enabled(), "per-key 频次默认必须关闭");
+        reset(); // reset 回到默认开启
+        set_vk_enabled(false); // 显式关闭（opt-out）
+        assert!(!vk_enabled(), "显式关闭后必须停止 per-key 记录");
         record_key_vk(65, false);
         record_key_vk(66, false);
         let evts = drain(local_min(2026, 6, 15, 10, 30)); // 建桶
