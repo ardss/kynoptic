@@ -14,6 +14,15 @@ use crate::types::{Event, EventHook, Monitor};
 
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// 数据库写失败累计（P0）：磁盘写满/写失败时旧实现只在 db 层 log（"降级逐条
+/// → 跳过"后无任何观测），而 DropWatchdog 只看 DROPPED_EVENTS（通道满载），
+/// 写失败完全静默。db/events.rs 的所有最终失败写路径（整批失败、单条降级
+/// 失败、提交失败）都累加此计数，由看门狗周期性读取并告警。
+pub(crate) static WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// 看门狗连续观察到写失败的周期数（>=3 升级 log::error）。
+static CONSECUTIVE_WRITE_FAILURE_PERIODS: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
     match tx.try_send(event) {
         Ok(()) => {}
@@ -26,16 +35,37 @@ pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
     }
 }
 
-/// 丢弃计数的唯一消费方：看门狗线程每 WATCHDOG_INTERVAL_SECS 秒 swap 一次。
-///
-/// 审查 P2：旧实现在 writer 收到事件时打日志——writer 正常但通道被挤爆时
-/// 能看到，可一旦写库卡死（事件堆积、writer 无事件可收），丢弃就完全静默。
-/// 独立看门狗线程保证无论 writer 状态如何，增量都会周期性暴露。
+/// 看门狗单次检查（纯逻辑，便于测试升级策略）：通道丢弃与写失败任一增量 >0
+/// 都打 log::warn（带数值与类型）；写失败连续 3 个周期出现则升级 log::error。
+/// 返回更新后的连续写失败周期数。
+fn watchdog_tick(dropped: u64, write_failures: u64, consecutive_wf: &mut u64) -> u64 {
+    if dropped > 0 {
+        log::warn!("通道已满，过去 60 秒丢弃了 {} 个事件", dropped);
+    }
+    if write_failures > 0 {
+        *consecutive_wf += 1;
+        let msg = format!(
+            "数据库写失败，过去 60 秒新增 {} 次（连续 {} 个周期）",
+            write_failures, *consecutive_wf
+        );
+        if *consecutive_wf >= 3 {
+            log::error!("{}", msg);
+        } else {
+            log::warn!("{}", msg);
+        }
+    } else {
+        *consecutive_wf = 0;
+    }
+    *consecutive_wf
+}
+
+/// 丢弃/写失败计数的唯一消费方：看门狗线程每 60 秒 swap 一次（两个计数器）。
 fn log_dropped_events_watchdog() {
     let dropped = DROPPED_EVENTS.swap(0, Ordering::Relaxed);
-    if dropped > 0 {
-        log::warn!("通道已满，过去 {} 秒丢弃了 {} 个事件", 60, dropped);
-    }
+    let write_failures = WRITE_FAILURES.swap(0, Ordering::Relaxed);
+    let mut consecutive = CONSECUTIVE_WRITE_FAILURE_PERIODS.load(Ordering::Relaxed);
+    watchdog_tick(dropped, write_failures, &mut consecutive);
+    CONSECUTIVE_WRITE_FAILURE_PERIODS.store(consecutive, Ordering::Relaxed);
 }
 
 /// flush 决策（纯函数，便于测试）。
@@ -115,11 +145,11 @@ fn create_monitors_for(
 }
 
 fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
-    // rowids 与 batch 一一对应（失败行为 0），供 agg 增量维护做幂等防护
-    let rowids = db.insert_events(batch);
+    // 聚合增量维护与 events 落库在同一事务内完成（审查 P1：两个独立事务之间
+    // kill 会留下"events 有 agg 无"的欠聚合且永不自愈）；rowids 与 batch 一一
+    // 对应（失败行为 0），事务化后由 insert 层内部直接用于 agg 维护。
+    let _rowids = db.insert_events_with_agg(batch);
     total_written.fetch_add(batch.len(), Ordering::Relaxed);
-    // 聚合读缓存增量维护（派生数据；失败仅 log，不影响原始写入）
-    db.update_agg(batch, &rowids);
 }
 
 fn writer_loop(
@@ -416,6 +446,8 @@ pub fn start_collection_custom(
     // 本实例独立的停机旗标（见 Collector.shutdown 字段文档）。
     let shutdown = Arc::new(AtomicBool::new(false));
     DROPPED_EVENTS.store(0, Ordering::Relaxed);
+    WRITE_FAILURES.store(0, Ordering::Relaxed);
+    CONSECUTIVE_WRITE_FAILURE_PERIODS.store(0, Ordering::Relaxed);
 
     let db = Arc::new(Database::open(db_path).expect("数据库初始化失败"));
     // 启动时清扫上次未关闭的 session（崩溃/强杀留的幽灵）
@@ -557,9 +589,10 @@ pub fn start_collection_custom(
         })
         .expect("维护线程启动失败");
 
-    // 丢弃事件看门狗（审查 P2）：writer 侧日志只在"还在正常收事件"时可见，
-    // 写库卡死导致通道持续满载时会完全静默。独立线程每 60 秒读一次全局
-    // DROPPED_EVENTS，增量 >0 即告警——与 writer 状态解耦。
+    // 丢弃/写失败看门狗（审查 P2 + P0）：writer 侧日志只在"还在正常收事件"时
+    // 可见，写库卡死导致通道持续满载、或磁盘写满导致事件被降级跳过时都会完全
+    // 静默。独立线程每 60 秒读一次全局 DROPPED_EVENTS 与 WRITE_FAILURES，
+    // 任一增量 >0 即告警（写失败连续 3 个周期升级 error）——与 writer 状态解耦。
     let sd_watch = shutdown.clone();
     thread::Builder::new()
         .name("DropWatchdog".into())
@@ -610,5 +643,25 @@ mod tests {
         let interval = Duration::from_secs(30);
         assert!(!should_flush(1, Duration::from_secs(1), 300, interval));
         assert!(!should_flush(60, Duration::from_secs(10), 300, interval));
+    }
+
+    /// P0 看门狗升级策略：写失败任一周期 >0 都告警，连续 3 个周期升级 error
+    /// （此处断言连续周期计数的推进与清零语义；日志级别由 watchdog_tick 内
+    /// 分支选择，error 分支对应返回值 >= 3）。
+    #[test]
+    fn watchdog_escalates_after_three_consecutive_write_failure_periods() {
+        let mut consecutive = 0u64;
+        // 无失败：不推进
+        assert_eq!(watchdog_tick(0, 0, &mut consecutive), 0);
+        // 连续三个周期有写失败：1 → 2 → 3（第 3 周期起 error）
+        assert_eq!(watchdog_tick(0, 5, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(0, 1, &mut consecutive), 2);
+        assert_eq!(watchdog_tick(0, 1, &mut consecutive), 3);
+        assert_eq!(watchdog_tick(0, 2, &mut consecutive), 4);
+        // 一个干净周期即清零
+        assert_eq!(watchdog_tick(7, 0, &mut consecutive), 0);
+        // 通道丢弃独立于写失败计数推进
+        assert_eq!(watchdog_tick(9, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 1, &mut consecutive), 1);
     }
 }

@@ -380,6 +380,18 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     // 负值截 0（宁可低估不夸大）。口径随响应返回。
     let unattended_fg_minutes = fg_total_min.saturating_sub(presence_minutes + automation_minutes);
 
+    // "机器值班"第一小时误导防线：数据不满一整天时，该指标只是"开机至今减
+    // 去活跃分钟"，人在场不 typing 也被累加。库中最早事件早于本地今日零点
+    // 才视为"满一天"（timestamp 列是 UTC RFC3339，直接比较本地今日零点边界，
+    // 不能截 UTC 日期字符串比较——UTC+8 会错位一天）。
+    let earliest_ts: Option<String> = conn
+        .query_row("SELECT MIN(timestamp) FROM events", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten();
+    let has_full_day = earliest_ts.map(|e| e < start).unwrap_or(false);
+
     json!({
         "host": host,
         "today": today,
@@ -390,6 +402,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "metrics_note": "口径：纯人分钟计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
         "unattended_fg_minutes": unattended_fg_minutes,
         "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes)，负值截 0（暂无分钟级前台采样）",
+        "has_full_day": has_full_day,
         "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,
         "fg_top": fg_top.map(|(a, _)| Value::from(a)).unwrap_or(Value::Null),

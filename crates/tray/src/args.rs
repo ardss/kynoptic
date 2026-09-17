@@ -22,6 +22,25 @@ pub struct Args {
     pub exit_flag: Option<PathBuf>,
 }
 
+/// 端口回退候选序列：preferred 起、逐个 +1，共 11 个（8422 被占时一路试到
+/// 8432）。纯函数，单测覆盖。preferred 之后的 10 个端口即"面板静默死亡"
+/// 的自救空间：回环上端口撞车（另一个服务占 8422）比换端口可接受得多。
+pub fn candidate_ports(preferred: u16) -> Vec<u16> {
+    (0..=10u16)
+        .filter_map(|i| preferred.checked_add(i))
+        .collect()
+}
+
+/// 在候选端口里挑第一个能 bind 127.0.0.1 的（探测 listener 立即 drop，
+/// 正式 bind 由 kynoptic_dash::serve 完成——存在极窄 TOCTOU 窗口，可接受：
+/// 单实例互斥体已保证没有第二个 kynoptic 抢同段端口）。
+/// 全部失败返回 None（调用方回退 preferred，由 serve 报原始错误）。
+pub fn pick_free_port(preferred: u16) -> Option<u16> {
+    candidate_ports(preferred)
+        .into_iter()
+        .find(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+}
+
 /// 解析托盘壳参数。db 缺省走 core 统一解析;未知选项报错。
 pub fn parse(args: &[String]) -> Result<Args, Error> {
     let mut port = DEFAULT_PORT;
@@ -77,6 +96,43 @@ mod tests {
 
     fn sv(args: &[&str]) -> Result<Args, Error> {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn port_fallback_candidates_are_contiguous_eleven() {
+        let v = candidate_ports(8422);
+        assert_eq!(v.len(), 11);
+        assert_eq!(v[0], 8422);
+        assert_eq!(v[10], 8432);
+        assert_eq!(
+            v,
+            (8422..=8432).collect::<Vec<u16>>(),
+            "必须从 preferred 起逐个 +1"
+        );
+    }
+
+    #[test]
+    fn port_fallback_never_wraps_on_overflow() {
+        // preferred 贴近 u16::MAX 时不得回绕到 0（回环低端口不允许偷偷占）
+        let v = candidate_ports(u16::MAX);
+        assert_eq!(v, vec![u16::MAX]);
+    }
+
+    #[test]
+    fn pick_free_port_skips_occupied_and_reports_actual() {
+        // 占住 8422，pick 应跳到下一个端口；选出的端口可被再次 bind 前提是
+        // 先 drop 探测——这里只验证返回值 != 被占端口且落在候选集内
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 8432)).unwrap();
+        let picked = pick_free_port(8432).unwrap();
+        assert_ne!(picked, 8432, "被占端口必须跳过");
+        assert!(candidate_ports(8432).contains(&picked));
+        drop(blocker);
+    }
+
+    #[test]
+    fn port_zero_random_passes_through_candidates() {
+        // port 0（随机空闲端口）路径不走回退，但 candidate_ports(0) 不panic
+        assert_eq!(candidate_ports(0)[0], 0);
     }
 
     #[test]

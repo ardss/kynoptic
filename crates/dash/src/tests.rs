@@ -181,6 +181,31 @@ fn overview_reports_session_today_events_and_uptime() {
     assert_eq!(v["foreground_app"], json!("code"));
 }
 
+/// has_full_day：数据起点早于今天才 true；仅今日有数据（首装第一小时）
+/// 为 false，前端据此在"机器值班"卡显示空态而非误导数字。
+#[test]
+fn overview_has_full_day_gates_unattended_metric() {
+    // 仅今日有数据 → false
+    let conn = mem_conn();
+    let today = queries::today_local_str();
+    let (start, _) = queries::local_day_range(&today).unwrap();
+    insert(&conn, &start, "keyboard", "press", None);
+    let v = api_overview(&conn, Path::new("definitely-missing.db"));
+    assert_eq!(v["has_full_day"], json!(false));
+
+    // 有昨日数据 → true（用真实"昨天"，不依赖固定锚定日期）
+    let conn2 = mem_conn();
+    let (ystart, _) = queries::local_day_range(&queries::date_offset_str(-1)).unwrap();
+    insert(&conn2, &ystart, "keyboard", "press", None);
+    let v2 = api_overview(&conn2, Path::new("definitely-missing.db"));
+    assert_eq!(v2["has_full_day"], json!(true));
+
+    // 空库（MIN 为 NULL）→ false
+    let conn3 = mem_conn();
+    let v3 = api_overview(&conn3, Path::new("definitely-missing.db"));
+    assert_eq!(v3["has_full_day"], json!(false));
+}
+
 #[test]
 fn overview_closed_session_and_empty_db() {
     let conn = mem_conn();

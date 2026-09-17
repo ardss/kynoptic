@@ -89,9 +89,10 @@ impl McpServer {
         }
     }
 
-    /// 五工具的具体执行。公开给 CLI 复用（`kynoptic now` 走同一数据面）。
+    /// 六工具的具体执行。公开给 CLI 复用（`kynoptic now` 走同一数据面）。
     pub fn call_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
-        let conn = state::open_reader(&self.db_path).map_err(|e| format!("打开数据库失败: {e}"))?;
+        let conn = state::open_reader(&self.db_path)
+            .map_err(|e| format!("Failed to open database: {e}（打开数据库失败: {e}）"))?;
         match name {
             "get_current_status" => {
                 let groups = args.get("groups").and_then(|g| g.as_array()).map(|a| {
@@ -134,20 +135,55 @@ impl McpServer {
                     .get("granularity")
                     .and_then(|v| v.as_str())
                     .unwrap_or("minute");
-                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-                let (segments, truncated) = state::timeline(&conn, &from, &to, granularity, limit)?;
-                Ok(json!({ "segments": segments, "truncated": truncated }))
+                let (limit, clamped_to) = parse_limit(args)?;
+                let mut v = state::timeline(&conn, &from, &to, granularity, limit)?;
+                if let Some(n) = clamped_to {
+                    v["clamped_to"] = json!(n);
+                }
+                Ok(v)
+            }
+            "get_top_apps" => {
+                let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
+                let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
+                let (from, to) = match (from, to) {
+                    (Some(f), Some(t)) => (f, t),
+                    (None, Some(t)) => (default_from(), t),
+                    (Some(f), None) => (f, chrono::Utc::now().to_rfc3339()),
+                    (None, None) => (default_from(), chrono::Utc::now().to_rfc3339()),
+                };
+                let (limit, clamped_to) = parse_limit(args)?;
+                let mut v = state::top_apps(&conn, &from, &to, limit)?;
+                if let Some(n) = clamped_to {
+                    v["clamped_to"] = json!(n);
+                }
+                Ok(v)
             }
             "get_anomalies" => {
-                let days = args.get("days").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-                Ok(state::anomalies(&conn, days, limit))
+                let days_raw = args.get("days").and_then(|v| v.as_i64());
+                if let Some(d) = days_raw {
+                    if d < 1 {
+                        return Err(
+                            "days must be >= 1（days 必须 >= 1，不接受 0 或负数）".to_string()
+                        );
+                    }
+                }
+                let days = days_raw.unwrap_or(1).clamp(1, 30) as usize;
+                let clamped_days = if days_raw.unwrap_or(1) > 30 {
+                    Some(30)
+                } else {
+                    None
+                };
+                let (limit, clamped_limit) = parse_limit(args)?;
+                let mut v = state::anomalies(&conn, days, limit);
+                if let Some(n) = clamped_days.or(clamped_limit) {
+                    v["clamped_to"] = json!(n);
+                }
+                Ok(v)
             }
             "wait_for" => {
-                let signal = args
-                    .get("signal")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "缺少 signal 参数".to_string())?;
+                let signal = args.get("signal").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "Missing required argument: signal（缺少必填参数 signal）".to_string()
+                })?;
                 let timeout = args
                     .get("timeout_sec")
                     .and_then(|v| v.as_u64())
@@ -155,13 +191,49 @@ impl McpServer {
                 state::wait_for(&conn, signal, timeout)
             }
             other => Err(format!(
-                "未知工具: {other}（可用: {}）",
+                "Unknown tool: {other} (available: {})（未知工具，可用: {}）",
+                crate::Tool::all()
+                    .iter()
+                    .map(|t| t.name())
+                    .collect::<Vec<_>>()
+                    .join("/"),
                 crate::Tool::all()
                     .iter()
                     .map(|t| t.name())
                     .collect::<Vec<_>>()
                     .join("/")
             )),
+        }
+    }
+}
+
+/// get_timeline/get_top_apps 缺省 from：今日本地起点。
+fn default_from() -> String {
+    let today = kynoptic_core::queries::today_local_str();
+    kynoptic_core::queries::local_day_range(&today)
+        .map(|(s, _)| s)
+        .unwrap_or(today)
+}
+
+/// 解析 limit 参数：缺省 20；必须是整数；<1 报错（不静默回落）；
+/// >100 钳到 100 并返回 clamped_to 标记。
+fn parse_limit(args: &Value) -> Result<(usize, Option<usize>), String> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok((20, None)),
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| format!("limit must be an integer, got {v}（limit 必须是整数）"))?;
+            if n < 1 {
+                return Err(format!(
+                    "limit must be >= 1, got {n}（limit 必须 >= 1，不接受 0 或负数）"
+                ));
+            }
+            if n > 100 {
+                Ok((100, Some(100)))
+            } else {
+                Ok((n as usize, None))
+            }
         }
     }
 }
@@ -207,14 +279,26 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_timeline",
-            "description": "应用/窗口时间线段落（前台应用占用段，返回应用名，应用名为空时回退返回窗口标题（本地数据完整优先），两者皆空记为 (unknown)）",
+            "description": "应用/窗口时间线段（前台应用占用段，应用名为空时回退窗口标题，皆空记 (unknown)）。裸日期 from/to 按本地日界解析；to 为日期时含当天全天；响应含 total_segments 与 truncation（超限时按事件时间升序丢弃最旧段，truncation=oldest-dropped）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "from": { "type": "string", "description": "起始时间（RFC3339 或 YYYY-MM-DD），默认今日起点" },
-                    "to": { "type": "string", "description": "结束时间，默认现在" },
+                    "from": { "type": "string", "description": "起始时间（RFC3339 或 YYYY-MM-DD，裸日期按本地时区 00:00），默认今日起点" },
+                    "to": { "type": "string", "description": "结束时间（RFC3339 或 YYYY-MM-DD，裸日期含该本地日全天到 24:00），默认现在" },
                     "granularity": { "type": "string", "enum": ["minute", "hour"], "default": "minute" },
-                    "limit": limit_schema("最多返回段数"),
+                    "limit": limit_schema("最多返回段数；超过 100 钳到 100 并带 clamped_to"),
+                }
+            },
+        }),
+        json!({
+            "name": "get_top_apps",
+            "description": "窗口 [from,to) 内各前台应用的驻留秒数排行（降序）。驻留 = 相邻 window/switch 事件间隔，末段计到 to。适合『上周二我用的哪个工具/应用』这类问题。裸日期按本地日界解析",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "起始（RFC3339 或 YYYY-MM-DD，裸日期按本地时区 00:00），默认今日起点" },
+                    "to": { "type": "string", "description": "结束（RFC3339 或 YYYY-MM-DD，裸日期含该本地日全天），默认现在" },
+                    "limit": limit_schema("最多返回应用数；超过 100 钳到 100 并带 clamped_to"),
                 }
             },
         }),
@@ -231,7 +315,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "wait_for",
-            "description": "阻塞等待语义信号触发（订阅兜底，MCP Tool 无推送语义）；超时返回 timeout 标记",
+            "description": "阻塞等待语义信号触发（订阅兜底，MCP Tool 无推送语义）；超时返回 timeout 标记。注意：wait_for 在后台线程执行，其响应可能乱序返回，客户端必须按 JSON-RPC id 关联响应",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,7 +362,9 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
             continue;
         }
         // 审查 P2：wait_for 最长 1800s，同步处理会卡死读循环且客户端断开后
-        // 进程僵住——仅这类长请求走后台线程；其余顺序处理保证 JSONL 响应有序
+        // 进程僵住——仅这类长请求走后台线程；其余顺序处理保证 JSONL 响应有序。
+        // 代价：wait_for 的响应可能在后续请求响应之后到达（乱序），客户端必须
+        // 按 JSON-RPC id 关联（已写入 wait_for 工具 description）。
         let is_long = serde_json::from_str::<Value>(&line)
             .ok()
             .and_then(|m| {
@@ -370,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_five_spec_tools() {
+    fn tools_list_has_six_spec_tools() {
         let srv = McpServer::new(":memory:");
         let resp = srv
             .handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
@@ -387,6 +473,7 @@ mod tests {
                 "get_current_status",
                 "get_summary",
                 "get_timeline",
+                "get_top_apps",
                 "get_anomalies",
                 "wait_for"
             ]
@@ -438,5 +525,128 @@ mod tests {
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap());
         assert!(resp.get("error").is_none());
+    }
+
+    // ─── 参数校验回归（P1：非法参数曾静默回落/静默钳制） ───────────────
+
+    fn mem_db() -> String {
+        // 每测试一个独立临时库文件（:memory: 连接不跨 call_tool 存活——每请求重开）
+        let dir = std::env::temp_dir().join(format!("kynoptic-mcp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "db-{}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // 预设 WAL：open_reader 只读连接上 journal_mode=WAL 是写操作，库必须
+        // 在写入侧（采集器/此处）先转成 WAL，与生产库一致
+        kynoptic_core::db::apply_pragmas(&conn).unwrap();
+        conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+        path.display().to_string()
+    }
+
+    fn insert_window_switch(db: &str, ts: &str, app: &str) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,'window','switch',NULL,?2,?2,NULL)",
+            rusqlite::params![ts, app],
+        )
+        .unwrap();
+    }
+
+    fn call(srv: &McpServer, id: i32, name: &str, args: Value) -> Value {
+        srv.handle(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }))
+        .unwrap()["result"]
+            .clone()
+    }
+
+    #[test]
+    fn limit_zero_and_negative_are_rejected_not_silently_fallback() {
+        let srv = McpServer::new(mem_db());
+        let r = call(&srv, 1, "get_timeline", json!({ "limit": 0 }));
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+        assert!(r["content"][0]["text"].as_str().unwrap().contains(">= 1"));
+        let r = call(&srv, 2, "get_timeline", json!({ "limit": -5 }));
+        assert!(r["isError"].as_bool().unwrap(), "-5 不得静默回落默认值");
+        let r = call(&srv, 3, "get_anomalies", json!({ "days": 0 }));
+        assert!(r["isError"].as_bool().unwrap(), "days=0 不得静默返回空");
+        let r = call(&srv, 4, "get_anomalies", json!({ "days": -1 }));
+        assert!(r["isError"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn over_max_limit_and_days_report_clamped_to() {
+        let srv = McpServer::new(mem_db());
+        let r = call(&srv, 1, "get_timeline", json!({ "limit": 500 }));
+        assert!(!r["isError"].as_bool().unwrap());
+        assert_eq!(
+            serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap()
+                ["clamped_to"],
+            json!(100)
+        );
+        let r = call(&srv, 2, "get_anomalies", json!({ "days": 500 }));
+        assert_eq!(
+            serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap()
+                ["clamped_to"],
+            json!(30)
+        );
+    }
+
+    #[test]
+    fn get_top_apps_basic() {
+        let db = mem_db();
+        insert_window_switch(&db, "2026-09-09T01:00:00+00:00", "code");
+        insert_window_switch(&db, "2026-09-09T01:40:00+00:00", "web");
+        insert_window_switch(&db, "2026-09-09T01:50:00+00:00", "code");
+        let srv = McpServer::new(&db);
+        let r = call(
+            &srv,
+            1,
+            "get_top_apps",
+            json!({
+                "from": "2026-09-09T01:00:00+00:00",
+                "to": "2026-09-09T02:00:00+00:00"
+            }),
+        );
+        assert!(!r["isError"].as_bool().unwrap(), "{r}");
+        let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        let apps = v["apps"].as_array().unwrap();
+        // code: 40min + 10min = 3000s；web: 600s
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0]["app"], json!("code"));
+        assert_eq!(apps[0]["dwell_sec"], json!(3000));
+        assert_eq!(apps[1]["dwell_sec"], json!(600));
+    }
+
+    /// KYNOPTIC_DB 环境变量决定数据面连的库（`kynoptic mcp --db` 经 cli 的
+    /// cmd_mcp 转成该变量；这里验证 serve_stdio 的读取端契约）。
+    #[test]
+    fn serve_stdio_honors_kynoptic_db_env() {
+        let db = mem_db();
+        insert_window_switch(&db, "2026-09-09T01:00:00+00:00", "envmarker");
+        // 直接验证 call_tool 层用 db_path 打开对应库（env → db_path 的映射在 serve_stdio）
+        let srv = McpServer::new(&db);
+        let r = call(
+            &srv,
+            1,
+            "get_top_apps",
+            json!({ "from": "2026-09-09T00:00:00+00:00", "to": "2026-09-09T02:00:00+00:00" }),
+        );
+        let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["apps"][0]["app"], json!("envmarker"));
+        // 读取端契约：KYNOPTIC_DB 优先于默认解析
+        std::env::set_var("KYNOPTIC_DB", &db);
+        assert_eq!(
+            std::env::var("KYNOPTIC_DB").unwrap(),
+            db,
+            "cmd_mcp 必须通过 KYNOPTIC_DB 传递 --db"
+        );
+        std::env::remove_var("KYNOPTIC_DB");
     }
 }

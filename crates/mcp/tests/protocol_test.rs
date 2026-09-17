@@ -140,7 +140,7 @@ fn full_initialize_list_call_roundtrip() {
         json!("2024-11-05")
     );
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
 
     let status = text_payload(&responses[2]);
     assert_eq!(status["cpu_pct"], json!(12.0));

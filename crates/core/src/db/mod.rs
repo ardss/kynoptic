@@ -271,8 +271,8 @@ impl Database {
         // perf3 2026-09 P0 实测：1M 事件存量库首开时同步回填把 Database::open
         // 阻塞 10.5 分钟（631,594 ms；目标 <500ms）。改为：open 只做廉价门槛
         // 检查（两条 EXISTS），分块（本地 date,hour）回填在后台线程执行——
-        // 每块一个短事务（DELETE 该块聚合行 + events 重算），writer 增量
-        // update_agg 可在块间穿插；进度记在 metadata.agg_backfill_cursor，
+        // 每块一个短事务（DELETE 该块聚合行 + events 重算），writer 的批量写入
+        // （events 落库 + 同事务聚合增量）可在块间穿插；进度记在 metadata.agg_backfill_cursor，
         // 中断后下次 open 自动续跑。回填完成前聚合查询回退 events 现算
         // （正确但慢），原始 events 只读不动。
         let backfill_done: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)> =
@@ -319,11 +319,41 @@ impl Database {
                     }
                 });
         } else {
-            // 无回填任务：立即置完成信号
-            if let Ok(mut d) = backfill_done.0.lock() {
-                *d = true;
+            // 欠聚合核对（P1，廉价：两条聚合查询）：events 里应有聚合贡献的
+            // 原始行（press/click/switch）最大 id 超过该日 agg_minute 已记录的
+            // max_event_rowid → 该日欠聚合（历史 kill 中断/存量遗留），后台
+            // 逐小时重算自愈。增量路径已与 events 落库同事务（见
+            // insert_events_with_agg），此核对只兜底存量与极端故障。
+            let lag_dates = agg::under_agg_dates(&writer);
+            if lag_dates.is_empty() {
+                // 无回填任务：立即置完成信号
+                if let Ok(mut d) = backfill_done.0.lock() {
+                    *d = true;
+                }
+                backfill_done.1.notify_all();
+            } else {
+                log::info!(
+                    "检测到 {} 个本地日期欠聚合（events 有而 agg 无），后台自愈",
+                    lag_dates.len()
+                );
+                let bg_path = path.to_string();
+                let done_flag = backfill_done.clone();
+                let _ = thread::Builder::new()
+                    .name("agg-lag-heal".into())
+                    .spawn(move || {
+                        let _guard = BackfillDoneGuard(&done_flag);
+                        match Connection::open(&bg_path) {
+                            Ok(c) => {
+                                let _ = apply_pragmas(&c);
+                                match agg::heal_under_agg(&c) {
+                                    Ok(n) => log::info!("欠聚合自愈完成（{} 个日期）", n),
+                                    Err(e) => log::warn!("欠聚合自愈失败: {e}"),
+                                }
+                            }
+                            Err(e) => log::warn!("欠聚合自愈连接创建失败: {e}"),
+                        }
+                    });
             }
-            backfill_done.1.notify_all();
         }
 
         let mut readers = Vec::with_capacity(constants::READER_POOL_SIZE);
@@ -427,11 +457,17 @@ impl Database {
         }
     }
 
-    /// 完整的维护操作：清理 + WAL 检查点 + VACUUM 压缩
+    /// 完整的维护操作：清理 + 欠聚合核对自愈 + WAL 检查点 + VACUUM 压缩
     pub fn maintenance(&self) {
         self.cleanup_old_events();
         self.cleanup_old_sessions();
         self.refresh_daily_agg();
+        // 每日欠聚合核对（P1 自愈）：不一致日期逐小时重算（无欠聚合时只是
+        // 两条聚合查询的廉价核对）
+        let healed = self.heal_agg_lag();
+        if healed > 0 {
+            log::info!("维护：欠聚合自愈完成（{} 个日期）", healed);
+        }
         let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
             return;
         };

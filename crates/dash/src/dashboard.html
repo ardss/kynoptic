@@ -448,6 +448,7 @@ const T = {
         restoredHint: "reset to defaults on screen — click save to apply.",
         beforeData: "no data before",
         fgdwellNote: "estimated from window dwell; includes unattended time",
+        unattendedWarmup: "shown after a full day of data",
         noEventsYet: "(no events yet)", lastEvent: "last event:", readOnly: "read-only",
         hourIdle: "no events",
         focusOmitted: "blocks over 4h omitted — they may include away/idle periods (see timeline)",
@@ -464,6 +465,7 @@ const T = {
         restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
         beforeData: "该日期早于数据起点",
         fgdwellNote: "按窗口驻留推算，含人不在场时段",
+        unattendedWarmup: "数据满一天后展示",
         noEventsYet: "（尚无事件）", lastEvent: "最近事件：", readOnly: "只读",
         hourIdle: "无事件",
         focusOmitted: "存在超长块，可能包含离开/挂机时段（详见时间线）",
@@ -555,12 +557,22 @@ async function loadOverview() {
   document.getElementById("c-fgdwell").textContent = fmtDuration(fd);
   document.getElementById("c-fgdwell-note").textContent = t("fgdwellNote") + ". ";
   document.getElementById("c-fgtop").textContent = o.fg_top || "–";
-  // 后端正在加 unattended_fg_minutes：防御性判空，字段存在才显示第四卡
+  // 后端正在加 unattended_fg_minutes：防御性判空，字段存在才显示第四卡。
+  // 第一小时误导防线（has_full_day=false）：数据不满一天时"机器值班"只是
+  // "开机减活跃"，人在场不 typing 也被累加——显示空态文案而不是误导数字。
+  // 字段缺失（旧后端）时 hasFullDay 默认 true，保持旧行为。
   const um = o.unattended_fg_minutes;
   const uCard = document.getElementById("card-unattended");
-  if (typeof um === "number" && isFinite(um)) {
+  const uVal = document.getElementById("c-unattended");
+  const hasFullDay = o.has_full_day !== false;
+  if (typeof um === "number" && isFinite(um) && hasFullDay) {
     uCard.style.display = "";
-    document.getElementById("c-unattended").textContent = fmtDuration(um);
+    uVal.textContent = fmtDuration(um);
+    uVal.classList.remove("empty-note");
+  } else if (typeof um === "number" && isFinite(um) && !hasFullDay) {
+    uCard.style.display = "";
+    uVal.textContent = t("unattendedWarmup");
+    uVal.classList.add("empty-note");
   } else {
     uCard.style.display = "none";
   }

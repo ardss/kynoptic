@@ -55,7 +55,7 @@ Subcommands:
   collect   [--db PATH] [--all]             Run the collector (Ctrl+C to stop)
   stats     [--date YYYY-MM-DD] [--days N]   Show summary stats
   export    [--days N] [--format csv|json|jsonl] [--out PATH] [--redact]
-  report    [--date YYYY-MM-DD] [--save PATH]   Generate Markdown report
+  report    [--date today|yesterday|YYYY-MM-DD] [--save PATH]   Generate Markdown report
   db        [stats|cleanup [N]|vacuum|checkpoint|recompute-agg]   DB maintenance
   analyze   [--date YYYY-MM-DD] [--days N]     Focus/fragment/anomaly report
   ghost                                       Close ghost sessions
@@ -399,6 +399,28 @@ fn strip_c0(s: &str) -> String {
 }
 
 // === report ===
+
+/// report 的 --date 解析：空 = 今天；today/yesterday 别名（复用 parse_when，
+/// 与 query --from/--to 同口径）；其余走 parse_date（YYYY-MM-DD）。
+/// 纯逻辑抽出以便单测。
+fn resolve_report_date(raw: &str) -> Result<String> {
+    if raw.is_empty() {
+        return Ok(queries::today_local_str());
+    }
+    if raw == "today" || raw == "yesterday" {
+        // 与 parse_when 的 today/yesterday 分支同一时钟源（queries::date_offset_str，
+        // 本地日界）。不截 parse_when 返回的 RFC3339 前 10 字符——那是 UTC 边界，
+        // UTC+8 的本地凌晨会错位一天。
+        Ok(queries::date_offset_str(if raw == "today" {
+            0
+        } else {
+            -1
+        }))
+    } else {
+        parse_date(raw)
+    }
+}
+
 fn cmd_report(args: &[String]) -> Result<()> {
     let mut date = String::new();
     let mut save = String::new();
@@ -421,11 +443,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
         }
         i += 1;
     }
-    let date = if date.is_empty() {
-        queries::today_local_str()
-    } else {
-        parse_date(&date)?
-    };
+    let date = resolve_report_date(&date)?;
     let conn = open_db(&resolve_db())?;
     let analysis = analyzer::analyze_day(&conn, &date)?;
     let anomalies = anomaly::detect_all(&conn, &date).unwrap_or_default();
@@ -991,6 +1009,9 @@ fn truncate_col(s: &str, max: usize) -> String {
 
 /// `kynoptic mcp`：启动 MCP server（stdio JSON-RPC，阻塞到 stdin 关闭）。
 fn cmd_mcp() -> Result<()> {
+    // serve_stdio 只认 KYNOPTIC_DB 环境变量：把 --db 覆盖（或默认解析）经环境
+    // 变量传入，修复 `kynoptic mcp --db X` 静默连错库的实测问题。
+    std::env::set_var("KYNOPTIC_DB", resolve_db());
     kynoptic_mcp::serve_stdio();
     Ok(())
 }
@@ -1003,17 +1024,57 @@ const SKILL_MD: &str = include_str!("assets/skill.md");
 /// skill 目录约定：home 下的 `.zcode/.claude/.cursor` 三家，各 `skills/kynoptic/SKILL.md`。
 const SKILL_CLIENT_DIRS: [&str; 3] = [".zcode", ".claude", ".cursor"];
 
+/// Windows reparse point 属性位（symlink 与 junction 都带；std 的
+/// `FileType::is_symlink` 对 junction 的返回语义历史上不稳定，直接查原始
+/// 属性位最可靠——junction 是 IO_REPARSE_TAG_MOUNT_POINT，属性里必挂
+/// FILE_ATTRIBUTE_REPARSE_POINT = 0x400）。
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// 路径存在且是 symlink/junction（reparse point）。
+#[cfg(windows)]
+fn is_reparse_point(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(p)
+        .map(|md| md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+#[cfg(not(windows))]
+fn is_reparse_point(p: &Path) -> bool {
+    std::fs::symlink_metadata(p)
+        .map(|md| md.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// 把内嵌 SKILL.md 写入 base 下的各客户端 skill 目录。返回写入路径列表。
 /// 抽出 base 以便单测注入临时目录。
+///
+/// 安全防线（junction 跟随修复）：`skills\kynoptic` 若被换成指向任意目录的
+/// junction/symlink（恶意软件可预建 `%USERPROFILE%\.claude` 等目录结构），
+/// create_dir_all 会无声跟随、SKILL.md 直接写进目标处——这里先对目标目录
+/// 做 reparse point 检查，命中即报错退出。写入用 tmp + rename 原子落盘：
+/// 半程崩溃不会留下截断的 SKILL.md。
 fn skill_install_to(base: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut written = Vec::new();
     for dir in SKILL_CLIENT_DIRS {
-        let target = base.join(dir).join("skills").join("kynoptic");
+        let parent = base.join(dir).join("skills");
+        std::fs::create_dir_all(&parent)
+            .map_err(|e| Error::InvalidData(format!("创建 {} 失败: {e}", parent.display())))?;
+        let target = parent.join("kynoptic");
+        if is_reparse_point(&target) {
+            return Err(Error::InvalidData(format!(
+                "{} 是符号链接/junction，拒绝写入（防目录穿越；如非你本人设置请排查）",
+                target.display()
+            )));
+        }
         std::fs::create_dir_all(&target)
             .map_err(|e| Error::InvalidData(format!("创建 {} 失败: {e}", target.display())))?;
         let file = target.join("SKILL.md");
-        std::fs::write(&file, SKILL_MD)
-            .map_err(|e| Error::InvalidData(format!("写入 {} 失败: {e}", file.display())))?;
+        let tmp = target.join("SKILL.md.tmp");
+        std::fs::write(&tmp, SKILL_MD)
+            .map_err(|e| Error::InvalidData(format!("写入 {} 失败: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, &file)
+            .map_err(|e| Error::InvalidData(format!("落盘 {} 失败: {e}", file.display())))?;
         written.push(file);
     }
     Ok(written)
@@ -1700,12 +1761,37 @@ fn csv_cell(v: &str) -> String {
     }
 }
 
+/// 子命令名定位：参数里第一个非 `--db` 且非"`--db` 的值"的元素下标。
+/// 修复位置陷阱：`kynoptic --db X presence` 旧实现取 args[0] 当子命令，
+/// 报"未知子命令 --db"。纯函数，单测覆盖。
+fn find_subcommand(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--db" {
+            // 成对跳过 --db 及其值；尾部悬挂的 --db（缺值）也一并跳过
+            i += 2;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
+    let sub_idx = find_subcommand(&args);
+    let sub: String = sub_idx
+        .map(|i| args[i].clone())
+        .unwrap_or_else(|| "help".to_string());
     // 全局 --db（审查 P2）：所有子命令可用，摘出后写入 DB_OVERRIDE 覆盖
-    // resolve_db()。dashboard 自带 --db 解析，保持原样跳过。
-    let mut rest: Vec<String> = args.iter().skip(1).cloned().collect();
+    // resolve_db()。rest 先去掉子命令本身，使 --db 在任意位置都被成对摘除。
+    // dashboard 自带 --db 解析，保持原样跳过。
+    let mut rest: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != sub_idx)
+        .map(|(_, v)| v.clone())
+        .collect();
     let db_parsed = if sub == "dashboard" {
         Ok(())
     } else {
@@ -1713,7 +1799,7 @@ fn main() -> ExitCode {
     };
     let result: Result<()> = match db_parsed {
         Err(e) => Err(e),
-        Ok(()) => match sub {
+        Ok(()) => match sub.as_str() {
             "collect" => cmd_collect(&rest),
             "stats" => cmd_stats(&rest),
             "export" => cmd_export(&rest),
@@ -1777,6 +1863,101 @@ mod tests {
         assert!(extract_global_db(&mut b).is_err());
         // 清理全局状态，避免影响其他用例
         *DB_OVERRIDE.lock().unwrap() = None;
+    }
+
+    // === 子命令定位（--db 任意位置） ===
+
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn find_subcommand_ignores_global_db_anywhere() {
+        // 回归：`kynoptic --db X presence` 旧实现报"未知子命令 --db"
+        assert_eq!(
+            find_subcommand(&sv(&["--db", "x/y.db", "presence"])),
+            Some(2)
+        );
+        assert_eq!(
+            find_subcommand(&sv(&["presence", "--db", "x/y.db"])),
+            Some(0)
+        );
+        // 子命令后的标志位（如 --days）会被当作"第一个非 --db 参数"：
+        // 全局 --db 的正确用法是放在子命令前或后均可，但子命令本身必须是
+        // 第一个非 --db/--db值 参数
+        assert_eq!(
+            find_subcommand(&sv(&["--days", "3", "--db", "x.db"])),
+            Some(0)
+        );
+        assert_eq!(find_subcommand(&sv(&["collect"])), Some(0));
+        // 悬挂 --db（缺值）：无可被子命令，交由 extract_global_db 报错
+        assert_eq!(find_subcommand(&sv(&["--db"])), None);
+        assert_eq!(find_subcommand(&sv(&[])), None);
+    }
+
+    // === report --date 别名 ===
+
+    #[test]
+    fn report_date_accepts_today_yesterday_aliases() {
+        // 回归：`kynoptic report --date today` 旧实现报日期格式错
+        let today = resolve_report_date("today").unwrap();
+        assert_eq!(today, queries::today_local_str());
+        let yesterday = resolve_report_date("yesterday").unwrap();
+        assert_eq!(yesterday, queries::date_offset_str(-1));
+        // 空串与纯日期行为不变
+        assert_eq!(resolve_report_date("").unwrap(), queries::today_local_str());
+        assert_eq!(resolve_report_date("2026-09-09").unwrap(), "2026-09-09");
+        assert!(resolve_report_date("not-a-date").is_err());
+    }
+
+    // === skill install（junction 防护 + 原子写） ===
+
+    #[test]
+    fn skill_install_writes_files_without_tmp_leftover() {
+        let base = std::env::temp_dir().join(format!("kynoptic-skill-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let files = skill_install_to(&base).unwrap();
+        assert_eq!(files.len(), 3);
+        for f in &files {
+            let content = std::fs::read_to_string(f).unwrap();
+            assert!(!content.is_empty());
+            // tmp + rename 原子写：不应留下 .tmp 残留
+            let tmp = f.with_extension("md.tmp");
+            assert!(!tmp.exists(), "不应残留 {tmp:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skill_install_refuses_junction_target() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!("kynoptic-skill-j-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let secret = base.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        // 动态创建 junction（mklink /J，无需管理员权限）：把 .claude\skills\kynoptic
+        // 换成指向 secret 的 junction——安装必须拒绝，而不是把文件写进 secret
+        let junction = base.join(".claude").join("skills").join("kynoptic");
+        std::fs::create_dir_all(junction.parent().unwrap()).unwrap();
+        let out = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junction.to_string_lossy(),
+                &secret.to_string_lossy(),
+            ])
+            .output()
+            .expect("mklink 运行失败");
+        assert!(out.status.success(), "junction 创建失败（测试环境问题）");
+        // 命中 reparse point：报错退出，secret 目录保持为空
+        assert!(
+            skill_install_to(&base).is_err(),
+            "junction 目标必须拒绝写入"
+        );
+        assert!(std::fs::read_dir(&secret).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // === parse_when ===

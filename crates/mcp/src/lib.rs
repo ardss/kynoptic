@@ -1,6 +1,6 @@
 //! kynoptic-mcp —— MCP server（stdio JSON-RPC 2.0）
 //!
-//! 依据《mcp-tool-spec-v1》实现五工具：多语义小工具、列表类工具必带 `limit`
+//! 依据《mcp-tool-spec-v1》实现六工具：多语义小工具、列表类工具必带 `limit`
 //! （默认 20，上限 100）。协议层见 [`server`]，数据面见 [`state`]。
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,8 @@ pub enum Tool {
     GetSummary,
     /// C. get_timeline —— 应用/窗口时间线段落
     GetTimeline,
+    /// C2. get_top_apps —— 窗口内应用驻留排行
+    GetTopApps,
     /// D. get_anomalies —— 异常事件列表
     GetAnomalies,
     /// E. wait_for —— 阻塞轮询兜底（MCP Tool 无推送语义）
@@ -31,6 +33,7 @@ impl Tool {
             Tool::GetCurrentStatus => "get_current_status",
             Tool::GetSummary => "get_summary",
             Tool::GetTimeline => "get_timeline",
+            Tool::GetTopApps => "get_top_apps",
             Tool::GetAnomalies => "get_anomalies",
             Tool::WaitFor => "wait_for",
         }
@@ -41,6 +44,7 @@ impl Tool {
             Tool::GetCurrentStatus,
             Tool::GetSummary,
             Tool::GetTimeline,
+            Tool::GetTopApps,
             Tool::GetAnomalies,
             Tool::WaitFor,
         ]
@@ -84,6 +88,7 @@ mod tests {
                 "get_current_status",
                 "get_summary",
                 "get_timeline",
+                "get_top_apps",
                 "get_anomalies",
                 "wait_for"
             ]

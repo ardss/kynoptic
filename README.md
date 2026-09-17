@@ -91,9 +91,9 @@ target\release\kynoptic.exe dashboard          # local-only web panel (127.0.0.1
 
 ### Use it from your AI assistant (MCP)
 
-Kynoptic ships an MCP server (stdio JSON-RPC) with five tools:
-`get_current_status`, `get_summary`, `get_timeline`, `get_anomalies`,
-`wait_for`. Point your MCP client at it:
+Kynoptic ships an MCP server (stdio JSON-RPC) with six tools:
+`get_current_status`, `get_summary`, `get_timeline`, `get_top_apps`,
+`get_anomalies`, `wait_for`. Point your MCP client at it:
 
 ```json
 {
@@ -103,8 +103,34 @@ Kynoptic ships an MCP server (stdio JSON-RPC) with five tools:
 }
 ```
 
+To point the MCP server at a specific database, set the `KYNOPTIC_DB`
+environment variable (the MCP config `env` field works well):
+
+```json
+{
+  "mcpServers": {
+    "kynoptic": {
+      "command": "kynoptic",
+      "args": ["mcp"],
+      "env": { "KYNOPTIC_DB": "D:/data/kynoptic.db" }
+    }
+  }
+}
+```
+
+Note: `kynoptic mcp` does not accept a `--db` flag — pass the database path
+via the `KYNOPTIC_DB` environment variable as shown above (the CLI's other
+read-only subcommands do take `--db`).
+
 Your assistant can then answer questions like "what was I doing when the CPU
-spiked yesterday?" without the data ever leaving your disk.
+spiked yesterday?" or "which app did I use most last Tuesday?" without the
+data ever leaving your disk.
+
+Threat model: any local program that can spawn processes (or is granted MCP
+access by your assistant) can read your activity database with the same
+rights as this MCP server — treat MCP access like plain file read access to
+`KYNOPTIC_DB`. The server opens the database read-only and never sends data
+off-machine, but it cannot protect the file from other local processes.
 
 ## Performance
 

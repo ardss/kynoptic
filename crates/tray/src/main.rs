@@ -25,6 +25,7 @@
 //! 用法:kynoptic-tray [--db PATH] [--port N] [--all]
 
 mod args;
+mod ghost;
 mod icons;
 mod paths;
 mod state;
@@ -37,7 +38,7 @@ use tray::CollectorCmd;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let parsed = match args::parse(&argv) {
+    let mut parsed = match args::parse(&argv) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("kynoptic-tray: {e}");
@@ -88,6 +89,25 @@ fn main() {
         .unwrap_or_else(paths::resolve_exit_flag);
     let _ = std::fs::remove_file(&exit_flag);
 
+    // 幽灵 session 清扫（双 open 修复）：在采集器 open DB 之前闭合全部遗留
+    // open session。必须先于 CollectorCmd::Start——采集器启动路径里的
+    // close_ghost_sessions 会把"最新的 1 个幽灵"当当前 session 保留，随后
+    // start_session 再建一个，重启后永远双 open（见 ghost.rs 模块注释）。
+    if parsed.db.exists() {
+        let _ = ghost::close_all_open_sessions(&parsed.db);
+    }
+
+    // dashboard 端口回退（P0：8422 被占 = 面板静默死亡）：在 spawn 服务线程
+    // 前选好实际端口，托盘菜单 Open Dashboard 也用同一个端口，不会打开死链接。
+    // port 0（随机空闲端口）语义保留，不走回退。
+    let dash_port_requested = parsed.port;
+    let dash_port = if dash_port_requested == 0 {
+        0
+    } else {
+        args::pick_free_port(dash_port_requested).unwrap_or(dash_port_requested)
+    };
+    parsed.port = dash_port;
+
     // 采集心跳:每 30s touch exe 同目录心跳文件(RFC3339 时间戳)。
     // watchdog 除互斥体探活外还会检查心跳新鲜度——进程活着但采集主循环挂死
     // 时,心跳停止,watchdog 据此 kill 并重启(4-8 小时空洞的根因修复)。
@@ -108,7 +128,6 @@ fn main() {
     // 必失败且托盘无控制台（错误不可见,外面就是"拒绝连接"）。因此先等库
     // 文件就绪（至多 60s）,serve 失败再写日志文件,绝不静默消失。
     let dash_db = parsed.db.clone();
-    let dash_port = parsed.port;
     let _dash_handle = thread::Builder::new()
         .name("Dashboard".into())
         .spawn(move || {
@@ -133,6 +152,22 @@ fn main() {
             }
         })
         .expect("dashboard 线程启动失败");
+
+    // 端口落盘 + 换端口提示（托盘壳刻意不弹气泡：tray.rs 铁律 NIF_INFO 永不
+    // 使用，退化为 log + 文件）。dashboard-port.txt 始终写实际端口，供排障与
+    // 外部工具读取；仅当相对请求端口发生变化时额外记一条显式告警。
+    if dash_port_requested != 0 {
+        if let Some(dir) = parsed.db.parent() {
+            let _ = std::fs::write(dir.join("dashboard-port.txt"), format!("{dash_port}\n"));
+        }
+        if dash_port != dash_port_requested {
+            let msg = format!(
+                "面板已换端口：{dash_port_requested} 被占用，dashboard 改用 {dash_port}（http://127.0.0.1:{dash_port}，已写入 dashboard-port.txt）"
+            );
+            log::warn!("{msg}");
+            eprintln!("kynoptic-tray: {msg}");
+        }
+    }
 
     // 采集器属主线程:Collector 只在本线程构造/持有/关停(所有权不跨线程)
     let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCmd>();

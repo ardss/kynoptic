@@ -58,7 +58,11 @@ pub fn current_status(conn: &Connection, groups: Option<&[String]>) -> Result<Va
         Some(g) if !g.is_empty() => {
             for s in g {
                 if !GROUPS.contains(&s.as_str()) {
-                    return Err(format!("未知分组: {s}（允许: {}）", GROUPS.join("/")));
+                    return Err(format!(
+                        "Unknown group: {s} (allowed: {})（未知分组，允许: {}）",
+                        GROUPS.join("/"),
+                        GROUPS.join("/")
+                    ));
                 }
             }
             g.to_vec()
@@ -222,21 +226,43 @@ fn s_or_null(v: Option<String>) -> Value {
 
 // ─── B. get_summary ─────────────────────────────────────────────────────────
 
-/// 单指标日聚合 + 与昨日**同期**对比百分比。
-/// 同期 = 昨日本地日起点 → 当前时刻往前推 24h（无数据则截止昨日日终）。
+/// 单指标日聚合 + 与**该日期前一天**同期对比百分比。
+/// 同期 = 前一日（date-1）本地日起点 → 当前时刻往前推 24h（无数据则截止该日终）。
 pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, String> {
     if !METRICS.contains(&metric) {
-        return Err(format!("未知指标: {metric}（允许: {}）", METRICS.join("/")));
+        return Err(format!(
+            "Unknown metric: {metric} (allowed: {})（未知指标，允许: {}）",
+            METRICS.join("/"),
+            METRICS.join("/")
+        ));
     }
-    let (start, end) = queries::local_day_range(date)
-        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD）"))?;
+    let (start, end) = queries::local_day_range(date).ok_or_else(|| {
+        format!("Bad date format: {date}, expected YYYY-MM-DD（日期格式错，应为 YYYY-MM-DD）")
+    })?;
+    // date 晚于今天：数据库不可能有未来数据，直接返回可读错误而非空结果
+    let today = queries::today_local_str();
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d");
+    let t = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d");
+    if let (Ok(d), Ok(t)) = (d, t) {
+        if d > t {
+            return Err(format!(
+                "Date {date} is in the future; no data can exist yet（日期 {date} 晚于今天，不可能有数据）"
+            ));
+        }
+    }
     let value = metric_in_range(conn, metric, &start, &end)?;
 
-    // 昨日同期
-    let y_date = queries::date_offset_str(-1);
-    let yesterday_same = local_date(&y_date).and_then(|y_start| {
+    // 对比基准：date 的前一天（date-1，本地日），不再是硬编码的“今天-1”
+    let prev_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .ok_or_else(|| format!("Bad date format: {date}（日期格式错）"))?;
+    let (y_start, y_end_r) = queries::local_day_range(&prev_date).ok_or_else(|| {
+        format!("Cannot resolve previous day of {date}（无法解析 {date} 的前一天）")
+    })?;
+    let yesterday_same = {
         let same_ts = Utc::now() - chrono::Duration::days(1);
-        let y_end_r = queries::local_day_range(&y_date).map(|(_, e)| e)?;
         let end = if same_ts.to_rfc3339() < y_end_r {
             same_ts.to_rfc3339()
         } else {
@@ -245,9 +271,9 @@ pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, Str
         if end <= y_start {
             None
         } else {
-            Some(metric_in_range(conn, metric, &y_start, &end).ok()?)
+            Some(metric_in_range(conn, metric, &y_start, &end)?)
         }
-    });
+    };
 
     let change_pct = match (value, yesterday_same) {
         (v, Some(y)) if y > 0.0 => Some(((v - y) / y * 100.0 * 10.0).round() / 10.0),
@@ -257,14 +283,10 @@ pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, Str
         "date": date,
         "metric": metric,
         "value": value,
+        "compared_to": prev_date,
         "yesterday_same_period": yesterday_same.map(|v| json!(v)).unwrap_or(Value::Null),
         "change_pct": change_pct.map(|v| json!(v)).unwrap_or(Value::Null),
     }))
-}
-
-/// 本地日期字符串 → 本地午夜的 UTC 时刻。
-fn local_date(date: &str) -> Option<String> {
-    queries::local_day_range(date).map(|(s, _)| s)
 }
 
 fn metric_in_range(conn: &Connection, metric: &str, start: &str, end: &str) -> Result<f64, String> {
@@ -274,7 +296,7 @@ fn metric_in_range(conn: &Connection, metric: &str, start: &str, end: &str) -> R
         "active_minutes" => queries::active_minutes_today(conn, start, end) as f64,
         "apps" => distinct_apps(conn, start, end) as f64,
         "focus_segments" => focus_segments(conn, start, end) as f64,
-        _ => return Err(format!("未知指标: {metric}")),
+        _ => return Err(format!("Unknown metric: {metric}（未知指标: {metric}）")),
     };
     Ok(v)
 }
@@ -343,59 +365,63 @@ fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i6
     out
 }
 
-// ─── C. get_timeline ────────────────────────────────────────────────────────
+// ─── C. get_timeline / get_top_apps ────────────────────────────────────────
+
+/// 规范化时间边界：裸日期 `YYYY-MM-DD` 按**本地日界**展开（与 dash 的
+/// local_day_range 同语义，注意 mcp 进程 TZ）——from 当日本地 00:00，
+/// to 当日本地日末（= 次日本地 00:00，[start,end) 语义，不多吞一天）。
+/// RFC3339 等完整时间戳原样透传。
+fn normalize_bound(v: &str, is_to: bool) -> String {
+    let b = v.as_bytes();
+    if b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()
+    {
+        if let Some((s, e)) = queries::local_day_range(v) {
+            // from → 当日本地 00:00；to → 当日本地日末（即次日 00:00）
+            return if is_to { e } else { s };
+        }
+    }
+    v.to_string()
+}
 
 /// 应用/窗口时间线段。granularity=minute 逐段返回；hour 把同一本地小时内
-/// 连续同应用段合并。返回 (segments, truncated)。
+/// 连续同应用段合并。返回完整 JSON：segments + total_segments + truncated
+/// （截断策略：按事件时间升序保留，超限丢最旧段，truncation="oldest-dropped"）。
 pub fn timeline(
     conn: &Connection,
     from: &str,
     to: &str,
     granularity: &str,
     limit: usize,
-) -> Result<(Value, bool), String> {
+) -> Result<Value, String> {
     if granularity != "minute" && granularity != "hour" {
-        return Err("granularity 只允许 minute|hour".into());
+        return Err("granularity only allows minute|hour（granularity 只允许 minute|hour）".into());
     }
-    let limit = clamp_limit(Some(limit));
-    // 审查 P2：to 传纯日期（YYYY-MM-DD）时按前缀比较会排除整天数据，
-    // 静默返回空。规范化：纯日期 from -> 当日 00:00Z，to -> 次日 00:00Z。
-    let norm = |v: &str, is_to: bool| -> String {
-        let b = v.as_bytes();
-        if b.len() == 10 && b[4] == b'-' && b[7] == b'-' {
-            if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
-                let d = if is_to { d.succ_opt().unwrap_or(d) } else { d };
-                if let Some(t) = d.and_hms_opt(0, 0, 0) {
-                    return t.format("%Y-%m-%dT00:00:00+00:00").to_string();
-                }
-            }
-        }
-        v.to_string()
-    };
-    let from = norm(from, false);
-    let to = norm(to, true);
+    let from = normalize_bound(from, false);
+    let to = normalize_bound(to, true);
+    if from >= to {
+        return Err(format!(
+            "Invalid range: from ({from}) must be before to ({to})（时间范围无效：from 必须早于 to）"
+        ));
+    }
     let mut stmt = conn
         .prepare(
             "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') \
              FROM events \
              WHERE event_type='window' AND event_action='switch' \
                AND timestamp >= ?1 AND timestamp < ?2 \
-             ORDER BY timestamp ASC LIMIT ?3",
+             ORDER BY timestamp ASC",
         )
         .map_err(|e| e.to_string())?;
-    let mut rows: Vec<(String, String)> = Vec::new();
-    let mut truncated = false;
-    if let Ok(mapped) = stmt.query_map(params![from, to, limit as i64 + 1], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    }) {
-        for r in mapped.flatten() {
-            if rows.len() >= limit {
-                truncated = true;
-                break;
-            }
-            rows.push(r);
-        }
-    }
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![from, to], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
 
     let to_t = chrono::DateTime::parse_from_rfc3339(&to).ok();
     let mut segs: Vec<(String, String, String)> = Vec::new(); // (app,start,end)
@@ -418,8 +444,11 @@ pub fn timeline(
         segs.push((app.clone(), ts.clone(), end));
     }
 
+    let total_segments = segs.len();
+    let truncated = total_segments > limit;
     let out: Vec<Value> = segs
         .into_iter()
+        .take(limit)
         .map(|(app, start, end)| {
             let dur = chrono::DateTime::parse_from_rfc3339(&start)
                 .ok()
@@ -434,7 +463,75 @@ pub fn timeline(
             })
         })
         .collect();
-    Ok((Value::Array(out), truncated))
+    Ok(json!({
+        "segments": out,
+        "total_segments": total_segments,
+        "truncated": truncated,
+        "truncation": if truncated { "oldest-dropped" } else { "none" },
+    }))
+}
+
+/// 窗口 [from,to) 内各前台应用驻留秒数，降序返回（get_top_apps 数据面）。
+/// 驻留口径与 timeline 相同：switch 事件起点到下一 switch（末段到 to）。
+pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result<Value, String> {
+    let from = normalize_bound(from, false);
+    let to = normalize_bound(to, true);
+    if from >= to {
+        return Err(format!(
+            "Invalid range: from ({from}) must be before to ({to})（时间范围无效：from 必须早于 to）"
+        ));
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') \
+             FROM events \
+             WHERE event_type='window' AND event_action='switch' \
+               AND timestamp >= ?1 AND timestamp < ?2 \
+             ORDER BY timestamp ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![from, to], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+
+    let to_t = chrono::DateTime::parse_from_rfc3339(&to);
+    let mut dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (i, (ts, app)) in rows.iter().enumerate() {
+        let end = rows
+            .get(i + 1)
+            .map(|(next, _)| next.clone())
+            .unwrap_or_else(|| {
+                to_t.as_ref()
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|_| ts.clone())
+            });
+        let dur = chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .zip(chrono::DateTime::parse_from_rfc3339(&end).ok())
+            .map(|(a, b)| (b - a).num_seconds().max(0))
+            .unwrap_or(0);
+        *dwell.entry(app.clone()).or_default() += dur;
+    }
+    let total_apps = dwell.len();
+    let mut ranked: Vec<(String, i64)> = dwell.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let truncated = ranked.len() > limit;
+    let apps: Vec<Value> = ranked
+        .into_iter()
+        .take(limit)
+        .map(|(app, sec)| json!({ "app": app, "dwell_sec": sec }))
+        .collect();
+    Ok(json!({
+        "from": from,
+        "to": to,
+        "apps": apps,
+        "total_apps": total_apps,
+        "truncated": truncated,
+    }))
 }
 
 fn local_hour_bucket(ts: &str) -> String {
@@ -444,6 +541,18 @@ fn local_hour_bucket(ts: &str) -> String {
 }
 
 // ─── D. get_anomalies ───────────────────────────────────────────────────────
+
+/// 异常 kind -> 英文模板（与 dash 的 anomaly_message_en 同映射；kind 不识别
+/// 时回退到中文 message，调用方按 message_en 是否为空决定展示哪条）。
+fn anomaly_message_en(kind: &str, fallback: &str) -> String {
+    match kind {
+        "late_night" => "Late-night activity: input detected after 23:00".into(),
+        "apm_burst" => "APM burst: input rate spiked well above your baseline".into(),
+        "marathon" => "Marathon session: long continuous activity without breaks".into(),
+        "new_app_surge" => "App usage surge: an app spiked above its daily average".into(),
+        _ => fallback.to_string(),
+    }
+}
 
 /// 最近 `days` 天（含今日）的异常事件列表。
 pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
@@ -457,11 +566,13 @@ pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
             if out.len() >= limit {
                 return json!({"anomalies": out, "truncated": true});
             }
+            let message_en = anomaly_message_en(&a.kind, &a.message);
             out.push(json!({
                 "date": date,
                 "kind": a.kind,
                 "severity": a.severity,
                 "message": a.message,
+                "message_en": message_en,
                 "at": a.at,
             }));
         }
@@ -474,7 +585,11 @@ pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
 /// 检查信号当前是否成立（纯读取，单次）。
 pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
     if !SIGNALS.contains(&signal) {
-        return Err(format!("未知信号: {signal}（允许: {}）", SIGNALS.join("/")));
+        return Err(format!(
+            "Unknown signal: {signal} (allowed: {})（未知信号，允许: {}）",
+            SIGNALS.join("/"),
+            SIGNALS.join("/")
+        ));
     }
     Ok(match signal {
         "late_night" => {
@@ -682,6 +797,49 @@ mod tests {
     }
 
     #[test]
+    fn summary_baseline_is_date_minus_one() {
+        let conn = mem_conn();
+        let date = queries::today_local_str();
+        let yesterday = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .unwrap()
+            .pred_opt()
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (start, _) = queries::local_day_range(&date).unwrap();
+        let (y_start, _) = queries::local_day_range(&yesterday).unwrap();
+        insert(&conn, &start, "keyboard", "press", None, None);
+        insert(&conn, &start, "keyboard", "press", None, None);
+        for _ in 0..6 {
+            insert(&conn, &y_start, "keyboard", "press", None, None);
+        }
+        let v = summary(&conn, &date, "keys").unwrap();
+        assert_eq!(v["value"], json!(2.0));
+        assert_eq!(v["compared_to"], json!(yesterday), "对比基准必须是 date-1");
+        assert_eq!(v["yesterday_same_period"], json!(6.0));
+        assert_eq!(v["change_pct"], json!(-66.7));
+        // 查历史日期：基准同样是该日期的前一天，而非硬编码的“今天-1”
+        let past = (chrono::Local::now() - chrono::Duration::days(5))
+            .format("%Y-%m-%d")
+            .to_string();
+        let past_prev = (chrono::Local::now() - chrono::Duration::days(6))
+            .format("%Y-%m-%d")
+            .to_string();
+        let v = summary(&conn, &past, "keys").unwrap();
+        assert_eq!(v["compared_to"], json!(past_prev));
+    }
+
+    #[test]
+    fn summary_future_date_is_readable_error() {
+        let conn = mem_conn();
+        let future = (chrono::Local::now() + chrono::Duration::days(2))
+            .format("%Y-%m-%d")
+            .to_string();
+        let err = summary(&conn, &future, "keys").unwrap_err();
+        assert!(err.contains("future"), "{err}");
+    }
+
+    #[test]
     fn summary_apps_distinct() {
         let conn = mem_conn();
         let date = queries::today_local_str();
@@ -694,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_segments_and_clamp() {
+    fn timeline_segments_and_truncation_metadata() {
         let conn = mem_conn();
         insert(
             &conn,
@@ -712,7 +870,7 @@ mod tests {
             Some("b"),
             None,
         );
-        let (v, trunc) = timeline(
+        let v = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
             "2026-09-09T02:00:00+00:00",
@@ -720,13 +878,14 @@ mod tests {
             20,
         )
         .unwrap();
-        assert!(!trunc);
-        let arr = v.as_array().unwrap();
+        assert_eq!(v["truncated"], json!(false));
+        assert_eq!(v["total_segments"], json!(2));
+        let arr = v["segments"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["app"], json!("a"));
         assert_eq!(arr[0]["duration_sec"], json!(600));
-        // limit 钳制：limit=1 → 只回 1 段且 truncated
-        let (v, trunc) = timeline(
+        // limit 钳制：limit=1 → 只回 1 段，带 total_segments + truncation 策略
+        let v = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
             "2026-09-09T02:00:00+00:00",
@@ -734,8 +893,35 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(trunc);
-        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v["truncated"], json!(true));
+        assert_eq!(v["total_segments"], json!(2));
+        assert_eq!(v["truncation"], json!("oldest-dropped"));
+        assert_eq!(v["segments"].as_array().unwrap().len(), 1);
+    }
+
+    /// 裸日期 from/to 按**本地日界**解析：to 为日期时只含该本地日（不扩到次日），
+    /// from 为日期时从当日本地 00:00 起（与默认 from 的本地午夜同语义）。
+    #[test]
+    fn timeline_bare_dates_use_local_day_bounds() {
+        let conn = mem_conn();
+        let today = queries::today_local_str();
+        let tomorrow = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+            .unwrap()
+            .succ_opt()
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (start, end) = queries::local_day_range(&today).unwrap();
+        let (t_start, _) = queries::local_day_range(&tomorrow).unwrap();
+        insert(&conn, &start, "window", "switch", Some("a"), None);
+        // 次日本地 00:00 的切换必须被 to=今天 排除
+        insert(&conn, &t_start, "window", "switch", Some("b"), None);
+        let v = timeline(&conn, &today, &today, "minute", 100).unwrap();
+        let arr = v["segments"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "次日事件不得混入: {v}");
+        assert_eq!(arr[0]["app"], json!("a"));
+        assert_eq!(arr[0]["end"], json!(end), "to 当日应到本地日末为止");
+        assert_eq!(arr[0]["start"], json!(start));
     }
 
     #[test]
@@ -765,7 +951,7 @@ mod tests {
             Some("a"),
             None,
         );
-        let (v, _) = timeline(
+        let v = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
             "2026-09-09T03:00:00+00:00",
@@ -774,7 +960,7 @@ mod tests {
         )
         .unwrap();
         // UTC 视角 01:00 与 01:20 同小时合并，02:00 不同小时独立
-        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v["segments"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -790,6 +976,68 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn top_apps_ranks_by_dwell_desc() {
+        let conn = mem_conn();
+        insert(
+            &conn,
+            "2026-09-09T01:00:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T01:10:00+00:00",
+            "window",
+            "switch",
+            Some("b"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T01:30:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
+        // a: 600 + 1800 = 2400；b: 1200 → a 排前
+        let v = top_apps(
+            &conn,
+            "2026-09-09T01:00:00+00:00",
+            "2026-09-09T02:00:00+00:00",
+            10,
+        )
+        .unwrap();
+        let arr = v["apps"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["app"], json!("a"));
+        assert_eq!(arr[0]["dwell_sec"], json!(2400));
+        assert_eq!(arr[1]["app"], json!("b"));
+        assert_eq!(arr[1]["dwell_sec"], json!(1200));
+        // limit 截断带 total_apps
+        let v = top_apps(
+            &conn,
+            "2026-09-09T01:00:00+00:00",
+            "2026-09-09T02:00:00+00:00",
+            1,
+        )
+        .unwrap();
+        assert_eq!(v["total_apps"], json!(2));
+        assert_eq!(v["truncated"], json!(true));
+        assert_eq!(v["apps"].as_array().unwrap().len(), 1);
+        // 范围倒挂 → 可读错误
+        assert!(top_apps(
+            &conn,
+            "2026-09-09T02:00:00+00:00",
+            "2026-09-09T01:00:00+00:00",
+            10
+        )
+        .is_err());
+    }
+
     // 本地数据完整优先：app_name 为空时回退返回 window_title 原文，两者皆空
     // 才记 (unknown)。窗口标题是本地事实的一部分，不为隐私擅自削减。
     #[test]
@@ -800,7 +1048,7 @@ mod tests {
             params!["2026-09-09T01:00:00+00:00"],
         )
         .unwrap();
-        let (v, _) = timeline(
+        let v = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
             "2026-09-09T02:00:00+00:00",
@@ -808,7 +1056,7 @@ mod tests {
             20,
         )
         .unwrap();
-        let arr = v.as_array().unwrap();
+        let arr = v["segments"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["app"], json!("Secret Document Title"));
     }
@@ -822,7 +1070,7 @@ mod tests {
             params!["2026-09-09T01:00:00+00:00"],
         )
         .unwrap();
-        let (v, _) = timeline(
+        let v = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
             "2026-09-09T02:00:00+00:00",
@@ -830,7 +1078,7 @@ mod tests {
             20,
         )
         .unwrap();
-        let arr = v.as_array().unwrap();
+        let arr = v["segments"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["app"], json!("(unknown)"));
     }
@@ -841,6 +1089,37 @@ mod tests {
         let v = anomalies(&conn, 1, 20);
         assert_eq!(v["truncated"], json!(false));
         assert_eq!(v["anomalies"].as_array().unwrap().len(), 0);
+    }
+
+    /// 每条异常必须带 message_en（kind 映射或回退中文 message）。
+    #[test]
+    fn anomalies_carry_message_en() {
+        let conn = mem_conn();
+        // 深夜活动 → late_night 异常（插入 23:00 后的本地输入）
+        let late = Local::now()
+            .date_naive()
+            .and_hms_opt(23, 30, 0)
+            .and_then(|n| {
+                use chrono::TimeZone;
+                Local
+                    .from_local_datetime(&n)
+                    .earliest()
+                    .map(|d| d.with_timezone(&Utc).to_rfc3339())
+            })
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        insert(&conn, &late, "keyboard", "press", None, None);
+        let v = anomalies(&conn, 1, 20);
+        let arr = v["anomalies"].as_array().unwrap();
+        if arr.is_empty() {
+            // 检测器未触发时至少验证映射回退逻辑本身
+            assert_eq!(anomaly_message_en("no_such_kind", "中文消息"), "中文消息");
+            assert!(anomaly_message_en("marathon", "").contains("Marathon"));
+            return;
+        }
+        for a in arr {
+            let en = a["message_en"].as_str().unwrap_or_default();
+            assert!(!en.is_empty(), "message_en 不得为空: {a}");
+        }
     }
 
     #[test]

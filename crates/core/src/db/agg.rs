@@ -22,9 +22,16 @@
 //! 取「以增量语义为准」对齐）。
 //!
 //! 维护路径：
-//! 1. 增量：writer 每次 flush 后调 [`super::Database::update_agg`]（见 collector.rs）；
+//! 1. 增量：writer 每次 flush 时与 events 落库**同一事务**调用 [`apply_event`]
+//!    （见 `db::events::insert_events_with_agg`；审查 P1 事务化，kill 不再留下
+//!    "events 有 agg 无"的欠聚合）；[`super::Database::update_agg`] 保留为
+//!    独立维护入口（测试/兼容路径）。
 //! 2. 懒回填：[`Database::open`] 时若 agg 全空而 events 非空 → [`backfill_if_needed`]
 //!    （存量库首开自动补齐；选此方案而非 CLI 命令，见 CODE_NOTES.md §8）。
+//! 3. 欠聚合自愈：[`under_agg_dates`] 廉价核对（events 中应有聚合贡献的原始行
+//!    最大 id 与该日 agg_minute 已记录 max_event_rowid 对比），不一致日期由
+//!    [`Database::open`] 后台与每日 maintenance 调 [`heal_under_agg`] 重算——
+//!    兜底覆盖事务化之前遗留的欠聚合存量数据。
 
 use chrono::{Local, Timelike, Utc};
 use rusqlite::{params, Connection};
@@ -70,7 +77,7 @@ ON CONFLICT(date, bucket_id) DO UPDATE SET
 ///
 /// `rowid` = 该事件在 events 表的 rowid（落库时分配；未知传 0 → 增量行被
 /// 守卫跳过，快照行仅更新计数快照）。
-fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite::Result<()> {
+pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite::Result<()> {
     let ts = match chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
         Ok(t) => t,
         Err(_) => return Ok(()), // 时间戳不可解析：跳过（不阻塞整批）
@@ -196,6 +203,21 @@ impl super::Database {
             || 0,
         )
     }
+
+    /// 欠聚合核对 + 自愈（写连接上执行）。返回自愈的日期数（0 = 一致，无需自愈）。
+    /// 供每日 maintenance 与需要显式触发自愈的调用方使用；启动路径在
+    /// [`super::Database::open`] 的后台线程里做（不阻塞启动）。
+    pub fn heal_agg_lag(&self) -> usize {
+        self.with_writer(
+            |conn| {
+                crate::db::agg::heal_under_agg(conn).unwrap_or_else(|e| {
+                    log::warn!("欠聚合自愈失败（下次维护重试）: {e}");
+                    0
+                })
+            },
+            || 0,
+        )
+    }
 }
 
 /// 从 events 全量重建聚合缓存（幂等）。返回重建的 agg_minute 行数。
@@ -260,6 +282,62 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
 
     let n = conn.query_row("SELECT COUNT(*) FROM agg_minute", [], |r| r.get(0))?;
     Ok(n)
+}
+
+/// 欠聚合廉价核对（P1 自愈门槛，两条聚合查询）：返回本地日期列表——该日
+/// events 中"应有聚合贡献"的原始行（press/click/switch）最大 id 大于该日
+/// agg_minute 已记录的 MAX(max_event_rowid)（含该日完全没有聚合行的情况）。
+///
+/// 只对比原始贡献行（不含 input_agg/move 等快照行）：快照行在增量维护中
+/// rowid 记 0，且重算路径写入桶内 MAX(id) 覆盖全部 keyboard/mouse/window 行，
+/// 因此重算后该指标必然收敛（不产生持续误报）。
+pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
+    let off = crate::queries::local_offset_modifier();
+    let sql = format!(
+        "SELECT e.d FROM (
+           SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d, MAX(id) AS maxid
+           FROM events
+           WHERE event_type IN ('keyboard','mouse','window')
+             AND event_action IN ('press','click','switch')
+           GROUP BY d
+         ) e
+         LEFT JOIN (
+           SELECT date, MAX(COALESCE(max_event_rowid, 0)) AS m
+           FROM agg_minute GROUP BY date
+         ) a ON a.date = e.d
+         WHERE COALESCE(a.m, 0) < e.maxid
+         ORDER BY e.d",
+        off = off,
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("欠聚合核对查询失败（跳过本次自愈检查）: {e}");
+            return Vec::new();
+        }
+    };
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+    match rows {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            log::warn!("欠聚合核对读取失败（跳过本次自愈检查）: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// 欠聚合自愈：对 [`under_agg_dates`] 列出的每个本地日期逐小时重算
+/// [`backfill_chunk`]（幂等：DELETE 该块聚合行 + 从 events 重算，小时块无事件
+/// 时廉价跳过）。返回自愈的日期数。
+pub fn heal_under_agg(conn: &Connection) -> crate::Result<usize> {
+    let dates = under_agg_dates(conn);
+    for date in &dates {
+        for h in 0..24i64 {
+            backfill_chunk(conn, date, h)?;
+        }
+        log::info!("欠聚合日期 {date} 已重算自愈");
+    }
+    Ok(dates.len())
 }
 
 /// 懒回填：agg 全空而 events 非空时执行一次全量重建（存量库首开路径）。

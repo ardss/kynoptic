@@ -228,6 +228,65 @@ fn print_compare(
     }
 }
 
+/// SQLite 文件头魔数（前 16 字节）。
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// 文件头是否为 SQLite 3 数据库。纯函数，单测覆盖。
+fn is_sqlite_header(head: &[u8]) -> bool {
+    head.len() >= SQLITE_HEADER.len() && &head[..SQLITE_HEADER.len()] == SQLITE_HEADER
+}
+
+/// 前置校验：--db 必须是可读的 SQLite 文件。修复"非 SQLite 文件先复制后
+/// panic"——复制一个几 GB 的非库文件纯属浪费，且 panic 信息不可读。
+/// 1) 文件头 16 字节魔数；2) 只读打开 + PRAGMA quick_check。
+///
+/// 任一失败：友好报错并 exit 2，绝不进入复制/重算流程。
+fn preflight_db_check(db: &Path) {
+    if !db.is_file() {
+        eprintln!("错误: {:?} 不是文件（不存在或是目录）", db);
+        exit(2);
+    }
+    let mut head = [0u8; 16];
+    match fs::File::open(db).and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut head)
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("错误: 无法读取 {:?} 的文件头: {e}", db);
+            exit(2);
+        }
+    }
+    if !is_sqlite_header(&head) {
+        eprintln!(
+            "错误: {:?} 不是 SQLite 数据库文件（文件头魔数不符）。确认 --db 指向 kynoptic.db 后重试。",
+            db
+        );
+        exit(2);
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("错误: 只读打开 {:?} 失败: {e}", db);
+        exit(2);
+    });
+    let quick: String = conn
+        .query_row("PRAGMA quick_check", [], |r| r.get(0))
+        .unwrap_or_else(|e| {
+            eprintln!("错误: PRAGMA quick_check 执行失败: {e}");
+            exit(2);
+        });
+    if quick != "ok" {
+        eprintln!(
+            "错误: {:?} 完整性检查未通过（quick_check: {quick}）。先修复数据库再重算。",
+            db
+        );
+        exit(2);
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = parse_args();
@@ -238,6 +297,9 @@ fn main() {
         args.to,
         if args.apply { "APPLY" } else { "DRY-RUN" }
     );
+
+    // ---- 0. 前置校验：非 SQLite / 损坏库直接 exit 2，不做任何复制 ----
+    preflight_db_check(&args.db);
 
     // ---- 1. 期望值：副本上用公开 rebuild_all 从 events 全量重算（只读原始数据）----
     let copy1 = copy_db(&args.db, "expect");
@@ -426,4 +488,20 @@ fn main() {
         copy2.parent()
     );
     let _ = Utc::now(); // 引用 chrono（事件时间均为 UTC RFC3339，由 core 处理）
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_header_magic_recognized() {
+        assert!(is_sqlite_header(b"SQLite format 3\0"));
+        assert!(is_sqlite_header(b"SQLite format 3\0plus trailing bytes"));
+        assert!(!is_sqlite_header(b""));
+        assert!(!is_sqlite_header(b"SQLite format "));
+        // 常见误传：文本/日志/旧 Python pickle
+        assert!(!is_sqlite_header(b"hello world"));
+        assert!(!is_sqlite_header(b"PK\x03\x04rest-of-zip"));
+    }
 }

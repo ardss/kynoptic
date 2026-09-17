@@ -1,8 +1,15 @@
 //! `events` 表的写入与清理
 //!
 //! 批量插入带三级降级（整批事务 → 单条重试 → 单条独立事务），确保成功行不丢失。
+//!
+//! 聚合一致性（审查 P1）：[`Database::insert_events_with_agg`] 把 events 落库与
+//! agg_minute/agg_daily 增量维护包进**同一个事务**——旧实现两者是独立事务，
+//! 中间 kill 会留下"events 有 agg 无"的欠聚合（backfill_needed 只在 agg 全空时
+//! 触发，永不自愈）。事务化后窗口消失；[`Database::insert_events`] 保持只插
+//! events 的旧语义，供测试与不需要聚合维护的调用方使用。
 
 use rusqlite::params;
+use rusqlite::Connection;
 
 use super::{lock_writer, Database};
 use crate::types::Event;
@@ -21,8 +28,40 @@ ON CONFLICT(timestamp, event_type) WHERE event_action = 'input_agg'
 DO UPDATE SET event_data = excluded.event_data
 ";
 
+/// 写失败计数（P0）：磁盘写满/写失败时旧实现只 log::warn（且"降级逐条→跳过"
+/// 后无任何聚合观测），告警看门狗只看通道满载计数，写失败完全静默。所有
+/// 最终失败的写路径（整批失败、单条降级失败、提交失败）都累加此计数，由
+/// collector 的 DropWatchdog 周期性读取并告警。
+fn note_write_failure(n: u64) {
+    crate::collector::WRITE_FAILURES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 单条事件落库（input_agg 行走 UPSERT，其余 INSERT）。返回该行的 events
+/// rowid（input_agg 聚合行无稳定新 rowid，返回 0，与旧 insert_events 语义一致）。
+fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
+    let data_str = e.event_data.as_ref().map(|v| v.to_string());
+    // input_agg 聚合行走 UPSERT（同分钟同类型覆盖），其余照旧 INSERT
+    let is_agg = e.event_action == crate::types::EventAction::InputAgg;
+    // prepare_cached 复用 prepared statement 计划，避免每行重新 prepare/finalize
+    let mut stmt = tx.prepare_cached(if is_agg {
+        UPSERT_INPUT_AGG_SQL
+    } else {
+        INSERT_SQL
+    })?;
+    stmt.execute(params![
+        e.timestamp,
+        e.event_type.as_str(),
+        e.event_action.as_str(),
+        data_str,
+        e.app_name,
+        e.window_title,
+        e.session_id,
+    ])?;
+    Ok(if is_agg { 0 } else { tx.last_insert_rowid() })
+}
+
 impl Database {
-    /// 批量插入事件
+    /// 批量插入事件（只插 events，不做聚合维护）。
     ///
     /// 健壮性：单条失败不会让整批丢失——
     /// 1. 第一次尝试：事务内逐条 INSERT
@@ -41,8 +80,30 @@ impl Database {
         match self.insert_events_tx(events) {
             Ok(rowids) => rowids,
             Err(e) => {
+                note_write_failure(1);
                 log::error!("批量插入失败，降级为逐条: {e}");
                 self.insert_events_one_by_one(events)
+            }
+        }
+    }
+
+    /// 批量插入事件并在**同一事务**内维护聚合缓存（writer 主路径）。
+    ///
+    /// 审查 P1：events 落库与 agg 增量 UPSERT 原为两个独立事务，中间 kill 即
+    /// 欠聚合且无法自愈。合并后两者同生共死：要么 events+agg 都提交，要么都
+    /// 回滚（回滚后走逐条降级，同样每条带聚合维护）。
+    /// 返回与 `events` 一一对应的 rowid（同 [`Database::insert_events`]）。
+    pub fn insert_events_with_agg(&self, events: &[Event]) -> Vec<i64> {
+        if events.is_empty() {
+            return Vec::new();
+        }
+
+        match self.insert_events_with_agg_tx(events) {
+            Ok(rowids) => rowids,
+            Err(e) => {
+                note_write_failure(1);
+                log::error!("批量插入（含聚合维护）失败，降级为逐条: {e}");
+                self.insert_events_with_agg_one_by_one(events)
             }
         }
     }
@@ -52,80 +113,78 @@ impl Database {
             return Err(rusqlite::Error::ExecuteReturnedResults);
         };
         let tx = conn.unchecked_transaction()?;
-        // prepare_cached 复用 prepared statement 计划，避免每行重新 prepare/finalize
-        // （原 tx.execute 每行都 prepare 一次，批量 300 条 = 300 次 prepare）。
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
-        {
-            let mut stmt = tx.prepare_cached(INSERT_SQL)?;
-            let mut agg_stmt = tx.prepare_cached(UPSERT_INPUT_AGG_SQL)?;
-            for e in events {
-                let data_str = e.event_data.as_ref().map(|v| v.to_string());
-                // input_agg 聚合行走 UPSERT（同分钟同类型覆盖），其余照旧 INSERT
-                let is_agg = e.event_action == crate::types::EventAction::InputAgg;
-                // as_str() 返回 &'static str，替代原 to_string() 的每行堆分配
-                (if is_agg { &mut agg_stmt } else { &mut stmt } as &mut rusqlite::Statement<'_>)
-                    .execute(params![
-                        e.timestamp,
-                        e.event_type.as_str(),
-                        e.event_action.as_str(),
-                        data_str,
-                        e.app_name,
-                        e.window_title,
-                        e.session_id,
-                    ])?;
-                rowids.push(if is_agg { 0 } else { tx.last_insert_rowid() });
-            }
+        for e in events {
+            rowids.push(execute_event(&tx, e)?);
         }
         tx.commit()?;
         Ok(rowids)
     }
 
-    fn insert_events_one_by_one(&self, events: &[Event]) -> Vec<i64> {
+    fn insert_events_with_agg_tx(&self, events: &[Event]) -> rusqlite::Result<Vec<i64>> {
+        let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
+            return Err(rusqlite::Error::ExecuteReturnedResults);
+        };
+        let tx = conn.unchecked_transaction()?;
+        let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
+        for e in events {
+            let rowid = execute_event(&tx, e)?;
+            // 聚合增量与事件写入同事务：max_event_rowid 守卫保留作为幂等兜底
+            // （事务化后"回填重算与增量并发"的交错窗口消失，重复投递仍被跳过）
+            super::agg::apply_event(&tx, e, rowid)?;
+            rowids.push(rowid);
+        }
+        tx.commit()?;
+        Ok(rowids)
+    }
+
+    /// 降级路径公共体：单条独立事务（可选附带聚合维护），失败计数并跳过。
+    fn insert_one_by_one_impl(&self, events: &[Event], with_agg: bool) -> Vec<i64> {
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
         for e in events {
             let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
+                note_write_failure(1);
                 continue;
             };
             let Ok(tx) = conn.unchecked_transaction() else {
+                note_write_failure(1);
                 continue;
             };
-            let data_str = e.event_data.as_ref().map(|v| v.to_string());
-            // 降级路径同样用 prepare_cached + as_str；input_agg 行必须走
-            // UPSERT（裸 INSERT 撞部分唯一索引会静默丢行，且关停 flush 无自愈）
-            let is_agg = e.event_action == crate::types::EventAction::InputAgg;
-            let result = (|| -> rusqlite::Result<()> {
-                let sql: &str = if is_agg {
-                    UPSERT_INPUT_AGG_SQL
-                } else {
-                    INSERT_SQL
-                };
-                let mut stmt = tx.prepare_cached(sql)?;
-                stmt.execute(params![
-                    e.timestamp,
-                    e.event_type.as_str(),
-                    e.event_action.as_str(),
-                    data_str,
-                    e.app_name,
-                    e.window_title,
-                    e.session_id,
-                ])?;
-                rowids.push(if is_agg { 0 } else { tx.last_insert_rowid() });
-                Ok(())
+            // 降级路径 input_agg 行同样必须走 UPSERT（裸 INSERT 撞部分唯一
+            // 索引会静默丢行，且关停 flush 无自愈）
+            let result = (|| -> rusqlite::Result<i64> {
+                let rowid = execute_event(&tx, e)?;
+                if with_agg {
+                    super::agg::apply_event(&tx, e, rowid)?;
+                }
+                Ok(rowid)
             })();
             match result {
-                Ok(_) => {
+                Ok(rowid) => {
                     if let Err(c) = tx.commit() {
                         log::warn!("单条提交失败: {c}");
+                        note_write_failure(1);
                         rowids.push(0);
+                    } else {
+                        rowids.push(rowid);
                     }
                 }
                 Err(err) => {
                     log::warn!("单条事件写入失败（已跳过）: {err}");
+                    note_write_failure(1);
                     rowids.push(0);
                 }
             }
         }
         rowids
+    }
+
+    fn insert_events_one_by_one(&self, events: &[Event]) -> Vec<i64> {
+        self.insert_one_by_one_impl(events, false)
+    }
+
+    fn insert_events_with_agg_one_by_one(&self, events: &[Event]) -> Vec<i64> {
+        self.insert_one_by_one_impl(events, true)
     }
 
     /// 清理超过保留天数的事件
@@ -156,5 +215,52 @@ impl Database {
             },
             || 0,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{EventAction, EventType};
+
+    /// P0 注入测试：删除 events 表使一切写入必然失败（等效磁盘故障/只读），
+    /// 断言 WRITE_FAILURES 计数增长且所有 rowid 落 0。
+    #[test]
+    fn write_failures_are_counted() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-wf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wf.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.with_writer(
+            |c| {
+                let _ = c.execute("DROP TABLE events", []);
+            },
+            || (),
+        );
+
+        let before = crate::collector::WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        let e = Event::new(EventAction::Press, EventType::Keyboard);
+        let rowids = db.insert_events(&[e.clone(), e]);
+        let after = crate::collector::WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "写失败必须累加 WRITE_FAILURES（before={before}, after={after}）"
+        );
+        assert_eq!(rowids, vec![0, 0]);
+
+        // 含聚合维护的主路径同样计数
+        let before = after;
+        let _ = db.insert_events_with_agg(&[Event::new(EventAction::Press, EventType::Keyboard)]);
+        let after = crate::collector::WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "with_agg 降级路径也必须计数");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

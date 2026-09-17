@@ -323,3 +323,40 @@ fn app_daily_cache_matches_legacy_scan() {
     assert_eq!(top, vec![("code.exe".to_string(), 2)]);
     cleanup(&path);
 }
+
+/// 审查 P1 自愈回归：模拟"插入事件后、agg 更新前"的 kill 中断（直接往 events
+/// 插原始贡献行、不更新 agg），重开 Database 时欠聚合核对必须发现并自动重算，
+/// 使 agg_minute 自愈到与 events 一致。
+#[test]
+fn under_agg_self_heals_on_reopen() {
+    let path = tmp_db_path();
+    {
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        assert!(
+            db.wait_for_backfill(std::time::Duration::from_secs(30)),
+            "空库首开不应有回填任务"
+        );
+        // 模拟中断：只插 events（press 原始贡献行），不跑聚合维护
+        let now = Utc::now().to_rfc3339();
+        db.insert_events(&[raw(&now, "keyboard", "press", None)]);
+        // db 在此 drop（等效进程退出）
+    }
+    let db = Database::open(path.to_str().unwrap()).unwrap();
+    assert!(
+        db.wait_for_backfill(std::time::Duration::from_secs(30)),
+        "欠聚合自愈应在后台完成"
+    );
+    let today = queries::today_local_str();
+    let conn = db.reader();
+    assert!(
+        agg::has_minute_for_date(&conn, &today),
+        "重开后该日必须有聚合行（自愈生效）"
+    );
+    assert_eq!(
+        queries::day_totals(&conn, &today).keys,
+        1,
+        "自愈后聚合计数必须与 events 一致"
+    );
+    drop(conn);
+    cleanup(&path);
+}
