@@ -30,6 +30,10 @@ pub struct Anomaly {
 
 /// 深夜活动：23:00 之后按键 ≥ [`LATE_NIGHT_MIN_KEYS`]。
 ///
+/// 口径注（backlog，2026-09）：本检测的深夜窗口为 [23, 24) 点
+/// （[`constants::LATE_NIGHT_HOUR_START`]）；insights 的深夜卡用 [0, 6) 点，
+/// 两处口径尚未统一，待 backlog 收口（本轮只改 core 侧注释，不动 dash/insights）。
+///
 /// **纯函数**：`late_night_keys` 由 [`queries::late_night_key_count`] 预先取出。
 pub fn late_night_from_count(late_night_keys: i64, date: &str) -> Vec<Anomaly> {
     if late_night_keys >= LATE_NIGHT_MIN_KEYS {

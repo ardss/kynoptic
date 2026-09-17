@@ -524,18 +524,40 @@ pub fn late_night_key_count(conn: &Connection, date: &str, hour_threshold: i64) 
             )
             .unwrap_or(0);
     }
-    let (start, end) = match super::local_day_range(date) {
-        Some(r) => r,
-        None => (date.to_string(), format!("{date}\u{7f}")),
-    };
+    let off = super::local_offset_modifier();
+    match super::local_day_range(date) {
+        Some((start, end)) => {
+            late_night_key_count_in_range(conn, &start, &end, hour_threshold, &off)
+        }
+        None => {
+            let end = format!("{date}\u{7f}");
+            late_night_key_count_in_range(conn, date, &end, hour_threshold, &off)
+        }
+    }
+}
+
+/// [`late_night_key_count`] 的机器无关核心：显式接收 UTC `[start, end)` 边界与
+/// 本地偏移修饰符（供单测注入固定 UTC+8 语义）。
+///
+/// **时区语义（fix 2026-09）**：小时过滤必须先把 UTC timestamp 换算成**本地**时刻
+/// （`datetime(timestamp, ?4)`）再 `substr` 取 HH——此前直接 `substr(timestamp,12,2)`
+/// 取的是 UTC 小时，UTC+8 下本地 07:30 会被误判为深夜（UTC 23 点），真深夜 23:30
+/// （UTC 15 点）反而漏报。与 [`hourly_counts_today`] 的本地小时桶同一模式。
+pub(crate) fn late_night_key_count_in_range(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    hour_threshold: i64,
+    off_modifier: &str,
+) -> i64 {
     conn.query_row(
         &format!(
             "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
              WHERE timestamp >= ?1 AND timestamp < ?2 \
-               AND CAST(substr(timestamp, 12, 2) AS INTEGER) >= ?3 \
+               AND CAST(substr(datetime(timestamp, ?4), 12, 2) AS INTEGER) >= ?3 \
                AND event_type = 'keyboard' AND event_action IN ('press','input_agg')"
         ),
-        params![start, end, hour_threshold],
+        params![start, end, hour_threshold, off_modifier],
         |r| r.get::<_, i64>(0),
     )
     .unwrap_or(0)
@@ -689,4 +711,51 @@ pub fn app_history_totals(conn: &Connection, app: &str, before_date: &str) -> (i
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     )
     .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn conn() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::db::SCHEMA).unwrap();
+        let _ = crate::db::run_migrations(&c);
+        c
+    }
+
+    /// 插入一条 keyboard press 事件（timestamp 为 UTC RFC3339）。
+    fn press(c: &Connection, ts_utc: &str) {
+        c.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, session_id) \
+             VALUES (?1, 'keyboard', 'press', 1)",
+            params![ts_utc],
+        )
+        .unwrap();
+    }
+
+    const OFF8: &str = "+28800 seconds";
+    /// UTC+8 下「本地 2026-06-15」对应的 UTC `[start, end)` 边界。
+    const RANGE: (&str, &str) = ("2026-06-14T16:00:00+00:00", "2026-06-15T16:00:00+00:00");
+
+    /// UTC+8 下本地 07:30（UTC 23:30 前一日）不是深夜：修复前 UTC 小时=23 会被误报。
+    #[test]
+    fn local_morning_0730_is_not_late_night_at_utc8() {
+        let c = conn();
+        press(&c, "2026-06-14T23:30:00+00:00"); // 本地 2026-06-15 07:30
+        press(&c, "2026-06-15T00:00:00+00:00"); // 本地 08:00
+        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, OFF8);
+        assert_eq!(n, 0, "本地早晨 07:30 不应计为深夜");
+    }
+
+    /// UTC+8 下本地 23:30（UTC 15:30）是深夜：修复前 UTC 小时=15 会被漏报。
+    #[test]
+    fn local_night_2330_is_late_night_at_utc8() {
+        let c = conn();
+        press(&c, "2026-06-15T15:30:00+00:00"); // 本地 23:30
+        press(&c, "2026-06-15T05:00:00+00:00"); // 本地 13:00，白天不计
+        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, OFF8);
+        assert_eq!(n, 1, "本地深夜 23:30 应计入");
+    }
 }

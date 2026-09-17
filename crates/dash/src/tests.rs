@@ -241,17 +241,15 @@ fn overview_cpu_mem_from_system_heartbeat_like_current_status() {
 #[test]
 fn heatmap_fills_missing_days_with_zero_and_counts_input_minutes() {
     let conn = mem_conn();
-    // 口径（审查 DeepSeek）：热力图 = 每日"有键鼠输入的分钟数"（agg_minute，
-    // 绝对值），不再是事件条数。今天 2 个输入分钟，前天 1 个。
-    for (h, m) in [(10, 0), (10, 30)] {
-        conn.execute(
-            "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) VALUES ('2026-09-09', ?1, ?2, 'input_keys', 5, 5)",
-            rusqlite::params![h, m],
-        )
-        .unwrap();
-    }
+    // 口径（审查 DeepSeek）：热力图 = 每日"有键鼠输入的分钟数"（daily_agg
+    // 派生缓存，绝对值），不再是事件条数。今天 2 个输入分钟，前天 1 个。
     conn.execute(
-        "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) VALUES ('2026-09-07', 9, 15, 'input_keys', 3, 3)",
+        "INSERT INTO daily_agg (date, keys, clicks, active_minutes) VALUES ('2026-09-09', 10, 2, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO daily_agg (date, keys, clicks, active_minutes) VALUES ('2026-09-07', 3, 1, 1)",
         [],
     )
     .unwrap();
@@ -265,6 +263,43 @@ fn heatmap_fills_missing_days_with_zero_and_counts_input_minutes() {
     assert_eq!(days[4]["value"], json!(1));
     assert_eq!(days[0]["value"], json!(0), "缺数天补零");
     assert_eq!(days[0]["date"], json!("2026-09-03"));
+}
+
+// 性能实证修复的等价性测试：heatmap 改读 daily_agg（PK 直取）后，
+// 输出值必须与旧 agg_minute 去重分钟算法在同数据上一致。
+#[test]
+fn heatmap_daily_agg_equivalent_to_agg_minute_distinct_minutes() {
+    let conn = mem_conn();
+    // 同一天同时造两种口径的数据：agg_minute 3 个不同输入分钟；
+    // daily_agg.active_minutes 记 3（与去重分钟同源，采集器维护）。
+    for (h, m) in [(10, 0), (10, 30), (11, 15)] {
+        conn.execute(
+            "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) VALUES ('2026-09-09', ?1, ?2, 'input_keys', 5, 5)",
+            rusqlite::params![h, m],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO daily_agg (date, keys, clicks, active_minutes) VALUES ('2026-09-09', 30, 5, 3)",
+        [],
+    )
+    .unwrap();
+    // 旧算法参考值：agg_minute GROUP BY date 的去重分钟
+    let legacy: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT hour * 60 + minute) FROM agg_minute WHERE sum_value > 0 AND bucket_id IN ('input_keys','input_clicks','input_moves') AND date = '2026-09-09'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
+    let v = api_heatmap_at(&conn, 1, today);
+    let value = v["days"].as_array().unwrap()[6]["value"].as_i64().unwrap();
+    assert_eq!(legacy, 3);
+    assert_eq!(
+        value, legacy,
+        "daily_agg 口径必须与 agg_minute 去重分钟等价: {v}"
+    );
 }
 
 #[test]
@@ -479,6 +514,163 @@ fn settings_post_vk_frequency_bool_and_audit_log() {
     assert_eq!(code, 200);
     let log = std::fs::read_to_string(&audit).unwrap();
     assert_eq!(log.lines().count(), 1, "无变更不写审计: {log}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// === fuzz 加固：设置面输入校验 ===
+
+#[test]
+fn settings_post_rejects_port_zero_and_out_of_range() {
+    let dir = tmpdir("port-zero");
+    let db = dir.join("kyn.db");
+    // 0 是毒值：落库后面板绑定不到有效端口
+    for port in [0u64, 65536, 99999] {
+        let (code, _, out) = route_req(
+            &mem_conn(),
+            "POST",
+            "/api/settings",
+            &format!(r#"{{"dashboard_port":{port}}}"#),
+            &db,
+        );
+        assert_eq!(code, 400, "port {port} 必须被拒绝: {out}");
+    }
+    // 负数/字符串类型错同样 400
+    let (code, _, _) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"dashboard_port":-1}"#,
+        &db,
+    );
+    assert_eq!(code, 400);
+    // 有效值 1 与 65535 仍被接受
+    for port in [1u64, 65535] {
+        let (code, _, out) = route_req(
+            &mem_conn(),
+            "POST",
+            "/api/settings",
+            &format!(r#"{{"dashboard_port":{port}}}"#),
+            &db,
+        );
+        assert_eq!(code, 200, "port {port} 应有效: {out}");
+    }
+    // 毒值未落库
+    let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["dashboard_port"], json!(65535));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn settings_post_dedups_enabled_monitors() {
+    let dir = tmpdir("dedup");
+    let db = dir.join("kyn.db");
+    // fuzz 实证：500 元素含 495 重复照落。现在应去重保序，只留唯一 id
+    let ids: Vec<String> = ["window", "keyboard_hook", "mouse_hook"]
+        .iter()
+        .flat_map(|id| std::iter::repeat_n(id.to_string(), 170))
+        .collect();
+    let body = format!(r#"{{"enabled_monitors":{}}}"#, json!(ids));
+    let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &body, &db);
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["enabled_monitors"],
+        json!(["window", "keyboard_hook", "mouse_hook"]),
+        "重复 id 应去重且保序: {out}"
+    );
+    // 已写盘
+    let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["enabled_monitors"],
+        json!(["window", "keyboard_hook", "mouse_hook"])
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn settings_post_rejects_oversized_categories() {
+    let dir = tmpdir("cat-limit");
+    let db = dir.join("kyn.db");
+    let mk = |n: usize, name_len: usize| {
+        let rules: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "name": "x".repeat(if i == 0 { name_len } else { 1 }),
+                    "pattern": format!("p{i}"),
+                })
+            })
+            .collect();
+        json!(rules).to_string()
+    };
+    let wrap = |arr: String| format!(r#"{{"categories":{arr}}}"#);
+    // 101 条 → 400
+    let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &wrap(mk(101, 1)), &db);
+    assert_eq!(code, 400, "101 条必须被拒绝: {out}");
+    assert!(out.contains("100"), "报错应可读（含上限 100）: {out}");
+    // 100 条但首条 name 257 字节 → 400
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        &wrap(mk(100, 257)),
+        &db,
+    );
+    assert_eq!(code, 400, "超长 name 必须被拒绝: {out}");
+    assert!(out.contains("256"), "报错应可读（含上限 256）: {out}");
+    // pattern 超长 → 400
+    let body = json!({"categories":[{"name": "ok", "pattern": "y".repeat(257)}]}).to_string();
+    let (code, _, _) = route_req(&mem_conn(), "POST", "/api/settings", &body, &db);
+    assert_eq!(code, 400);
+    // 边界内（100 条 + 256 字节 name）→ 200
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        &wrap(mk(100, 256)),
+        &db,
+    );
+    assert_eq!(code, 200, "100 条 + 256 字节应可接受: {out}");
+    // 毒值未落库
+    let (_, _, out) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["categories"].as_array().unwrap().len(), 100);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn settings_post_reports_ignored_unknown_fields() {
+    let dir = tmpdir("ignored");
+    let db = dir.join("kyn.db");
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"autostart":true,"hack_admin":true,"mystery":[1]}"#,
+        &db,
+    );
+    assert_eq!(code, 200, "未知字段不 400（patch 兼容）: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["ignored"],
+        json!(["hack_admin", "mystery"]),
+        "未知顶层字段应在响应 ignored 列表: {out}"
+    );
+    // 无未知字段时不带 ignored 键
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"autostart":false}"#,
+        &db,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("ignored").is_none(),
+        "无未知字段不应有 ignored: {out}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -710,6 +902,136 @@ fn insights_rhythm_updates_last_and_marks_single_event_day() {
     assert!(zh.contains("17:00"), "最后输入应被更新而非停在首条: {zh}");
     assert!(zh.contains("仅一条输入记录"), "单事件日应标注: {zh}");
     assert!(en.contains("single input event"), "en 侧同步: {en}");
+}
+
+// === insights：P1 驻留封顶 / P3 黄金时段 / 文案门槛 ===
+
+#[test]
+fn insights_dwell_caps_single_segment_at_30_minutes() {
+    let conn = mem_conn();
+    // 跨天空档：appA 切入后 72 小时才有下一次切换——单段必须截到 30 分钟，
+    // 不再输出 "appA 72.0h" 级别的荒谬值。
+    insert(&conn, &local_ts(-6, 0, 1), "window", "switch", Some("appA"));
+    insert(&conn, &local_ts(-3, 0, 1), "window", "switch", Some("appB"));
+    // 过 50 事件门槛（50 条输入）
+    for _ in 0..50 {
+        insert(&conn, &local_ts(-1, 12, 0), "keyboard", "press", None);
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    let dwell_card = v["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title_en"] == json!("Top 3 apps by dwell time"))
+        .expect("驻留卡应存在");
+    let en = dwell_card["text_en"].as_str().unwrap();
+    assert!(en.contains("appA 0.5h"), "72h 空档应截断为 30 分钟: {en}");
+    assert!(!en.contains("72"), "不得出现未封顶时长: {en}");
+}
+
+#[test]
+fn insights_golden_hours_pair_midnight_across_day_boundary() {
+    let conn = mem_conn();
+    // 23 点与 0 点各 40 条：跨午夜组合 (23:00-01:00) 必须当选；
+    // 旧实现 for h in 0..23 永远看不到 h=23 的配对。
+    for _ in 0..40 {
+        insert(&conn, &local_ts(-1, 0, 30), "keyboard", "press", None);
+        insert(&conn, &local_ts(-1, 23, 30), "keyboard", "press", None);
+    }
+    // 干扰项：9/10 点各 30 条（各不足总数 140 的 25%）
+    for _ in 0..30 {
+        insert(&conn, &local_ts(-1, 9, 30), "keyboard", "press", None);
+        insert(&conn, &local_ts(-1, 10, 30), "keyboard", "press", None);
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    let golden = v["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title_en"] == json!("Your golden hours"))
+        .expect("黄金时段卡应存在");
+    let zh = golden["text_zh"].as_str().unwrap();
+    assert!(zh.contains("23:00-01:00"), "跨午夜组合应当选: {zh}");
+}
+
+#[test]
+fn insights_golden_hours_requires_each_hour_at_least_quarter_of_total() {
+    let conn = mem_conn();
+    // 小时 0 密集（60）+ 小时 1 全空：不带 25% 门槛时 (0,1) 组合和 60 会
+    // 以更早的 h=0 胜出，把"密集小时 + 空小时"拼成"最密集两小时"。
+    // 门槛下 (0,1) 出局，由 9/10 点（各 30，恰好 >= 总数 120 的 25%）当选。
+    for _ in 0..60 {
+        insert(&conn, &local_ts(-1, 0, 30), "keyboard", "press", None);
+    }
+    for _ in 0..30 {
+        insert(&conn, &local_ts(-1, 9, 30), "keyboard", "press", None);
+        insert(&conn, &local_ts(-1, 10, 30), "keyboard", "press", None);
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    let golden = v["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title_en"] == json!("Your golden hours"))
+        .expect("黄金时段卡应存在");
+    let zh = golden["text_zh"].as_str().unwrap();
+    assert!(
+        zh.contains("09:00-11:00") && !zh.contains("00:00-02:00"),
+        "密集+空小时拼凑的组合不得当选，应选双密集小时: {zh}"
+    );
+}
+
+#[test]
+fn insights_below_gate_with_today_data_shows_warming_up_card() {
+    let conn = mem_conn();
+    // 今日已有 10 条输入但未到 50 门槛：给"数据积累中"info 卡而非空列表
+    for _ in 0..10 {
+        insert(&conn, &local_ts(0, 10, 0), "keyboard", "press", None);
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    let list = v["insights"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "应恰好一张 warming-up 卡: {v}");
+    assert_eq!(list[0]["title_en"], json!("Still warming up"));
+    assert_eq!(list[0]["title_zh"], json!("数据积累中"));
+    assert!(
+        list[0]["text_en"]
+            .as_str()
+            .unwrap()
+            .contains("10 events so far"),
+        "en 文案应带事件数"
+    );
+    assert!(
+        list[0]["text_zh"]
+            .as_str()
+            .unwrap()
+            .contains("已记录 10 条"),
+        "zh 文案应带事件数"
+    );
+}
+
+#[test]
+fn insights_empty_db_returns_empty_list() {
+    let conn = mem_conn();
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    assert!(
+        v["insights"].as_array().unwrap().is_empty(),
+        "完全无数据时仍为空列表（不出 warming-up 卡）: {v}"
+    );
 }
 
 // === anomalies：message_en 映射 ===
@@ -1038,6 +1360,41 @@ mod socket_tests {
             "垃圾字节后服务必须存活: {resp}"
         );
         // serve 线程仍持只读连接，Windows 上目录删除是尽力而为
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_body_gets_413_not_silent_truncation() {
+        let (port, dir) = start_server("body-413");
+        // fuzz 实证：Content-Length > 64KB 旧实现静默截断到 64KB 继续解析。
+        // 现在必须直接 413（带安全头、Connection: close），不读 body。
+        let req = format!(
+            "POST /api/settings HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Origin: http://127.0.0.1:{port}\r\n\
+             X-Kynoptic: 1\r\n\
+             Content-Length: 70000\r\n\
+             \r\n"
+        );
+        let resp = get(port, &req);
+        assert!(
+            resp.starts_with("HTTP/1.1 413 "),
+            "超限 body 必须回 413: {resp}"
+        );
+        assert!(resp.contains("nosniff"), "413 必须带安全头: {resp}");
+        assert!(
+            resp.contains("Connection: close"),
+            "413 必须声明关闭连接: {resp}"
+        );
+        // 服务存活：正常请求仍 200
+        let resp = get(
+            port,
+            &format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "413 后服务必须存活: {resp}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

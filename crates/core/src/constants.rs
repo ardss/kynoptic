@@ -32,7 +32,7 @@ pub const DB_FILENAME: &str = "kynoptic.db";
 /// 读连接池耗尽时最多等待的周期数（每周期 5s）。
 /// 超过则降级为新建临时连接，避免调用方无限阻塞。
 pub const READER_POOL_MAX_WAITS: u32 = 3;
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段
@@ -41,7 +41,11 @@ pub const FOCUS_MIN_MINUTES: i64 = 5;
 pub const FOCUS_MAX_WINDOW_SWITCHES_PER_MIN: i64 = 3;
 
 // === 异常检测阈值（anomaly） ===
-/// 23:00 之后视为深夜
+/// 23:00 之后视为深夜。
+///
+/// 口径注（backlog，2026-09）：本常量当前定义深夜为 [23, 24) 点；
+/// insights 的深夜卡用的是 [0, 6) 点——两处口径尚未统一，待后续
+/// backlog 收口（本轮只改 core 侧常量与注释，不动 dash/insights 行为）。
 pub const LATE_NIGHT_HOUR_START: u32 = 23;
 /// 深夜至少 N 次按键才报警
 pub const LATE_NIGHT_MIN_KEYS: i64 = 50;

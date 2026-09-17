@@ -7,6 +7,7 @@
 //! - 0001：v0.1 采集器基础表（events / sessions / metadata / daily_agg + 索引）
 //! - 0002：开放 bucket 模型（schema_meta / buckets / event_types / agg_minute /
 //!   agg_daily / current_state）+ pet 遗留表清理
+//! - 0010：device_snapshot「最新含字段快照」部分索引（api_input / overview 硬件卡）
 //!
 //! PRAGMA 只在 [`apply_pragmas`] 出现一次。
 
@@ -48,6 +49,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0009_events_action_ts",
         include_str!("migrations/0009_events_action_ts.sql"),
+    ),
+    (
+        "0010_snapshot_partial_idx",
+        include_str!("migrations/0010_snapshot_partial_idx.sql"),
     ),
 ];
 
@@ -179,5 +184,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// 0010 部分索引命中验证（perf P0：api_input / overview 硬件卡的
+    /// "最新含字段快照"查询，无匹配行时不得反向扫全部历史 device_snapshot）。
+    /// 用 EXPLAIN QUERY PLAN 断言 dash 侧两条真实 SQL（WHERE 谓词必须与索引
+    /// 谓词完全同形）走 idx_events_action_id_input / idx_events_action_id_hw。
+    #[test]
+    fn snapshot_partial_indexes_are_used_by_latest_snapshot_queries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let _ = run_migrations(&conn);
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let mut out = String::new();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(r) = rows.next().unwrap() {
+                out.push_str(&r.get::<_, String>(3).unwrap());
+                out.push_str("; ");
+            }
+            out
+        };
+
+        // dash /api/input：最新 input_devices 拓扑快照
+        let p = plan(
+            "SELECT event_data FROM events \
+             WHERE event_action = 'device_snapshot' \
+               AND json_extract(event_data, '$.input_devices') IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+        );
+        assert!(
+            p.contains("idx_events_action_id_input"),
+            "api_input 快照查询应命中部分索引，实际计划: {p}"
+        );
+
+        // dash overview 硬件卡：最新 memory.total_gb 快照
+        let p = plan(
+            "SELECT event_data FROM events \
+             WHERE event_action = 'device_snapshot' \
+               AND json_extract(event_data, '$.memory.total_gb') IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+        );
+        assert!(
+            p.contains("idx_events_action_id_hw"),
+            "overview 硬件卡快照查询应命中部分索引，实际计划: {p}"
+        );
+
+        // 无匹配行时不退化：空表/无含字段行时计划不变（部分索引为空即 O(1)）
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, session_id) \
+             VALUES ('2026-06-15T00:00:00+00:00', 'device', 'device_snapshot', 1)",
+            [],
+        )
+        .unwrap();
+        let p = plan(
+            "SELECT event_data FROM events \
+             WHERE event_action = 'device_snapshot' \
+               AND json_extract(event_data, '$.input_devices') IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+        );
+        assert!(
+            p.contains("idx_events_action_id_input"),
+            "无匹配行时仍应走部分索引（空扫），实际计划: {p}"
+        );
     }
 }

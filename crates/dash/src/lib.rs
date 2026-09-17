@@ -518,28 +518,32 @@ fn db_path_with_wal(db_path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
-/// GET /api/heatmap?weeks= — 近 `weeks` 周按本地日聚合的活跃度（事件总量）。
+/// GET /api/heatmap?weeks= — 近 `weeks` 周按本地日聚合的活跃度。
 /// 返回 `[{date, value}]`，按日升序，缺数天补零。`now` 注入以便测试。
+///
+/// 性能实证修复：旧实现扫 agg_minute 全史 GROUP BY（90 天库 cache miss
+/// 实测 ~1s，overview 连续有输入天数/streak 卡即读此数据）。改读
+/// daily_agg 日粒度派生缓存（date 为 PRIMARY KEY，一年最多 ~365 行，
+/// PK 直取 ms 级）。语义不变：value = 当日本地时区有键鼠输入的分钟数
+/// （daily_agg.active_minutes 与 agg_minute 去重分钟同源，见
+/// core/src/daily_agg.rs）。
 pub fn api_heatmap_at(conn: &Connection, weeks: u32, today: chrono::NaiveDate) -> Value {
     let weeks = weeks.clamp(1, 52);
     let days = i64::from(weeks) * 7;
     let since = today - chrono::Duration::days(days - 1);
-    let _since_utc = queries::local_day_range(&since.format("%Y-%m-%d").to_string())
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    // 审查（DeepSeek）：口径从"每日事件条数"改为"每日键鼠输入分钟"（绝对值，
-    // 不再做窗口内相对分档）——事件条数会被系统事件与自动化注入通胀
+    // 审查（DeepSeek）：口径 = "每日键鼠输入分钟"（绝对值）——事件条数会被
+    // 系统事件与自动化注入通胀
     let mut by_date: std::collections::BTreeMap<String, i64> = {
         let mut m = std::collections::BTreeMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT date, COUNT(DISTINCT hour * 60 + minute) FROM agg_minute              WHERE sum_value > 0 AND bucket_id IN ('input_keys','input_clicks','input_moves')                AND date >= ?1 GROUP BY date",
-        ) {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT date, active_minutes FROM daily_agg WHERE date >= ?1")
+        {
             let since_str = since.format("%Y-%m-%d").to_string();
             if let Ok(rows) = stmt.query_map(params![&since_str], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
             }) {
                 for (d, v) in rows.flatten() {
-                    m.insert(d, v);
+                    m.insert(d, v.max(0));
                 }
             }
         }
@@ -725,7 +729,9 @@ fn command_output_capped(
 /// 最近一次 device_snapshot 的 memory + disks（总量/剩余，来自采集器快照）。
 fn latest_device_snapshot(conn: &Connection) -> serde_json::Value {
     let Ok(data) = conn.query_row(
-        "SELECT event_data FROM events          WHERE event_action = 'device_snapshot' AND json_valid(event_data)            AND json_extract(event_data, '$.memory.total_gb') IS NOT NULL          ORDER BY id DESC LIMIT 1",
+        // WHERE 必须与 0010 迁移部分索引 idx_events_action_id_hw 的谓词完全同形
+        // 才能命中（故去掉冗余 json_valid；event_data 只写合法 JSON 或 NULL）。
+        "SELECT event_data FROM events          WHERE event_action = 'device_snapshot'            AND json_extract(event_data, '$.memory.total_gb') IS NOT NULL          ORDER BY id DESC LIMIT 1",
         [],
         |r| r.get::<_, Option<String>>(0),
     ) else {
@@ -964,6 +970,24 @@ fn insights_compute(
     }
     let mut insights: Vec<Value> = Vec::new();
     if acts.len() < 50 {
+        // 文案实证修复：前端曾对空列表硬编码"采集满一天后…"，与真实门槛
+        // （7 天窗口 >=50 条输入事件）不符。acts<50 但今日已有数据时，
+        // 输出一张"数据积累中"的 info 卡替代空列表。
+        let today_start =
+            queries::local_day_range(&now.date_naive().format("%Y-%m-%d").to_string())
+                .and_then(|(s2, _)| chrono::DateTime::parse_from_rfc3339(&s2).ok());
+        let has_today = today_start
+            .map(|s2| acts.iter().any(|(t, _)| *t >= s2))
+            .unwrap_or(false);
+        if has_today {
+            let n = acts.len();
+            return json!({"insights": [{
+                "title_zh": "数据积累中",
+                "title_en": "Still warming up",
+                "text_zh": format!("已记录 {n} 条输入事件，积累到 50 条后生成洞察。"),
+                "text_en": format!("Still warming up ({n} events so far) — insights appear after 50."),
+            }]});
+        }
         return json!({"insights": []});
     }
     let fmt_hm = |t: &chrono::DateTime<chrono::FixedOffset>| -> String {
@@ -1018,12 +1042,16 @@ fn insights_compute(
         }));
     }
 
-    // 2) 应用驻留 Top3（窗口切换间隔推算，单段上限 30 分钟）
+    // 2) 应用驻留 Top3（窗口切换间隔推算，单段上限 30 分钟）。
+    //    P1 实证修复：注释声称"单段上限 30 分钟"但实现无封顶，跨天空档
+    //    （如下一次切换在 3 天后）会输出 "appA 142.0h" 荒谬值。恢复封顶：
+    //    单段贡献截断到 1800 秒。
     let mut dwell: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for i in 0..switches.len() {
         let (t, a) = &switches[i];
         let nxt = switches.get(i + 1).map(|(t2, _)| *t2).unwrap_or(*t);
-        *dwell.entry(a.clone()).or_insert(0.0) += (nxt - *t).num_seconds() as f64;
+        let seg = (nxt - *t).num_seconds().clamp(0, 30 * 60);
+        *dwell.entry(a.clone()).or_insert(0.0) += seg as f64;
     }
     let mut top: Vec<(String, f64)> = dwell.into_iter().collect();
     top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1081,17 +1109,26 @@ fn insights_compute(
         }));
     }
 
-    // 5) 黄金时段（输入最密集的连续 2 小时）
+    // 5) 黄金时段（输入最密集的连续 2 小时）。
+    //    P3 实证修复：旧实现 `for h in 0..23` 漏掉 h=23，23:00-24:00 与
+    //    0:00-1:00 的跨午夜组合永不当选——循环改 0..=23 取模配对。
+    //    同时要求两小时各自事件数 >= 窗口总数的 25%：防止"空小时 + 密集
+    //    小时"被拼成"最密集两小时"。
     let mut in_hour: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for (t, _) in &acts {
         *in_hour
             .entry(t.with_timezone(&chrono::Local).hour())
             .or_insert(0) += 1;
     }
+    let in_total: usize = in_hour.values().sum();
     let mut best2: (usize, u32) = (0, 0);
-    for h in 0..23u32 {
-        let sum = in_hour.get(&h).copied().unwrap_or(0)
-            + in_hour.get(&((h + 1) % 24)).copied().unwrap_or(0);
+    for h in 0..=23u32 {
+        let a = in_hour.get(&h).copied().unwrap_or(0);
+        let b = in_hour.get(&((h + 1) % 24)).copied().unwrap_or(0);
+        if a * 4 < in_total || b * 4 < in_total {
+            continue;
+        }
+        let sum = a + b;
         if sum > best2.0 {
             best2 = (sum, h);
         }
@@ -1472,7 +1509,7 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     let mut next = settings::load(db_path);
     let prev = next.clone();
     if let Some(v) = req.get("enabled_monitors") {
-        let ids: Vec<String> = v
+        let mut ids: Vec<String> = v
             .as_array()
             .ok_or("enabled_monitors 应为字符串数组")?
             .iter()
@@ -1485,6 +1522,9 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         if let Some(bad) = settings::first_invalid_id(&ids) {
             return Err(format!("未知监控器 id: {bad}"));
         }
+        // fuzz 加固：去重保序（重复 id 不改变语义，不必落库冗余条目）
+        let mut seen = std::collections::HashSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
         next.enabled_monitors = ids;
     }
     if let Some(v) = req.get("input_counts_only") {
@@ -1512,6 +1552,10 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     if let Some(v) = req.get("categories") {
         let arr = v.as_array().ok_or("categories 应为数组")?;
+        // fuzz 加固：条数与单条长度上限（拒绝毒值大对象落盘）
+        if arr.len() > 100 {
+            return Err(format!("categories 条数不能超过 100（当前 {}）", arr.len()));
+        }
         let mut rules = Vec::with_capacity(arr.len());
         for r in arr {
             let name = r
@@ -1524,14 +1568,21 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
                 .and_then(|x| x.as_str())
                 .ok_or("categories[].pattern 缺失")?
                 .to_string();
+            if name.len() > 256 {
+                return Err("categories[].name 长度不能超过 256".into());
+            }
+            if pattern.len() > 256 {
+                return Err("categories[].pattern 长度不能超过 256".into());
+            }
             rules.push(settings::CategoryRule { name, pattern });
         }
         next.categories = rules;
     }
     if let Some(v) = req.get("dashboard_port") {
-        let port = v.as_u64().ok_or("dashboard_port 应为 0-65535 整数")?;
-        if port > u16::MAX as u64 {
-            return Err("dashboard_port 应为 0-65535 整数".into());
+        let port = v.as_u64().ok_or("dashboard_port 应为 1-65535 整数")?;
+        // fuzz 加固：0 也是毒值（绑定语义在 serve 层，落库 0 只会让面板打不开）
+        if !(1..=u16::MAX as u64).contains(&port) {
+            return Err("dashboard_port 应为 1-65535 整数".into());
         }
         next.dashboard_port = port as u16;
     }
@@ -1540,7 +1591,32 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         append_settings_audit(db_path, &settings_audit_summary(&prev, &next));
     }
     SETTINGS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(settings_payload(&next))
+    let mut payload = settings_payload(&next);
+    // 可选低成本兼容：未知顶层字段不 400，仅在响应里回 "ignored" 供前端排查
+    const KNOWN: [&str; 9] = [
+        "enabled_monitors",
+        "input_counts_only",
+        "vk_frequency_enabled",
+        "autostart",
+        "presence_bridge_minutes",
+        "daily_goal_minutes",
+        "categories",
+        "dashboard_port",
+        "monitors",
+    ];
+    let ignored: Vec<&str> = req
+        .as_object()
+        .map(|o| {
+            o.keys()
+                .filter(|k| !KNOWN.contains(&k.as_str()))
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !ignored.is_empty() {
+        payload["ignored"] = json!(ignored);
+    }
+    Ok(payload)
 }
 
 /// POST /api/settings 审计行：RFC3339 时间 + 变更字段摘要（JSON），一行一条。
@@ -1985,7 +2061,16 @@ fn handle_client(
             );
         }
     }
-    content_length = content_length.min(64 * 1024);
+    // fuzz 加固：超限 body 直接 413，不再静默截断解析（旧路径截断到 64KB 后
+    // 仍进 JSON 解析，且与客户端期望的字节数不一致会导致连接重置）。
+    if content_length > 64 * 1024 {
+        return http_simple(
+            &mut stream,
+            413,
+            "application/json",
+            "{\"error\":\"payload too large (max 65536 bytes)\"}",
+        );
+    }
     while raw.len() < header_end + content_length {
         let n = stream.read(&mut buf)?;
         if n == 0 {
@@ -2034,6 +2119,7 @@ fn http_simple(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Error",

@@ -1,6 +1,10 @@
 ﻿; Kynoptic 安装器脚本（Inno Setup 6）
 ; CI: iscc kynoptic.iss /DAppVersion=0.1.0
 
+#ifndef AppVersion
+#define AppVersion "0.1.0"
+#endif
+
 #define AppName "Kynoptic"
 #define AppPublisher "ardss"
 #define AppExeName "kynoptic-tray.exe"
@@ -108,7 +112,7 @@ begin
     // 未勾选：清掉旧安装留下的 DISABLE 僵尸任务与残留 Run 值。
     if not WizardIsTaskSelected('autostart') then begin
       RunHidden('schtasks', '/Delete /F /TN "Kynoptic Watchdog"');
-      RegDeleteStringValue(HKEY_CURRENT_USER,
+      RegDeleteValue(HKEY_CURRENT_USER,
         'Software\Microsoft\Windows\CurrentVersion\Run', 'Kynoptic');
     end;
   end;
@@ -133,10 +137,15 @@ begin
     AppDir := ExpandConstant('{app}');
     DataDir := AppDir + '\data';
     // 卸载询问（默认"否"，即默认保留数据）
-    DeleteDataOnUninstall :=
-      (MsgBox('是否同时删除用户数据目录？' #13#10 + DataDir + #13#10#13#10 +
-              '（包含 kynoptic.db 与 settings.json，选"否"则保留数据）',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES);
+    // 静默卸载（/VERYSILENT /SUPPRESSMSGBOXES）下 MsgBox 不会消失会挂死：
+    // 静默时跳过询问，默认保留数据（安全侧）。
+    if UninstallSilent then
+      DeleteDataOnUninstall := False
+    else
+      DeleteDataOnUninstall :=
+        (MsgBox('是否同时删除用户数据目录？' #13#10 + DataDir + #13#10#13#10 +
+                '（包含 kynoptic.db 与 settings.json，选"否"则保留数据）',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES);
 
     // 清理运行期残留文件（忽略不存在的情况）
     Leftovers[0] := AppDir + '\tray-exit.flag';
