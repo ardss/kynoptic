@@ -31,8 +31,9 @@ CLI 默认路径推导时会打印 `using db: <path>` 到 stderr——**注意�
 kynoptic presence --days 7        # 三指标：每日 presence/automation/foreground + mixed（权威口径）
 kynoptic now                      # 即时状态：APM/CPU/前台应用/idle
 kynoptic stats                    # 输入统计（raw 口径）
-kynoptic report [date]            # 单日报告
-kynoptic analyze --days 7         # 多日分析
+kynoptic report --date YYYY-MM-DD   # 单日报告
+kynoptic analyze --days 7           # 近 7 天逐日专注/碎片/异常分析
+kynoptic analyze --date YYYY-MM-DD  # 单日专注/碎片/异常分析
 kynoptic export --days 7 --out FILE [--format csv|jsonl] [--redact]
 kynoptic db stats                 # 行数/库大小
 kynoptic mcp                      # 启动 MCP 服务器（stdio）

@@ -138,10 +138,10 @@ impl Monitor for FileActivityMonitor {
 
         // 节流：每分钟最多 MAX_EVENTS_PER_MINUTE 条
         let now = Instant::now();
-        let within_window = match st.window_start {
-            Some(start) if now.duration_since(start) < Duration::from_secs(60) => true,
-            _ => false,
-        };
+        let within_window = matches!(
+            st.window_start,
+            Some(start) if now.duration_since(start) < Duration::from_secs(60)
+        );
         if !within_window {
             st.window_start = Some(now);
             st.window_count = 0;
@@ -206,7 +206,12 @@ pub fn spawn_watcher(path: &str, root_name: &str, tx: crossbeam_channel::Sender<
         .ok();
 }
 
-fn watch_loop(path: &str, root_name: &str, tx: &crossbeam_channel::Sender<RawChange>, stop: &AtomicBool) {
+fn watch_loop(
+    path: &str,
+    root_name: &str,
+    tx: &crossbeam_channel::Sender<RawChange>,
+    stop: &AtomicBool,
+) {
     loop {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -264,24 +269,8 @@ fn watch_loop(path: &str, root_name: &str, tx: &crossbeam_channel::Sender<RawCha
                 break;
             }
 
-            let mut changes = parse_notify_buffer(&buffer[..returned as usize]);
-            // 合并 rename 对：OLD_NAME + NEW_NAME 相邻出现，统一记为 renamed（用新名）
-            let mut i = 0;
-            while i < changes.len() {
-                if changes[i].0 == FILE_ACTION_RENAMED_OLD_NAME {
-                    let is_pair = i + 1 < changes.len()
-                        && changes[i + 1].0 == FILE_ACTION_RENAMED_NEW_NAME;
-                    changes[i].0 = if is_pair {
-                        changes[i + 1].0
-                    } else {
-                        FILE_ACTION_RENAMED_NEW_NAME
-                    };
-                    if is_pair {
-                        changes.remove(i + 1);
-                    }
-                }
-                i += 1;
-            }
+            let changes = parse_notify_buffer(&buffer[..returned as usize]);
+            let changes = merge_rename_pairs(changes);
 
             for (action, name) in changes {
                 let Some(seg) = first_path_segment(&name) else {
@@ -316,6 +305,27 @@ fn open_watch_handle(path: &str) -> HANDLE {
     }
 }
 
+/// 合并 rename 对：OLD_NAME + NEW_NAME 相邻出现，统一记为 renamed（用新名）。
+/// 未配对的 OLD_NAME（重命名到监控树外）按删除（REMOVED）处理。
+fn merge_rename_pairs(mut changes: Vec<(u32, String)>) -> Vec<(u32, String)> {
+    let mut i = 0;
+    while i < changes.len() {
+        if changes[i].0 == FILE_ACTION_RENAMED_OLD_NAME {
+            let is_pair = i + 1 < changes.len() && changes[i + 1].0 == FILE_ACTION_RENAMED_NEW_NAME;
+            if is_pair {
+                // 用 NEW_NAME 段的文件名替换被合并条目，再移除 NEW_NAME
+                changes[i].0 = FILE_ACTION_RENAMED_NEW_NAME;
+                changes[i].1 = std::mem::take(&mut changes[i + 1].1);
+                changes.remove(i + 1);
+            } else {
+                changes[i].0 = FILE_ACTION_REMOVED;
+            }
+        }
+        i += 1;
+    }
+    changes
+}
+
 /// 解析 FILE_NOTIFY_INFORMATION 链表，返回 (action, 文件名) 列表
 pub fn parse_notify_buffer(buf: &[u8]) -> Vec<(u32, String)> {
     let mut out = Vec::new();
@@ -330,8 +340,10 @@ pub fn parse_notify_buffer(buf: &[u8]) -> Vec<(u32, String)> {
             break;
         }
         let name_utf16: Vec<u16> = buf[name_start..name_start + name_len]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         out.push((action, String::from_utf16_lossy(&name_utf16)));
         if next == 0 {
@@ -346,7 +358,10 @@ pub fn parse_notify_buffer(buf: &[u8]) -> Vec<(u32, String)> {
 fn first_path_segment(name: &str) -> Option<String> {
     // 去掉扩展路径前缀 \\?\
     let cleaned = name.strip_prefix("\\\\?\\").unwrap_or(name);
-    cleaned.split('\\').find(|s| !s.is_empty()).map(String::from)
+    cleaned
+        .split('\\')
+        .find(|s| !s.is_empty())
+        .map(String::from)
 }
 
 fn map_action(action: u32) -> &'static str {
@@ -441,6 +456,33 @@ mod tests {
     }
 
     #[test]
+    fn rename_pair_merges_to_new_name() {
+        let merged = merge_rename_pairs(vec![
+            (FILE_ACTION_RENAMED_OLD_NAME, "old.txt".into()),
+            (FILE_ACTION_RENAMED_NEW_NAME, "new.txt".into()),
+            (FILE_ACTION_MODIFIED, "keep.bin".into()),
+        ]);
+        assert_eq!(merged.len(), 2);
+        // 配对成功：记为 renamed 且用新名，不保留旧名
+        assert_eq!(merged[0].0, FILE_ACTION_RENAMED_NEW_NAME);
+        assert_eq!(merged[0].1, "new.txt");
+        assert_eq!(merged[1], (FILE_ACTION_MODIFIED, "keep.bin".to_string()));
+    }
+
+    #[test]
+    fn unpaired_old_name_is_deleted() {
+        // 重命名到监控树外：只剩 OLD_NAME，应按删除而非 renamed 处理
+        let merged = merge_rename_pairs(vec![
+            (FILE_ACTION_RENAMED_OLD_NAME, "gone.txt".into()),
+            (FILE_ACTION_ADDED, "other.txt".into()),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].0, FILE_ACTION_REMOVED);
+        assert_eq!(merged[0].1, "gone.txt");
+        assert_eq!(map_action(merged[0].0), "deleted");
+    }
+
+    #[test]
     fn first_path_segment_works() {
         assert_eq!(first_path_segment("a.txt"), Some("a.txt".into()));
         assert_eq!(first_path_segment("sub\\deep\\f.txt"), Some("sub".into()));
@@ -521,7 +563,10 @@ mod tests {
 
         // 去抖窗口内：不产事件
         monitor.collect(&tx);
-        assert!(rx.try_recv().is_err(), "within debounce window must not emit");
+        assert!(
+            rx.try_recv().is_err(),
+            "within debounce window must not emit"
+        );
 
         // 把 pending 时间戳拨回 3 秒前：去抖通过，产事件
         {

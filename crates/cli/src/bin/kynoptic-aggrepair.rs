@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use chrono::{NaiveDate, Utc};
-use rusqlite::{Connection, OpenFlags};
 use kynoptic_core::db::agg;
+use rusqlite::{Connection, OpenFlags};
 
 const BUCKET_KEYS: &str = "input_keys";
 
@@ -75,7 +75,12 @@ fn parse_args() -> Args {
         eprintln!("--from 晚于 --to");
         exit(2);
     }
-    Args { db, from, to, apply }
+    Args {
+        db,
+        from,
+        to,
+        apply,
+    }
 }
 
 /// 复制 db 三件套（db / -wal / -shm）到 %TEMP%/kynoptic-aggrepair-<tag>/，
@@ -114,7 +119,12 @@ fn read_minute_keys(conn: &Connection, from: &str, to: &str) -> BTreeMap<(String
     let mut map = BTreeMap::new();
     let rows = stmt
         .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, f64>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
         })
         .expect("查询 agg_minute 失败");
     for row in rows {
@@ -146,28 +156,61 @@ fn diff_minutes(
         .collect()
 }
 
-fn print_compare(title: &str, from: &str, to: &str, current: &BTreeMap<(String, i64, i64), f64>, expected: &BTreeMap<(String, i64, i64), f64>) {
+fn print_compare(
+    title: &str,
+    from: &str,
+    to: &str,
+    current: &BTreeMap<(String, i64, i64), f64>,
+    expected: &BTreeMap<(String, i64, i64), f64>,
+) {
     println!("== {title} ==");
     let mut day = from.to_string();
     let end = to.to_string();
     loop {
-        let cur_total: f64 = current.iter().filter(|((d, _, _), _)| *d == day).map(|(_, v)| *v).sum();
-        let exp_total: f64 = expected.iter().filter(|((d, _, _), _)| *d == day).map(|(_, v)| *v).sum();
+        let cur_total: f64 = current
+            .iter()
+            .filter(|((d, _, _), _)| *d == day)
+            .map(|(_, v)| *v)
+            .sum();
+        let exp_total: f64 = expected
+            .iter()
+            .filter(|((d, _, _), _)| *d == day)
+            .map(|(_, v)| *v)
+            .sum();
         let diffs = diff_minutes(
-            &current.iter().filter(|((d, _, _), _)| *d == day).map(|(k, v)| (k.clone(), *v)).collect(),
-            &expected.iter().filter(|((d, _, _), _)| *d == day).map(|(k, v)| (k.clone(), *v)).collect(),
+            &current
+                .iter()
+                .filter(|((d, _, _), _)| *d == day)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            &expected
+                .iter()
+                .filter(|((d, _, _), _)| *d == day)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
         );
-        let ratio = if exp_total > 0.0 { cur_total / exp_total } else { f64::NAN };
+        let ratio = if exp_total > 0.0 {
+            cur_total / exp_total
+        } else {
+            f64::NAN
+        };
         println!(
             "  {} : 当前 keys 合计 = {:.0}, 期望(events 重算) = {:.0}, 差异分钟数 = {}{}",
             day,
             cur_total,
             exp_total,
             diffs.len(),
-            if exp_total > 0.0 { format!(", 当前/期望 = {:.2}x", ratio) } else { String::new() },
+            if exp_total > 0.0 {
+                format!(", 当前/期望 = {:.2}x", ratio)
+            } else {
+                String::new()
+            },
         );
         for ((d, h, m), c, e) in diffs.iter().take(20) {
-            println!("    {} {:02}:{:02}  当前 = {:.0}, 期望 = {:.0}", d, h, m, c, e);
+            println!(
+                "    {} {:02}:{:02}  当前 = {:.0}, 期望 = {:.0}",
+                d, h, m, c, e
+            );
         }
         if diffs.len() > 20 {
             println!("    ...（其余 {} 个差异分钟省略）", diffs.len() - 20);
@@ -188,8 +231,13 @@ fn print_compare(title: &str, from: &str, to: &str, current: &BTreeMap<(String, 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = parse_args();
-    println!("kynoptic-aggrepair: db = {:?}, 范围 = {} ..= {}（本地日，含端点）, 模式 = {}",
-        args.db, args.from, args.to, if args.apply { "APPLY" } else { "DRY-RUN" });
+    println!(
+        "kynoptic-aggrepair: db = {:?}, 范围 = {} ..= {}（本地日，含端点）, 模式 = {}",
+        args.db,
+        args.from,
+        args.to,
+        if args.apply { "APPLY" } else { "DRY-RUN" }
+    );
 
     // ---- 1. 期望值：副本上用公开 rebuild_all 从 events 全量重算（只读原始数据）----
     let copy1 = copy_db(&args.db, "expect");
@@ -198,7 +246,11 @@ fn main() {
         kynoptic_core::db::run_migrations(&conn).expect("副本迁移失败");
         let t0 = std::time::Instant::now();
         let n = agg::rebuild_all(&conn).expect("副本重算失败");
-        println!("副本重算完成：{} 行 agg_minute（{} ms）", n, t0.elapsed().as_millis());
+        println!(
+            "副本重算完成：{} 行 agg_minute（{} ms）",
+            n,
+            t0.elapsed().as_millis()
+        );
     }
     let expected_conn = Connection::open(&copy1).expect("重开副本失败");
     let expected = read_minute_keys(&expected_conn, &args.from, &args.to);
@@ -211,7 +263,13 @@ fn main() {
     .unwrap_or_else(|e| panic!("只读打开 {:?} 失败: {e}", args.db));
     let current = read_minute_keys(&target_ro, &args.from, &args.to);
 
-    print_compare("dry-run 对比（agg 当前值 vs events 重算期望值）", &args.from, &args.to, &current, &expected);
+    print_compare(
+        "dry-run 对比（agg 当前值 vs events 重算期望值）",
+        &args.from,
+        &args.to,
+        &current,
+        &expected,
+    );
     let total_diff = diff_minutes(&current, &expected).len();
     println!("范围差异分钟总数 = {}", total_diff);
     if !args.apply {
@@ -221,14 +279,28 @@ fn main() {
 
     // ---- 3. apply：范围外快照 -> 事务内 rebuild_all -> 快照插回 ----
     println!("--apply：开始重算目标库（范围外聚合行将原样保留）...");
-    let target = Connection::open(&args.db).unwrap_or_else(|e| panic!("打开 {:?} 失败: {e}", args.db));
+    let target =
+        Connection::open(&args.db).unwrap_or_else(|e| panic!("打开 {:?} 失败: {e}", args.db));
     kynoptic_core::db::run_migrations(&target).expect("目标库迁移失败");
 
     // 快照范围外 agg_minute 与 agg_daily(app:%) 行（逐行读入内存）
     #[allow(dead_code)]
-    struct MinRow { date: String, hour: i64, minute: i64, bucket: String, sum: Option<f64>, count: Option<i64>, max_rowid: i64 }
+    struct MinRow {
+        date: String,
+        hour: i64,
+        minute: i64,
+        bucket: String,
+        sum: Option<f64>,
+        count: Option<i64>,
+        max_rowid: i64,
+    }
     #[allow(dead_code)]
-    struct DayRow { date: String, bucket: String, sum: Option<f64>, count: Option<i64> }
+    struct DayRow {
+        date: String,
+        bucket: String,
+        sum: Option<f64>,
+        count: Option<i64>,
+    }
     let mut min_rows = Vec::new();
     {
         let mut stmt = target
@@ -241,8 +313,12 @@ fn main() {
         let rows = stmt
             .query_map([], |r| {
                 Ok(MinRow {
-                    date: r.get(0)?, hour: r.get(1)?, minute: r.get(2)?,
-                    bucket: r.get(3)?, sum: r.get(4)?, count: r.get(5)?,
+                    date: r.get(0)?,
+                    hour: r.get(1)?,
+                    minute: r.get(2)?,
+                    bucket: r.get(3)?,
+                    sum: r.get(4)?,
+                    count: r.get(5)?,
                     max_rowid: r.get(6)?,
                 })
             })
@@ -258,16 +334,27 @@ fn main() {
             .expect("快照 agg_daily 失败");
         let rows = stmt
             .query_map([], |r| {
-                Ok(DayRow { date: r.get(0)?, bucket: r.get(1)?, sum: r.get(2)?, count: r.get(3)? })
+                Ok(DayRow {
+                    date: r.get(0)?,
+                    bucket: r.get(1)?,
+                    sum: r.get(2)?,
+                    count: r.get(3)?,
+                })
             })
             .expect("快照 agg_daily 失败");
         for row in rows {
             day_rows.push(row.expect("快照 agg_daily 行失败"));
         }
     }
-    println!("快照：范围外 agg_minute {} 行, agg_daily(app:%) {} 行", min_rows.len(), day_rows.len());
+    println!(
+        "快照：范围外 agg_minute {} 行, agg_daily(app:%) {} 行",
+        min_rows.len(),
+        day_rows.len()
+    );
 
-    target.execute_batch("BEGIN IMMEDIATE;").expect("开启事务失败");
+    target
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("开启事务失败");
     let rebuild_result = agg::rebuild_all(&target);
     if let Err(e) = rebuild_result {
         let _ = target.execute_batch("ROLLBACK;");
@@ -279,8 +366,16 @@ fn main() {
             .prepare("INSERT OR REPLACE INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
             .expect("准备插回失败");
         for r in &min_rows {
-            stmt.execute(rusqlite::params![r.date, r.hour, r.minute, r.bucket, r.sum, r.count, r.max_rowid])
-                .expect("插回 agg_minute 失败");
+            stmt.execute(rusqlite::params![
+                r.date,
+                r.hour,
+                r.minute,
+                r.bucket,
+                r.sum,
+                r.count,
+                r.max_rowid
+            ])
+            .expect("插回 agg_minute 失败");
         }
     }
     // rebuild_all 会重建全部日期的 agg_daily(app:%)。范围外插回原值，
@@ -305,9 +400,19 @@ fn main() {
         agg::rebuild_all(&conn).expect("复验重算失败");
     }
     let vconn = Connection::open(&copy2).expect("重开复验副本失败");
-    let after_current = read_minute_keys(&Connection::open(&args.db).expect("重开目标库失败"), &args.from, &args.to);
+    let after_current = read_minute_keys(
+        &Connection::open(&args.db).expect("重开目标库失败"),
+        &args.from,
+        &args.to,
+    );
     let after_expected = read_minute_keys(&vconn, &args.from, &args.to);
-    print_compare("apply 后复验（目标库当前值 vs events 重算期望值）", &args.from, &args.to, &after_current, &after_expected);
+    print_compare(
+        "apply 后复验（目标库当前值 vs events 重算期望值）",
+        &args.from,
+        &args.to,
+        &after_current,
+        &after_expected,
+    );
     let remaining = diff_minutes(&after_current, &after_expected);
     if remaining.is_empty() {
         println!("PASS：范围内全部分钟与 events 重算期望一致。");
@@ -315,6 +420,10 @@ fn main() {
         println!("FAIL：仍有 {} 个差异分钟。", remaining.len());
         exit(1);
     }
-    println!("临时副本保留于 {:?} 与 {:?} 备查。", copy1.parent(), copy2.parent());
+    println!(
+        "临时副本保留于 {:?} 与 {:?} 备查。",
+        copy1.parent(),
+        copy2.parent()
+    );
     let _ = Utc::now(); // 引用 chrono（事件时间均为 UTC RFC3339，由 core 处理）
 }

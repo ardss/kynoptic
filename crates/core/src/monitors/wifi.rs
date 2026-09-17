@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::NetworkManagement::WiFi::{
-    wlan_intf_opcode_current_connection, wlan_interface_state_connected, WlanCloseHandle,
-    WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+    wlan_interface_state_connected, wlan_interface_state_disconnected,
+    wlan_intf_opcode_current_connection, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
+    WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
 };
 
 pub struct WifiMonitor {
@@ -76,22 +76,27 @@ pub struct WifiInfo {
 
 /// 原生 Native WiFi API 查询当前连接（任一无线接口已连接则返回其信息）。
 ///
-/// 接口存在但均未连接 → 返回 state="disconnected"（与旧 netsh 路径一致，
-/// 断开也能产 WifiChange 事件）。整体失败（打开句柄/枚举失败，例如无无线
-/// 网卡或 WLAN 服务未运行）返回 None → collect 跳过本轮。
+/// 接口存在但均处于 disconnected → 返回 state="disconnected"（与旧 netsh 路径
+/// 一致，断开也能产 WifiChange 事件）。过渡态（authenticating/associating 等，
+/// 既非 connected 也非 disconnected）返回 None → collect 跳过本轮：只对两个
+/// 终态产事件，消除连接过程中"断开+连接"的事件抖动。整体失败（打开句柄/
+/// 枚举失败，例如无无线网卡或 WLAN 服务未运行）也返回 None。
 fn query_wifi_native() -> Option<WifiInfo> {
     unsafe {
         let mut negotiated: u32 = 0;
         let mut handle = std::ptr::null_mut();
-        if WlanOpenHandle(2, std::ptr::null(), &mut negotiated, &mut handle) != ERROR_SUCCESS as u32 {
+        if WlanOpenHandle(2, std::ptr::null(), &mut negotiated, &mut handle) != ERROR_SUCCESS {
             return None;
         }
 
         let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
         let mut result: Option<WifiInfo> = None;
-        if WlanEnumInterfaces(handle, std::ptr::null(), &mut list) == ERROR_SUCCESS as u32 && !list.is_null() {
-            // 枚举成功但没有任何已连接接口 → 明确的 disconnected 状态
+        if WlanEnumInterfaces(handle, std::ptr::null(), &mut list) == ERROR_SUCCESS
+            && !list.is_null()
+        {
+            // 枚举成功：connected 优先；没有任何终态接口则视为过渡态（跳过本轮）
             let mut connected = false;
+            let mut disconnected = false;
             let count = (*list).dwNumberOfItems as usize;
             let items = (*list).InterfaceInfo.as_ptr();
             for i in 0..count {
@@ -106,7 +111,7 @@ fn query_wifi_native() -> Option<WifiInfo> {
                     &mut data_size,
                     &mut data,
                     std::ptr::null_mut(),
-                ) == ERROR_SUCCESS as u32
+                ) == ERROR_SUCCESS
                     && !data.is_null()
                 {
                     // P1 修复：查询成功不等于已连接。旧实现只要 WlanQueryInterface
@@ -116,10 +121,9 @@ fn query_wifi_native() -> Option<WifiInfo> {
                     if attrs.isState == wlan_interface_state_connected {
                         let assoc = &attrs.wlanAssociationAttributes;
                         let ssid_len = assoc.dot11Ssid.uSSIDLength as usize;
-                        let ssid: String = String::from_utf8_lossy(
-                            &assoc.dot11Ssid.ucSSID[..ssid_len.min(32)],
-                        )
-                        .into_owned();
+                        let ssid: String =
+                            String::from_utf8_lossy(&assoc.dot11Ssid.ucSSID[..ssid_len.min(32)])
+                                .into_owned();
                         // wlanSignalQuality 为 0-100 的信号强度百分比
                         result = Some(WifiInfo {
                             state: "connected".to_string(),
@@ -131,12 +135,15 @@ fn query_wifi_native() -> Option<WifiInfo> {
                         connected = true;
                         break; // 取第一个已连接接口即可
                     }
-                    // 未连接的接口：释放后继续看下一个接口（多网卡场景）
+                    if attrs.isState == wlan_interface_state_disconnected {
+                        disconnected = true;
+                    }
+                    // 过渡态接口：释放后继续看下一个接口（多网卡场景）
                     WlanFreeMemory(data as *const _);
                 }
             }
             WlanFreeMemory(list as *const _);
-            if !connected {
+            if !connected && disconnected {
                 result = Some(WifiInfo {
                     state: "disconnected".to_string(),
                     ssid: String::new(),

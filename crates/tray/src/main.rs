@@ -272,9 +272,10 @@ fn main() {
                 "kynoptic-tray: settings.json 不存在({})，使用默认值",
                 sp.display()
             );
-            if let Err(e) =
-                kynoptic_dash::settings::save(&parsed.db, &kynoptic_dash::settings::AppSettings::default())
-            {
+            if let Err(e) = kynoptic_dash::settings::save(
+                &parsed.db,
+                &kynoptic_dash::settings::AppSettings::default(),
+            ) {
                 log::warn!("写出默认 settings.json 失败: {e}");
                 eprintln!("kynoptic-tray: 写出默认 settings.json 失败: {e}");
             }

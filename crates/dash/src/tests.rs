@@ -517,7 +517,10 @@ fn settings_concurrent_save_storm_always_valid_json() {
         (60..=1359).contains(&goal),
         "终值必须是某次写入的值: {goal}"
     );
-    assert!(settings::try_load(&db).is_some(), "终值必须是合法 AppSettings");
+    assert!(
+        settings::try_load(&db).is_some(),
+        "终值必须是合法 AppSettings"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -665,7 +668,12 @@ fn insights_rhythm_updates_last_and_marks_single_event_day() {
         insert(&conn, &local_ts(-1, 17, 0), "keyboard", "press", None);
     }
     insert(&conn, &local_ts(0, 22, 30), "keyboard", "press", None);
-    let v = api_insights(&conn, 2);
+    // 注入"今天 23:30"作为当前时刻：与 local_ts 的 2026-09-09 锚点同基准，
+    // 窗口推导不随真实日历漂移。
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
     let rhythm = v["insights"]
         .as_array()
         .unwrap()
@@ -705,7 +713,10 @@ fn trends_no_presence_alias_and_notes_raw_metric() {
     let d = &v["daily"].as_array().unwrap()[0];
     assert_eq!(d["active_minutes"], json!(45));
     // 假别名彻底移除：active_minutes 是 raw 输入口径，不得冒充"人在场"
-    assert!(d.get("presence_minutes").is_none(), "trends 不得再有 presence_minutes 假别名: {d}");
+    assert!(
+        d.get("presence_minutes").is_none(),
+        "trends 不得再有 presence_minutes 假别名: {d}"
+    );
     assert!(v["this_week"].get("presence_minutes").is_none());
     // note 字段说明口径并指向权威入口
     let note = v["note"].as_str().unwrap();
@@ -901,20 +912,19 @@ mod socket_tests {
                 .nth(1)
                 .and_then(|c| c.parse().ok())
                 .unwrap_or(0);
-            assert!(
-                code != 0,
-                "10 秒内必须得到完整 HTTP 响应（不悬挂）: {resp}"
-            );
+            assert!(code != 0, "10 秒内必须得到完整 HTTP 响应（不悬挂）: {resp}");
             codes.push(code);
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "70 个正常请求必须在 10 秒内全部完成"
         );
-        assert_eq!(codes.iter().filter(|&&c| c == 200).count() as i64
-            + codes.iter().filter(|&&c| c == 503).count() as i64,
+        assert_eq!(
+            codes.iter().filter(|&&c| c == 200).count() as i64
+                + codes.iter().filter(|&&c| c == 503).count() as i64,
             70,
-            "每个响应必须是 200 或设计内 503: {codes:?}");
+            "每个响应必须是 200 或设计内 503: {codes:?}"
+        );
         let served = codes.iter().filter(|&&c| c == 200).count();
         assert!(served > 0, "至少部分正常请求应被服务（200）: {codes:?}");
         eprintln!(

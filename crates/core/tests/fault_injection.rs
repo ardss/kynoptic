@@ -86,10 +86,7 @@ fn fi1_writer_stall_recovers_without_panic() {
     // 注入：后台线程独占写连接 5 秒，writer 在 lock_writer 上排队
     let db = col.db.clone();
     let holder = std::thread::spawn(move || {
-        db.with_writer(
-            |_| std::thread::sleep(Duration::from_secs(5)),
-            || (),
-        );
+        db.with_writer(|_| std::thread::sleep(Duration::from_secs(5)), || ());
     });
     std::thread::sleep(Duration::from_millis(2500)); // 期间事件持续入 channel
     holder.join().unwrap();
@@ -97,7 +94,10 @@ fn fi1_writer_stall_recovers_without_panic() {
     // 释放后 writer 必须恢复落库
     std::thread::sleep(Duration::from_secs(3));
     let written = col.total_written.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(written > 0, "写锁释放后 writer 必须恢复落库（total_written={written}）");
+    assert!(
+        written > 0,
+        "写锁释放后 writer 必须恢复落库（total_written={written}）"
+    );
 
     col.shutdown();
     let conn = Connection::open(&db_path).unwrap();
@@ -131,7 +131,10 @@ fn fi2_shutdown_storm_ten_rounds_no_deadlock_no_ghosts() {
                     write_flush_interval_secs: 1,
                     vk_frequency_enabled: true,
                 };
-                let db_path = dir.join(format!("r{round}.db")).to_string_lossy().to_string();
+                let db_path = dir
+                    .join(format!("r{round}.db"))
+                    .to_string_lossy()
+                    .to_string();
                 let mut col = start_collection_custom(&hook_only_enabled(), settings, &db_path);
                 ids.push(col.session_id);
                 col.shutdown();
@@ -220,7 +223,10 @@ fn fi5_agg_rebuild_concurrent_with_writes_consistent() {
     let dir = temp_dir("agg-conc");
     let path = dir.join("kyn.db");
     let db = std::sync::Arc::new(Database::open(path.to_str().unwrap()).unwrap());
-    assert!(db.wait_for_backfill(Duration::from_secs(5)), "空库回填应立即完成");
+    assert!(
+        db.wait_for_backfill(Duration::from_secs(5)),
+        "空库回填应立即完成"
+    );
 
     let bf_conn = Connection::open(&path).unwrap();
     kynoptic_core::db::apply_pragmas(&bf_conn).unwrap();
@@ -230,32 +236,34 @@ fn fi5_agg_rebuild_concurrent_with_writes_consistent() {
     let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
 
     let db_w = db.clone();
-    let writer = std::thread::spawn(move || -> std::result::Result<(i64, Vec<i64>, Vec<Event>), String> {
-        let mut total = 0i64;
-        let mut last_rowids = Vec::new();
-        let mut last_batch = Vec::new();
-        let base = chrono::Utc::now() - chrono::Duration::hours(2);
-        for i in 0..100i64 {
-            let mut batch = Vec::with_capacity(20);
-            for j in 0..20i64 {
-                let mut e = Event::new(EventAction::Press, EventType::Keyboard);
-                e.timestamp = (base + chrono::Duration::minutes(i)
-                    + chrono::Duration::seconds(j % 50))
-                    .to_rfc3339();
-                batch.push(e);
+    let writer = std::thread::spawn(
+        move || -> std::result::Result<(i64, Vec<i64>, Vec<Event>), String> {
+            let mut total = 0i64;
+            let mut last_rowids = Vec::new();
+            let mut last_batch = Vec::new();
+            let base = chrono::Utc::now() - chrono::Duration::hours(2);
+            for i in 0..100i64 {
+                let mut batch = Vec::with_capacity(20);
+                for j in 0..20i64 {
+                    let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+                    e.timestamp =
+                        (base + chrono::Duration::minutes(i) + chrono::Duration::seconds(j % 50))
+                            .to_rfc3339();
+                    batch.push(e);
+                }
+                let rowids = db_w.insert_events(&batch);
+                db_w.update_agg(&batch, &rowids);
+                total += 20;
+                last_batch = batch;
+                last_rowids = rowids;
+                if i == 0 {
+                    let _ = gate_tx.send(());
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
-            let rowids = db_w.insert_events(&batch);
-            db_w.update_agg(&batch, &rowids);
-            total += 20;
-            last_batch = batch;
-            last_rowids = rowids;
-            if i == 0 {
-                let _ = gate_tx.send(());
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        Ok((total, last_rowids, last_batch))
-    });
+            Ok((total, last_rowids, last_batch))
+        },
+    );
 
     gate_rx
         .recv_timeout(Duration::from_secs(30))
@@ -294,7 +302,10 @@ fn fi5_agg_rebuild_concurrent_with_writes_consistent() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(inc_keys, total, "增量 agg 必须与 events 一致（并发 backfill 下）");
+    assert_eq!(
+        inc_keys, total,
+        "增量 agg 必须与 events 一致（并发 backfill 下）"
+    );
 
     // max_event_rowid 守卫：全量重建后重放最后一批增量，不得重复累计
     kynoptic_core::db::agg::rebuild_all(&conn).unwrap();
@@ -322,8 +333,14 @@ fn fi5_agg_rebuild_concurrent_with_writes_consistent() {
 fn fi7_midnight_rollover_drain_flush_sequences() {
     let _g = seq_guard();
     kynoptic_core::input_agg::reset();
-    let t2359 = Local.with_ymd_and_hms(2026, 1, 31, 23, 59, 0).earliest().unwrap();
-    let t0000 = Local.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).earliest().unwrap();
+    let t2359 = Local
+        .with_ymd_and_hms(2026, 1, 31, 23, 59, 0)
+        .earliest()
+        .unwrap();
+    let t0000 = Local
+        .with_ymd_and_hms(2026, 2, 1, 0, 0, 0)
+        .earliest()
+        .unwrap();
 
     // 23:59：建桶（drain 不产出）
     kynoptic_core::input_agg::record_key();

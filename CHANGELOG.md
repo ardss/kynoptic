@@ -23,12 +23,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collector and the local dashboard together.
 - Update path: background chunked aggregate backfill for large legacy
   databases (1M-row DB open: 631 s to ~8 ms).
+- `presence` subcommand: daily human presence / automation / foreground
+  dwell summary, sharing the single authoritative implementation in
+  `kynoptic-core::queries::presence::classify_minutes` with the
+  dashboard overview.
+- `skill install` subcommand: syncs the bundled SKILL.md to AI client
+  skill directories; the installer keeps it in sync automatically.
+- Watchdog heartbeat with exponential backoff circuit breaker.
+- `update` subcommand: self-update from GitHub releases with SHA256
+  checksum verification, backup of the existing binary trio, and
+  rollback on failure.
+- `export`: writes `window_title` verbatim by default; `--redact`
+  strips URL query strings from titles (opt-in).
+- Input granularity defaults to minute (`input_counts_only` default
+  true): keyboard/mouse stored as per-minute counts.
+- Aggregate repair tool `kynoptic-aggrepair` (`--db X --from A --to B`,
+  dry-run by default, `--apply` to execute).
+- Native `wifi` / `power_plan` collection (native WiFi API +
+  `PowerGetActiveScheme`): the default monitor set no longer spawns
+  netsh/powercfg subprocesses — zero subprocesses by default.
+- `vk` per-key frequency counts for the dashboard heatmap (on by
+  default, opt-out in settings).
+- Dashboard security headers: `X-Content-Type-Options`,
+  `X-Frame-Options`, `Referrer-Policy`, and CSP.
 - Benchmark harness (`perf-write` / `perf-startup` / `perf-hook` /
   `perf-query` / `perf-idle` / `perf3-*`); methodology and numbers in
   [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Fixed
 
+- `file_activity` monitor rewritten on `ReadDirectoryChangesW` (native
+  change notifications instead of polling).
+- `ime` monitor switched to native registry polling (no PowerShell
+  subprocess).
 - Foreground window/switch events now record the process name in
   `app_name` (was hardcoded empty).
 - Writer thread idle busy-spin removed (idle CPU from ~100% of one core

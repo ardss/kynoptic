@@ -59,7 +59,11 @@ fn compute_change(
 ) -> (String, Option<Event>) {
     let mut sorted: Vec<&str> = layouts.iter().map(|s| s.as_str()).collect();
     sorted.sort();
-    let fingerprint = format!("{}|{}", sorted.join(","), override_.clone().unwrap_or_default());
+    let fingerprint = format!(
+        "{}|{}",
+        sorted.join(","),
+        override_.clone().unwrap_or_default()
+    );
 
     let event = match prev {
         None => None,
@@ -187,8 +191,10 @@ fn query_input_method_override() -> Option<String> {
 /// 把 u8 切片按 LE u16 解释（长度保证为 2 的倍数）
 fn to_u16_vec(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect()
 }
 

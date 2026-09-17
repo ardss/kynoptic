@@ -84,8 +84,7 @@ fn read_clipboard_hash() -> (String, [u8; 16], usize) {
         }
 
         let byte_len = len * 2;
-        let bytes: Vec<u8> =
-            std::slice::from_raw_parts(ptr as *const u8, byte_len).to_vec();
+        let bytes: Vec<u8> = std::slice::from_raw_parts(ptr as *const u8, byte_len).to_vec();
         GlobalUnlock(handle);
         CloseClipboard();
 
@@ -137,7 +136,7 @@ mod tests {
     #[test]
     fn payload_contains_digest_and_len() {
         let digest = simple_hash("hello".as_bytes());
-        let len = "hello".as_bytes().len() * 2; // UTF-16 字节数
+        let len = "hello".len() * 2; // UTF-16 字节数
 
         // 复刻 collect 的 payload 组装逻辑（不依赖真实剪贴板状态）
         let digest_hex = hex8_local(&digest);
@@ -149,7 +148,11 @@ mod tests {
 
         assert!(payload["digest"].is_string(), "payload must contain digest");
         assert_eq!(payload["digest"].as_str().unwrap().len(), 8);
-        assert!(payload["digest"].as_str().unwrap().chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(payload["digest"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
         assert_eq!(payload["len"].as_u64().unwrap(), 10);
         assert_eq!(payload["content_type"], "text");
         // 不写内容本身

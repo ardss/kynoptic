@@ -184,7 +184,10 @@ mod tests {
         drop(taken);
         drop(tx);
         assert!(
-            matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)),
+            matches!(
+                rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ),
             "sender drop 后通道必须 Disconnected，否则 writer join 永久阻塞"
         );
     }

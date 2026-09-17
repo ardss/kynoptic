@@ -4,7 +4,7 @@
 //! 桶坐标在测试里手工算死——跨午夜错桶（23:59 记到昨天、00:01 记到今天、
 //! 或两边都记进同一天）在这里直接红。
 
-use chrono::{Datelike, DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use kynoptic_core::db::Database;
 use kynoptic_core::types::{Event, EventAction, EventType};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,8 +129,16 @@ fn events_at_2359_and_0001_land_in_correct_local_day_buckets() {
         },
         || panic!("写连接不可用"),
     );
-    assert_eq!(daily_keys(&db, &today.format("%Y-%m-%d").to_string()), 3, "今日 keys=3（只有 23:59 那 3 次）");
-    assert_eq!(daily_keys(&db, &tomorrow.format("%Y-%m-%d").to_string()), 2, "明日 keys=2（只有 00:01 那 2 次）");
+    assert_eq!(
+        daily_keys(&db, &today.format("%Y-%m-%d").to_string()),
+        3,
+        "今日 keys=3（只有 23:59 那 3 次）"
+    );
+    assert_eq!(
+        daily_keys(&db, &tomorrow.format("%Y-%m-%d").to_string()),
+        2,
+        "明日 keys=2（只有 00:01 那 2 次）"
+    );
 
     // 除这两天外，不得有别的日期行吸收了事件
     let conn = db.reader();

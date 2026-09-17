@@ -9,9 +9,9 @@ use serde_json::json;
 use std::cell::Cell;
 use std::time::Duration;
 
+use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Power::PowerGetActiveScheme;
-use windows_sys::core::GUID;
 
 pub struct PowerPlanMonitor {
     prev_plan: Cell<Option<String>>,
@@ -57,13 +57,12 @@ fn get_active_plan() -> String {
     }
     unsafe {
         let mut guid: *mut GUID = std::ptr::null_mut();
-        if PowerGetActiveScheme(std::ptr::null_mut(), &mut guid) != ERROR_SUCCESS as u32
-            || guid.is_null()
+        if PowerGetActiveScheme(std::ptr::null_mut(), &mut guid) != ERROR_SUCCESS || guid.is_null()
         {
             return "unknown".to_string();
         }
         let g = *guid;
-        LocalFree(guid.cast());        // 输出与旧 powercfg 解析路径同构：小写连字符 GUID（powercfg 输出即小写）
+        LocalFree(guid.cast()); // 输出与旧 powercfg 解析路径同构：小写连字符 GUID（powercfg 输出即小写）
         format!(
             "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             g.data1,
@@ -91,8 +90,7 @@ mod tests {
     fn active_plan_is_guid_or_unknown() {
         let plan = get_active_plan();
         assert!(
-            plan == "unknown"
-                || (plan.len() == 36 && plan.matches('-').count() == 4),
+            plan == "unknown" || (plan.len() == 36 && plan.matches('-').count() == 4),
             "active plan 应为 GUID 字符串或 unknown，实际: {plan}"
         );
     }

@@ -56,8 +56,8 @@ Subcommands:
   stats     [--date YYYY-MM-DD] [--days N]   Show summary stats
   export    [--days N] [--format csv|json|jsonl] [--out PATH] [--redact]
   report    [--date YYYY-MM-DD] [--save PATH]   Generate Markdown report
-  db        [stats|cleanup [N]|vacuum|checkpoint]   DB maintenance
-  analyze   [--date YYYY-MM-DD]                Focus/fragment/anomaly report
+  db        [stats|cleanup [N]|vacuum|checkpoint|recompute-agg]   DB maintenance
+  analyze   [--date YYYY-MM-DD] [--days N]     Focus/fragment/anomaly report
   ghost                                       Close ghost sessions
   autostart [enable|disable|status]            Toggle auto-start
   migrate   [--legacy PATH] [--target PATH]   Migrate from legacy db
@@ -413,7 +413,11 @@ fn cmd_report(args: &[String]) -> Result<()> {
                 i += 1;
                 save = args.get(i).cloned().unwrap_or_default();
             }
-            _ => {}
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（report 支持 --date/--save）"
+                )))
+            }
         }
         i += 1;
     }
@@ -540,9 +544,7 @@ fn cmd_db(args: &[String]) -> Result<()> {
             // delete_closed_sessions_before(now)，把全部已关闭 sessions 删光
             // （实测 57 → 2）。days<=0（含负数，cutoff 会落到未来更危险）一律 no-op。
             if days <= 0 {
-                println!(
-                    "✓ cleanup {days}: 保留天数 0 表示永不清理, 未删除任何数据"
-                );
+                println!("✓ cleanup {days}: 保留天数 0 表示永不清理, 未删除任何数据");
                 return Ok(());
             }
             if with_events && days < 30 {
@@ -592,22 +594,50 @@ fn file_size(p: &Path) -> u64 {
 // === analyze ===
 fn cmd_analyze(args: &[String]) -> Result<()> {
     let mut date = String::new();
+    let mut days: u32 = 1;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--date" {
-            i += 1;
-            date = args.get(i).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--date" => {
+                i += 1;
+                date = args.get(i).cloned().unwrap_or_default();
+            }
+            "--days" => {
+                i += 1;
+                days = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| Error::InvalidData("--days 需要一个正整数".into()))?;
+                if days == 0 {
+                    return Err(Error::InvalidData("--days 需要一个正整数（>=1）".into()));
+                }
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（analyze 支持 --date/--days）"
+                )))
+            }
         }
         i += 1;
     }
-    let date = if date.is_empty() {
-        queries::today_local_str()
-    } else {
-        parse_date(&date)?
-    };
+    // --date 是窗口的最后一天（默认今天）；--days N 往前多看 N-1 天
+    let end = parse_date(&date)?;
     let conn = open_db(&resolve_db())?;
-    let analysis = analyzer::analyze_day(&conn, &date)?;
-    let anomalies = anomaly::detect_all(&conn, &date).unwrap_or_default();
+    let end_d = chrono::NaiveDate::parse_from_str(&end, "%Y-%m-%d")
+        .map_err(|e| Error::InvalidData(format!("日期格式错: {e}")))?;
+    for off in (0..days).rev() {
+        let d = (end_d - chrono::Duration::days(i64::from(off)))
+            .format("%Y-%m-%d")
+            .to_string();
+        print_analyze_day(&conn, &d)?;
+    }
+    Ok(())
+}
+
+/// analyze 的单日输出（多日模式逐日调用）。
+fn print_analyze_day(conn: &Connection, date: &str) -> Result<()> {
+    let analysis = analyzer::analyze_day(conn, date)?;
+    let anomalies = anomaly::detect_all(conn, date).unwrap_or_default();
     println!("=== Analyze {} ===", date);
     println!("keys:           {}", analysis.total_keys);
     println!("clicks:         {}", analysis.total_clicks);
@@ -633,12 +663,7 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
     );
     println!("anomalies:      {}", anomalies.len());
     for a in &anomalies {
-        println!(
-            "  [{}] {} - {}",
-            a.severity,
-            a.kind,
-            strip_c0(&a.message)
-        );
+        println!("  [{}] {} - {}", a.severity, a.kind, strip_c0(&a.message));
     }
     Ok(())
 }
@@ -994,6 +1019,17 @@ fn skill_install_to(base: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(written)
 }
 
+/// `skill` 子命令入口：只接受 `skill install`，其他形式报 USAGE。
+fn cmd_skill(args: &[String]) -> Result<()> {
+    if args != ["install"] {
+        return Err(Error::InvalidData(format!(
+            "skill 子命令用法: kynoptic-ctl skill install（收到 {} 个参数）\n\n{USAGE}",
+            args.len()
+        )));
+    }
+    cmd_skill_install()
+}
+
 fn cmd_skill_install() -> Result<()> {
     let home = std::env::var("USERPROFILE")
         .map(std::path::PathBuf::from)
@@ -1242,7 +1278,9 @@ const BACKOFF_STEPS_SECS: [i64; 3] = [120, 480, 1800];
 const STALE_RECHECK_WAIT_SECS: u64 = 40;
 
 fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()))
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
 }
 
 /// 退出旗标路径：env 覆盖 > exe 同目录（与 tray 的 paths::resolve_exit_flag 同规则）
@@ -1421,8 +1459,8 @@ fn backoff_delay_secs(consecutive_failures: u32) -> i64 {
     if consecutive_failures < FAILURE_THRESHOLD {
         return 0;
     }
-    let idx = ((consecutive_failures - FAILURE_THRESHOLD) as usize)
-        .min(BACKOFF_STEPS_SECS.len() - 1);
+    let idx =
+        ((consecutive_failures - FAILURE_THRESHOLD) as usize).min(BACKOFF_STEPS_SECS.len() - 1);
     BACKOFF_STEPS_SECS[idx]
 }
 
@@ -1688,7 +1726,7 @@ fn main() -> ExitCode {
             "now" => cmd_now(&rest),
             "query" => cmd_query(&rest),
             "mcp" => cmd_mcp(),
-            "skill" => cmd_skill_install(),
+            "skill" => cmd_skill(&rest),
             "probe" => cmd_probe(&rest),
             "dashboard" => dashboard::cmd_dashboard(&rest),
             "update" => update::cmd_update(&rest),
@@ -1953,21 +1991,45 @@ mod tests {
     fn presence_metrics_counts_human_automation_foreground() {
         let conn = setup_presence_db();
         // 10:00 人工输入（keys=10, injected=0）-> 在场
-        insert_event(&conn, "2026-09-13T10:00:30+08:00", "keyboard", "input_agg", r#"{"keys":10}"#);
+        insert_event(
+            &conn,
+            "2026-09-13T10:00:30+08:00",
+            "keyboard",
+            "input_agg",
+            r#"{"keys":10}"#,
+        );
         // 10:07 全注入 -> 自动化
-        insert_event(&conn, "2026-09-13T10:07:00+08:00", "keyboard", "input_agg", r#"{"keys":5,"injected_keys":5}"#);
+        insert_event(
+            &conn,
+            "2026-09-13T10:07:00+08:00",
+            "keyboard",
+            "input_agg",
+            r#"{"keys":5,"injected_keys":5}"#,
+        );
         // 混合分钟（human=8>0 且 injected=2>0）-> 同时计入在场与自动化
-        insert_event(&conn, "2026-09-13T10:08:00+08:00", "keyboard", "input_agg", r#"{"keys":10,"injected_keys":2}"#);
+        insert_event(
+            &conn,
+            "2026-09-13T10:08:00+08:00",
+            "keyboard",
+            "input_agg",
+            r#"{"keys":10,"injected_keys":2}"#,
+        );
         // 窗口切换:10:00 -> 11:00 = 60 分钟前台
         insert_event(&conn, "2026-09-13T10:00:00+08:00", "window", "switch", "");
         insert_event(&conn, "2026-09-13T11:00:00+08:00", "window", "switch", "");
         let (start, end) = queries::local_day_range("2026-09-13").unwrap();
         let day = queries::classify_minutes(&conn, "2026-09-13", 2);
         let f = foreground_minutes(&conn, &start, &end);
-        assert_eq!(day.automation_minutes, 2, "注入分钟 10:07 + 混合分钟 10:08 = 2");
+        assert_eq!(
+            day.automation_minutes, 2,
+            "注入分钟 10:07 + 混合分钟 10:08 = 2"
+        );
         assert_eq!(day.mixed_minutes, 1, "混合分钟双计，单独返回");
         // 大间隙按 dash 同款公式只补 bridge+1 步长（cap 后为 3）: 1 + 3 = 4
-        assert_eq!(day.presence_minutes, 4, "两个在场分钟 + 间隙按 bridge 上限补步长（与 dash 口径一致）");
+        assert_eq!(
+            day.presence_minutes, 4,
+            "两个在场分钟 + 间隙按 bridge 上限补步长（与 dash 口径一致）"
+        );
         assert_eq!(f, 60, "前台 = 一次切换间隔 60 分钟");
     }
 
@@ -1985,7 +2047,10 @@ mod tests {
         }
         let day = queries::classify_minutes(&conn, "2026-09-13", 2);
         assert_eq!(day.automation_minutes, 0);
-        assert_eq!(day.presence_minutes, 6, "10:00-10:01 + 桥接 10:02-10:03 + 10:04-10:05 = 6 分钟");
+        assert_eq!(
+            day.presence_minutes, 6,
+            "10:00-10:01 + 桥接 10:02-10:03 + 10:04-10:05 = 6 分钟"
+        );
     }
 
     #[test]
@@ -1994,7 +2059,11 @@ mod tests {
         let (start, end) = queries::local_day_range("2026-09-13").unwrap();
         let day = queries::classify_minutes(&conn, "2026-09-13", 2);
         assert_eq!(
-            (day.presence_minutes, day.automation_minutes, foreground_minutes(&conn, &start, &end)),
+            (
+                day.presence_minutes,
+                day.automation_minutes,
+                foreground_minutes(&conn, &start, &end)
+            ),
             (0, 0, 0)
         );
     }
@@ -2079,8 +2148,7 @@ mod tests {
         assert_eq!(back.consecutive_failures, 4);
         assert_eq!(back.backoff_until_epoch, 9999);
         // 损坏/缺字段：serde default 兜底 + 顶层回退缺省
-        let partial: WatchdogState =
-            serde_json::from_str(r#"{"consecutive_failures":2}"#).unwrap();
+        let partial: WatchdogState = serde_json::from_str(r#"{"consecutive_failures":2}"#).unwrap();
         assert_eq!(partial.consecutive_failures, 2);
         assert_eq!(partial.last_spawn_epoch, 0);
         assert!(serde_json::from_str::<WatchdogState>("garbage").is_err());
@@ -2112,7 +2180,10 @@ mod tests {
             rotated_log_path(p),
             PathBuf::from(r"C:\apps\watchdog.log.old")
         );
-        assert_eq!(rotated_log_path(Path::new("watchdog.log")), PathBuf::from("watchdog.log.old"));
+        assert_eq!(
+            rotated_log_path(Path::new("watchdog.log")),
+            PathBuf::from("watchdog.log.old")
+        );
     }
 
     // === export 脱敏（--redact opt-in）与缺省目录 ===
@@ -2188,7 +2259,10 @@ mod tests {
         assert_eq!(files.len(), SKILL_CLIENT_DIRS.len());
         for f in &files {
             let content = std::fs::read_to_string(f).expect("SKILL.md written");
-            assert!(content.starts_with("---\nname: kynoptic"), "frontmatter intact in {f:?}");
+            assert!(
+                content.starts_with("---\nname: kynoptic"),
+                "frontmatter intact in {f:?}"
+            );
             assert!(content.contains("意图路由"));
         }
         std::fs::remove_dir_all(&tmp).ok();

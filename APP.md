@@ -5,8 +5,8 @@
 > with numbered-SQL migrations, `cli`, and an `mcp` server; the dashboard and
 > tray shell live in their own crates). 40 monitors cover the system, 14 are
 > enabled by default (12 polling
-> monitors + 2 low-level input hooks; pure Win32, the few shell-out probes are
-> being replaced by native APIs). Input is recorded as per-minute counts only —
+> monitors + 2 low-level input hooks; pure Win32, zero subprocesses —
+> wifi/power_plan use native APIs). Input is recorded as per-minute counts only —
 > never key contents — with injected (LLKHF_INJECTED) events separated from
 > human presence, and the raw event log is append-only: cleanup is opt-in and
 > aggregates are rebuildable derived caches. The dashboard exposes a
@@ -23,7 +23,9 @@ Kynoptic 的本机感知层（采集器 + CLI + MCP 工具面）Rust workspace�
 |-------|------|
 | `crates/core` (`kynoptic-core`) | 采集核心：40 个监控器（14 个默认启用：纯 windows-sys、零 PowerShell 子进程；26 个恢复自上游、默认关闭）、事件通道/写入线程、SQLite 存储层（编号 SQL 迁移）、查询/分析 |
 | `crates/cli` (`kynoptic-cli`) | 命令行工具：统计/导出/报告/分析/数据库维护/实时状态/事件查询/MCP 启动（bin 名 `kynoptic` 与别名 `kynoptic-ctl`） |
+| `crates/dash` (`kynoptic-dash`) | dashboard 服务与页面（CLI 与托盘共用） |
 | `crates/mcp` (`kynoptic-mcp`) | MCP server（stdio JSON-RPC 2.0）：`get_current_status` / `get_summary` / `get_timeline` / `get_anomalies` / `wait_for` |
+| `crates/tray` (`kynoptic-tray`) | 托盘壳（纯 Win32，宿主采集器与本地面板） |
 
 监控器全集 40 个（注册表：`crates/core/src/registry.rs`；配置模板：`crates/core/config/monitors.json`）。**默认启用 14 个**（纯 windows-sys、零子进程，与 v0.1 相同）：`system` `window` `keyboard_hook` `mouse_hook` `idle` `session` `battery` `network` `device` `process` `audio` `brightness` `wifi` `power_plan`。
 
@@ -72,8 +74,8 @@ Windows 专用（依赖 windows-sys）；需要 MSVC 工具链。
 
 ## 数据库
 
-SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（事务执行，幂等）：
-`0001_init.sql`（采集基础表）、`0002_bucket_model.sql`（开放 bucket 模型：schema_meta / buckets / event_types / agg_minute / agg_daily / current_state）。
+SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（事务执行，幂等）。
+概览：`0001_init`（采集基础表）、`0002_bucket_model`（开放 bucket 模型：schema_meta / buckets / event_types / agg_minute / agg_daily / current_state）、`0003` 起（perf/聚合读缓存覆盖索引等性能与派生缓存迁移）至 `0009`，逐个文件见 `crates/core/src/db/migrations/`。
 
 数据库路径解析：环境变量 `KYNOPTIC_DB` > exe 同级 `data/kynoptic.db` > cwd 候选。
 
@@ -87,6 +89,13 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 | `now [--json]` | ✅ v0.1 | 当前机器状态紧凑视图（cpu/mem/前台应用/idle/APM/电量），与 MCP `get_current_status` 同数据面 |
 | `query --from T --to T --bucket B --limit N --json` | ✅ v0.1（营销口径的子集） | 时间范围事件查询。`--from/--to` 接受 `today`/`yesterday`/`YYYY-MM-DD`/RFC3339；`--bucket` 接受 bucket id（`activity/keys`、`activity/mouse`、`app/window`、`system/*`、`network/*`、`session/*`、`device/*`）或裸 event_type。网站的 `--metric gpu` / `--join window` 依赖 GPU/窗口聚合层，**后置到 v0.2**（`current_state`/`agg_*` 表已建，采集器未写入） |
 | `mcp` | ✅ v0.1 | 启动 MCP server（stdio，阻塞到 stdin 关闭） |
+| `collect` | ✅ | 前台运行采集器，Ctrl+C 优雅停止（`--db PATH` / `--all` 覆盖 settings） |
+| `dashboard [--port N] [--db PATH]` | ✅ | 仅本机可访问的只读网页面板（127.0.0.1） |
+| `presence [--days N]` | ✅ | 三指标日报（presence/automation/foreground + mixed），与 dashboard overview 同一权威实现 |
+| `skill install` | ✅ | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
+| `probe [--monitor ID] [--secs N] [--all]` | ✅ | 逐监控器硬件实测探针 |
+| `watchdog [--db PATH] [--once]` | ✅ | 看门狗心跳（供计划任务调用，确保托盘存活） |
+| `update` | ✅ | 自更新（GitHub releases，SHA256 校验 + 三件套备份 + 失败回滚） |
 
 ### Claude Desktop / 任意 MCP 客户端接入
 

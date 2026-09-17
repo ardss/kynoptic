@@ -15,6 +15,9 @@ use windows_sys::Win32::System::SystemInformation::*;
 /// 默认启用的 14 个监控器之一（零子进程硬约束，见 CODE_NOTES.md §9），
 /// 故默认 `false`（disk_io 字段省略）。需要 I/O 速率时显式启用，
 /// 或等原生方案（PDH/IOCTL）落地后转默认。
+/// 上次落库的硬件快照内容（内存 + 磁盘列表 + 可选磁盘 I/O）
+type PrevDeviceSnapshot = (MemInfo, Vec<DiskItem>, Option<DiskIo>);
+
 #[derive(Debug, Default)]
 pub struct DeviceMonitor {
     /// 是否采集磁盘 I/O 速率（PS 子进程，默认关闭）
@@ -22,7 +25,7 @@ pub struct DeviceMonitor {
     /// 上次输入设备拓扑（Raw Input 枚举，仅变化时写行）
     last_input_topology: std::sync::Mutex<Option<Vec<crate::raw_input_devices::InputDeviceInfo>>>,
     /// 上次落库的硬件快照（P1 写放大修复：memory/disks/disk_io 全同则跳过）
-    prev_snapshot: std::sync::Mutex<Option<(MemInfo, Vec<DiskItem>, Option<DiskIo>)>>,
+    prev_snapshot: std::sync::Mutex<Option<PrevDeviceSnapshot>>,
     /// 上次落库时间（低频心跳：每 10 分钟强制写一行证明存活）
     last_emitted: Cell<Option<std::time::Instant>>,
 }

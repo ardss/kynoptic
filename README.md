@@ -52,8 +52,7 @@ there? The overview card does exactly that arithmetic:
 - **40 monitors** cover the system: foreground window and app switches,
   keyboard/mouse activity counts, idle time, battery, network interfaces,
   devices, processes, audio, brightness, Wi-Fi and more. **14 are enabled by
-  default** (pure Win32 APIs; note wifi/power-plan probes shell out to
-  netsh/powercfg); 26 more (browser tabs,
+  default** (pure Win32 APIs, zero subprocesses); 26 more (browser tabs,
   clipboard, Bluetooth, and others) ship in the binary and are opt-in.
 - **Raw events are stored untouched** in SQLite on your machine. Aggregate
   tables (per-minute/per-day buckets) exist only as derived read caches for
@@ -147,8 +146,10 @@ complete, and it is trustworthy precisely because it is local.
 | Crate | Purpose |
 |---|---|
 | `crates/core` | Collectors, event pipeline, SQLite storage, queries |
-| `crates/cli` | `kynoptic` / `kynoptic-ctl` CLI and local dashboard |
+| `crates/cli` | `kynoptic` / `kynoptic-ctl` CLI |
+| `crates/dash` | Dashboard service and pages (shared by CLI and tray) |
 | `crates/mcp` | MCP server (stdio) |
+| `crates/tray` | Tray shell (pure Win32, hosts the collector and dashboard) |
 
 Monitor registry (single source of truth for what is enabled by default):
 `crates/core/src/registry.rs`. Extended app-internal docs: [APP.md](APP.md),

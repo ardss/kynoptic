@@ -471,10 +471,7 @@ mod tests {
         // 推进到下一分钟：被抑制分钟的累计必须整体丢弃（P1：判定针对被折叠 key）
         let t1 = MinuteKey::of(t0 + chrono::Duration::minutes(1)).start_local;
         let evts = drain(t1);
-        assert!(
-            evts.is_empty(),
-            "被抑制分钟的事件不得在 rollover 时产出"
-        );
+        assert!(evts.is_empty(), "被抑制分钟的事件不得在 rollover 时产出");
         // 抑制已解除：下一分钟正常计数并产出
         record_key();
         let t2 = MinuteKey::of(t1 + chrono::Duration::minutes(1)).start_local;

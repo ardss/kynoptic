@@ -44,7 +44,12 @@ fn log_dropped_events_watchdog() {
 /// 入队一次，旧实现"见 Agg 即提交"把提交节奏拉高到每秒一次事务（每次约 38KB
 /// WAL 页写）。UPSERT 是整行覆盖语义（0005 迁移），跟随常规批量节奏（batch 满
 /// 或 flush_interval 到期）不会丢数——后写覆盖先写，终值正确。
-fn should_flush(batch_len: usize, elapsed_since_flush: Duration, batch_size: usize, flush_interval: Duration) -> bool {
+fn should_flush(
+    batch_len: usize,
+    elapsed_since_flush: Duration,
+    batch_size: usize,
+    flush_interval: Duration,
+) -> bool {
     batch_len >= batch_size || (batch_len > 0 && elapsed_since_flush >= flush_interval)
 }
 
@@ -133,7 +138,14 @@ fn writer_loop(
     let mut batch: Vec<Event> = Vec::with_capacity(batch_size);
     loop {
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            writer_loop_inner(&rx, &db, batch_size, flush_interval, &total_written, &mut batch)
+            writer_loop_inner(
+                &rx,
+                &db,
+                batch_size,
+                flush_interval,
+                &total_written,
+                &mut batch,
+            )
         }));
         match result {
             Ok(Some(flush_count)) => {
@@ -181,7 +193,7 @@ fn writer_loop_inner(
                 Err(TryRecvError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        write_batch(db, &batch, total_written);
+                        write_batch(db, batch, total_written);
                     }
                     return Some(n);
                 }
@@ -197,7 +209,7 @@ fn writer_loop_inner(
             batch_size,
             flush_interval,
         ) {
-            write_batch(db, &batch, total_written);
+            write_batch(db, batch, total_written);
             batch.clear();
             last_flush = now;
         }
@@ -212,7 +224,7 @@ fn writer_loop_inner(
                 Err(RecvTimeoutError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        write_batch(db, &batch, total_written);
+                        write_batch(db, batch, total_written);
                     }
                     return Some(n);
                 }
@@ -232,7 +244,7 @@ fn writer_loop_inner(
                 Err(RecvTimeoutError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        write_batch(db, &batch, total_written);
+                        write_batch(db, batch, total_written);
                     }
                     return Some(n);
                 }

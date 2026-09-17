@@ -119,24 +119,59 @@ fn golden_raw_press_click_exact_totals() {
     db.update_agg(&events, &rowids);
 
     // ── 增量维护路径的黄金值 ──
-    assert_eq!(agg_minute_sum(&db, "input_keys", "sum_value"), 50, "keys 总量黄金值 50（增量）");
-    assert_eq!(agg_minute_sum(&db, "input_keys", "count_value"), 50, "keys 样本黄金值 50（增量）");
-    assert_eq!(agg_minute_sum(&db, "input_clicks", "sum_value"), 10, "clicks 总量黄金值 10（增量）");
-    assert_eq!(agg_minute_rows(&db, "input_keys"), 10, "10 个分钟桶（增量）");
+    assert_eq!(
+        agg_minute_sum(&db, "input_keys", "sum_value"),
+        50,
+        "keys 总量黄金值 50（增量）"
+    );
+    assert_eq!(
+        agg_minute_sum(&db, "input_keys", "count_value"),
+        50,
+        "keys 样本黄金值 50（增量）"
+    );
+    assert_eq!(
+        agg_minute_sum(&db, "input_clicks", "sum_value"),
+        10,
+        "clicks 总量黄金值 10（增量）"
+    );
+    assert_eq!(
+        agg_minute_rows(&db, "input_keys"),
+        10,
+        "10 个分钟桶（增量）"
+    );
 
     // ── 全量重建路径必须给出完全相同的黄金值 ──
     assert!(db.rebuild_agg() > 0);
-    assert_eq!(agg_minute_sum(&db, "input_keys", "sum_value"), 50, "keys 黄金值 50（重建）");
-    assert_eq!(agg_minute_sum(&db, "input_keys", "count_value"), 50, "keys 样本 50（重建）");
-    assert_eq!(agg_minute_sum(&db, "input_clicks", "sum_value"), 10, "clicks 黄金值 10（重建）");
-    assert_eq!(agg_minute_rows(&db, "input_keys"), 10, "10 个分钟桶（重建）");
+    assert_eq!(
+        agg_minute_sum(&db, "input_keys", "sum_value"),
+        50,
+        "keys 黄金值 50（重建）"
+    );
+    assert_eq!(
+        agg_minute_sum(&db, "input_keys", "count_value"),
+        50,
+        "keys 样本 50（重建）"
+    );
+    assert_eq!(
+        agg_minute_sum(&db, "input_clicks", "sum_value"),
+        10,
+        "clicks 黄金值 10（重建）"
+    );
+    assert_eq!(
+        agg_minute_rows(&db, "input_keys"),
+        10,
+        "10 个分钟桶（重建）"
+    );
 
     // ── daily_agg 黄金值 ──
     recompute_daily(&db);
     let (keys, clicks, active) = daily_row(&db);
     assert_eq!(keys, 50, "daily keys 黄金值 50");
     assert_eq!(clicks, 10, "daily clicks 黄金值 10");
-    assert_eq!(active, 10, "daily active_minutes 黄金值 10（10 个不同分钟）");
+    assert_eq!(
+        active, 10,
+        "daily active_minutes 黄金值 10（10 个不同分钟）"
+    );
 
     cleanup(&path);
 }
@@ -152,9 +187,8 @@ fn golden_input_agg_keys_exact_not_inflated() {
 
     let mut events = Vec::new();
     for m in 0..10i64 {
-        let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard).data(
-            serde_json::json!({"keys": 5, "keys_samples": 5, "samples": 5}),
-        );
+        let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard)
+            .data(serde_json::json!({"keys": 5, "keys_samples": 5, "samples": 5}));
         e.timestamp = ts_at_minute_offset(m);
         events.push(e);
     }
@@ -167,12 +201,20 @@ fn golden_input_agg_keys_exact_not_inflated() {
         50,
         "input_agg keys 黄金值 50 = 10 分钟 × 5；虚高即回归"
     );
-    assert_eq!(agg_minute_sum(&db, "input_keys", "count_value"), 50, "样本黄金值 50");
+    assert_eq!(
+        agg_minute_sum(&db, "input_keys", "count_value"),
+        50,
+        "样本黄金值 50"
+    );
     assert_eq!(agg_minute_rows(&db, "input_keys"), 10, "10 个分钟桶");
 
     // 重建等价
     db.rebuild_agg();
-    assert_eq!(agg_minute_sum(&db, "input_keys", "sum_value"), 50, "重建后黄金值仍 50");
+    assert_eq!(
+        agg_minute_sum(&db, "input_keys", "sum_value"),
+        50,
+        "重建后黄金值仍 50"
+    );
     assert_eq!(agg_minute_sum(&db, "input_keys", "count_value"), 50);
 
     // daily：keys=50、活跃分钟=10（绝不能是 10 行 × 60 秒之类）
@@ -209,7 +251,11 @@ fn golden_mouse_input_agg_moves_exact() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((click_sum, click_cnt), (3, 20), "clicks sum=$.clicks=3, count=samples=20");
+    assert_eq!(
+        (click_sum, click_cnt),
+        (3, 20),
+        "clicks sum=$.clicks=3, count=samples=20"
+    );
 
     let (mv_sum, mv_cnt): (i64, i64) = conn
         .query_row(
@@ -220,7 +266,10 @@ fn golden_mouse_input_agg_moves_exact() {
         )
         .unwrap();
     assert_eq!(mv_sum, 500, "input_moves sum=$.move_distance_px=500");
-    assert_eq!(mv_cnt, 10, "input_moves count=$.moves=10（绝不能取 $.samples=20）");
+    assert_eq!(
+        mv_cnt, 10,
+        "input_moves count=$.moves=10（绝不能取 $.samples=20）"
+    );
 
     // 重建逐值等价
     db.rebuild_agg();
@@ -232,7 +281,11 @@ fn golden_mouse_input_agg_moves_exact() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((mv_sum, mv_cnt), (mv_sum2, mv_cnt2), "重建后 input_moves 黄金值不变");
+    assert_eq!(
+        (mv_sum, mv_cnt),
+        (mv_sum2, mv_cnt2),
+        "重建后 input_moves 黄金值不变"
+    );
 
     cleanup(&path);
 }

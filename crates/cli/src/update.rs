@@ -172,8 +172,8 @@ mod sha256 {
                 h[1] = h[0];
                 h[0] = t1.wrapping_add(t2);
             }
-            for i in 0..8 {
-                self.state[i] = self.state[i].wrapping_add(h[i]);
+            for (s, &v) in self.state.iter_mut().zip(h.iter()) {
+                *s = s.wrapping_add(v);
             }
         }
     }
@@ -195,14 +195,8 @@ mod sha256 {
 
 /// 点分数字版本比较（语义化版本的保守近似；无法解析的部分按字符串比）
 fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let pa: Vec<Option<u64>> = a
-        .split('.')
-        .map(|s| s.parse::<u64>().ok())
-        .collect();
-    let pb: Vec<Option<u64>> = b
-        .split('.')
-        .map(|s| s.parse::<u64>().ok())
-        .collect();
+    let pa: Vec<Option<u64>> = a.split('.').map(|s| s.parse::<u64>().ok()).collect();
+    let pb: Vec<Option<u64>> = b.split('.').map(|s| s.parse::<u64>().ok()).collect();
     for i in 0..std::cmp::max(pa.len(), pb.len()) {
         let (x, y) = (pa.get(i).copied().flatten(), pb.get(i).copied().flatten());
         match (x, y) {
@@ -242,7 +236,10 @@ fn download_file(url: &str, dest: &std::path::Path) -> crate::Result<()> {
     let value_err = |err| crate::Error::InvalidData(format!("self-update header value: {err}"));
     self_update::Download::from_url(url)
         .show_progress(true)
-        .set_header("Accept".parse().map_err(name_err)?, "application/octet-stream".parse().map_err(value_err)?)
+        .set_header(
+            "Accept".parse().map_err(name_err)?,
+            "application/octet-stream".parse().map_err(value_err)?,
+        )
         .download_to(&mut f)
         .map_err(e)?;
     f.flush().map_err(io_err)?;
@@ -291,15 +288,13 @@ fn replace_with_backup(dest: &std::path::Path, new_file: &std::path::Path) -> (b
     // (replaced, killed_to_unlock)
     let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
     let _ = std::fs::remove_file(&bak);
-    if dest.exists() {
+    if dest.exists() && std::fs::rename(dest, &bak).is_err() {
+        let killed = kill_process(&dest.file_name().unwrap_or_default().to_string_lossy());
+        if killed {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         if std::fs::rename(dest, &bak).is_err() {
-            let killed = kill_process(&dest.file_name().unwrap_or_default().to_string_lossy());
-            if killed {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            if std::fs::rename(dest, &bak).is_err() {
-                return (false, killed);
-            }
+            return (false, killed);
         }
     }
     match std::fs::rename(new_file, dest) {
@@ -373,7 +368,9 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     let release = releases
         .into_iter()
         .find(|r| {
-            BIN_NAMES.iter().all(|n| r.assets.iter().any(|a| &a.name == n))
+            BIN_NAMES
+                .iter()
+                .all(|n| r.assets.iter().any(|a| &a.name == n))
                 && r.assets.iter().any(|a| a.name == SUMS_NAME)
         })
         .ok_or_else(|| {
@@ -438,11 +435,12 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         let dest = dir.join(name);
         let (replaced, _) = replace_with_backup(&dest, src);
         if replaced {
-            backups.push((dest.clone(), std::path::PathBuf::from(format!("{}.bak", dest.display()))));
+            backups.push((
+                dest.clone(),
+                std::path::PathBuf::from(format!("{}.bak", dest.display())),
+            ));
         } else if name == "kynoptic-tray.exe" {
-            warnings.push(
-                "托盘未更新，请退出托盘后重跑 update".to_string(),
-            );
+            warnings.push("托盘未更新，请退出托盘后重跑 update".to_string());
         } else {
             warnings.push(format!("{name} 被占用未更新，请关闭后重跑 update"));
         }
@@ -457,7 +455,10 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     }
 
     println!("updated to {new_ver}");
-    eprintln!("旧版本已保留为同名 .bak 文件（{}\\*.bak），确认无误后可手动删除", dir.display());
+    eprintln!(
+        "旧版本已保留为同名 .bak 文件（{}\\*.bak），确认无误后可手动删除",
+        dir.display()
+    );
     for w in warnings {
         eprintln!("警告: {w}");
     }
@@ -478,7 +479,10 @@ mod tests {
             looks_like_package_manager_install("C:\\Users\\x\\.cargo\\bin\\kynoptic.exe"),
             Some("cargo install kynoptic")
         );
-        assert_eq!(looks_like_package_manager_install("C:\\tools\\kynoptic\\kynoptic.exe"), None);
+        assert_eq!(
+            looks_like_package_manager_install("C:\\tools\\kynoptic\\kynoptic.exe"),
+            None
+        );
     }
 
     #[test]
@@ -492,9 +496,7 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            sha256::hex_digest(
-                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-            ),
+            sha256::hex_digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         // 跨块（>64 字节）+ 长度取模场景

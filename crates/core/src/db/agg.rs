@@ -85,7 +85,11 @@ fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite::Result<()>
             let keys = json_counter(e, "keys");
             // 键盘专属样本数优先（input_agg.rs 新增字段）；旧行回退 samples
             let ks = json_counter(e, "keys_samples");
-            let samples = if ks > 0 { ks } else { json_counter(e, "samples") };
+            let samples = if ks > 0 {
+                ks
+            } else {
+                json_counter(e, "samples")
+            };
             if keys > 0 {
                 conn.execute(
                     UPSERT_MINUTE_SNAPSHOT,
@@ -768,10 +772,9 @@ mod tests {
     fn moves_count_uses_moves_field_not_samples() {
         let c = conn();
         // 事件 JSON：clicks/samples/moves/move_distance_px 并存
-        let e = Event::new(EventAction::InputAgg, EventType::Mouse)
-            .data(serde_json::json!({
-                "clicks": 3, "samples": 20, "moves": 10, "move_distance_px": 500,
-            }));
+        let e = Event::new(EventAction::InputAgg, EventType::Mouse).data(serde_json::json!({
+            "clicks": 3, "samples": 20, "moves": 10, "move_distance_px": 500,
+        }));
         let mut e = e;
         e.timestamp = "2026-06-15T02:30:00+00:00".into();
         ins(

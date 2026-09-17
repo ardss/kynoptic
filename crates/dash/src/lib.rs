@@ -99,9 +99,10 @@ fn top5_with_other(mut apps: Vec<(String, i64)>) -> Vec<(String, i64)> {
 /// `now` 注入以便硬件无关测试。只含有数据的桶，桶内应用 top5 + other。
 ///
 /// human_min 口径（与 overview presence 一致，权威实现 queries::minute_classification
-/// + queries::bridge_count）：`human_min` = 桥接后分钟数（向后兼容页面显示的字段名），
-/// `human_min_unbridged` = 未桥接的原始人在场分钟数，
-/// `human_min_bridged` = 桥接后分钟数（与 human_min 同值，显式字段）。
+/// + queries::bridge_count）：
+/// - `human_min` = 桥接后分钟数（向后兼容页面显示的字段名）
+/// - `human_min_unbridged` = 未桥接的原始人在场分钟数
+/// - `human_min_bridged` = 桥接后分钟数（与 human_min 同值，显式字段）
 pub fn api_timeline_at(
     conn: &Connection,
     hours: u32,
@@ -377,8 +378,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     // "机器替人值班"指标：有前台窗口但无任何输入（含桥接）的分钟数。
     // 暂无分钟级前台采样，取保守近似：fg_dwell_min - (presence + automation)，
     // 负值截 0（宁可低估不夸大）。口径随响应返回。
-    let unattended_fg_minutes =
-        fg_total_min.saturating_sub(presence_minutes + automation_minutes);
+    let unattended_fg_minutes = fg_total_min.saturating_sub(presence_minutes + automation_minutes);
 
     json!({
         "host": host,
@@ -795,11 +795,21 @@ pub fn api_insights(conn: &Connection, bridge_minutes: u32) -> Value {
             }
         }
     }
-    let v = insights_compute(conn, bridge_minutes);
+    let v = insights_compute(conn, bridge_minutes, chrono::Local::now());
     if let Ok(mut g) = CACHE.lock() {
         *g = Some((Instant::now(), bridge_minutes, v.clone()));
     }
     v
+}
+
+/// [`api_insights`] 的可注入时刻版本（绕过缓存）：`now` 指定"当前时刻"，
+/// 供测试锚定日历、永不随真实日期漂移。
+pub fn api_insights_at(
+    conn: &Connection,
+    bridge_minutes: u32,
+    now: chrono::DateTime<chrono::Local>,
+) -> Value {
+    insights_compute(conn, bridge_minutes, now)
 }
 
 /// 测试/观测用：api_insights 缓存命中次数。
@@ -808,19 +818,27 @@ pub fn insights_cache_hits() -> u64 {
 }
 
 /// insights 的实际计算（无缓存）。见 [`api_insights`]。
-fn insights_compute(conn: &Connection, bridge_minutes: u32) -> Value {
+/// `now` 可注入，窗口与"今天"全部由它推导（测试锚定日历用）。
+fn insights_compute(
+    conn: &Connection,
+    bridge_minutes: u32,
+    now: chrono::DateTime<chrono::Local>,
+) -> Value {
     let bridge_minutes = bridge_minutes.clamp(0, 15);
     let gap_secs = i64::from(bridge_minutes) * 60;
     // 窗口 = 6 天前零点 -> 现在（踩坑：local_day_range(date-6) 的 end 是
     // "6 天前当天"的结束，会让整个查询窗口落在有数据之前）
-    let start = queries::local_day_range(&queries::date_offset_str(-6))
+    let start_date = (now.date_naive() - chrono::Duration::days(6))
+        .format("%Y-%m-%d")
+        .to_string();
+    let start = queries::local_day_range(&start_date)
         .map(|(s2, _)| s2)
         .ok_or_else(|| json!({"insights": []}));
     let start = match start {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let end = chrono::Local::now().to_rfc3339();
+    let end = now.to_rfc3339();
     // 7 天窗口的人侧事件：timestamp、类型、应用
     let mut acts: Vec<(chrono::DateTime<chrono::FixedOffset>, String)> = Vec::new();
     let mut switches: Vec<(chrono::DateTime<chrono::FixedOffset>, String)> = Vec::new();
@@ -1886,8 +1904,7 @@ fn handle_client(
     let conn: &Connection = match shared_guard.as_ref() {
         Some(g) => g,
         None => {
-            tmp_conn =
-                open_read_only(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
+            tmp_conn = open_read_only(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
             &tmp_conn
         }
     };

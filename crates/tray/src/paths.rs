@@ -77,7 +77,10 @@ mod tests {
         let p = heartbeat_for_exe(Path::new("kynoptic-tray.exe")).unwrap();
         assert_eq!(p, Path::new(HEARTBEAT_FILE));
         // resolve_* 的兜底名与契约一致(watchdog 侧同名常量)
-        assert_eq!(Path::new(EXIT_FLAG_FILE).file_name().unwrap(), "tray-exit.flag");
+        assert_eq!(
+            Path::new(EXIT_FLAG_FILE).file_name().unwrap(),
+            "tray-exit.flag"
+        );
         assert_eq!(
             Path::new(HEARTBEAT_FILE).file_name().unwrap(),
             "kynoptic-heartbeat"

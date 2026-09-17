@@ -102,12 +102,7 @@ fn every_migration_step_upgrades_successfully_from_previous_version() {
     let n = files.len();
     for k in 2..=n {
         let conn = upgraded_to(&files, k - 1);
-        assert_eq!(
-            version_of(&conn),
-            (k - 1) as i64,
-            "前置：应停在 v{}",
-            k - 1
-        );
+        assert_eq!(version_of(&conn), (k - 1) as i64, "前置：应停在 v{}", k - 1);
         kynoptic_core::db::run_migrations(&conn)
             .unwrap_or_else(|e| panic!("从 v{} 升级失败: {e}", k - 1));
         assert_eq!(
@@ -150,7 +145,11 @@ fn failed_migration_transaction_rolls_back_and_keeps_version() {
     assert!(r.is_err(), "坏 SQL 应该报错");
     conn.execute_batch("ROLLBACK;").unwrap();
 
-    assert_eq!(version_of(&conn), v_before, "回滚后 schema_version 必须不变");
+    assert_eq!(
+        version_of(&conn),
+        v_before,
+        "回滚后 schema_version 必须不变"
+    );
     let half: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='half_done_migration'",
@@ -166,5 +165,8 @@ fn failed_migration_transaction_rolls_back_and_keeps_version() {
 
     // 回滚后的库必须仍可正常完成全部迁移
     kynoptic_core::db::run_migrations(&conn).expect("回滚后的库应能完成迁移");
-    assert_eq!(version_of(&conn), kynoptic_core::constants::CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        version_of(&conn),
+        kynoptic_core::constants::CURRENT_SCHEMA_VERSION
+    );
 }
