@@ -140,7 +140,7 @@ fn counts_include_input_agg_rows() {
     // 异常读取走 agg 缓存路径，数值与 events 现算一致
     let conn = db.reader();
     assert!(agg::has_minute_for_date(&conn, &today));
-    assert_eq!(queries::late_night_key_count(&conn, &today, 0), 6); // hour>=0 = 全天
+    assert_eq!(queries::late_night_key_count(&conn, &today, 0, 0), 6); // hour>=0 = 全天
     assert_eq!(queries::day_totals(&conn, &today).keys, 6);
     drop(conn);
     cleanup(&path);
@@ -221,7 +221,7 @@ fn cached_results_match_legacy_computation() {
 
     // —— 无缓存（events 现算）基准值 ——
     let legacy_day = queries::day_totals(db.reader().deref(), &today);
-    let legacy_late_night = queries::late_night_key_count(db.reader().deref(), &today, 0);
+    let legacy_late_night = queries::late_night_key_count(db.reader().deref(), &today, 0, 0);
     let legacy_burst_max = queries::top_burst_minutes(db.reader().deref(), &today, 100)
         .iter()
         .map(|(_, n)| *n)
@@ -232,7 +232,7 @@ fn cached_results_match_legacy_computation() {
     db.update_agg(&events, &(1..=events.len() as i64).collect::<Vec<i64>>());
     let conn = db.reader();
     let cached_day = queries::day_totals(&conn, &today);
-    let cached_late_night = queries::late_night_key_count(&conn, &today, 0);
+    let cached_late_night = queries::late_night_key_count(&conn, &today, 0, 0);
     let cached_burst_max = queries::top_burst_minutes(&conn, &today, 100)
         .iter()
         .map(|(_, n)| *n)

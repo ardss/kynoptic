@@ -15,7 +15,8 @@
 //! - `/`                             内嵌双语单页（Overview/Activity/Anomalies/Settings）
 //! - `/api/summary?date=`            当日 active_minutes / keys / clicks / top_app
 //! - `/api/timeline?hours=`          近 N 小时按本地小时桶的应用分布（top5 + other）
-//! - `/api/anomalies?days=`          复用 MCP `get_anomalies` 的同一异常检测
+//! - `/api/anomalies?days=`          与 MCP `get_anomalies` 同一异常检测
+//!   （marathon 桥接阈值读 settings 的 presence_bridge_minutes）
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
 //! - `/api/overview`                 本次会话 uptime / 今日事件数 / 启用监控器数 /
 //!   DB 大小 / CPU / 内存 / 前台应用（复用 MCP `get_current_status` 同一数据面）
@@ -327,28 +328,34 @@ fn anomaly_message_en(kind: &str, message: &str, at: Option<&str>) -> String {
     }
 }
 
-/// GET /api/anomalies?days= — 复用 MCP get_anomalies 的同一检测入口，
-/// 每条按中文 message 重新参数化 message_en（分钟数/倍率/应用名全部带上；
-/// kind 不识别时给通用文案）。
-pub fn api_anomalies(conn: &Connection, days: u32) -> Value {
-    let mut v = kynoptic_mcp::state::anomalies(conn, days as usize, 100);
-    if let Some(arr) = v.get_mut("anomalies").and_then(Value::as_array_mut) {
-        for a in arr {
-            let kind = a
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let message = a
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let at = a.get("at").and_then(Value::as_str).map(str::to_string);
-            a["message_en"] = Value::String(anomaly_message_en(&kind, &message, at.as_deref()));
+/// GET /api/anomalies?days= — 与 MCP get_anomalies 同一检测入口，但 marathon
+/// 的连续性桥接阈值读 settings 的 `presence_bridge_minutes`（全站连续性口径
+/// 统一源），每条按中文 message 重新参数化 message_en。
+pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
+    let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
+    let days = days.clamp(1, 30) as usize;
+    let mut out: Vec<Value> = Vec::new();
+    for i in 0..days {
+        let date = queries::date_offset_str(-(i as i64));
+        let list =
+            kynoptic_core::anomaly::detect_all_with_bridge(conn, &date, bridge).unwrap_or_default();
+        for a in list {
+            if out.len() >= 100 {
+                return json!({"anomalies": out, "truncated": true});
+            }
+            let at = a.at.clone();
+            let message_en = anomaly_message_en(&a.kind, &a.message, at.as_deref());
+            out.push(json!({
+                "date": date,
+                "kind": a.kind,
+                "severity": a.severity,
+                "message": a.message,
+                "message_en": message_en,
+                "at": at,
+            }));
         }
     }
-    v
+    json!({"anomalies": out, "truncated": false})
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
@@ -1321,19 +1328,36 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
         .iter()
         .map(|(d, k, c, m)| json!({"date": d, "keys": k, "clicks": c, "active_minutes": m}))
         .collect();
-    let sum7 = |offset: usize| -> (i64, i64, i64) {
-        let n = rows.len();
-        let hi = n.saturating_sub(offset);
-        let lo = hi.saturating_sub(7);
-        rows[lo..hi].iter().fold((0, 0, 0), |acc, (_, k, c, m)| {
-            (acc.0 + k, acc.1 + c, acc.2 + m)
-        })
+    // 口径（统一 2026-09）：sum7 按日历日对齐——窗口固定 7 个日历日
+    // （today-offset-6 ..= today-offset），daily_agg 缺行（缺日）按 0 计。
+    // 此前按行号切片 rows，缺日时本周窗口会"吃进"更早日期的行、两周对比错位。
+    let mut by_date: std::collections::HashMap<&str, (i64, i64, i64)> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for (d, k, c, m) in &rows {
+        by_date.insert(d.as_str(), (*k, *c, *m));
+    }
+    let sum7 = |offset: i64| -> (i64, i64, i64) {
+        (0..7)
+            .map(|d| {
+                let day = (today - chrono::Duration::days(offset + d))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                by_date.get(day.as_str()).copied().unwrap_or((0, 0, 0))
+            })
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
     };
     let (k1, c1, m1) = sum7(0);
     let (k0, c0, m0) = sum7(7);
     // 审查（DeepSeek）：上周数据不足（<3 个有数据日）时对比无意义——上周置空，
     // 前端显示"上周数据不足，已跳过对比"而非误导性增长率
-    let last_week_days = rows.len().saturating_sub(7).min(7);
+    let last_week_days = (0..7)
+        .filter(|d| {
+            let day = (today - chrono::Duration::days(7 + *d as i64))
+                .format("%Y-%m-%d")
+                .to_string();
+            by_date.contains_key(day.as_str())
+        })
+        .count();
     let last_week = if last_week_days >= 3 {
         json!({"keys": k0, "clicks": c0, "active_minutes": m0})
     } else {
@@ -1752,7 +1776,7 @@ pub fn route_req(
             (
                 200,
                 "application/json",
-                api_anomalies(conn, days).to_string(),
+                api_anomalies(conn, days, db_path).to_string(),
             )
         }
         ("GET", "/api/status") => (

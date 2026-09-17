@@ -369,19 +369,22 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
     out
 }
 
-/// 当日 distinct 活跃分钟列表（ISO "YYYY-MM-DDTHH:MM"），按时间升序。
+/// 当日活跃分钟列表（ISO "YYYY-MM-DDTHH:MM"），按时间升序。
+///
+/// 口径（统一 2026-09）：**剔除 move-only 分钟**——仅当该分钟有 keys 或
+/// clicks 才算活跃（脚本级纯鼠标移动不能伪造活跃/马拉松）。
 ///
 /// 供 [`crate::analyzer::fragmentation_score`] 与
 /// [`crate::anomaly::detect_marathon_session`] 共享——两者此前各写一份
 /// `SELECT DISTINCT substr(timestamp,1,16) WHERE event_type IN ('keyboard','mouse')`。
 pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
     let mut out = Vec::new();
-    // 优先读 agg_minute 读缓存（有任意输入桶行即视为活跃分钟，含 move-only 分钟）
+    // 优先读 agg_minute 读缓存（有 keys/clicks 桶行即视为活跃分钟，不含 move-only）
     if agg::has_minute_for_date(conn, date) {
         let Ok(mut stmt) = conn.prepare(
             "SELECT hour, minute FROM agg_minute \
              WHERE date = ?1 \
-               AND bucket_id IN ('input_keys','input_clicks','input_moves') \
+               AND bucket_id IN ('input_keys','input_clicks') \
              GROUP BY hour, minute ORDER BY hour, minute",
         ) else {
             return out;
@@ -405,7 +408,8 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
         "SELECT DISTINCT substr(timestamp, 1, 16) AS minute \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
-           AND (event_type='keyboard' OR event_type='mouse') \
+           AND (event_type='keyboard' \
+                OR (event_type='mouse' AND event_action IN ('click','input_agg'))) \
          ORDER BY minute",
     ) else {
         return out;
@@ -503,23 +507,28 @@ pub fn top_app_window_in_range(
 
 // ─── 异常检测数据读取（供 [`crate::anomaly`] 消费） ──────────────────────────
 
-/// 当日 `hour_threshold` 时之后的键盘按键数。
+/// 当日深夜窗口 `[hour_start, hour_end)` 内（跨午夜：本地小时 ≥ hour_start
+/// **或** < hour_end，如 23:00-06:00）的键盘按键数。
 ///
 /// 供 [`crate::anomaly`] 的深夜活动检测——此前该业务模块手写
 /// `COUNT(*) WHERE CAST(substr(timestamp,12,2)) >= ?`。
+///
+/// 口径（统一 2026-09）：调用方传 `(23, 6)`，深夜 = 本地 23:00-06:00，与
+/// insights 深夜卡同一窗口；跨午夜部分按同一本地日的 hour<6 计。
 ///
 /// 性能注（perf-query 1M 事件库 2026-09 实测）：日期过滤必须用
 /// `timestamp >= ?1 AND timestamp < ?2` 的可走索引（idx_events_timestamp）
 /// 区间谓词；`substr(timestamp,1,10)=?` 对整列求值无法走索引，1M 行时每次
 /// 调用退化为全表扫描（~300ms+），get_anomalies(7d) 会累计到秒级。
-pub fn late_night_key_count(conn: &Connection, date: &str, hour_threshold: i64) -> i64 {
+pub fn late_night_key_count(conn: &Connection, date: &str, hour_start: i64, hour_end: i64) -> i64 {
     // 优先读 agg_minute 读缓存（O(当日聚合行数)），缺失回退 events 现算
     if agg::has_minute_for_date(conn, date) {
         return conn
             .query_row(
                 "SELECT CAST(COALESCE(SUM(sum_value), 0) AS INTEGER) FROM agg_minute \
-                 WHERE date = ?1 AND hour >= ?2 AND bucket_id = 'input_keys'",
-                params![date, hour_threshold],
+                 WHERE date = ?1 AND (hour >= ?2 OR hour < ?3) \
+                   AND bucket_id = 'input_keys'",
+                params![date, hour_start, hour_end],
                 |r| r.get::<_, i64>(0),
             )
             .unwrap_or(0);
@@ -527,11 +536,11 @@ pub fn late_night_key_count(conn: &Connection, date: &str, hour_threshold: i64) 
     let off = super::local_offset_modifier();
     match super::local_day_range(date) {
         Some((start, end)) => {
-            late_night_key_count_in_range(conn, &start, &end, hour_threshold, &off)
+            late_night_key_count_in_range(conn, &start, &end, hour_start, hour_end, &off)
         }
         None => {
             let end = format!("{date}\u{7f}");
-            late_night_key_count_in_range(conn, date, &end, hour_threshold, &off)
+            late_night_key_count_in_range(conn, date, &end, hour_start, hour_end, &off)
         }
     }
 }
@@ -540,24 +549,28 @@ pub fn late_night_key_count(conn: &Connection, date: &str, hour_threshold: i64) 
 /// 本地偏移修饰符（供单测注入固定 UTC+8 语义）。
 ///
 /// **时区语义（fix 2026-09）**：小时过滤必须先把 UTC timestamp 换算成**本地**时刻
-/// （`datetime(timestamp, ?4)`）再 `substr` 取 HH——此前直接 `substr(timestamp,12,2)`
+/// （`datetime(timestamp, ?5)`）再 `substr` 取 HH——此前直接 `substr(timestamp,12,2)`
 /// 取的是 UTC 小时，UTC+8 下本地 07:30 会被误判为深夜（UTC 23 点），真深夜 23:30
 /// （UTC 15 点）反而漏报。与 [`hourly_counts_today`] 的本地小时桶同一模式。
+/// **跨午夜（统一 2026-09）**：窗口为 `hour >= hour_start OR hour < hour_end`
+/// （如 23 点后或 6 点前都算深夜）。
 pub(crate) fn late_night_key_count_in_range(
     conn: &Connection,
     start: &str,
     end: &str,
-    hour_threshold: i64,
+    hour_start: i64,
+    hour_end: i64,
     off_modifier: &str,
 ) -> i64 {
     conn.query_row(
         &format!(
             "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
              WHERE timestamp >= ?1 AND timestamp < ?2 \
-               AND CAST(substr(datetime(timestamp, ?4), 12, 2) AS INTEGER) >= ?3 \
+               AND (CAST(substr(datetime(timestamp, ?5), 12, 2) AS INTEGER) >= ?3 \
+                    OR CAST(substr(datetime(timestamp, ?5), 12, 2) AS INTEGER) < ?4) \
                AND event_type = 'keyboard' AND event_action IN ('press','input_agg')"
         ),
-        params![start, end, hour_threshold, off_modifier],
+        params![start, end, hour_start, hour_end, off_modifier],
         |r| r.get::<_, i64>(0),
     )
     .unwrap_or(0)
@@ -745,7 +758,7 @@ mod tests {
         let c = conn();
         press(&c, "2026-06-14T23:30:00+00:00"); // 本地 2026-06-15 07:30
         press(&c, "2026-06-15T00:00:00+00:00"); // 本地 08:00
-        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, OFF8);
+        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, 6, OFF8);
         assert_eq!(n, 0, "本地早晨 07:30 不应计为深夜");
     }
 
@@ -755,7 +768,20 @@ mod tests {
         let c = conn();
         press(&c, "2026-06-15T15:30:00+00:00"); // 本地 23:30
         press(&c, "2026-06-15T05:00:00+00:00"); // 本地 13:00，白天不计
-        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, OFF8);
+        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, 6, OFF8);
         assert_eq!(n, 1, "本地深夜 23:30 应计入");
+    }
+
+    /// 统一口径（2026-09）：窗口 [23, 06) 跨午夜——02:00 也计入深夜，
+    /// 正午 12:00 不计入。
+    #[test]
+    fn late_night_window_spans_midnight_23_to_06() {
+        let c = conn();
+        press(&c, "2026-06-15T15:30:00+00:00"); // 本地 23:30 → 计
+        press(&c, "2026-06-14T18:00:00+00:00"); // 本地 02:00（同 UTC 日窗内）→ 计
+        press(&c, "2026-06-15T04:00:00+00:00"); // 本地 12:00 → 不计
+        press(&c, "2026-06-15T10:00:00+00:00"); // 本地 18:00 → 不计
+        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, 6, OFF8);
+        assert_eq!(n, 2, "23:30 与 02:00 计入深夜，12:00/18:00 不计入");
     }
 }

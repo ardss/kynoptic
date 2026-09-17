@@ -27,8 +27,7 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 对比三者即可回答原始活动日志回答不了的问题：**那里有没有"人"？**总览卡片
 做的就是这道算术：
 
-<!-- TODO 发布前替换为真实截图 assets/dashboard-hero.png -->
-<!-- ![Kynoptic 仪表盘总览](assets/dashboard-hero.png) -->
+![Kynoptic 仪表盘总览](assets/dashboard-hero.png)
 
 > 真实一天的数据示例：前台驻留 **20 小时 1 分**，而人在场只有 **10 小时 14 分**
 > → **9 小时 39 分**的"无人值守前台时间"——机器看起来在忙、但没有任何人
@@ -58,7 +57,7 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 ```bash
 git clone https://github.com/ardss/kynoptic
 cd kynoptic
-cargo build --release -p kynoptic-cli
+cargo build --release -p kynoptic
 
 # 采集（前台运行，Ctrl+C 优雅停止；数据默认写 %LOCALAPPDATA%\kynoptic\kynoptic.db）
 target\release\kynoptic.exe collect --help     # 查看可用参数

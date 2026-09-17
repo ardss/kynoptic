@@ -41,12 +41,13 @@ pub const FOCUS_MIN_MINUTES: i64 = 5;
 pub const FOCUS_MAX_WINDOW_SWITCHES_PER_MIN: i64 = 3;
 
 // === 异常检测阈值（anomaly） ===
-/// 23:00 之后视为深夜。
+/// 深夜窗口起点（本地时）：23:00。
 ///
-/// 口径注（backlog，2026-09）：本常量当前定义深夜为 [23, 24) 点；
-/// insights 的深夜卡用的是 [0, 6) 点——两处口径尚未统一，待后续
-/// backlog 收口（本轮只改 core 侧常量与注释，不动 dash/insights 行为）。
+/// 口径（统一 2026-09）：深夜 = [23:00, 次日 06:00)，与 insights 深夜卡的
+/// 0-6 点合并为同一个 23:00-06:00 窗口（[`LATE_NIGHT_END_HOUR`]）。
 pub const LATE_NIGHT_HOUR_START: u32 = 23;
+/// 深夜窗口终点（本地时，跨午夜）：次日 06:00。
+pub const LATE_NIGHT_END_HOUR: u32 = 6;
 /// 深夜至少 N 次按键才报警
 pub const LATE_NIGHT_MIN_KEYS: i64 = 50;
 /// 当分钟 APM >= 历史均值的 N 倍视为突增
@@ -55,6 +56,10 @@ pub const APM_BURST_MULTIPLIER: f64 = 3.0;
 pub const APM_BURST_MIN_KEYS: i64 = 100;
 /// 持续活跃 N 分钟算"马拉松会话"
 pub const MARATHON_MIN_MINUTES: i64 = 180;
+/// 在场/连续性桥接默认阈值（分钟）。与 dash settings 的
+/// `presence_bridge_minutes` 默认值同源；marathon 检测在无 settings 注入时
+/// （MCP/ctl 入口）使用此默认值。
+pub const DEFAULT_PRESENCE_BRIDGE_MINUTES: u32 = 2;
 /// 某应用事件数 >= 历史均值的 N 倍视为突增
 pub const NEW_APP_SURGE_MULTIPLIER: f64 = 5.0;
 

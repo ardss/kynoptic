@@ -120,12 +120,14 @@ fn timeline_hours_clamped_and_range_excludes_old_events() {
     assert!(v["local_offset_note"].as_str().unwrap().contains("DST"));
 }
 
-// === anomalies（与 MCP 同入口） ===
+// === anomalies（与 MCP 同入口；marathon 桥接阈值读 settings） ===
 
 #[test]
-fn anomalies_shape_matches_mcp_entry() {
+fn anomalies_shape_matches_core_entry_with_bridge() {
     let conn = mem_conn();
-    let v = api_anomalies(&conn, 7);
+    // settings 文件不存在 → 默认值（bridge=2），不影响 shape
+    let db = Path::new("/tmp/kynoptic-test-nonexistent/settings.json");
+    let v = api_anomalies(&conn, 7, db);
     assert!(v["anomalies"].is_array());
     assert_eq!(v["truncated"], json!(false));
 }
@@ -1113,6 +1115,33 @@ fn trends_no_presence_alias_and_notes_raw_metric() {
     let note = v["note"].as_str().unwrap();
     assert!(note.contains("active_minutes"), "{note}");
     assert!(note.contains("/api/overview"), "{note}");
+}
+
+/// 口径（统一 2026-09）：sum7 窗口固定 7 个日历日，daily_agg 缺行按 0 计。
+///
+/// 本周（09-10..09-16）缺 09-13 一天：正确合计 = 6 天 × 100 = 600；
+/// 修复前按行号切片会把窗口前移一天"吃进"09-09 的 100 → 误得 700。
+#[test]
+fn trends_sum7_aligned_by_calendar_date_zero_fills_missing_days() {
+    let conn = mem_conn();
+    for d in 3..=16u32 {
+        if d == 13 {
+            continue; // 本周中间缺 09-13 一天
+        }
+        conn.execute(
+            "INSERT INTO daily_agg (date, keys, clicks, active_minutes) \
+             VALUES (?1, 100, 10, 5)",
+            params![format!("2026-09-{d:02}")],
+        )
+        .unwrap();
+    }
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+    let v = api_trends_at(&conn, today);
+    assert_eq!(v["this_week"]["keys"], json!(600), "缺日按 0 计: {v}");
+    assert_eq!(v["this_week"]["active_minutes"], json!(30));
+    // 上周（09-03..09-09）7 天全有数据：不受本周缺日影响
+    assert_eq!(v["last_week"]["keys"], json!(700));
+    assert_eq!(v["daily"].as_array().unwrap().len(), 13);
 }
 
 // === 真 socket 测试（审查清单 A5）：真实 TcpListener + 真实 TCP 连接 ===

@@ -70,11 +70,11 @@ fn apm_burst_empty_input_no_alert() {
 
 #[test]
 fn marathon_at_180_minutes_triggers() {
-    // 10:00 - 12:59 共 180 连续分钟
+    // 10:00 - 12:59 共 180 连续分钟（bridge=0，不桥接）
     let mins: Vec<String> = (0..180)
         .map(|m| format!("2026-06-15T{:02}:{:02}", 10 + m / 60, m % 60))
         .collect();
-    let out = marathon_from_minutes(&mins);
+    let out = marathon_from_minutes(&mins, 0);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].kind, "marathon");
     assert!(out[0].message.contains("180"));
@@ -82,18 +82,41 @@ fn marathon_at_180_minutes_triggers() {
 
 #[test]
 fn marathon_below_threshold_no_alert() {
-    // 只 100 连续分钟（< 180 阈值）
+    // 只 100 连续分钟（< 180 阈值），即使桥接也不该报
     let mins: Vec<String> = (0..100)
         .map(|m| format!("2026-06-15T10:{:02}", m))
         .collect();
-    let out = marathon_from_minutes(&mins);
+    let out = marathon_from_minutes(&mins, 15);
     assert!(out.is_empty());
 }
 
 #[test]
 fn marathon_empty_no_alert() {
-    let out = marathon_from_minutes(&[]);
+    let out = marathon_from_minutes(&[], 2);
     assert!(out.is_empty());
+}
+
+/// 口径（统一 2026-09）：90 + 6 分钟午饭空洞 + 90（由 85+6gap+85 原型扩到
+/// 90/90 以越过 180 阈值）——bridge=2 时午饭把会话拆开（最长 90，不报）；
+/// bridge=15 时空洞按"无输入阅读"补齐（连续 186，报马拉松）。
+#[test]
+fn marathon_bridge_gap_2_vs_15_split_or_merge() {
+    let mut mins: Vec<String> = Vec::new();
+    // 09:00-10:29（90 分钟）
+    for m in 0..90 {
+        mins.push(format!("2026-06-15T{:02}:{:02}", 9 + (m / 60), m % 60));
+    }
+    // 10:30-10:35 缺席（6 分钟午饭），10:36-12:05（90 分钟）
+    for m in 36..126 {
+        mins.push(format!("2026-06-15T{:02}:{:02}", 10 + (m / 60), m % 60));
+    }
+    // bridge=2：6 分钟间隙 > 2，不桥接 → 最长 90 < 180，不报
+    let out2 = marathon_from_minutes(&mins, 2);
+    assert!(out2.is_empty(), "bridge=2 时午饭应拆开会话");
+    // bridge=15：6 分钟间隙被补齐 → 连续 90+6+90=186，报马拉松
+    let out15 = marathon_from_minutes(&mins, 15);
+    assert_eq!(out15.len(), 1, "bridge=15 时午饭应被桥接");
+    assert!(out15[0].message.contains("186"), "{}", out15[0].message);
 }
 
 // ─── 纯函数：new_app_surge_from_data ──────────────────────────────────────────
@@ -170,4 +193,61 @@ fn detect_all_empty_db_no_panic() {
     let conn = setup();
     let anomalies = kynoptic_core::anomaly::detect_all(&conn, "2026-06-15").unwrap();
     assert_eq!(anomalies.len(), 0);
+}
+
+// ─── 编排层：marathon 剔除 move-only 分钟（agg_minute 缓存路径，时区无关） ────
+
+fn setup_agg_minute() -> rusqlite::Connection {
+    let conn = setup();
+    conn.execute_batch(
+        "CREATE TABLE agg_minute (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            hour INTEGER NOT NULL,
+            minute INTEGER NOT NULL,
+            bucket_id TEXT NOT NULL,
+            sum_value INTEGER,
+            count_value INTEGER,
+            max_rowid INTEGER
+        );",
+    )
+    .expect("create agg_minute");
+    conn
+}
+
+fn ins_minute(c: &rusqlite::Connection, date: &str, hm: usize, bucket: &str) {
+    c.execute(
+        "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) \
+         VALUES (?1, ?2, ?3, ?4, 1, 1)",
+        rusqlite::params![date, hm / 60, hm % 60, bucket],
+    )
+    .unwrap();
+}
+
+/// 口径（统一 2026-09）：纯 input_moves 分钟不算活跃。
+///
+/// 08:00-10:59 共 180 个键盘分钟，但把 09:30 换成 input_moves-only——
+/// active 序列在 09:29/09:31 之间出现 1 分钟空洞：
+/// - bridge=0：空洞断开 → 最长 90 < 180，不报（若 move 算活跃则 180 连续会误报）；
+/// - bridge=15：1 分钟空洞被补齐 → 连续 180，报马拉松。
+#[test]
+fn detect_marathon_ignores_move_only_minutes_and_bridges() {
+    let conn = setup_agg_minute();
+    let date = "2026-06-15";
+    for m in 480..660 {
+        // 08:00 = 第 480 分钟 .. 10:59
+        if m == 570 {
+            // 09:30：脚本级纯鼠标抖动分钟
+            ins_minute(&conn, date, m, "input_moves");
+        } else {
+            ins_minute(&conn, date, m, "input_keys");
+        }
+    }
+    // bridge=0：move-only 分钟剔除后空洞断开，不报马拉松
+    let out0 = kynoptic_core::anomaly::detect_marathon_session(&conn, date, 0).unwrap();
+    assert!(out0.is_empty(), "move-only 分钟不能撑起马拉松");
+    // bridge=15：1 分钟空洞按无输入阅读补齐 → 连续 180，报马拉松
+    let out15 = kynoptic_core::anomaly::detect_marathon_session(&conn, date, 15).unwrap();
+    assert_eq!(out15.len(), 1);
+    assert!(out15[0].message.contains("180"), "{}", out15[0].message);
 }

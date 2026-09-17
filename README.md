@@ -38,8 +38,7 @@ The dashboard is built on three metrics:
 Comparing them answers the question raw activity logs can't: was *someone*
 there? The overview card does exactly that arithmetic:
 
-<!-- TODO before launch: replace with real screenshot at assets/dashboard-hero.png -->
-<!-- ![Kynoptic dashboard overview](assets/dashboard-hero.png) -->
+![Kynoptic dashboard overview](assets/dashboard-hero.png)
 
 > Example from a real day: foreground dwell **20h 1m** vs human presence
 > **10h 14m** → **9h 39m** of "unattended" foreground time — hours the machine
@@ -80,7 +79,7 @@ Requirements: Windows 10/11 and a Rust toolchain (stable, MSVC target).
 ```bash
 git clone https://github.com/ardss/kynoptic
 cd kynoptic
-cargo build --release -p kynoptic-cli
+cargo build --release -p kynoptic
 
 # collect (background, writes to %LOCALAPPDATA%\kynoptic\kynoptic.db by default)
 target\release\kynoptic.exe collect --help     # see available flags

@@ -66,6 +66,7 @@ Subcommands:
                                               Event query in time range
   mcp                                         Run MCP server over stdio
   skill install                               Sync bundled SKILL.md to AI client skill dirs
+  --version / -V                              Print version
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update                                      Self-update from GitHub releases
@@ -1779,6 +1780,11 @@ fn find_subcommand(args: &[String]) -> Option<usize> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // --version/-V：update.rs 的 verify_launch 依赖 exit 0 判定自更新成功
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("kynoptic {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let sub_idx = find_subcommand(&args);
     let sub: String = sub_idx
         .map(|i| args[i].clone())

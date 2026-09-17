@@ -19,13 +19,15 @@
 
 ## Privacy boundary
 
-- No account, no telemetry, no analytics, no network calls. Data never
-  leaves the machine by default.
+- No account, no telemetry, no analytics. Data never leaves the machine
+  by default; the only network call is the user-invoked `update`
+  subcommand (GitHub releases).
 - Keyboard and mouse are stored as per-minute counts only - never key
-  contents. Per-key detail is opt-in via settings.
+  contents. Per-key frequency counts (used by the dashboard heatmap) are
+  on by default and can be disabled in settings.
 - The dashboard and MCP server bind to 127.0.0.1 only.
 
-## Architecture (three crates, plus a tray shell)
+## Architecture (four crates, plus a tray shell)
 
 - `crates/core` - collectors, event pipeline, SQLite storage
   (numbered migrations), queries, monitor registry
@@ -34,14 +36,16 @@
 - `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary: `now`,
   `query`, `stats`, `collect`, `dashboard`, `probe`, and the MCP
   launcher. Includes a local-only read-only web dashboard.
+- `crates/dash` - dashboard service and pages (shared by CLI and tray).
 - `crates/mcp` - MCP server over stdio JSON-RPC 2.0.
 - `crates/tray` - pure Win32 tray shell hosting the collector and
   dashboard in one process.
 
-## MCP tools (five)
+## MCP tools (six)
 
-`get_current_status`, `get_summary`, `get_timeline`, `get_anomalies`,
-`wait_for` - all read locally collected data; nothing is uploaded.
+`get_current_status`, `get_summary`, `get_timeline`, `get_top_apps`,
+`get_anomalies`, `wait_for` - all read locally collected data; nothing
+is uploaded.
 
 ## Key documents
 
