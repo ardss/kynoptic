@@ -65,6 +65,7 @@ Subcommands:
   query     [--from T] [--to T] [--bucket B] [--limit N] [--json]
                                               Event query in time range
   mcp                                         Run MCP server over stdio
+  skill install                               Sync bundled SKILL.md to AI client skill dirs
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update                                      Self-update from GitHub releases
@@ -969,6 +970,42 @@ fn cmd_mcp() -> Result<()> {
     Ok(())
 }
 
+// === skill ===
+
+/// SKILL.md 内容（随二进制内嵌，`skill install` 同步到各 AI 客户端 skill 目录）。
+const SKILL_MD: &str = include_str!("assets/skill.md");
+
+/// skill 目录约定：home 下的 `.zcode/.claude/.cursor` 三家，各 `skills/kynoptic/SKILL.md`。
+const SKILL_CLIENT_DIRS: [&str; 3] = [".zcode", ".claude", ".cursor"];
+
+/// 把内嵌 SKILL.md 写入 base 下的各客户端 skill 目录。返回写入路径列表。
+/// 抽出 base 以便单测注入临时目录。
+fn skill_install_to(base: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut written = Vec::new();
+    for dir in SKILL_CLIENT_DIRS {
+        let target = base.join(dir).join("skills").join("kynoptic");
+        std::fs::create_dir_all(&target)
+            .map_err(|e| Error::InvalidData(format!("创建 {} 失败: {e}", target.display())))?;
+        let file = target.join("SKILL.md");
+        std::fs::write(&file, SKILL_MD)
+            .map_err(|e| Error::InvalidData(format!("写入 {} 失败: {e}", file.display())))?;
+        written.push(file);
+    }
+    Ok(written)
+}
+
+fn cmd_skill_install() -> Result<()> {
+    let home = std::env::var("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| Error::InvalidData("USERPROFILE 未设置，无法定位 skill 目录".into()))?;
+    let files = skill_install_to(&home)?;
+    println!("Kynoptic skill 已安装/更新到:");
+    for f in &files {
+        println!("  {}", f.display());
+    }
+    Ok(())
+}
+
 // === probe ===
 
 /// `kynoptic-ctl probe [--monitor ID] [--secs N] [--all]`
@@ -1651,6 +1688,7 @@ fn main() -> ExitCode {
             "now" => cmd_now(&rest),
             "query" => cmd_query(&rest),
             "mcp" => cmd_mcp(),
+            "skill" => cmd_skill_install(),
             "probe" => cmd_probe(&rest),
             "dashboard" => dashboard::cmd_dashboard(&rest),
             "update" => update::cmd_update(&rest),
@@ -2141,5 +2179,18 @@ mod tests {
         assert_eq!(csv_cell("=cmd|' /C calc'!A0"), "'=cmd|' /C calc'!A0");
         assert_eq!(csv_cell("@SUM"), "'@SUM");
         assert_eq!(csv_cell("普通标题"), "普通标题");
+    }
+
+    #[test]
+    fn skill_install_writes_all_client_dirs_with_content() {
+        let tmp = std::env::temp_dir().join(format!("kyn-skill-{}", std::process::id()));
+        let files = skill_install_to(&tmp).expect("skill install should succeed");
+        assert_eq!(files.len(), SKILL_CLIENT_DIRS.len());
+        for f in &files {
+            let content = std::fs::read_to_string(f).expect("SKILL.md written");
+            assert!(content.starts_with("---\nname: kynoptic"), "frontmatter intact in {f:?}");
+            assert!(content.contains("意图路由"));
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

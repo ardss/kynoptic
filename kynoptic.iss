@@ -41,6 +41,8 @@ Source: "dist\kynoptic-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\kynoptic.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\kynoptic-watchdog.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\README.md"; DestDir: "{app}"; Flags: ignoreversion
+; SKILL.md 随安装包分发（AI 客户端 skill，见 [Run] 段 skill install）
+Source: "crates\cli\src\assets\skill.md"; DestDir: "{app}"; DestName: "SKILL.md"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
@@ -55,6 +57,8 @@ Name: "autostart"; Description: "{cm:AutoStartTask}"; Flags: unchecked
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Kynoptic"; ValueData: """{app}\{#AppExeName}"" --minimized"; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
+; AI 客户端 skill 同步（静默、总是执行；升级覆盖安装也会刷新 SKILL.md）
+Filename: "{app}\kynoptic.exe"; Parameters: "skill install"; Flags: runhidden
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 ; 看门狗:计划任务每分钟跑一次 `kynoptic watchdog --once`,托盘被杀/崩溃时自动拉起;
 ; 用户从托盘菜单主动退出则写旗标,watchdog 不拉起。随 autostart 任务一起安装。
