@@ -14,14 +14,16 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 
 ## 定位二进制与数据（按序尝试）
 
-1. `D:\Kynoptic\kynoptic.exe`（默认安装位）
-2. `kynoptic` 在 PATH（installer 会加）
-3. 源码仓库 `G:\kynoptic\target\release\kynoptic.exe`（G 盘可能未挂载）
+1. `D:\Kynoptic\kynoptic.exe`（安装版默认位；换机后路径可能变，先确认盘符）
+2. `kynoptic` 在 PATH（安装版会加）
+3. 开发正本 `K:\kynoptic\target\release\kynoptic.exe`（仓库克隆+便携构建，权威源）
 
-数据约定：db 与 settings.json 在**安装目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`）。
+**两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。开发在 K:\kynoptic（git 正本，G 盘已弃用），改完 `cargo build --release -p kynoptic -p kynoptic-tray` 后把二进制拷到安装目录重启托盘才生效。
+
+数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
 CLI 解析顺序：`KYNOPTIC_DB` 环境变量 > `--db <PATH>` 全局参数 > exe 同级 data\。
 CLI 默认路径推导时会打印 `using db: <path>` 到 stderr——**注意核对**，防静默读到错误库。
-仪表盘：http://127.0.0.1:8422/（只读 HTTP，浏览器可直接验收）。
+仪表盘：http://127.0.0.1:8422/（只读 HTTP；服务没起来 panel 000 时先找托盘进程）。
 
 ## 核心命令
 
@@ -72,7 +74,7 @@ HTTP API（GET 全部只读）：
 
 ## 数据迁移（换机）
 
-1. 新机装 Release 安装包（无需工具链）
-2. 旧机停进程后整体拷贝 `data\`（kynoptic.db + wal/shm + settings.json）到新机同结构位置
+1. 新机装 Release 安装包（无需工具链；skill 会被安装器自动同步，老包手动跑 `kynoptic skill install`）
+2. 旧机停进程后整体拷贝 `data\`（kynoptic.db + wal/shm + settings.json）到新机安装目录的 data\
 3. 管理员跑一次 `wevtutil sl Microsoft-Windows-DNS-Client/Operational /e:true`（dns 监控器依赖，不随数据走）
 4. 验收：面板四卡有数 + `/api/settings` monitors 40/40 + `kynoptic presence --days 3` 与面板一致
