@@ -233,19 +233,103 @@ fn local_offset_modifier_at(now: DateTime<Utc>) -> String {
     )
 }
 
-/// 异常 kind -> 英文模板（前端 message_en 备用文案）。
-fn anomaly_message_en(kind: &str) -> String {
+/// 从中文 message 中提取数字参数（按模板出现顺序），供英文参数化文案复用。
+/// 只识别 ASCII 数字与小数点，逐字节扫描在 UTF-8 下安全（多字节序列的高位
+/// 字节不会命中 is_ascii_digit），且数字段起点/终点均为 ASCII 边界。
+fn message_numbers(message: &str) -> Vec<f64> {
+    let mut out = Vec::new();
+    let b = message.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len()
+                && (b[i].is_ascii_digit()
+                    || (b[i] == b'.' && i + 1 < b.len() && b[i + 1].is_ascii_digit()))
+            {
+                i += 1;
+            }
+            if let Ok(v) = message[start..i].parse::<f64>() {
+                out.push(v);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 整数化的数字展示（模板里分钟数/事件数都是整数；倍率保留 1 位小数）。
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// 异常 kind + 中文 message -> 参数化英文文案（前端 message_en）。
+/// 与中文模板同源：分钟数 / 倍率 / 应用名等数字全部带上，信息量对齐。
+/// kynoptic-mcp 的同名函数只给静态模板；dash 侧拿到完整 message 后重新
+/// 参数化，避免英文侧丢失 "240 分钟""13.2x" 这类关键数字。
+fn anomaly_message_en(kind: &str, message: &str, at: Option<&str>) -> String {
     match kind {
-        "late_night" => "Late-night activity: input detected after 23:00".into(),
-        "apm_burst" => "APM burst: input rate spiked well above your baseline".into(),
-        "marathon" => "Marathon session: long continuous activity without breaks".into(),
-        "new_app_surge" => "App usage surge: an app spiked above its daily average".into(),
+        // "深夜活动：{n} 按键"
+        "late_night" => format!(
+            "Late-night activity: {} keystrokes after 23:00",
+            fmt_num(message_numbers(message).first().copied().unwrap_or(0.0))
+        ),
+        // "APM 突增：{minute} 达到 {n}（历史均值 {avg} 的 {ratio:.1}x）"
+        // 分钟时间戳本身含数字，从 "达到" 之后再取数（n, avg, ratio）。
+        "apm_burst" => {
+            let tail = message.split("达到").nth(1).unwrap_or(message);
+            let n = message_numbers(tail);
+            format!(
+                "APM burst: {} hit {} ({:.1}x the {} historical average)",
+                at.unwrap_or_default(),
+                fmt_num(n.first().copied().unwrap_or(0.0)),
+                n.get(2).copied().unwrap_or(0.0),
+                fmt_num(n.get(1).copied().unwrap_or(0.0)),
+            )
+        }
+        // "马拉松会话：连续活跃 {longest} 分钟"
+        "marathon" => format!(
+            "Marathon session: {} minutes of continuous activity without breaks",
+            fmt_num(message_numbers(message).first().copied().unwrap_or(0.0))
+        ),
+        // "应用使用突增：{app}（今天 {n}，日均 {avg}，{ratio:.1}x）"
+        // "新应用首次出现：{app}（{n} 事件）"
+        "new_app_surge" => {
+            let app = message
+                .split_once('：')
+                .map(|(_, rest)| rest)
+                .unwrap_or("")
+                .split('（')
+                .next()
+                .unwrap_or("")
+                .trim();
+            let n = message_numbers(message);
+            if message.contains("首次出现") {
+                format!(
+                    "New app first seen: {app} ({} events)",
+                    fmt_num(n.first().copied().unwrap_or(0.0))
+                )
+            } else {
+                format!(
+                    "App usage surge: {app} (today {}, daily average {}, {:.1}x)",
+                    fmt_num(n.first().copied().unwrap_or(0.0)),
+                    fmt_num(n.get(1).copied().unwrap_or(0.0)),
+                    n.get(2).copied().unwrap_or(0.0),
+                )
+            }
+        }
         other => format!("Anomaly detected: {other}"),
     }
 }
 
 /// GET /api/anomalies?days= — 复用 MCP get_anomalies 的同一检测入口，
-/// 每条附加 message_en（按 kind 映射英文模板，kind 不识别时给通用文案）。
+/// 每条按中文 message 重新参数化 message_en（分钟数/倍率/应用名全部带上；
+/// kind 不识别时给通用文案）。
 pub fn api_anomalies(conn: &Connection, days: u32) -> Value {
     let mut v = kynoptic_mcp::state::anomalies(conn, days as usize, 100);
     if let Some(arr) = v.get_mut("anomalies").and_then(Value::as_array_mut) {
@@ -255,7 +339,13 @@ pub fn api_anomalies(conn: &Connection, days: u32) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            a["message_en"] = Value::String(anomaly_message_en(&kind));
+            let message = a
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let at = a.get("at").and_then(Value::as_str).map(str::to_string);
+            a["message_en"] = Value::String(anomaly_message_en(&kind, &message, at.as_deref()));
         }
     }
     v

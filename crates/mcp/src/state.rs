@@ -370,7 +370,11 @@ fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i6
 /// 规范化时间边界：裸日期 `YYYY-MM-DD` 按**本地日界**展开（与 dash 的
 /// local_day_range 同语义，注意 mcp 进程 TZ）——from 当日本地 00:00，
 /// to 当日本地日末（= 次日本地 00:00，[start,end) 语义，不多吞一天）。
-/// RFC3339 等完整时间戳原样透传。
+/// RFC3339 等完整时间戳统一解析后转成 **UTC 规范形**（`+00:00` 后缀、秒精度）
+/// 再进 SQL：timestamp 列全部由 `DateTime<Utc>::to_rfc3339()` 写入（`+00:00` 形），
+/// 边界若原样透传 `+08:00` 等显式偏移字面量，RFC3339 **字符串比较**的字典序
+/// 将不等于时间序（如 `+08:00` < `+00:00` 字典序为假的时间序），导致边界漏/多事件。
+/// 解析失败（非 RFC3339）时回退原样，保持既有行为。
 fn normalize_bound(v: &str, is_to: bool) -> String {
     let b = v.as_bytes();
     if b.len() == 10
@@ -383,7 +387,12 @@ fn normalize_bound(v: &str, is_to: bool) -> String {
             return if is_to { e } else { s };
         }
     }
-    v.to_string()
+    match chrono::DateTime::parse_from_rfc3339(v) {
+        Ok(t) => t
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        Err(_) => v.to_string(),
+    }
 }
 
 /// 应用/窗口时间线段。granularity=minute 逐段返回；hour 把同一本地小时内
@@ -922,6 +931,83 @@ mod tests {
         assert_eq!(arr[0]["app"], json!("a"));
         assert_eq!(arr[0]["end"], json!(end), "to 当日应到本地日末为止");
         assert_eq!(arr[0]["start"], json!(start));
+    }
+
+    /// 带显式偏移的边界必须按**时刻**而非字符串比较：to=本地(UTC+8) 9/17 00:00
+    /// 即 16:00Z，之后的 16:30Z 事件不得混入；Z 与 +00:00 混用同样成立。
+    #[test]
+    fn timeline_explicit_offsets_compare_by_instant() {
+        let conn = mem_conn();
+        insert(
+            &conn,
+            "2026-09-16T15:30:00+00:00",
+            "window",
+            "switch",
+            Some("in"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-16T16:30:00+00:00",
+            "window",
+            "switch",
+            Some("out"),
+            None,
+        );
+        let v = timeline(
+            &conn,
+            "2026-09-16T08:00:00+08:00",
+            "2026-09-17T00:00:00+08:00",
+            "minute",
+            10,
+        )
+        .unwrap();
+        let arr = v["segments"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "to(+08:00)=16:00Z 之后的事件不得混入: {v}");
+        assert_eq!(arr[0]["app"], json!("in"));
+        // from 用 Z、to 用 +00:00 混排：两事件都在窗口内
+        let v = top_apps(
+            &conn,
+            "2026-09-16T15:00:00Z",
+            "2026-09-16T17:00:00+00:00",
+            10,
+        )
+        .unwrap();
+        assert_eq!(v["total_apps"], json!(2));
+        // 边界倒挂（按时刻）：16:00Z 之后不能作为 to 排在 from 前，应报可读错误
+        assert!(timeline(
+            &conn,
+            "2026-09-17T18:00:00+08:00", // 10:00Z，晚于 to
+            "2026-09-17T09:00:00Z",
+            "minute",
+            10
+        )
+        .is_err());
+    }
+
+    /// Z 形输入规范化为 `+00:00` 形（与库内 timestamp 存储格式一致）；
+    /// 非 RFC3339 回退原样不破坏既有行为。
+    #[test]
+    fn normalize_bound_canonicalizes_offsets() {
+        assert_eq!(
+            normalize_bound("2026-09-17T00:00:00Z", true),
+            "2026-09-17T00:00:00+00:00"
+        );
+        assert_eq!(
+            normalize_bound("2026-09-17T00:00:00+08:00", true),
+            "2026-09-16T16:00:00+00:00"
+        );
+        // 带小数秒 → 截到秒精度（与库内整秒字面量字典序可比）
+        assert_eq!(
+            normalize_bound("2026-09-17T00:00:00.123+08:00", false),
+            "2026-09-16T16:00:00+00:00"
+        );
+        // 解析失败回退原样
+        assert_eq!(normalize_bound("garbage", false), "garbage");
+        // 裸日期路径不变
+        let (s, e) = queries::local_day_range("2026-09-17").unwrap();
+        assert_eq!(normalize_bound("2026-09-17", false), s);
+        assert_eq!(normalize_bound("2026-09-17", true), e);
     }
 
     #[test]

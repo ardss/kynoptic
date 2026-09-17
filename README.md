@@ -69,7 +69,9 @@ there? The overview card does exactly that arithmetic:
 Download [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)
 from the latest release, run it, and launch Kynoptic from the Start menu.
 Collection starts automatically and the dashboard opens at
-`http://127.0.0.1:8422` in your browser.
+`http://127.0.0.1:8422` in your browser (if 8422 is taken, the dashboard
+falls back to the next free port and records it in
+`data\dashboard-port.txt`).
 
 **Option 2 — Build from source:**
 
@@ -118,9 +120,16 @@ environment variable (the MCP config `env` field works well):
 }
 ```
 
-Note: `kynoptic mcp` does not accept a `--db` flag — pass the database path
-via the `KYNOPTIC_DB` environment variable as shown above (the CLI's other
-read-only subcommands do take `--db`).
+Both `--db <PATH>` and the `KYNOPTIC_DB` environment variable work — `mcp
+--db` is passed to the server internally via `KYNOPTIC_DB`:
+
+```json
+{
+  "mcpServers": {
+    "kynoptic": { "command": "kynoptic", "args": ["mcp", "--db", "D:/data/kynoptic.db"] }
+  }
+}
+```
 
 Your assistant can then answer questions like "what was I doing when the CPU
 spiked yesterday?" or "which app did I use most last Tuesday?" without the

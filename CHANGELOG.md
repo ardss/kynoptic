@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with live-probe verification harness (`kynoptic-ctl probe`).
 - CLI: `now` / `query` / `stats` / `collect` / `dashboard` / `mcp`
   subcommands, `kynoptic` and `kynoptic-ctl` binaries.
-- MCP server (stdio JSON-RPC 2.0) with five tools: `get_current_status`,
-  `get_summary`, `get_timeline`, `get_anomalies`, `wait_for`.
+- MCP server (stdio JSON-RPC 2.0) with six tools: `get_current_status`,
+  `get_summary`, `get_timeline`, `get_top_apps`, `get_anomalies`,
+  `wait_for`.
 - Dashboard settings: `settings.json` store, local-only settings tab
   (per-monitor toggles, input granularity, autostart), `GET/POST
   /api/settings` with registry id validation; `collect` now reads
@@ -49,9 +50,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmark harness (`perf-write` / `perf-startup` / `perf-hook` /
   `perf-query` / `perf-idle` / `perf3-*`); methodology and numbers in
   [BENCHMARKS.md](BENCHMARKS.md).
+- Dashboard port fallback: when the default port 8422 is occupied the
+  dashboard tries the next free ports (up to 8422+10) and writes the
+  actual port to `data\dashboard-port.txt`; an explicit `--port 0`
+  (random free port) keeps its semantics and skips the fallback.
+- Unattended-card warmup gate: the "machine unattended" card shows an
+  empty-state note (`has_full_day=false`) instead of a misleading number
+  until a full day of data is collected.
+- CLI `--db <PATH>` is consumed from any argument position (paired
+  extraction, last occurrence wins) instead of only the fixed positions.
+- `report --date` accepts `today` / `yesterday` aliases (empty = today,
+  local timezone).
+- `db recompute-agg` subcommand: rebuild derived aggregate tables from
+  the raw layer.
+- Write-failure counter with escalating alarm on persistent store write
+  failures.
+- Junction/symlink guards for `skill install` target directories
+  (reparse-point check before writing) and atomic tmp+rename writes.
+- Strict argument validation for `skill` / `analyze` subcommands;
+  `analyze --days N`.
 
 ### Fixed
 
+- `kynoptic mcp --db PATH` now reaches the MCP server: the resolved path
+  is exported as `KYNOPTIC_DB` before startup (previously the server
+  silently connected to the default database). Both `--db` and
+  `KYNOPTIC_DB` work.
+- MCP correctness pass: `get_summary` gains an explicit `compared_to`
+  baseline date (default date-1; empty comparison instead of a misleading
+  growth rate when the baseline day has no data); `get_timeline` parses
+  bare dates by the local day boundary and returns `total_segments` plus
+  a `truncation` strategy (`oldest-dropped`) when segments exceed the
+  limit; `get_top_apps` added for in-window per-app dwell ranking;
+  stricter parameter validation across tools.
+- Aggregate (agg_minute/daily_agg) writes are transactional; under-filled
+  aggregate days self-heal on subsequent reads instead of serving stale
+  buckets.
+- Ghost tray/watchdog processes from a previous session are detected and
+  closed automatically at startup.
+- Foreground self-exclusion: the collector's own process (including the
+  installed `KYNOPTIC.EXE` path) no longer counts as the foreground app.
 - `file_activity` monitor rewritten on `ReadDirectoryChangesW` (native
   change notifications instead of polling).
 - `ime` monitor switched to native registry polling (no PowerShell

@@ -48,7 +48,8 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 从最新 Release 下载
 [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)，
 运行安装，从开始菜单启动 Kynoptic。采集自动开始，仪表盘在浏览器
-`http://127.0.0.1:8422` 打开。
+`http://127.0.0.1:8422` 打开（若 8422 被占用，面板自动回退到下一个空闲
+端口，实际端口写入 `data\dashboard-port.txt`）。
 
 **方式二——从源码构建：**
 
@@ -70,13 +71,28 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 
 ### 让 AI 助手使用它（MCP）
 
-内置 MCP server（stdio JSON-RPC），提供五个工具：`get_current_status`、
-`get_summary`、`get_timeline`、`get_anomalies`、`wait_for`。接入你的 MCP 客户端：
+内置 MCP server（stdio JSON-RPC），提供六个工具：`get_current_status`、
+`get_summary`、`get_timeline`、`get_top_apps`、`get_anomalies`、`wait_for`。接入你的 MCP 客户端：
 
 ```json
 {
   "mcpServers": {
     "kynoptic": { "command": "kynoptic", "args": ["mcp"] }
+  }
+}
+```
+
+指定数据库时 `--db <PATH>` 与 `KYNOPTIC_DB` 环境变量均可（`mcp --db` 内部
+即经 `KYNOPTIC_DB` 传递）：
+
+```json
+{
+  "mcpServers": {
+    "kynoptic": {
+      "command": "kynoptic",
+      "args": ["mcp"],
+      "env": { "KYNOPTIC_DB": "D:/data/kynoptic.db" }
+    }
   }
 }
 ```

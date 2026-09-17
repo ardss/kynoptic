@@ -716,11 +716,55 @@ fn insights_rhythm_updates_last_and_marks_single_event_day() {
 
 #[test]
 fn anomalies_message_en_covers_all_kinds() {
-    assert!(anomaly_message_en("late_night").contains("Late-night"));
-    assert!(anomaly_message_en("apm_burst").contains("APM"));
-    assert!(anomaly_message_en("marathon").contains("Marathon"));
-    assert!(anomaly_message_en("new_app_surge").contains("surge"));
-    assert!(anomaly_message_en("unknown_kind").contains("unknown_kind"));
+    // 与 kynoptic-core anomaly.rs 的中文模板逐字同源（数字全带上）
+    let late = anomaly_message_en("late_night", "深夜活动：240 按键", None);
+    assert!(late.contains("Late-night"), "{late}");
+    assert!(late.contains("240"), "message_en 应带上按键数: {late}");
+
+    let burst = anomaly_message_en(
+        "apm_burst",
+        "APM 突增：2026-09-17T10:23 达到 87（历史均值 12 的 7.3x）",
+        Some("2026-09-17T10:23"),
+    );
+    assert!(burst.contains("APM burst"), "{burst}");
+    assert!(burst.contains("87"), "message_en 应带上峰值 APM: {burst}");
+    assert!(burst.contains("7.3x"), "message_en 应带上倍率: {burst}");
+    assert!(
+        burst.contains("2026-09-17T10:23"),
+        "message_en 应带上分钟: {burst}"
+    );
+
+    let marathon = anomaly_message_en("marathon", "马拉松会话：连续活跃 195 分钟", None);
+    assert!(marathon.contains("Marathon"), "{marathon}");
+    assert!(
+        marathon.contains("195"),
+        "message_en 应带上分钟数: {marathon}"
+    );
+
+    let surge = anomaly_message_en(
+        "new_app_surge",
+        "应用使用突增：code.exe（今天 800，日均 60，13.2x）",
+        None,
+    );
+    assert!(surge.contains("surge"), "{surge}");
+    assert!(
+        surge.contains("code.exe"),
+        "message_en 应带上应用名: {surge}"
+    );
+    assert!(
+        surge.contains("800"),
+        "message_en 应带上今日事件数: {surge}"
+    );
+    assert!(surge.contains("13.2x"), "message_en 应带上倍率: {surge}");
+
+    let fresh = anomaly_message_en("new_app_surge", "新应用首次出现：foo.exe（120 事件）", None);
+    assert!(fresh.contains("first seen"), "{fresh}");
+    assert!(
+        fresh.contains("foo.exe") && fresh.contains("120"),
+        "{fresh}"
+    );
+
+    assert!(anomaly_message_en("unknown_kind", "未知异常", None).contains("unknown_kind"));
 }
 
 // === trends：presence_minutes 假别名已移除（第四口径修复） ===

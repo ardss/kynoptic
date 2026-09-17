@@ -151,10 +151,7 @@ mod tests {
             "kynoptic.exe",
             r"C:\Program Files\Kynoptic\KYNOPTIC.EXE"
         ));
-        assert!(exe_matches_self(
-            "kynoptic.exe",
-            r#""C:\x\kynoptic.exe""#
-        ));
+        assert!(exe_matches_self("kynoptic.exe", r#""C:\x\kynoptic.exe""#));
     }
 
     #[test]

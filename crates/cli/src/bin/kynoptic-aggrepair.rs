@@ -451,7 +451,43 @@ fn main() {
                 .expect("插回 agg_daily 失败");
         }
     }
+    // daily_agg（anomaly apm_burst 检测的历史基线）不属于 agg::rebuild_all 的
+    // 范畴——rebuild 只重建 agg_minute / agg_daily(app:%)。纯 repair 的库若不
+    // 补这一步，daily_agg.apm_avg 会缺行/空值，apm_burst 因"无基线"静默失效。
+    // 这里对范围内每个本地日调用 core 公开的 recompute_day 补齐。
+    let mut daily_dates = Vec::new();
+    {
+        let mut d = args.from.clone();
+        loop {
+            daily_dates.push(d.clone());
+            if d == args.to {
+                break;
+            }
+            d = NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+                .expect("日期")
+                .succ_opt()
+                .expect("日期")
+                .format("%Y-%m-%d")
+                .to_string();
+        }
+    }
+    let mut daily_changed = 0usize;
+    for d in &daily_dates {
+        match kynoptic_core::daily_agg::recompute_day(&target, d) {
+            Ok(true) => daily_changed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                let _ = target.execute_batch("ROLLBACK;");
+                panic!("daily_agg recompute_day({d}) 失败，已回滚: {e}");
+            }
+        }
+    }
     target.execute_batch("COMMIT;").expect("提交事务失败");
+    println!(
+        "daily_agg 已重算范围日 {} 天（{} 天有变化）。",
+        daily_dates.len(),
+        daily_changed
+    );
     println!("重算已提交。");
 
     // ---- 4. 复验：重新复制目标库 -> 重算 -> 逐分钟对比，应零差异 ----
@@ -481,6 +517,45 @@ fn main() {
     } else {
         println!("FAIL：仍有 {} 个差异分钟。", remaining.len());
         exit(1);
+    }
+
+    // 复验 daily_agg：范围日行必须存在且 apm_avg 有值（apm_burst 基线）。
+    {
+        let vtarget = Connection::open(&args.db).expect("重开目标库失败");
+        let mut bad = Vec::new();
+        let mut d = args.from.clone();
+        loop {
+            let row: Option<(i64, i64, i64, Option<f64>)> = vtarget
+                .query_row(
+                    "SELECT keys, clicks, active_minutes, apm_avg FROM daily_agg WHERE date = ?1",
+                    rusqlite::params![d],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .ok();
+            match row {
+                None => bad.push(format!("{d} 缺行")),
+                Some((_, _, _, apm)) if apm.is_none() => bad.push(format!("{d} apm_avg 为空")),
+                Some(_) => {}
+            }
+            if d == args.to {
+                break;
+            }
+            d = NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+                .expect("日期")
+                .succ_opt()
+                .expect("日期")
+                .format("%Y-%m-%d")
+                .to_string();
+        }
+        if bad.is_empty() {
+            println!(
+                "PASS：daily_agg 范围日（{} ..= {}）行齐全且 apm_avg 有值（apm_burst 基线可用）。",
+                args.from, args.to
+            );
+        } else {
+            println!("FAIL：daily_agg 范围日基线异常：{}", bad.join("; "));
+            exit(1);
+        }
     }
     println!(
         "临时副本保留于 {:?} 与 {:?} 备查。",

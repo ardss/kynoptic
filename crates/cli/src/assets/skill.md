@@ -21,9 +21,9 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 **两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。开发在 K:\kynoptic（git 正本，G 盘已弃用），改完 `cargo build --release -p kynoptic -p kynoptic-tray` 后把二进制拷到安装目录重启托盘才生效。
 
 数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
-CLI 解析顺序：`KYNOPTIC_DB` 环境变量 > `--db <PATH>` 全局参数 > exe 同级 data\。
+CLI 解析顺序：`KYNOPTIC_DB` 环境变量 > `--db <PATH>` 全局参数 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。
 CLI 默认路径推导时会打印 `using db: <path>` 到 stderr——**注意核对**，防静默读到错误库。
-仪表盘：http://127.0.0.1:8422/（只读 HTTP；服务没起来 panel 000 时先找托盘进程）。
+仪表盘：http://127.0.0.1:8422/（只读 HTTP；8422 被占会回退到下一个空闲端口，实际端口写在 data\dashboard-port.txt；服务没起来 panel 000 时先找托盘进程）。
 
 ## 核心命令
 
@@ -36,7 +36,7 @@ kynoptic analyze --days 7           # 近 7 天逐日专注/碎片/异常分析
 kynoptic analyze --date YYYY-MM-DD  # 单日专注/碎片/异常分析
 kynoptic export --days 7 --out FILE [--format csv|jsonl] [--redact]
 kynoptic db stats                 # 行数/库大小
-kynoptic mcp                      # 启动 MCP 服务器（stdio）
+kynoptic mcp [--db PATH]           # 启动 MCP 服务器（stdio）；--db 与 KYNOPTIC_DB 均可（--db 内部即经 KYNOPTIC_DB 传递）
 ```
 
 HTTP API（GET 全部只读）：
@@ -50,7 +50,9 @@ HTTP API（GET 全部只读）：
 - **人在场的唯一权威实现**在 `kynoptic-core::queries::presence::classify_minutes`，dashboard overview 与 CLI `presence` 共用。两者数字必须一致；不一致=bug，直接报告不要解释。
 - `stats`/`heatmap`/`summary` 的 active/输入分钟是 **raw 口径**（含注入、不桥接），与 presence 语义不同，**不要混用或互相换算**。
 - timeline 的 `human_min` 是桥接后值（另有 `human_min_unbridged`）。
-- MCP get_summary 的 active_minutes 已过滤 heartbeat/snapshot，与 dashboard summary 同源。
+- MCP 共六工具：`get_current_status` / `get_summary` / `get_timeline` / `get_top_apps` / `get_anomalies` / `wait_for`。
+- MCP get_summary 的 active_minutes 已过滤 heartbeat/snapshot，与 dashboard summary 同源；`compared_to` 是对比基准日（默认 date-1，基准日无数据时该对比字段为空而非 0 增长）。
+- MCP get_timeline 的裸日期 from/to 按**本地日界**解析，to 为日期时含当天全天；响应带 `total_segments` 与截断策略（超限丢弃最旧段，`truncation=oldest-dropped`）。
 
 ## 安全规则（优先级高于效率）
 
@@ -71,7 +73,7 @@ HTTP API（GET 全部只读）：
 | "有没有异常" | `/api/anomalies`（APM 突增/深夜活动/马拉松会话） |
 | "把我的数据导出来" | `export --days N --out`；确认目标位置含敏感明文 |
 | "面板打不开" | tasklist 查 kynoptic-tray → curl 8422 → 看 heartbeat/watchdog.log → 杀掉后 `kynoptic-tray --minimized` 重启（先杀 watchdog 再动 tray） |
-| "让 AI 读取活动数据" | 配 MCP：命令 `kynoptic mcp`（stdio）；新机器记得 `KYNOPTIC_DB` 或把 db 放默认位 |
+| "让 AI 读取活动数据" | 配 MCP：命令 `kynoptic mcp`（stdio，`--db` 与 `KYNOPTIC_DB` 均可）；新机器记得设其一或把 db 放默认位 |
 
 ## 数据迁移（换机）
 
