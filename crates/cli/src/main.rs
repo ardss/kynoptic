@@ -2441,7 +2441,7 @@ mod tests {
         for f in &files {
             let content = std::fs::read_to_string(f).expect("SKILL.md written");
             assert!(
-                content.starts_with("---\nname: kynoptic"),
+                content.replace("\r\n", "\n").starts_with("---\nname: kynoptic"),
                 "frontmatter intact in {f:?}"
             );
             assert!(content.contains("意图路由"));
