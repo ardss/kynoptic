@@ -137,10 +137,6 @@ mod tests {
         // 都不该进前台事件；且每个 bin 只匹配自己的名字，不误伤兄弟 bin。
         for own in ["kynoptic.exe", "kynoptic-tray.exe", "kynoptic-ctl.exe"] {
             assert!(exe_matches_self(own, own), "{own} 应与自身匹配");
-            assert!(exe_matches_self(
-                r"C:\Program Files\Kynoptic\KYNOPTIC.EXE",
-                own
-            ));
             for other in ["kynoptic.exe", "kynoptic-tray.exe", "kynoptic-ctl.exe"] {
                 if other != own {
                     assert!(
@@ -150,6 +146,15 @@ mod tests {
                 }
             }
         }
+        // 大小写与引号路径归一化后仍应命中自身（kynoptic.exe 归一化即此名）
+        assert!(exe_matches_self(
+            "kynoptic.exe",
+            r"C:\Program Files\Kynoptic\KYNOPTIC.EXE"
+        ));
+        assert!(exe_matches_self(
+            "kynoptic.exe",
+            r#""C:\x\kynoptic.exe""#
+        ));
     }
 
     #[test]
