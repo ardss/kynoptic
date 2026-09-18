@@ -494,6 +494,22 @@ impl Database {
         }
     }
 
+    /// WAL 文件大小（字节）；文件不存在返回 None。
+    pub fn wal_size_bytes(&self) -> Option<u64> {
+        let p = format!("{}-wal", self.db_path);
+        std::fs::metadata(&p).ok().map(|m| m.len())
+    }
+
+    /// 被动 checkpoint（不阻塞读写，WAL 超 64MB 时的日常防线）。
+    pub fn checkpoint_passive(&self) {
+        self.with_writer(
+            |w| {
+                let _ = w.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+            },
+            || {},
+        );
+    }
+
     /// 完整的维护操作：清理 + 欠聚合核对自愈 + WAL 检查点 + VACUUM 压缩
     pub fn maintenance(&self) {
         self.cleanup_old_events();

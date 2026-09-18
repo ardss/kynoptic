@@ -826,8 +826,14 @@ fn route_table_and_error_codes() {
 
     let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=6", "", db);
     assert_eq!(code, 200);
-    let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=nope", "", db);
-    assert_eq!(code, 200, "hours 非法回退默认 12");
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?hours=nope", "", db);
+    assert_eq!(
+        code, 400,
+        "hours 非法必须 400（Wave16：静默回退掩盖客户端 bug）"
+    );
+    assert!(body.contains("error"));
+    let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=-5", "", db);
+    assert_eq!(code, 400, "负 hours 同样 400");
 
     let (code, _, _) = route_req(&conn, "GET", "/api/anomalies?days=3", "", db);
     assert_eq!(code, 200);

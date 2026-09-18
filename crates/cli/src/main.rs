@@ -1469,7 +1469,7 @@ fn heartbeat_age_secs(now: chrono::DateTime<Utc>, content: &str) -> Option<i64> 
 }
 
 /// 心跳是否过期（缺失/不可解析/超龄/stalled 都算过期）。
-/// 审查 P1：stalled=true 表示 tray 自报"采集器在跑但 writer 停滞超 300s"，
+/// 审查 P1：stalled=true 表示 tray 自报"采集器在跑但 writer 停滞超 1800s"，
 /// 属采集挂死而非进程死亡——必须同样触发 kill/重启路径。
 fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
     match content {
@@ -1827,7 +1827,7 @@ fn mark_spawned(state: &mut WatchdogState, now_epoch: i64, hb_mtime: i64) {
 /// 心跳读取四态语义（P1 修复"挂死 tray 永不重启"；审查 P1 增补 Stalled）：
 /// - `HeartbeatRead::Age` — 文件可读、内容时间戳合法且未自报 stalled，携带距今年龄
 /// - `HeartbeatRead::Stalled` — 内容合法（JSON）但 stalled=true：tray 进程活着、
-///   心跳线程照常写,但采集 writer 停滞超 300s（采集挂死）——按过期处理
+///   心跳线程照常写,但采集 writer 停滞超 1800s（采集挂死）——按过期处理
 /// - `HeartbeatRead::Missing` — 文件不存在
 /// - `HeartbeatRead::Unparseable` — 文件存在但解析失败
 ///

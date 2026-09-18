@@ -373,6 +373,12 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)]) {
 /// `update --check`：只查不装。打印 `UPDATE <ver>`（有新版）或
 /// `UP TO DATE`，退出码恒 0。供托盘每日自动检查复用（托盘无 HTTP 客户端，
 /// 子进程 + 文件是唯一低成本通路）。安装版也允许查（只有安装才被拒）。
+pub fn is_stable_release(version: &str) -> bool {
+    // semver 预发布约定：tag 含 '-' 即非稳定（v0.2.0-1 这类带后缀 tag 同样
+    // 被拒——文档化的有意决定，测试直接调用本函数防同义反复）
+    !version.contains('-')
+}
+
 pub fn cmd_check_only() -> crate::Result<()> {
     let cur = self_update::cargo_crate_version!();
     match latest_stable_version().ok_or_else(|| {
@@ -400,7 +406,7 @@ pub fn latest_stable_version() -> Option<Option<String>> {
         .ok()?;
     let cur = self_update::cargo_crate_version!();
     let release = releases.into_iter().find(|r| {
-        !r.version.contains('-')
+        is_stable_release(&r.version)
             && BIN_NAMES
                 .iter()
                 .all(|n| r.assets.iter().any(|a| &a.name == n))
@@ -462,7 +468,7 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             // 不过滤会让 0.1.x 稳定用户被"更到"beta/RC（version_cmp 对
             // 非数字尾缀组件的比较不可靠）。self_update 0.41 的 Release 不暴露
             // prerelease 标志，用 semver 预发布约定（tag 含 '-'）判定。
-            !r.version.contains('-')
+            is_stable_release(&r.version)
                 && ASSET_NAMES
                     .iter()
                     .all(|n| r.assets.iter().any(|a| &a.name == n))
@@ -666,14 +672,11 @@ mod tests {
 
     #[test]
     fn prerelease_tag_filter_predicate() {
-        // 回归守护（Wave13 覆盖缺口）：候选过滤谓词把 semver 预发布 tag
-        //（含 '-'）排除在稳定通道外。v0.2.0-1 这类合法但非本项目使用的
-        // tag 同样被拒——这是文档化的有意决定，不是巧合。
-        let assets_ok = |v: &str| v.starts_with("0.");
-        let eligible = |v: &str| !v.contains('-') && assets_ok(v);
-        assert!(eligible("0.3.0"));
-        assert!(!eligible("0.3.0-rc.1"), "预发布必须被过滤");
-        assert!(!eligible("0.2.0-1"), "带后缀的 tag 被过滤（有意）");
-        assert!(!eligible("0.2.0-beta"), "beta 必须被过滤");
+        // Wave16 审查：旧版测试用本地闭包复述生产逻辑，是同义反复——
+        // 真实谓词被改坏时测试照绿。改为直接调用生产函数。
+        assert!(is_stable_release("0.3.0"));
+        assert!(!is_stable_release("0.3.0-rc.1"), "预发布必须被过滤");
+        assert!(!is_stable_release("0.2.0-1"), "带后缀的 tag 被过滤（有意）");
+        assert!(!is_stable_release("0.2.0-beta"), "beta 必须被过滤");
     }
 }

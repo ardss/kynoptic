@@ -390,7 +390,13 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         .and_then(|d| std::fs::read_to_string(d.join("update-available.txt")).ok())
         .map(|s| s.trim().trim_start_matches('v').to_string())
         .filter(|v| {
-            !v.is_empty() && v.len() >= 3 && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+            // 长度/字符集双限（文件可被任意本地进程写）+ 与当前版本比较
+            //（一致性审查：手动装完新版后文件要等下次检查才刷新，不比较会
+            // 挂着过期横幅）
+            v.len() <= 16
+                && v.len() >= 3
+                && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && version_gt(v, env!("CARGO_PKG_VERSION"))
         });
     json!({
         "today": queries::today_local_str(),
@@ -404,6 +410,27 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         "read_only": true,
         "update_available": update_available,
     })
+}
+
+/// 语义化版本比较 a > b（数字三段式；与 tray 侧同口径）。
+fn version_gt(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split('-')
+            .next()
+            .unwrap_or(v)
+            .split('.')
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
+    };
+    let (pa, pb) = (parse(a), parse(b));
+    for i in 0..3 {
+        let x = pa.get(i).copied().unwrap_or(0);
+        let y = pb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
 }
 
 /// 数据目录性质提示（审查 P2：只给类别，不给路径）。db 与当前 exe 同目录时
@@ -1927,9 +1954,21 @@ pub fn route_req(
             }
         }
         ("GET", "/api/timeline") => {
-            let hours = qval("hours")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(12);
+            // 负数会被 parse::<u32> 拒绝→回退 12（一致性：非法数值参数
+            // 不静默放行，日期类参数都是 400——统一为 400）
+            let hours = match qval("hours") {
+                None => 12,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(h) => h.clamp(1, 8760),
+                    Err(_) => {
+                        return (
+                            400,
+                            "application/json",
+                            err_json(&format!("hours 应为正整数（收到 {v:?}）")),
+                        );
+                    }
+                },
+            };
             // 桥接阈值读 settings（与 overview presence 同一口径源）
             let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
             match api_timeline_at(conn, hours, Utc::now(), bridge) {

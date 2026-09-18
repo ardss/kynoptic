@@ -297,7 +297,7 @@ fn query_cpu_percent_map() -> HashMap<u32, f64> {
     PREV_TIMES.with(|prev| {
         PREV_INST.with(|prev_inst| {
             SMOOTHED.with(|smoothed| {
-                let prev_times = prev.borrow_mut();
+                let mut prev_times = prev.borrow_mut();
                 let elapsed = prev_inst
                     .borrow_mut()
                     .replace(now)
@@ -305,8 +305,14 @@ fn query_cpu_percent_map() -> HashMap<u32, f64> {
                     .unwrap_or(0.0);
                 let mut out: HashMap<u32, f64> = HashMap::new();
                 const ALPHA: f64 = 0.3;
+                // 全库审查 P1：PREV_TIMES 此前只读不写——CPU% 恒为 0。
+                // 先取上一轮快照，本轮结束回写，供下一轮差分。
+                let prev_snapshot: HashMap<u32, u64> = prev_times.clone();
                 for (pid, total) in &times {
-                    let delta_pct = match (elapsed, prev_times.get(pid)) {
+                    prev_times.insert(*pid, *total);
+                }
+                for (pid, total) in &times {
+                    let delta_pct = match (elapsed, prev_snapshot.get(pid)) {
                         (e, Some(prev_t)) if e > 0.0 => {
                             ((total.saturating_sub(*prev_t) as f64 / 10_000_000.0) / e * 100.0)
                                 .clamp(0.0, 100.0)

@@ -68,10 +68,33 @@ fn update_available_version(db: &std::path::Path) -> Option<String> {
     let txt = std::fs::read_to_string(dir.join("update-available.txt")).ok()?;
     let v = txt.trim().trim_start_matches('v');
     if v.len() >= 3 && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        Some(v.to_string())
+        // 与当前版本比较（一致性审查 P2：手动装完新版后文件要等下一次
+        // 24h 检查才更新，不比较会挂着过期提示）
+        (version_gt(v, env!("CARGO_PKG_VERSION"))).then(|| v.to_string())
     } else {
         None
     }
+}
+
+/// 语义化版本比较：a > b 视为真（仅支持数字三段式；本项目的 tag 形态）
+fn version_gt(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split('-')
+            .next()
+            .unwrap_or(v)
+            .split('.')
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
+    };
+    let (pa, pb) = (parse(a), parse(b));
+    for i in 0..3 {
+        let x = pa.get(i).copied().unwrap_or(0);
+        let y = pb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
 }
 
 /// 实际 dashboard 端口：优先读 db 目录下 dashboard-port.txt（bind 成功才写）。
@@ -220,14 +243,27 @@ impl TrayCtx {
                     const DETACHED_PROCESS: u32 = 0x0000_0008;
                     // 输出落档（全库审查 P1：一键更新此前全程静默，失败无人知）
                     if let Some(db_dir) = self.args.db.parent() {
-                        if let Ok(log) = std::fs::File::create(db_dir.join("update.log")) {
-                            let err = log.try_clone().ok();
+                        use std::io::Write;
+                        let open = || {
+                            std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(db_dir.join("update.log"))
+                                .ok()
+                        };
+                        if let Some(mut log) = open() {
+                            let _ = writeln!(
+                                log,
+                                "--- update requested {} ---",
+                                chrono::Local::now().to_rfc3339()
+                            );
+                            let errlog = open().unwrap_or_else(|| {
+                                std::fs::File::create(db_dir.join("update.log")).unwrap()
+                            });
                             let _ = std::process::Command::new(dir.join("kynoptic.exe"))
                                 .arg("update")
                                 .stdout(log)
-                                .stderr(err.unwrap_or_else(|| {
-                                    std::fs::File::create(db_dir.join("update.log")).unwrap()
-                                }))
+                                .stderr(errlog)
                                 .creation_flags(DETACHED_PROCESS)
                                 .spawn();
                         }

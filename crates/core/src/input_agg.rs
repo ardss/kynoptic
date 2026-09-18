@@ -748,6 +748,15 @@ mod tests {
             Some(false),
             "flush_partial 行必须是部分快照（final=false）"
         );
+        assert_eq!(
+            kb.event_data
+                .as_ref()
+                .unwrap()
+                .get("keys")
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "部分快照计数不得为 0（drain/事件时间换序写错时计数会漂移丢失）"
+        );
 
         // 场景二：10:31 的事件随 10:32 的 drain 折叠 → 终值行 final=true
         record_key();
