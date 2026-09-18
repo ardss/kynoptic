@@ -61,6 +61,19 @@ struct TrayCtx {
     args: Args,
 }
 
+/// 自动更新检查结果文件（data\update-available.txt，内容=新版本号）。
+/// 托盘后台线程每日检查写入；读不到/内容怪 = 无更新。
+fn update_available_version(db: &std::path::Path) -> Option<String> {
+    let dir = db.parent()?;
+    let txt = std::fs::read_to_string(dir.join("update-available.txt")).ok()?;
+    let v = txt.trim().trim_start_matches('v');
+    if v.len() >= 3 && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        Some(v.to_string())
+    } else {
+        None
+    }
+}
+
 /// 实际 dashboard 端口：优先读 db 目录下 dashboard-port.txt（bind 成功才写）。
 fn dashboard_port_actual(fallback: u16) -> u16 {
     let db = kynoptic_core::db::resolve_db_path();
@@ -103,7 +116,7 @@ impl TrayCtx {
         self.modify_icon(hwnd);
     }
 
-    /// 右键弹出菜单(五项)。
+    /// 右键弹出菜单(五项+可选更新项)。
     fn show_menu(&mut self, hwnd: HWND) {
         unsafe {
             let menu = CreatePopupMenu();
@@ -113,6 +126,14 @@ impl TrayCtx {
             append_item(menu, MenuId::OpenDashboard, self.state);
             append_item(menu, MenuId::TogglePause, self.state);
             append_item(menu, MenuId::OpenDataFolder, self.state);
+            // 自动更新检查发现新版本时插入一键更新项（日常检查由后台线程
+            // 写 data\update-available.txt，见 main.rs）
+            if let Some(ver) = update_available_version(&self.args.db) {
+                let text: Vec<u16> = format!("Update available: v{} - click to install\0", ver)
+                    .encode_utf16()
+                    .collect();
+                AppendMenuW(menu, MF_STRING, MenuId::UpdateNow as usize, text.as_ptr());
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
             append_item(menu, MenuId::Quit, self.state);
 
@@ -174,6 +195,32 @@ impl TrayCtx {
                 let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
                 wide.push(0);
                 open_with_shell(&wide);
+            }
+            MenuId::UpdateNow => {
+                // 一键更新：安装版跳下载页（安装版原地自更新会造成卸载数据库
+                // 版本漂移，被 update 拒绝）；便携版直接跑 `kynoptic update`
+                //（它自己会杀托盘/替换/拉回）。
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+                let installed = exe_dir
+                    .as_ref()
+                    .map(|d| d.join("unins000.exe").exists())
+                    .unwrap_or(false);
+                if installed {
+                    let url: Vec<u16> =
+                        String::from("https://github.com/ardss/kynoptic/releases/latest\0")
+                            .encode_utf16()
+                            .collect();
+                    open_with_shell(&url);
+                } else if let Some(dir) = exe_dir {
+                    use std::os::windows::process::CommandExt;
+                    const DETACHED_PROCESS: u32 = 0x0000_0008;
+                    let _ = std::process::Command::new(dir.join("kynoptic.exe"))
+                        .arg("update")
+                        .creation_flags(DETACHED_PROCESS)
+                        .spawn();
+                }
             }
             MenuId::Quit => {
                 // 优雅关停:命令通道通知属主线程置停机旗标并 join writer,

@@ -350,6 +350,50 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)]) {
 // 主流程
 // ---------------------------------------------------------------------------
 
+/// `update --check`：只查不装。打印 `UPDATE <ver>`（有新版）或
+/// `UP TO DATE`，退出码恒 0。供托盘每日自动检查复用（托盘无 HTTP 客户端，
+/// 子进程 + 文件是唯一低成本通路）。安装版也允许查（只有安装才被拒）。
+pub fn cmd_check_only() -> crate::Result<()> {
+    let cur = self_update::cargo_crate_version!();
+    match latest_stable_version().ok_or_else(|| {
+        crate::Error::InvalidData("GitHub Releases 上找不到完整的稳定版资产".to_string())
+    })? {
+        Some(v) => {
+            println!("UPDATE {v}");
+        }
+        None => {
+            println!("UP TO DATE ({cur})");
+        }
+    }
+    Ok(())
+}
+
+/// 查询最新稳定版版本号；无更新（<= 当前）返回 None。网络/资产错误返回
+/// None 并打日志——检查失败必须静默降级，不能打扰用户。
+pub fn latest_stable_version() -> Option<Option<String>> {
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner(REPO_OWNER)
+        .repo_name(REPO_NAME)
+        .build()
+        .ok()?
+        .fetch()
+        .ok()?;
+    let cur = self_update::cargo_crate_version!();
+    let release = releases.into_iter().find(|r| {
+        !r.version.contains('-')
+            && BIN_NAMES
+                .iter()
+                .all(|n| r.assets.iter().any(|a| &a.name == n))
+            && r.assets.iter().any(|a| a.name == SUMS_NAME)
+    })?;
+    let new_ver = release.version.trim_start_matches('v').to_string();
+    if version_cmp(&new_ver, cur) == std::cmp::Ordering::Greater {
+        Some(Some(new_ver))
+    } else {
+        Some(None)
+    }
+}
+
 pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     // 自更新按 current_exe 文件名收敛到 kynoptic（watchdog/ctl 没有对应资产，
     // 且即便有也只换一个文件造成三件套版本漂移。审查 P1）。

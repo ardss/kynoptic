@@ -383,6 +383,15 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
 /// db_path 只返回文件名（审查 P2：全路径暴露安装目录/用户名等本机拓扑）；
 /// 另带 db_dir_kind 提示数据目录性质（exe 同目录 / 其他），不暴露具体路径。
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
+    // 自动更新检查结果（托盘每日检查线程写 data\update-available.txt）：
+    // 有新版本时面板状态栏同步提示，与托盘菜单的一键更新项互为入口。
+    let update_available = db_path
+        .parent()
+        .and_then(|d| std::fs::read_to_string(d.join("update-available.txt")).ok())
+        .map(|s| s.trim().trim_start_matches('v').to_string())
+        .filter(|v| {
+            !v.is_empty() && v.len() >= 3 && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+        });
     json!({
         "today": queries::today_local_str(),
         "last_event_ts": queries::latest_event_ts(conn),
@@ -393,6 +402,7 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         "db_dir_kind": db_dir_kind(db_path),
         "bind": "127.0.0.1",
         "read_only": true,
+        "update_available": update_available,
     })
 }
 

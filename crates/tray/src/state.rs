@@ -7,6 +7,8 @@ pub enum MenuId {
     OpenDashboard = 1001,
     TogglePause = 1002,
     OpenDataFolder = 1003,
+    /// 自动更新检查发现新版本后动态插入的一键更新/下载项
+    UpdateNow = 1005,
     Quit = 1004,
 }
 
@@ -18,6 +20,7 @@ impl MenuId {
             1002 => Some(Self::TogglePause),
             1003 => Some(Self::OpenDataFolder),
             1004 => Some(Self::Quit),
+            1005 => Some(Self::UpdateNow),
             _ => None,
         }
     }
@@ -31,6 +34,8 @@ impl MenuId {
                 TrayState::Paused | TrayState::Error => "Resume",
             },
             Self::OpenDataFolder => "Open data folder",
+            // 版本号动态拼在调用侧(append_item 传 UTF-16 文案),此处给固定前缀
+            Self::UpdateNow => "Update available - install now",
             Self::Quit => "Quit",
         }
     }

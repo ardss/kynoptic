@@ -69,7 +69,7 @@ Subcommands:
   --version / -V                              Print version
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
-  update                                      Self-update from GitHub releases
+  update [--check]                          Self-update from GitHub releases (--check: report only)
   watchdog [--once]                         Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary
 
@@ -2175,7 +2175,13 @@ fn main() -> ExitCode {
             "skill" => cmd_skill(&rest),
             "probe" => cmd_probe(&rest),
             "dashboard" => dashboard::cmd_dashboard(&rest),
-            "update" => update::cmd_update(&rest),
+            "update" => {
+                if rest.iter().any(|a| a == "--check") {
+                    update::cmd_check_only()
+                } else {
+                    update::cmd_update(&rest)
+                }
+            }
             "watchdog" => cmd_watchdog(&rest),
             "presence" => cmd_presence(&rest),
             "help" | "-h" | "--help" => {

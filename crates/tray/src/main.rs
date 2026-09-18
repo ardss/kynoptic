@@ -252,6 +252,56 @@ fn main() {
             .expect("心跳线程启动失败");
     }
 
+    // 自动更新检查（用户设计要求：更新发现必须自动，不能指望用户敲命令）：
+    // 启动 2 分钟后首查，之后每 24h 一次。子进程跑 `kynoptic update --check`
+    //（托盘不带 HTTP 客户端，复用 CLI 的 GitHub 查询与预发布过滤），把结果
+    // 写 data\update-available.txt——托盘菜单动态插入一键更新项，dashboard
+    // 状态栏同步提示。检查失败静默（网络差不该变成用户的负担）。
+    {
+        let db_for_upd = parsed.db.clone();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+        thread::Builder::new()
+            .name("UpdateCheck".into())
+            .spawn(move || {
+                let run_check = || -> Option<String> {
+                    let exe = exe_dir.as_ref()?.join("kynoptic.exe");
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    let out = std::process::Command::new(exe)
+                        .args(["update", "--check"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output()
+                        .ok()?;
+                    let line = String::from_utf8_lossy(&out.stdout);
+                    let v = line
+                        .lines()
+                        .find(|l| l.starts_with("UPDATE "))?
+                        .split_whitespace()
+                        .nth(1)?
+                        .trim_start_matches('v')
+                        .to_string();
+                    Some(v)
+                };
+                let upd_path = db_for_upd
+                    .parent()
+                    .map(|d| d.join("update-available.txt"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("update-available.txt"));
+                loop {
+                    thread::sleep(std::time::Duration::from_secs(120)); // 启动缓冲，避开开机网络未就绪
+                    if let Some(v) = run_check() {
+                        let _ = std::fs::write(&upd_path, &v);
+                    } else {
+                        // 查询失败或无更新：清掉旧提示（无更新时 --check 打 UP TO DATE）
+                        let _ = std::fs::remove_file(&upd_path);
+                    }
+                    thread::sleep(std::time::Duration::from_secs(24 * 3600));
+                }
+            })
+            .expect("更新检查线程启动失败");
+    }
+
     // 采集器属主线程:Collector 只在本线程构造/持有/关停(所有权不跨线程)
     let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCmd>();
     let owner_db = parsed.db.clone();
