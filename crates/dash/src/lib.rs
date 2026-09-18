@@ -83,6 +83,28 @@ fn date_err(raw: &str, hint: &str) -> String {
 }
 
 /// GET /api/summary?date= — 当日四卡数据。数字全部来自 DB。
+/// 未来日期一律拒绝：查询"明天"拿到看似权威的全 0 比报错更误导
+///（Wave18 P1：/api/summary、report、hours、apps_grid 统一口径）。
+fn reject_future_date(date: &str) -> std::result::Result<(), String> {
+    // 只对"形如日期"的输入做未来判定：字面量 today 与垃圾输入分别由
+    // 各 api_* 的解析/净化路径处理（否则 "today" 会被误判为未来日期，
+    // 垃圾输入会绕过净化直接回显）
+    let is_date_like = date.len() == 10
+        && date.as_bytes()[..4].iter().all(|b| b.is_ascii_digit())
+        && date.as_bytes()[4] == b'-'
+        && date.as_bytes()[5..7].iter().all(|b| b.is_ascii_digit())
+        && date.as_bytes()[7] == b'-'
+        && date.as_bytes()[8..].iter().all(|b| b.is_ascii_digit());
+    if !is_date_like {
+        return Ok(());
+    }
+    let today = queries::today_local_str();
+    if date > today.as_str() {
+        return Err(format!("date {date} 在未来（今天 {today}）"));
+    }
+    Ok(())
+}
+
 pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, String> {
     let (start, end) =
         queries::local_day_range(date).ok_or_else(|| date_err(date, "YYYY-MM-DD"))?;
@@ -1948,6 +1970,9 @@ pub fn route_req(
         ("GET", "/") => (200, "text/html; charset=utf-8", DASHBOARD_HTML.to_string()),
         ("GET", "/api/summary") => {
             let date = qval("date").unwrap_or_else(queries::today_local_str);
+            if let Err(e) = reject_future_date(&date) {
+                return (400, "application/json", err_json(&e));
+            }
             match api_summary(conn, &date) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
@@ -1977,9 +2002,13 @@ pub fn route_req(
             }
         }
         ("GET", "/api/anomalies") => {
-            let days = qval("days")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(7);
+            let days = match qval("days") {
+                None => 7,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(d) => d,
+                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
+                },
+            };
             (
                 200,
                 "application/json",
@@ -1997,9 +2026,13 @@ pub fn route_req(
             api_overview(conn, db_path).to_string(),
         ),
         ("GET", "/api/heatmap") => {
-            let weeks = qval("weeks")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(12);
+            let weeks = match qval("weeks") {
+                None => 12,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(w) => w.clamp(1, 52),
+                    Err(_) => return (400, "application/json", err_json("weeks 应为非负整数")),
+                },
+            };
             (
                 200,
                 "application/json",
@@ -2007,9 +2040,13 @@ pub fn route_req(
             )
         }
         ("GET", "/api/apps") => {
-            let days = qval("days")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(7);
+            let days = match qval("days") {
+                None => 7,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(d) => d,
+                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
+                },
+            };
             (
                 200,
                 "application/json",
@@ -2018,15 +2055,22 @@ pub fn route_req(
         }
         ("GET", "/api/hours") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
+            if let Err(e) = reject_future_date(&date) {
+                return (400, "application/json", err_json(&e));
+            }
             match api_hours(conn, &date) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/input") => {
-            let days = qval("days")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(7);
+            let days = match qval("days") {
+                None => 7,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(d) => d,
+                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
+                },
+            };
             match api_input_at(conn, days, today_naive()) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
@@ -2045,6 +2089,9 @@ pub fn route_req(
         }
         ("GET", "/api/report") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
+            if let Err(e) = reject_future_date(&date) {
+                return (400, "application/json", err_json(&e));
+            }
             let s = settings::load(db_path);
             match api_report_at(conn, &date, &s) {
                 Ok(v) => (200, "application/json", v.to_string()),
@@ -2058,15 +2105,22 @@ pub fn route_req(
         ),
         ("GET", "/api/apps_grid") => {
             let date = qval("date").unwrap_or_else(|| "today".to_string());
+            if let Err(e) = reject_future_date(&date) {
+                return (400, "application/json", err_json(&e));
+            }
             match api_apps_grid_at(conn, &date) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/daily_top") => {
-            let days = qval("days")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(14);
+            let days = match qval("days") {
+                None => 14,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(d) => d,
+                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
+                },
+            };
             (
                 200,
                 "application/json",

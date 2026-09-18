@@ -372,6 +372,11 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)]) {
             let _ = std::fs::rename(bak, dest);
         }
     }
+    // Wave18 P1：回滚=更新失败退出，托盘已被杀且不会由本进程拉起——
+    // 旗标残留会让看门狗永久不拉起托盘（等于托盘凭空消失到下次重启）。
+    if let Some(dir) = backups.first().and_then(|(d, _)| d.parent()) {
+        let _ = std::fs::remove_file(exit_flag_for(dir));
+    }
 }
 
 // ---------------------------------------------------------------------------

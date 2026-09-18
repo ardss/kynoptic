@@ -142,7 +142,13 @@ fn status_reflects_last_event_ts() {
     let ts = local_ts(0, 9, 15);
     insert(&conn, &ts, "keyboard", "press", None);
     let v = api_status(&conn, Path::new("/tmp/x.db"));
-    assert_eq!(v["last_event_ts"], json!(queries::latest_event_ts(&conn)));
+    // 期望值用插入的已知 ts（Wave18：期望值调生产函数=同义反复，两边
+    // 一起坏掉时测试照绿），只对截断到秒的 19 字符前缀
+    assert_eq!(
+        v["last_event_ts"],
+        json!(ts.get(..19).unwrap_or(&ts)),
+        "last_event_ts = 插入时刻截到秒（UTC 裸串）"
+    );
     assert_eq!(v["today"], json!(queries::today_local_str()));
     assert_eq!(v["read_only"], json!(true));
     assert_eq!(v["bind"], json!("127.0.0.1"));
@@ -812,9 +818,14 @@ fn route_table_and_error_codes() {
     assert!(ctype.starts_with("text/html"));
     assert!(body.contains("All data is local"), "页脚数据声明必须内嵌");
 
-    let (code, ctype, _) = route_req(&conn, "GET", "/api/status", "", db);
+    let (code, ctype, body) = route_req(&conn, "GET", "/api/status", "", db);
     assert_eq!(code, 200);
     assert_eq!(ctype, "application/json");
+    // Wave18：核心端点补 body 关键字段断言（此前只看状态码，字段名写坏
+    // 也照绿）
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["last_event_ts"].is_string());
+    assert!(v["today"].is_string());
 
     let (code, _, body) = route_req(&conn, "GET", "/api/summary?date=bad", "", db);
     assert_eq!(code, 400);
@@ -824,8 +835,10 @@ fn route_table_and_error_codes() {
     let (code, _, _) = route_req(&conn, "GET", "/api/summary", "", db);
     assert_eq!(code, 200);
 
-    let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=6", "", db);
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?hours=6", "", db);
     assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["buckets"].is_array(), "timeline 必须有 buckets 数组");
     let (code, _, body) = route_req(&conn, "GET", "/api/timeline?hours=nope", "", db);
     assert_eq!(
         code, 400,
@@ -835,8 +848,54 @@ fn route_table_and_error_codes() {
     let (code, _, _) = route_req(&conn, "GET", "/api/timeline?hours=-5", "", db);
     assert_eq!(code, 400, "负 hours 同样 400");
 
-    let (code, _, _) = route_req(&conn, "GET", "/api/anomalies?days=3", "", db);
+    let (code, _, body) = route_req(&conn, "GET", "/api/anomalies?days=3", "", db);
     assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["anomalies"].is_array(), "anomalies 必须是数组");
+    // Wave18：numeric 参数非法与 hours 同口径 → 400
+    assert_eq!(
+        route_req(&conn, "GET", "/api/anomalies?days=nope", "", db).0,
+        400
+    );
+    assert_eq!(
+        route_req(&conn, "GET", "/api/heatmap?weeks=nope", "", db).0,
+        400
+    );
+    assert_eq!(
+        route_req(&conn, "GET", "/api/input?days=nope", "", db).0,
+        400
+    );
+    assert_eq!(
+        route_req(&conn, "GET", "/api/apps?days=nope", "", db).0,
+        400
+    );
+    assert_eq!(
+        route_req(&conn, "GET", "/api/daily_top?days=nope", "", db).0,
+        400
+    );
+    // 未来日期一律 400（wave18 P1：看似权威的全 0 比报错更误导）
+    assert_eq!(
+        route_req(&conn, "GET", "/api/summary?date=2099-01-01", "", db).0,
+        400
+    );
+    assert_eq!(
+        route_req(&conn, "GET", "/api/report?date=2099-01-01", "", db).0,
+        400
+    );
+    assert_eq!(
+        route_req(&conn, "GET", "/api/hours?date=2099-01-01", "", db).0,
+        400
+    );
+    // 字面量 today 不走未来判定（由 api_* 解析路径处理）
+    assert_eq!(
+        route_req(&conn, "GET", "/api/hours?date=today", "", db).0,
+        200
+    );
+    // weeks 越界仍 clamp：10000 → 52 周 = 364 天
+    let (code, _, body) = route_req(&conn, "GET", "/api/heatmap?weeks=10000", "", db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["days"].as_array().unwrap().len(), 364);
 
     let (code, _, body) = route_req(&conn, "GET", "/api/overview", "", db);
     assert_eq!(code, 200);

@@ -22,7 +22,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
     TranslateMessage, GWLP_USERDATA, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
 use crate::args::Args;
@@ -378,6 +379,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COMMAND => {
             if let Some(ctx) = ctx_ptr.as_mut() {
                 ctx.handle_command(hwnd, (wparam & 0xFFFFusize) as u32);
+            }
+            0
+        }
+        // 系统关机/注销：默认处理会直接放行强杀，丢掉 writer 内存批里
+        // 最多一个 flush 周期的事件（审查 P1）。发 Quit 走与菜单退出同一
+        // 条优雅关停链（排空通道+join writer+关 session），系统留给我们
+        // 的宽限窗口足够 writer 排空。
+        WM_QUERYENDSESSION => {
+            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if ctx_ptr != 0 {
+                if let Some(ctx) = unsafe { (ctx_ptr as *mut TrayCtx).as_mut() } {
+                    let _ = ctx.cmd_tx.send(CollectorCmd::Quit);
+                }
+            }
+            1 // 允许关机会话继续
+        }
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                let _ = unsafe { DestroyWindow(hwnd) };
             }
             0
         }

@@ -49,7 +49,7 @@ pub fn top_apps_today(
 ) -> Vec<(String, i64)> {
     let mut out = Vec::new();
     let Ok(mut stmt) = conn.prepare(
-        "SELECT COALESCE(app_name, '(unknown)'), COUNT(*) as cnt FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND app_name IS NOT NULL GROUP BY app_name ORDER BY cnt DESC LIMIT ?3"
+        "SELECT COALESCE(NULLIF(app_name, ''), '(unknown)'), COUNT(*) as cnt FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND app_name IS NOT NULL AND app_name != '' GROUP BY app_name ORDER BY cnt DESC LIMIT ?3"
     ) else {
         return out;
     };

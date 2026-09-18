@@ -173,7 +173,18 @@ fn main() {
                 }
                 DASH_FAILED.store(2, std::sync::atomic::Ordering::Relaxed);
                 let _ = port_tx.send(Some(cand));
-                match kynoptic_dash::serve(&dash_db, cand, true) {
+                // catch_unwind：serve panic 不许让线程静默死亡还挂着绿色
+                // Running 图标（审查 P2：活着但残废）——转成 Err 走候选重试
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    kynoptic_dash::serve(&dash_db, cand, true)
+                }));
+                let result = match attempt {
+                    Ok(r) => r,
+                    Err(_) => Err(kynoptic_core::Error::InvalidData(
+                        "dashboard 线程 panic".into(),
+                    )),
+                };
+                match result {
                     Ok(()) => return, // 正常退出路径（进程结束）
                     Err(e) => {
                         last_err = Some(format!("serve 127.0.0.1:{cand}: {e}"));
@@ -613,7 +624,14 @@ fn main() {
 
     // 优雅退出写旗标:watchdog 据此区分"用户主动退出"(不拉起)与"被杀/崩溃"(拉起)。
     // 被杀路径走不到这里,旗标不存在,watchdog 会重新拉起托盘。
-    let _ = std::fs::write(&exit_flag, chrono::Utc::now().to_rfc3339());
+    // 写失败重试（审查 P2：旗标写丢会让 watchdog 把用户明确退出的托盘
+    // 每分钟复活一次）；最终仍失败至少在心跳文件旁留痕。
+    for _ in 0..3 {
+        if std::fs::write(&exit_flag, chrono::Utc::now().to_rfc3339()).is_ok() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(300));
+    }
 }
 
 /// 设置变更防抖窗：mtime/epoch 稳定该时长后才触发采集器重启

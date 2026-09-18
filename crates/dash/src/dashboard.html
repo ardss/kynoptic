@@ -206,8 +206,8 @@
       <span class="l en">window dwell minus human and automation input</span><span class="l zh">前台驻留减去人在场与自动化</span>
     </div>
   </div>
-  <div id="overview-day-note" class="muted" style="display:none;font-size:12px"></div>
 </div>
+<div id="overview-day-note" class="muted" style="display:none;font-size:12px"></div>
 
 <!-- 后端口径说明（overview.metrics_note，双语已由后端给出），防御性渲染 -->
 <div id="overview-note" class="muted" style="font-size:12px;margin:4px 0 0"></div>
@@ -242,7 +242,7 @@
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
     <input type="date" id="report-date" class="date-input" onchange="loadReport()" onclick="this.showPicker && this.showPicker()">
-    <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=TODAY_STR; loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=todayStr(); loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
     <button class="save" style="margin-left:8px;background:#2A3442" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
     <button class="save" style="margin-left:8px;background:#2A3442" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
@@ -298,7 +298,7 @@
   <h2><span class="l en">hour by hour — which app you were in (pick a day)</span><span class="l zh">逐时一览 — 这天每个小时你在用什么（可选日期）</span></h2>
   <div style="margin-bottom:8px">
     <input type="date" id="apps-date" class="date-input" onclick="this.showPicker && this.showPicker()" onchange="loadApps()">
-    <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=TODAY_STR; loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=todayStr(); loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
   </div>
   <div id="apps-grid-chart">loading…</div>
   <div id="apps-legend" class="muted" style="margin-top:6px"></div>
@@ -558,7 +558,9 @@ function toggleLang() {
   // 设置页不刷新：语言切换不能覆盖未保存的勾选（与轮询豁免同一理由）；
   // 设置页静态文案由 .l.en/.l.zh + html[lang] CSS 即时切换，无需重渲染。
   if (currentView === "settings") return;
-  refreshAll().catch(() => {});
+  // 启动即拉一次设置：Overview 目标环用真实目标而非硬编码；失败不影响首屏
+loadSettings().catch(() => {});
+refreshAll().catch(() => {});
 }
 /* 手动验证：1) 打开面板停在 Overview，等数据渲染完成；2) 点右上角语言按钮
    切换中/英——Overview 卡片与 24h 时间线图例应立即变为目标语言，无需等 30 秒
@@ -816,6 +818,7 @@ function setHeatmapRange(weeks) {
 }
 let HM_SEQ = 0;
 async function loadHeatmap() {
+  if (currentView !== "report") return; // 隐藏页签不预拉 12 周数据
   const seq = ++HM_SEQ;
   const hm = await jget("/api/heatmap?weeks=" + HM_WEEKS);
   if (seq !== HM_SEQ) return; // 连点 12/26/52 周：只让最后一次的响应生效
@@ -1028,7 +1031,7 @@ async function loadReport() {
   const today = (tr.daily || []).slice(-1)[0];
   const goal = st.daily_goal_minutes || 0;
   document.getElementById("r-goal").textContent = goal
-    ? (today ? fmtMin(today.active_minutes) : "0m") + " / " + fmtMin(goal)
+    ? fmtMin(today ? today.active_minutes : 0) + " / " + fmtMin(goal)
     : t("goalOff");
   const tw = tr.this_week || {}, lw = tr.last_week;
   // 口径说明小字（trends.note）：字段缺失时静默留空
@@ -1299,8 +1302,12 @@ async function loadAnomalies() {
     // 本地化显示时刻；解析失败时原样回退
     let whenTxt = when;
     if (when) {
-      const d = new Date(when);
-      if (!isNaN(d.getTime())) whenTxt = d.toLocaleString();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(when)) {
+        whenTxt = when; // 日粒度异常没有时刻；new Date 会按 UTC 零点捏造 08:00
+      } else {
+        const d = new Date(when);
+        if (!isNaN(d.getTime())) whenTxt = d.toLocaleString();
+      }
     }
     // 按当前界面语言取文案，不无条件优先英文
     const msg = isEn ? (x.message_en || x.message) : (x.message || x.message_en);
@@ -1367,10 +1374,11 @@ async function loadHost() {
 }
 let SETTINGS_LOADED = false;
 async function loadSettings() {
-  SETTINGS_LOADED = true;
   loadHost().catch(() => {});
   const s = await jget("/api/settings");
   LAST_SETTINGS = s;
+  // 成功才置位（审查：失败后置 true 会让页签静默空白且不再重拉）
+  SETTINGS_LOADED = true;
   const enabled = new Set(s.enabled_monitors);
   const row = m => {
     const n = MON_NAMES[m.id];
@@ -1457,6 +1465,8 @@ async function saveSettings() {
       throw new Error(e.error || ("HTTP " + r.status));
     }
     settingsMsg(t("saved"), true);
+    // 同步缓存：目标环/确认弹窗立刻用新值，不再等刷新页面（Wave18 P1）
+    if (!("error" in (body || {}))) LAST_SETTINGS = Object.assign({}, LAST_SETTINGS, body);
   } catch (e) {
     settingsMsg(t("saveFailed") + e.message, false);
   } finally {
@@ -1534,10 +1544,11 @@ document.querySelectorAll("#hm-range .hm-tab").forEach(b =>
 setHeatmapRange(HM_WEEKS);
 applyLang(savedLang);
 // 日期框初始化为今天（显示具体日期，而不是 yyyy/mm/日 占位符）
-const TODAY_STR = (function () {
+function todayStr() {
   const d = new Date();
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
-})();
+}
+const TODAY_STR = todayStr(); // 仅作输入框初值；按钮点击现算（跨午夜选昨天修复）
 for (const id of ["report-date", "apps-date"]) {
   const el = document.getElementById(id);
   if (el && !el.value) el.value = TODAY_STR;
@@ -1555,8 +1566,9 @@ setInterval(() => {
     return;
   }
   refreshAll().catch(() => {
-    // 轮询失败不能静默停在旧数据，给出可见的断连提示
-    markDisconnected();
+    // 轮询失败不能静默停在旧数据；但只有状态端点本身失联才算"断连"
+    //（个别端点 500 时不该把好连接涂红——审查 P2）
+    loadStatus().then(() => {}).catch(() => markDisconnected());
   });
 }, 30000);
 function markDisconnected() {

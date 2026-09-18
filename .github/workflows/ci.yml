@@ -24,3 +24,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # Wave18：仪表盘 1500+ 行内嵌 JS 无任何语法检查——曾因重复 const 声明
+      # 整页死掉多轮没人发现（cargo test 只断言 HTML 含字符串，不执行 JS）
+      - name: Dashboard JS syntax check
+        shell: bash
+        run: node scripts/check-js.mjs
