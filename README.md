@@ -17,7 +17,7 @@ or MCP.
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![License](https://img.shields.io/badge/license-Apache--2.0-green) ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 - Website: <https://kynoptic.com>
-- Status: v0.1, in active development. API surface may still change.
+- Status: v0.2, in active development. API surface may still change.
 
 ## Computer activity ≠ human activity
 

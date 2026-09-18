@@ -331,6 +331,32 @@ fn count_all_active_minutes_dedupes_same_minute() {
     cleanup(&path);
 }
 
+/// 回归测试（Wave13 覆盖缺口 #2）：minute 粒度（input_agg 计数行）下
+/// 全时活跃分钟不得返回 0——这是 Wave10 修的 P1 的守护网。
+#[test]
+fn count_all_active_minutes_covers_input_agg_rows() {
+    let (db, path) = fresh_db();
+    let now = now_rfc3339();
+    let earlier = (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+    let earlier2 = (Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+
+    // 一条 raw press 行（1 分钟）+ 两条 input_agg 计数行（各自 1 分钟）
+    insert_event(&db, &now, "keyboard", "press", None);
+    let mut kb = Event::new(EventAction::InputAgg, EventType::Keyboard);
+    kb.timestamp = earlier.clone();
+    kb.event_data = Some(serde_json::json!({ "keys": 5, "final": true }));
+    db.insert_events(&[kb]);
+    let mut ms = Event::new(EventAction::InputAgg, EventType::Mouse);
+    ms.timestamp = earlier2;
+    ms.event_data = Some(serde_json::json!({ "clicks": 2, "final": true }));
+    db.insert_events(&[ms]);
+
+    let conn = db.reader();
+    // raw 分钟 1 + input_agg keys 分钟 1 + input_agg clicks 分钟 1 = 3
+    assert_eq!(queries::count_all_active_minutes(&conn), 3);
+    cleanup(&path);
+}
+
 // === recent input ===
 
 #[test]

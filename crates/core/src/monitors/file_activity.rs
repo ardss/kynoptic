@@ -12,7 +12,6 @@
 
 use crate::types::*;
 use serde_json::json;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
@@ -51,6 +50,8 @@ pub struct RawSender {
     tx: crossbeam_channel::Sender<RawChange>,
     /// 通道满被丢弃的原始变化条数（与 collect 共享）
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// 监视器消亡旗标（Drop 时置位；watcher 自检退出防泄漏）
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RawSender {
@@ -92,11 +93,14 @@ impl State {
 
 pub struct FileActivityMonitor {
     state: Mutex<State>,
+    /// watcher 共享的消亡旗标：monitor Drop（采集器重启/线程退出）置位
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for FileActivityMonitor {
     fn default() -> Self {
         Self {
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             state: Mutex::new(State {
                 started: false,
                 rx: None,
@@ -108,6 +112,12 @@ impl Default for FileActivityMonitor {
                 truncated: 0,
             }),
         }
+    }
+}
+
+impl Drop for FileActivityMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -136,6 +146,7 @@ impl Monitor for FileActivityMonitor {
                     RawSender {
                         tx: raw_tx.clone(),
                         dropped: Arc::clone(&st.dropped_raw),
+                        stop: Arc::clone(&self.stop),
                     },
                 );
             }
@@ -254,16 +265,18 @@ pub fn spawn_watcher(path: &str, root_name: &str, tx: RawSender) {
     }
     let path = path.to_string();
     let root_name = root_name.to_string();
-    let stop = Arc::new(AtomicBool::new(false));
     std::thread::Builder::new()
         .name(format!("file-watch-{}", root_name))
-        .spawn(move || watch_loop(&path, &root_name, &tx, &stop))
+        .spawn(move || watch_loop(&path, &root_name, &tx))
         .ok();
 }
 
-fn watch_loop(path: &str, root_name: &str, tx: &RawSender, stop: &AtomicBool) {
+fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
     loop {
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        // 回归审查 P2：watcher 生命周期绑定所属 monitor——monitor Drop 置位
+        // stop，旧线程自检退出，不再对着死通道空转泄漏（采集器设置热重载
+        // 每次重启都会诞生新 monitor 实例）。
+        if tx.stop.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let handle = open_watch_handle(path);
@@ -275,7 +288,7 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender, stop: &AtomicBool) {
 
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if tx.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 unsafe { CloseHandle(handle) };
                 return;
             }
@@ -470,6 +483,7 @@ mod tests {
             RawSender {
                 tx,
                 dropped: Arc::clone(&dropped),
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             rx,
             dropped,

@@ -1,6 +1,6 @@
 [package]
 name = "kynoptic"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "命令行工具:统计/导出/报告/分析/数据库维护"
 

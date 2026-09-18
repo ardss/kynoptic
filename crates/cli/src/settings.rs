@@ -86,6 +86,18 @@ mod tests {
     }
 
     #[test]
+    fn save_creates_missing_parent_dir() {
+        // 回归守护（Wave13 覆盖缺口）：首装时 data 目录可能晚于 settings
+        // 写出创建——save 必须自己建父目录（Wave9 修复，此前 os error 3）。
+        let dir = tmpdir("mkdir_parent");
+        let db = dir.join("sub").join("inner").join("kyn.db");
+        assert!(!db.parent().unwrap().exists());
+        save(&db, &AppSettings::default()).unwrap();
+        assert!(settings_path(&db).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn load_missing_file_returns_defaults() {
         let dir = tmpdir("missing");
         let db = dir.join("kyn.db");

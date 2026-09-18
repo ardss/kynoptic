@@ -538,6 +538,13 @@ pub fn start_collection_custom(
     DROPPED_EVENTS.store(0, Ordering::Relaxed);
     WRITE_FAILURES.store(0, Ordering::Relaxed);
     CONSECUTIVE_WRITE_FAILURE_PERIODS.store(0, Ordering::Relaxed);
+    // 回归审查 P1：flush epoch 是进程级全局，重启采集器时不清会带着上一
+    // 会话的时间戳——心跳线程立即误判 stalled（raw 粒度安静机器上首笔
+    // 落库可合法超过 300s），看门狗循环误杀健康托盘。置为当前时刻重启计时。
+    LAST_FLUSH_EPOCH.store(
+        chrono::Utc::now().timestamp().max(0) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let db = Arc::new(Database::open(db_path).expect("数据库初始化失败"));
     // 启动时清扫上次未关闭的 session（崩溃/强杀留的幽灵）

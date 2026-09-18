@@ -374,6 +374,11 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
         }
     }
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    // 回归审查 P2：serve 可重入（嵌入式/测试二次调用）——上一会话 EOF 留下
+    // 的关停旗标必须先清零，否则所有 wait_for 立即返回 shutdown 永不轮询。
+    server
+        .shutdown
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // 审查 P2：wait_for 并发上限 + EOF 关停信号。live_wait 统计在飞线程数，
     // 超过 MAX_CONCURRENT_WAIT_FOR 直接回错（不再无限 fan-out 出线程）。
     let live_wait = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

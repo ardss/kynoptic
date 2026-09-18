@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-18
+
+### Added
+
+- Corrupt-database visibility: collector startup failures now persist a
+  diagnosis (including `PRAGMA quick_check` result) to
+  `data\collector-error.log` and auto-retry every 60 s instead of
+  failing silently behind a healthy-looking tray icon.
+- Watchdog collector-liveness detection: the heartbeat carries the last
+  successful DB flush timestamp and a `stalled` flag — a hung collector
+  behind a live tray is now killed and restarted like a dead one.
+- Watchdog hardening: state-file mutation lock, sleep-window guard
+  against wrongful failure counting across suspend/resume, spawn-failure
+  backoff (missing exe / blocked taskkill are no longer silent infinite
+  retry loops), and log-rotation fallback.
+- Self-update ships and refreshes `SKILL.md` (verified against
+  SHA256SUMS), relaunches a tray it killed to unlock files, filters
+  pre-release tags, and never kills its own process image.
+- Input statistics in event time: minute buckets land in the minute the
+  keystrokes happened (robust across aggregator stalls and DST repeated
+  hours), with a `final` flag distinguishing complete minutes from
+  per-second snapshots so restarts merge instead of discarding.
+- First-run experience: collecting hints on all overview cards,
+  first-day provisional note, heatmap "no data yet" state.
+- Settings page: daily-goal minutes and dashboard-port controls.
+
+### Fixed
+
+- Silent autostart loss: the installer task is default-checked and
+  upgrades no longer remember the old unchecked state; the watchdog
+  scheduled task is always (re)created.
+- Installer packaged stale binaries from `dist\`; packaging now follows
+  the freshly built exes (build-order hygiene).
+- Unattended metric double-subtracted human/automation mixed minutes.
+- Presence/active-minute metrics: raw mode now reports first/last
+  activity; all-time active minutes include minute-mode data; DST
+  fall-back no longer collapses the repeated hour.
+- MCP: batch requests answered, client responses absorbed silently,
+  UTF-8 vs terminal IO errors distinguished, `wait_for` concurrency
+  capped with prompt EOF shutdown, non-RFC3339 time bounds rejected
+  readably, `days` wrong-type hard error, negative idle clamped.
+- Insufficient-capacity file watcher channels are bounded with visible
+  drop counters; clipboard polling no longer fabricates change events.
+- Dashboard: transient disconnection indicator now clears, report/apps
+  stale-response races guarded, Input tab tolerant of missing fields,
+  settings edits survive re-entering the tab.
+
 ## [Unreleased]
 
 ### Added

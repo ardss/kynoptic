@@ -465,6 +465,12 @@ pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
     // 极端兜底：pending 桶与当前分钟不一致（聚合线程刚 rollover 但事件
     // 尚未落库），以 pending 桶为准输出，避免把计数归错分钟。
     acc.add(&drained);
+    // 回归审查 P2：抑制判定也要覆盖 pending 桶分钟——聚合线程停滞跨分钟后
+    // 关停时，pending key 等于被抑制的分钟（< cur），上面的 cur 判定拦不住，
+    // 会把重启会话的小值当 final:false 写出去覆盖上一会话的大终值。
+    if matches!(sup.as_ref(), Some(k) if *k == key) {
+        return Vec::new();
+    }
     events_for(key, &acc, false)
 }
 

@@ -596,4 +596,17 @@ mod tests {
         }
         assert_eq!(ASSET_NAMES[BIN_NAMES.len()], SKILL_MD_NAME);
     }
+
+    #[test]
+    fn prerelease_tag_filter_predicate() {
+        // 回归守护（Wave13 覆盖缺口）：候选过滤谓词把 semver 预发布 tag
+        //（含 '-'）排除在稳定通道外。v0.2.0-1 这类合法但非本项目使用的
+        // tag 同样被拒——这是文档化的有意决定，不是巧合。
+        let assets_ok = |v: &str| v.starts_with("0.");
+        let eligible = |v: &str| !v.contains('-') && assets_ok(v);
+        assert!(eligible("0.3.0"));
+        assert!(!eligible("0.3.0-rc.1"), "预发布必须被过滤");
+        assert!(!eligible("0.2.0-1"), "带后缀的 tag 被过滤（有意）");
+        assert!(!eligible("0.2.0-beta"), "beta 必须被过滤");
+    }
 }

@@ -2100,6 +2100,10 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 release_watchdog_lock(&lock_path);
                 return Ok(());
             }
+            // 锁续命（回归审查 P1）：锁只在启动时创建、从不刷新——120s 后任何
+            // 并发 --once 都会把它当"崩溃残留"抢走，双实例互杀互拉。常驻循环
+            // 每轮重写锁文件刷新 mtime。
+            let _ = std::fs::write(&lock_path, Utc::now().to_rfc3339());
             std::thread::sleep(std::time::Duration::from_secs(15));
         }
     }
