@@ -10,6 +10,9 @@
 #define AppExeName "kynoptic-tray.exe"
 
 [Setup]
+; 升级不记忆上次的任务勾选（审查 P1：旧版本默认未勾 autostart，记忆会让
+; 修复后的默认勾选在升级场景永远不生效）。
+UsePreviousTasks=no
 ; 永久不可改动：AppId 是升级/卸载识别的惟一键，改动后旧版本无法被新安装包
 ; 覆盖升级，会装出第二份程序并留下无法卸载的旧记录。
 AppId={{E761967B-0337-4F1A-B522-1C45B57AFF1D}
@@ -55,7 +58,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "autostart"; Description: "{cm:AutoStartTask}"; Flags: unchecked
+; 默认勾选（审查 P1：静默安装按默认勾选态执行，unchecked 会让静默升级
+; 静默丢失自启动）；安装器 always-creates 看门狗任务，未勾选时转 DISABLE。
+Name: "autostart"; Description: "{cm:AutoStartTask}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Kynoptic"; ValueData: """{app}\{#AppExeName}"" --minimized"; Tasks: autostart; Flags: uninsdeletevalue
