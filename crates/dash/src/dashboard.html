@@ -593,7 +593,6 @@ async function loadStatus() {
   // 自动更新提示（托盘每日检查线程写入）：有新版本时全页面顶部横幅，
   // 指引用户用托盘菜单一键更新（不自动安装，本地采集软件保持用户掌控）。
   const ub = document.getElementById("update-banner");
-  const zh = document.documentElement.lang === "zh";
   if (s.update_available) {
     ub.style.display = "";
     ub.textContent = zh

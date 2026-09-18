@@ -243,7 +243,7 @@ fn main() {
                 let flush = kynoptic_core::collector::last_flush_epoch();
                 let running = COLLECTOR_RUNNING.load(std::sync::atomic::Ordering::Relaxed);
                 // flush==0 = 本进程尚未落过库(启动初期正常),不误报;真正
-                // 挂死场景是 flush 曾前进后停滞,由 300s 阈值覆盖。
+                // 挂死场景是 flush 曾前进后停滞,由 1800s 阈值覆盖。
                 let stalled =
                     running && flush > 0 && now.timestamp() - flush as i64 > HEARTBEAT_STALLED_SECS;
                 let content = format!(
@@ -287,14 +287,48 @@ fn main() {
                     let exe = exe_dir.join("kynoptic.exe");
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let Ok(out) = std::process::Command::new(exe)
+                    // Wave17 审查 P1：必须带超时。self_update/rustls 无内置
+                    // 超时，网络半开（VPN 挂起等）会让 .output() 永久阻塞，
+                    // 之后 24h 周期检查全部失效。
+                    let Ok(mut child) = std::process::Command::new(exe)
                         .args(["update", "--check"])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
                         .creation_flags(CREATE_NO_WINDOW)
-                        .output()
+                        .spawn()
                     else {
                         return CheckOutcome::Failed;
                     };
-                    let text = String::from_utf8_lossy(&out.stdout);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let mut out = None;
+                    while std::time::Instant::now() < deadline {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                // 读完管道再退出，避免子进程因管道满阻塞
+                                use std::io::Read;
+                                let mut buf = String::new();
+                                if let Some(mut io) = child.stdout.take() {
+                                    let _ = io.read_to_string(&mut buf);
+                                }
+                                let _ = status;
+                                out = Some(buf);
+                                break;
+                            }
+                            Ok(None) => thread::sleep(std::time::Duration::from_millis(250)),
+                            Err(_) => break,
+                        }
+                    }
+                    let Some(text) = (match out {
+                        Some(t) => Some(t),
+                        None => {
+                            // 超时/等待出错：杀掉子进程，视为查询失败
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            None
+                        }
+                    }) else {
+                        return CheckOutcome::Failed;
+                    };
                     if text.contains("UP TO DATE") {
                         return CheckOutcome::UpToDate;
                     }

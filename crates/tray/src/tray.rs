@@ -118,7 +118,7 @@ impl TrayCtx {
     fn tip_text(&self) -> &'static str {
         match self.state {
             // 双语（装机审查：托盘是英文系统之外用户唯一常驻可见面）
-            TrayState::Running => "Kynoptic: collecting · 右键菜单",
+            TrayState::Running => "Kynoptic: collecting / 采集中 · 右键菜单",
             TrayState::Paused => "Kynoptic: paused / 已暂停",
             TrayState::Error => "Kynoptic: error / 异常",
         }
@@ -154,9 +154,18 @@ impl TrayCtx {
             // 自动更新检查发现新版本时插入一键更新项（日常检查由后台线程
             // 写 data\update-available.txt，见 main.rs）
             if let Some(ver) = update_available_version(&self.args.db) {
-                let text: Vec<u16> = format!("Update available: v{} - click to install\0", ver)
-                    .encode_utf16()
-                    .collect();
+                // 文案单一来源（Wave17 P1：分安装形态，不做虚假 install 承诺）
+                let installed = std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+                    .map(|d| d.join("unins000.exe").exists())
+                    .unwrap_or(false);
+                let text: Vec<u16> = format!(
+                    "{}\0",
+                    crate::state::MenuId::update_menu_label(&ver, installed)
+                )
+                .encode_utf16()
+                .collect();
                 AppendMenuW(menu, MF_STRING, MenuId::UpdateNow as usize, text.as_ptr());
             }
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());

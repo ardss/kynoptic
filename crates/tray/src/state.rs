@@ -28,19 +28,30 @@ impl MenuId {
         }
     }
 
-    /// 当前状态下的菜单文案(无 emoji;Pause/Resume 随状态切换)。
+    /// 当前状态下的菜单文案(Wave17 双语化:托盘是常驻可见面,口径与
+    /// dashboard/安装器对齐;Pause/Resume 随状态切换)。
     pub fn label(self, state: TrayState) -> &'static str {
         match self {
-            Self::OpenDashboard => "Open Dashboard",
+            Self::OpenDashboard => "Open Dashboard / 打开面板",
             Self::TogglePause => match state {
-                TrayState::Running => "Pause",
-                TrayState::Paused | TrayState::Error => "Resume",
+                TrayState::Running => "Pause / 暂停采集",
+                TrayState::Paused | TrayState::Error => "Resume / 恢复采集",
             },
-            Self::OpenDataFolder => "Open data folder",
-            // 版本号动态拼在调用侧(append_item 传 UTF-16 文案),此处给固定前缀
-            Self::UpdateNow => "Update available - install now",
-            Self::About => "About Kynoptic (github)",
-            Self::Quit => "Quit",
+            Self::OpenDataFolder => "Open data folder / 打开数据目录",
+            // 版本号动态拼在调用侧(见 update_menu_label;此处仅测试锚点)
+            Self::UpdateNow => "Update available / 发现新版本",
+            Self::About => "About Kynoptic (github) / 关于",
+            Self::Quit => "Quit / 退出",
+        }
+    }
+
+    /// 一键更新菜单项文案(单一来源,Wave17 P1:此前调用侧自拼文案与
+    /// 此处措辞漂移)。安装版只能打开下载页,不做虚假的 "install" 承诺。
+    pub fn update_menu_label(version: &str, installed: bool) -> String {
+        if installed {
+            format!("New version v{version} - open download page / 新版本 v{version} - 打开下载页")
+        } else {
+            format!("Update to v{version} / 更新到 v{version}")
         }
     }
 }
@@ -107,18 +118,35 @@ mod tests {
 
     #[test]
     fn pause_resume_labels_follow_state() {
-        assert_eq!(MenuId::TogglePause.label(TrayState::Running), "Pause");
-        assert_eq!(MenuId::TogglePause.label(TrayState::Paused), "Resume");
-        assert_eq!(MenuId::TogglePause.label(TrayState::Error), "Resume");
-        assert_eq!(
-            MenuId::OpenDashboard.label(TrayState::Running),
-            "Open Dashboard"
-        );
-        assert_eq!(MenuId::Quit.label(TrayState::Paused), "Quit");
-        assert_eq!(
-            MenuId::OpenDataFolder.label(TrayState::Running),
-            "Open data folder"
-        );
+        // Wave17 双语化后锚定关键词而非全文（文案仍可能微调，语义不变）
+        for (st, kw) in [
+            (TrayState::Running, "Pause"),
+            (TrayState::Paused, "Resume"),
+            (TrayState::Error, "Resume"),
+        ] {
+            assert!(
+                MenuId::TogglePause.label(st).contains(kw),
+                "{kw} 应出现在 {:?} 的菜单项里",
+                st
+            );
+        }
+        assert!(MenuId::OpenDashboard
+            .label(TrayState::Running)
+            .contains("Open Dashboard"));
+        assert!(MenuId::Quit.label(TrayState::Paused).contains("Quit"));
+        assert!(MenuId::OpenDataFolder
+            .label(TrayState::Running)
+            .contains("Open data folder"));
+    }
+
+    #[test]
+    fn update_menu_label_matches_install_form() {
+        // Wave17 P1：安装版不许再承诺 "install"（行为是打开下载页）
+        let l = MenuId::update_menu_label("0.2.1", true);
+        assert!(l.contains("0.2.1") && l.contains("download"));
+        assert!(!l.to_lowercase().contains("install"));
+        let p = MenuId::update_menu_label("0.2.1", false);
+        assert!(p.contains("0.2.1") && p.to_lowercase().contains("update"));
     }
 
     #[test]

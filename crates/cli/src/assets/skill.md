@@ -15,7 +15,7 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 ## 定位二进制与数据（按序尝试）
 
 1. `%LOCALAPPDATA%\Programs\Kynoptic\kynoptic.exe`（安装版默认位；开始菜单快捷方式指向同处）
-2. `kynoptic` 在 PATH（安装版会加）
+2. `kynoptic` 在 PATH（若有；安装器并不写 PATH，此条仅为用户自配环境的兜底）
 3. 便携版=解压/拷贝目录下的 kynoptic.exe（与 kynoptic-tray.exe 同目录，data\ 就在其旁）
 
 **两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。数据一律在 exe 同级 data\kynoptic.db（安装与便携相同），dashboard 实际端口看 data\dashboard-port.txt。

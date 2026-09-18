@@ -54,6 +54,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Wave17)
+
+- Dashboard: a duplicate `const zh` declaration broke the entire page
+  script (every tab showed an eternal loading state); settings goal now
+  loads at boot so the goal ring uses the configured target; settings
+  tab retries after a failed load; day-note no longer squeezed into the
+  card grid; day-granularity anomalies no longer show a fabricated
+  08:00 time; heatmap no longer preloaded at boot.
+- Tray: menus fully bilingual; the update menu item now states what it
+  actually does per install form (download page for installed copies)
+  from a single source; update-check subprocess has a 60s timeout;
+  update.log is opened in append mode without panicking fallbacks.
+- Updater: tray-exit flag can no longer survive a failed update (it
+  would permanently suppress watchdog revival); "already up to date"
+  clears a stale update-available notice.
+- Installer: unchecking autostart can no longer be silently reverted by
+  the [Run] section recreating the watchdog task enabled; the task is
+  recreated pointing at the new install directory and kept disabled.
+
 ### Added
 
 - Automatic update discovery: the tray checks GitHub once daily
@@ -127,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `perf-query` / `perf-idle` / `perf3-*`); methodology and numbers in
   [BENCHMARKS.md](BENCHMARKS.md).
 - Dashboard port fallback: when the default port 8422 is occupied the
-  dashboard tries the next free ports (up to 8422+10) and writes the
+  dashboard tries the next free ports (8422/18422/28422 segments) and writes the
   actual port to `data\dashboard-port.txt`; an explicit `--port 0`
   (random free port) keeps its semantics and skips the fallback.
 - Unattended-card warmup gate: the "machine unattended" card shows an

@@ -340,6 +340,10 @@ fn replace_with_backup(dest: &std::path::Path, new_file: &std::path::Path) -> (b
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         if std::fs::rename(dest, &bak).is_err() {
+            // Wave17 审查 P1：旗标残留会永久压制看门狗拉起——失败路径必须清
+            if let Some(dir) = dest.parent() {
+                let _ = std::fs::remove_file(exit_flag_for(dir));
+            }
             return (false, killed);
         }
     }
@@ -349,6 +353,10 @@ fn replace_with_backup(dest: &std::path::Path, new_file: &std::path::Path) -> (b
             // 新文件放不进去：还原旧文件
             if bak.exists() {
                 let _ = std::fs::rename(&bak, dest);
+            }
+            // 旧文件已还原，旗标使命结束（见上：残留会压制看门狗）
+            if let Some(dir) = dest.parent() {
+                let _ = std::fs::remove_file(exit_flag_for(dir));
             }
             (false, false)
         }
@@ -483,6 +491,9 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     let new_ver = release.version.trim_start_matches('v').to_string();
     if version_cmp(&new_ver, cur) != std::cmp::Ordering::Greater {
         println!("already up to date ({cur})");
+        // Wave17：顺手清提示文件——一键更新成功后托盘进程仍是旧版，
+        // 靠 update-available.txt 判断的菜单项会再挂最长 24h。
+        let _ = std::fs::remove_file(dir.join("data").join("update-available.txt"));
         return Ok(());
     }
     eprintln!("downloading kynoptic v{new_ver}...");

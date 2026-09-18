@@ -76,7 +76,10 @@ Filename: "{app}\{#AppExeName}"; Description: "Launch Kynoptic (background tray 
 ; 用户从托盘菜单主动退出则写旗标,watchdog 不拉起。随 autostart 任务一起安装。
 ; /F 覆盖建:换目录升级时旧任务指向旧 {app} 成为死任务,/F 保证任务重建后
 ; 必指向本次安装目录(审查 P1-10)。
-Filename: "schtasks"; Parameters: "/Create /F /SC MINUTE /MO 1 /TN ""Kynoptic Watchdog"" /TR ""'{app}\kynoptic-watchdog.exe' watchdog --once"""; Flags: runhidden
+; Tasks: autostart —— 未勾选时不创建（Wave17 审查 P1：[Run] 在
+; ssPostInstall 之后执行，无条件创建会把刚做的 DISABLE 覆盖回 Enabled）。
+; 未勾选路径由 ssPostInstall 负责"重建指向新目录 + 保持 DISABLE"。
+Filename: "schtasks"; Parameters: "/Create /F /SC MINUTE /MO 1 /TN ""Kynoptic Watchdog"" /TR ""'{app}\kynoptic-watchdog.exe' watchdog --once"""; Flags: runhidden; Tasks: autostart
 
 [Code]
 // ============================ 通用辅助 ============================
@@ -123,7 +126,9 @@ begin
     // 静默丢看门狗）。未勾选 autostart：任务转 DISABLE（防无人值守拉起），
     // 并清掉旧安装残留的 Run 值。
     if not WizardIsTaskSelected('autostart') then begin
-      RunHidden('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE');
+      // Wave17：先 /F 重建指向本次安装目录（旧任务可能指向旧 {app} 的死
+      // 路径），再 DISABLE——[Run] 已按勾选门控，DISABLE 不再被覆盖。
+      RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "Kynoptic Watchdog" /TR "''" + ExpandConstant('{app}') + '\kynoptic-watchdog.exe'' watchdog --once"');
       RegDeleteValue(HKEY_CURRENT_USER,
         'Software\Microsoft\Windows\CurrentVersion\Run', 'Kynoptic');
     end;
