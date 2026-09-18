@@ -167,6 +167,10 @@ pub fn load(db_path: &Path) -> AppSettings {
 /// 写盘（原子性：先写 .tmp 再改名，避免半截 JSON）。
 pub fn save(db_path: &Path, settings: &AppSettings) -> std::io::Result<()> {
     let path = settings_path(db_path);
+    // 首次安装/数据目录晚于 settings 写出创建时，父目录可能尚不存在（os error 3）。
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, json)?;
