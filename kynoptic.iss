@@ -139,7 +139,7 @@ procedure CurUninstallStepChanged(CurStep: TUninstallStep);
 var
   AppDir, DataDir: String;
   I: Integer;
-  Leftovers: array[0..11] of String;
+  Leftovers: array[0..13] of String;
 begin
   if CurStep = usUninstall then begin
     // 审查 P1-6：先静默杀掉 tray 与 watchdog，防止文件占用导致卸载残留
@@ -181,7 +181,9 @@ begin
     Leftovers[9] := AppDir + '\kynoptic-tray.exe.bak';
     Leftovers[10] := AppDir + '\kynoptic.exe.bak';
     Leftovers[11] := AppDir + '\kynoptic-watchdog.exe.bak';
-    for I := 0 to 11 do begin
+    Leftovers[12] := AppDir + '\watchdog.lock';
+    Leftovers[13] := AppDir + '\SKILL.md.tmp';
+    for I := 0 to 13 do begin
       if FileExists(Leftovers[I]) then
         DeleteFile(Leftovers[I]);
     end;

@@ -56,6 +56,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Automatic update discovery: the tray checks GitHub once daily
+  (report-only); a new stable version surfaces as a tray menu item
+  (one-click install for portable copies; installed copies open the
+  download page) and a dashboard banner.
+- `update --check`: report-only update check (used by the tray).
+- Tray: single left-click opens the dashboard; About menu item;
+  bilingual tooltip; dashboard-health now drives the Error/Running
+  tray icons (previously dead state).
+- Dashboard: three-state status line (collecting / stale / no events),
+  overview vs-yesterday deltas + daily-goal percentage, monitor
+  presets (Essential / Full / Minimal), confirmation dialog before
+  enabling raw per-keystroke logging.
+- Installer: release page now carries real release notes; SmartScreen
+  guidance in README; bilingual uninstall dialogs; desktop icon
+  checked by default.
+- Foreground-dwell intervals spanning collector downtime (>2h) are no
+  longer attributed to the frontmost app.
+
+### Fixed
+
+- Update-check failure no longer clears a previously-found update
+  notice; manual update output is logged to `data\update.log`.
+- Heartbeat stalled threshold raised to 30 min (above the slowest
+  periodic writer) so idle machines are not kill-looped.
+- `update` writes the tray exit flag before force-killing, preventing
+  watchdog respawn races mid-upgrade.
+
+### Added
+
 - 40 system monitors (registry-driven; 14 enabled by default, 26 opt-in),
   with live-probe verification harness (`kynoptic-ctl probe`).
 - CLI: `now` / `query` / `stats` / `collect` / `dashboard` / `mcp`

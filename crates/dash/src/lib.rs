@@ -511,6 +511,12 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         for pair in rows.windows(2) {
             if let (Some(a), Some(b)) = (parse(&pair[0].0), parse(&pair[1].0)) {
                 let secs = (b - a).num_seconds(); // 不封顶：连续 N 小时就是 N 小时（审查 DeepSeek）
+                // 采集停摆（暂停/看门狗杀/关机）产生的窗口间隔不能记成前台
+                // 时长（全库审查 P1：8 小时关机会变成某应用 8 小时驻留），
+                // 超 2h 的间隔两侧都不归属。
+                if secs > 2 * 3600 {
+                    continue;
+                }
                 *fg_dwell.entry(pair[0].1.clone()).or_insert(0) += secs;
             }
         }

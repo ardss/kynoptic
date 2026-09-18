@@ -33,7 +33,9 @@ impl Monitor for AudioMonitor {
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
-        let (volume, muted) = read_audio_state();
+        let Some((volume, muted)) = read_audio_state() else {
+            return; // 设备暂不可用：本次跳过，不产出假数据
+        };
 
         let prev_volume = self.last_volume.get();
         let prev_muted = self.last_muted.get();
@@ -74,7 +76,10 @@ impl Monitor for AudioMonitor {
 
 /// 通过 waveOutGetVolume (winmm.dll) 获取音量，
 /// 通过注册表获取静音状态。
-fn read_audio_state() -> (u32, bool) {
+/// None = API 失败（设备暂不可用）。全库审查 P2：失败回退硬编码 50 会
+/// 制造假事件（真实音量→50→真实音量两跳幻影 VolumeChange），失败时
+/// 本次跳过采样。
+fn read_audio_state() -> Option<(u32, bool)> {
     let volume = unsafe {
         let mut vol: u32 = 0;
         // waveOutGetVolume: 0 表示默认设备
@@ -86,13 +91,13 @@ fn read_audio_state() -> (u32, bool) {
             // 映射到 0-100
             (avg / 655.35).round() as u32
         } else {
-            50 // API 调用失败时的默认值
+            return None;
         }
     };
 
     let muted = read_mute_from_registry();
 
-    (volume.min(100), muted)
+    Some((volume.min(100), muted))
 }
 
 /// 从注册表读取静音状态

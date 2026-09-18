@@ -13,7 +13,7 @@ pub use server::{serve_stdio, McpServer};
 /// 规范中的 MCP 工具（不含 Resource）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
-    /// A. get_current_status —— 标量最小视图，热路径 0 SQL（ArcSwap 快照）
+    /// A. get_current_status —— 标量最小视图，每次调用走 SQL 读（读连接池）
     GetCurrentStatus,
     /// B. get_summary —— 单指标聚合 + 昨日对比
     GetSummary,

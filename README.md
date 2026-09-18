@@ -165,7 +165,9 @@ harness in this repo (full methodology and raw numbers in
 ## Privacy
 
 - Recorded data never leaves your machine by default. There is no account, no
-  telemetry, no analytics, no network calls except the user-invoked kynoptic update (GitHub).
+  telemetry, no analytics, no network calls except a once-daily version check
+  (a few hundred bytes to GitHub; found versions are shown in the tray menu —
+  never auto-installed).
 - **Keyboard and mouse are stored as per-minute counts only — never key
   contents, key order, or timing.** The dashboard keyboard heatmap uses
   per-key frequency counts (how many times each key was pressed), which are

@@ -310,11 +310,31 @@ fn verify_launch(_exe: &std::path::Path) -> bool {
 
 /// 把下载好的新文件替换到 dest：旧文件改名 `.bak` 保留；被占用时对
 /// tray/watchdog 先 taskkill 再试一次；仍失败返回 false（跳过）。
+/// 托盘退出旗标路径（与 tray/paths.rs 同口径：exe 同目录 tray-exit.flag）。
+fn exit_flag_for(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    exe_dir.join("tray-exit.flag")
+}
+
 fn replace_with_backup(dest: &std::path::Path, new_file: &std::path::Path) -> (bool, bool) {
     // (replaced, killed_to_unlock)
     let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
     let _ = std::fs::remove_file(&bak);
     if dest.exists() && std::fs::rename(dest, &bak).is_err() {
+        // 杀托盘前置退出旗标（全库审查 P2：硬杀不写旗标会让看门狗在
+        // kill→rename 窗口把旧托盘拉回来重新锁文件，造成三件套版本漂移）
+        if dest
+            .file_name()
+            .map(|n| n == "kynoptic-tray.exe")
+            .unwrap_or(false)
+        {
+            if let Some(dir) = dest.parent() {
+                let _ = std::fs::write(
+                    exit_flag_for(dir),
+                    "updating
+",
+                );
+            }
+        }
         let killed = kill_process(&dest.file_name().unwrap_or_default().to_string_lossy());
         if killed {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -560,7 +580,10 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             .arg("--minimized")
             .spawn()
         {
-            Ok(_) => eprintln!("托盘已随更新自动重启"),
+            Ok(_) => {
+                let _ = std::fs::remove_file(exit_flag_for(&dir));
+                eprintln!("托盘已随更新自动重启");
+            }
             Err(err) => warnings.push(format!(
                 "托盘自动重启失败（{err}），请手动启动 kynoptic-tray.exe"
             )),

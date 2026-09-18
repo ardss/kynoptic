@@ -37,6 +37,7 @@ kynoptic analyze --date YYYY-MM-DD  # 单日专注/碎片/异常分析
 kynoptic export --days 7 --out FILE [--format csv|jsonl] [--redact]
 kynoptic db stats                 # 行数/库大小
 kynoptic mcp [--db PATH]           # 启动 MCP 服务器（stdio）；--db 与 KYNOPTIC_DB 均可（--db 内部即经 KYNOPTIC_DB 传递）
+kynoptic update --check            # 只查不装：stdout "UPDATE <ver>" 或 "UP TO DATE"；托盘每日自动检查并把新版本写入 data\update-available.txt（菜单/面板同步提示，绝不自动安装）
 ```
 
 HTTP API（GET 全部只读）：

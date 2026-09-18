@@ -48,7 +48,9 @@ static DASH_FAILED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 /// 采集停滞阈值（审查 P1）：flush 距今超过该秒数且采集器在跑,心跳打
 /// stalled:true。30s 写一轮心跳、正常批次间隔远小于此,300s ≈ 连续 10 个
 /// 心跳周期无落库,足以区分"空闲无输入"与"writer 挂死"。
-const HEARTBEAT_STALLED_SECS: i64 = 300;
+const HEARTBEAT_STALLED_SECS: i64 = 1800; // 30min：必须大于最慢的周期性写入者
+                                          //（process 监控器 600s 强制心跳 + 30% 抖动 ≈ 780s），否则空闲机器会被误判
+                                          // stalled 遭看门狗循环误杀（全库审查 P0：300<600 的余量倒挂）
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -229,7 +231,7 @@ fn main() {
     // 审查 P1 心跳解耦修复:旧实现心跳线程无脑每 30s 写 RFC3339,采集主循环
     // 挂死时心跳照常新鲜,"心跳新鲜 = 采集健康"被架空。现在内容升级为 JSON
     // {"pid","ts","flush","stalled"}:flush 取 core 的 last_flush_epoch()(writer
-    // 每次成功落库刷新);采集运行中且 flush 停滞超 HEARTBEAT_STALLED_SECS(300s)
+    // 每次成功落库刷新);采集运行中且 flush 停滞超 HEARTBEAT_STALLED_SECS(1800s)
     // 时打 stalled:true,watchdog 侧 classify_heartbeat 据此判为过期并 kill。
     // 旧版纯时间戳内容仍被 watchdog 兼容解析(向后兼容,滚动升级期两代共存)。
     {
@@ -270,24 +272,41 @@ fn main() {
         thread::Builder::new()
             .name("UpdateCheck".into())
             .spawn(move || {
-                let run_check = || -> Option<String> {
-                    let exe = exe_dir.as_ref()?.join("kynoptic.exe");
+                // Some(v)=有新版；None=明确无更新或查询失败。二者都清提示文件；
+                // 查询失败（子进程/网络挂）时保留旧文件不清除（全库审查 P1：
+                // 一次网络抖动不该让已发现的更新提示消失 24h）。
+                enum CheckOutcome {
+                    Update(String),
+                    UpToDate,
+                    Failed,
+                }
+                let run_check = || -> CheckOutcome {
+                    let Some(exe_dir) = exe_dir.as_ref() else {
+                        return CheckOutcome::Failed;
+                    };
+                    let exe = exe_dir.join("kynoptic.exe");
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let out = std::process::Command::new(exe)
+                    let Ok(out) = std::process::Command::new(exe)
                         .args(["update", "--check"])
                         .creation_flags(CREATE_NO_WINDOW)
                         .output()
-                        .ok()?;
-                    let line = String::from_utf8_lossy(&out.stdout);
-                    let v = line
+                    else {
+                        return CheckOutcome::Failed;
+                    };
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if text.contains("UP TO DATE") {
+                        return CheckOutcome::UpToDate;
+                    }
+                    match text
                         .lines()
-                        .find(|l| l.starts_with("UPDATE "))?
-                        .split_whitespace()
-                        .nth(1)?
-                        .trim_start_matches('v')
-                        .to_string();
-                    Some(v)
+                        .find(|l| l.starts_with("UPDATE "))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .map(|v| v.trim_start_matches('v').to_string())
+                    {
+                        Some(v) => CheckOutcome::Update(v),
+                        None => CheckOutcome::Failed,
+                    }
                 };
                 let upd_path = db_for_upd
                     .parent()
@@ -295,11 +314,16 @@ fn main() {
                     .unwrap_or_else(|| std::path::PathBuf::from("update-available.txt"));
                 loop {
                     thread::sleep(std::time::Duration::from_secs(120)); // 启动缓冲，避开开机网络未就绪
-                    if let Some(v) = run_check() {
-                        let _ = std::fs::write(&upd_path, &v);
-                    } else {
-                        // 查询失败或无更新：清掉旧提示（无更新时 --check 打 UP TO DATE）
-                        let _ = std::fs::remove_file(&upd_path);
+                    match run_check() {
+                        CheckOutcome::Update(v) => {
+                            let _ = std::fs::write(&upd_path, &v);
+                        }
+                        CheckOutcome::UpToDate => {
+                            let _ = std::fs::remove_file(&upd_path);
+                        }
+                        CheckOutcome::Failed => {
+                            // 查询失败：保留已有提示文件不动
+                        }
                     }
                     thread::sleep(std::time::Duration::from_secs(24 * 3600));
                 }

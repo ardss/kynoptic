@@ -577,7 +577,9 @@ async function loadStatus() {
   }
   // 状态行显示本地时间；tooltip 保留 UTC 原文
   const utcRaw = s.last_event_ts.replace("T", " ") + " UTC";
-  const d = new Date(s.last_event_ts);
+  // 后端 substr(...,19) 截掉的是 UTC 偏移——必须补 Z 才是正确时间点，
+  // 否则 Date 按本地解析，东八区年龄虚增 8h、西区为负永远"采集中"
+  const d = new Date(s.last_event_ts + "Z");
   const shown = isNaN(d.getTime()) ? utcRaw : d.toLocaleString();
   // 三态状态（定性审查：采集死了 vs 没数据 vs 正常采集必须可区分）
   const zh = document.documentElement.lang === "zh";
@@ -692,7 +694,7 @@ async function loadOverview() {
   const delta = (today, yest, el) => {
     const e = document.getElementById(el);
     if (!e) return;
-    if (collecting || typeof yest !== "number" || yest <= 0) { e.textContent = ""; return; }
+    if (collecting || typeof yest !== "number" || yest <= 0) { e.textContent = ""; e.style.color = ""; return; }
     const diff = today - yest;
     if (Math.abs(diff) < 1) { e.textContent = zh ? "与昨日持平" : "same as yesterday"; return; }
     const sign = diff > 0 ? "+" : "−";
@@ -1428,7 +1430,7 @@ async function saveSettings() {
     // 逐键原始记录是最敏感开关：关闭计数模式需显式确认（定性审查）
     const zh0 = document.documentElement.lang === "zh";
     if (!document.getElementById("set-counts").checked &&
-        LAST_SETTINGS && LAST_SETTINGS.input_counts_only) {
+        (!LAST_SETTINGS || LAST_SETTINGS.input_counts_only)) {
       const ok = confirm(zh0
         ? "即将开启逐键原始记录：将保存每一次按键的具体内容（不只次数）。确定继续吗？"
         : "This enables raw per-keystroke logging: the content of every keypress will be stored (not just counts). Continue?");

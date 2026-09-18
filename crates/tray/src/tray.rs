@@ -218,10 +218,20 @@ impl TrayCtx {
                 } else if let Some(dir) = exe_dir {
                     use std::os::windows::process::CommandExt;
                     const DETACHED_PROCESS: u32 = 0x0000_0008;
-                    let _ = std::process::Command::new(dir.join("kynoptic.exe"))
-                        .arg("update")
-                        .creation_flags(DETACHED_PROCESS)
-                        .spawn();
+                    // 输出落档（全库审查 P1：一键更新此前全程静默，失败无人知）
+                    if let Some(db_dir) = self.args.db.parent() {
+                        if let Ok(log) = std::fs::File::create(db_dir.join("update.log")) {
+                            let err = log.try_clone().ok();
+                            let _ = std::process::Command::new(dir.join("kynoptic.exe"))
+                                .arg("update")
+                                .stdout(log)
+                                .stderr(err.unwrap_or_else(|| {
+                                    std::fs::File::create(db_dir.join("update.log")).unwrap()
+                                }))
+                                .creation_flags(DETACHED_PROCESS)
+                                .spawn();
+                        }
+                    }
                 }
             }
             MenuId::About => {

@@ -1337,7 +1337,11 @@ fn foreground_minutes(conn: &Connection, start: &str, end: &str) -> i64 {
             let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
             for pair in stamps.windows(2) {
                 if let (Some(a), Some(b)) = (parse(&pair[0]), parse(&pair[1])) {
-                    fg_secs += (b - a).num_seconds();
+                    // 采集停摆的超长间隔不归属（同 dash 侧，全库审查 P1）
+                    let secs = (b - a).num_seconds();
+                    if secs <= 2 * 3600 {
+                        fg_secs += secs;
+                    }
                 }
             }
         }

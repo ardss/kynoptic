@@ -273,7 +273,7 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
                 NULL,
                 COUNT(*)
          FROM events
-         WHERE app_name IS NOT NULL AND event_type IN ('keyboard','mouse','window')
+         WHERE app_name IS NOT NULL AND app_name != '' AND event_type IN ('keyboard','mouse','window')
          GROUP BY 1, 2;",
         off = off,
         keys_row = crate::queries::KEYS_ROW_EXPR,
@@ -527,7 +527,7 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                         NULL,
                         COUNT(*)
                  FROM events
-                 WHERE app_name IS NOT NULL AND event_type IN ('keyboard','mouse','window')
+                 WHERE app_name IS NOT NULL AND app_name != '' AND event_type IN ('keyboard','mouse','window')
                    AND timestamp >= '{dstart}' AND timestamp < '{dend}'
                  GROUP BY 1, 2;",
                 off = off,

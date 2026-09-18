@@ -77,9 +77,9 @@ jobs:
 
           **Download and run [Kynoptic-Setup-$ver.exe](https://github.com/ardss/kynoptic/releases/download/$ver/Kynoptic-Setup-$ver.exe)** - that is the only file most users need.
 
-          - SmartScreen will warn (unsigned build): click **More info -> Run anyway**, or verify `SHA256SUMS.txt` / build from source.
+          - SmartScreen will warn (unsigned build): click **More info -> Run anyway**, or verify ``SHA256SUMS.txt`` / build from source.
           - Data stays on your machine: raw events are append-only, never uploaded, never auto-deleted.
-          - After install, find the tray icon (may be in the `^` overflow) and right-click -> Open Dashboard.
+          - After install, find the tray icon (may be in the ^ overflow) and right-click -> Open Dashboard.
           - AI integration: `kynoptic mcp` (stdio) or `kynoptic skill install` - see README.
 
           Other assets: portable zip (no installer), bare exes, SHA256SUMS.txt.

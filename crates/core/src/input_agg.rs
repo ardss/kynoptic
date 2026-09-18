@@ -382,9 +382,11 @@ fn events_for(key: MinuteKey, c: &MinuteCounters, final_row: bool) -> Vec<Event>
 /// 事件时间分桶（审查）：本批计数的落桶分钟取自 `LAST_EVENT_EPOCH_MIN`
 /// （钳到当前分钟），聚合线程停滞跨分钟时计数仍归入事件发生的那一分钟。
 pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
-    // 先取事件时间再 drain 原子计数（顺序保证两者对应同一批事件）
-    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
+    // 先 drain 计数再取事件时间（全库审查 P1：旧顺序在两步之间到达的事件
+    // 会被计入本批却带着上一分钟的 epoch，可能落进随即折叠的 final 行永久
+    // 错桶；新顺序下这些边界事件归到 cur，最多错桶一分钟且可被后续覆盖）
     let drained = drain_atomics();
+    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
     let cur = MinuteKey::of(now_local);
     let evt_key = MinuteKey::from_epoch_min(last_evt as i64, &cur).unwrap_or(cur);
     let mut out = Vec::new();
@@ -441,9 +443,9 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
 /// 关停兜底：把当前**未满**分钟的部分计数立即折叠成事件（不留到下一分钟；
 /// 行带 `$.final: false`，重启时可识别为部分快照）。
 pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
-    // 先取事件时间再 drain 原子计数（与 drain 同序）
-    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
+    // 与 drain 同序：先 drain 计数再取事件时间（见 drain 内注释）
     let drained = drain_atomics();
+    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
     let cur = MinuteKey::of(now_local);
     // 统一锁获取顺序：先 PENDING 再 SUPPRESS（与 drain 一致，审查 P2：
     // 两函数顺序相反构成潜在死锁对）。
