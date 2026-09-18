@@ -65,6 +65,13 @@ there? The overview card does exactly that arithmetic:
 
 **Option 1 — Installer (recommended, under 1 minute, no toolchain):**
 
+> **SmartScreen note:** the build is not code-signed, so Windows will show
+> "Windows protected your PC" on first run. Click **More info -> Run anyway**
+> (the binary is safe to inspect — sources and per-release SHA256 checksums
+> are on the release page, and everything is reproducible from source with
+> `cargo build --release`). It runs entirely on your machine and makes no
+> network calls except the daily update check.
+
 Download [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)
 from the latest release, run it, and launch Kynoptic from the Start menu.
 Collection starts automatically. Open the dashboard from the tray icon

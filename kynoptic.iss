@@ -57,7 +57,9 @@ Name: "{group}\{#AppName} CLI"; Filename: "{app}\kynoptic.exe"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; 桌面图标默认勾选（装机审查：唯一持久的"回到应用"入口，默认不勾会让
+; 用户装完找不到应用——托盘图标默认收在 Win11 溢出区）
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 ; 默认勾选（审查 P1：静默安装按默认勾选态执行，unchecked 会让静默升级
 ; 静默丢失自启动）；安装器 always-creates 看门狗任务，未勾选时转 DISABLE。
 Name: "autostart"; Description: "{cm:AutoStartTask}"
@@ -68,7 +70,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 ; AI 客户端 skill 同步（静默、总是执行；升级覆盖安装也会刷新 SKILL.md）
 Filename: "{app}\kynoptic.exe"; Parameters: "skill install"; Flags: runhidden
-Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; 说明性 Description：让用户知道启动的是后台托盘进程而非窗口程序
+Filename: "{app}\{#AppExeName}"; Description: "Launch Kynoptic (background tray - right-click the tray icon to open the dashboard / 启动 Kynoptic 后台托盘，右键托盘图标打开面板)"; Flags: nowait postinstall skipifsilent
 ; 看门狗:计划任务每分钟跑一次 `kynoptic watchdog --once`,托盘被杀/崩溃时自动拉起;
 ; 用户从托盘菜单主动退出则写旗标,watchdog 不拉起。随 autostart 任务一起安装。
 ; /F 覆盖建:换目录升级时旧任务指向旧 {app} 成为死任务,/F 保证任务重建后
@@ -152,14 +155,16 @@ begin
       DeleteDataOnUninstall := False
     else begin
       DeleteDataOnUninstall :=
-        (MsgBox('是否同时删除用户数据目录？' #13#10 + DataDir + #13#10#13#10 +
-                '（包含 kynoptic.db 与 settings.json，选"否"则保留数据）',
+        (MsgBox('是否同时删除用户数据目录？ / Also delete the user data directory?' #13#10 + DataDir + #13#10#13#10 +
+                '（包含 kynoptic.db 与 settings.json，选"否"则保留数据）' #13#10 +
+                '(contains kynoptic.db and settings.json; choose No to keep your data)',
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES);
       // 审查：用户选择删除后给一次不可逆警告（仅交互模式；数据一旦删除，
       // 历史记录无法找回，重装也不会恢复）
       if DeleteDataOnUninstall then
-        MsgBox('警告：删除后所有历史数据将无法找回，重新安装也不会恢复。' #13#10 +
-               '如需保留数据请取消本次卸载并重新选择"否"。',
+        MsgBox('警告：删除后所有历史数据将无法找回，重新安装也不会恢复。 / ' +
+               'Warning: deleted history cannot be recovered, reinstalling will not bring it back.' #13#10 +
+               '如需保留数据请取消本次卸载并重新选择"否"。 / To keep data, cancel and answer No.',
                mbInformation, MB_OK);
     end;
 
@@ -191,7 +196,7 @@ begin
       // 卸载完成提示：数据已保留
       if UninstallProgressForm <> nil then
         UninstallProgressForm.StatusLabel.Caption :=
-          '数据已保留在 ' + DataDir;
+          '数据已保留 / Data kept at ' + DataDir;
     end;
   end;
 end;

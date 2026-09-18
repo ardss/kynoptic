@@ -9,6 +9,8 @@ pub enum MenuId {
     OpenDataFolder = 1003,
     /// 自动更新检查发现新版本后动态插入的一键更新/下载项
     UpdateNow = 1005,
+    /// 关于（打开项目主页；全应用唯一的版本可见入口之一）
+    About = 1006,
     Quit = 1004,
 }
 
@@ -21,6 +23,7 @@ impl MenuId {
             1003 => Some(Self::OpenDataFolder),
             1004 => Some(Self::Quit),
             1005 => Some(Self::UpdateNow),
+            1006 => Some(Self::About),
             _ => None,
         }
     }
@@ -36,6 +39,7 @@ impl MenuId {
             Self::OpenDataFolder => "Open data folder",
             // 版本号动态拼在调用侧(append_item 传 UTF-16 文案),此处给固定前缀
             Self::UpdateNow => "Update available - install now",
+            Self::About => "About Kynoptic (github)",
             Self::Quit => "Quit",
         }
     }

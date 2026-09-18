@@ -94,9 +94,10 @@ impl TrayCtx {
 
     fn tip_text(&self) -> &'static str {
         match self.state {
-            TrayState::Running => "Kynoptic: collecting",
-            TrayState::Paused => "Kynoptic: paused",
-            TrayState::Error => "Kynoptic: error",
+            // 双语（装机审查：托盘是英文系统之外用户唯一常驻可见面）
+            TrayState::Running => "Kynoptic: collecting · 右键菜单",
+            TrayState::Paused => "Kynoptic: paused / 已暂停",
+            TrayState::Error => "Kynoptic: error / 异常",
         }
     }
 
@@ -126,6 +127,7 @@ impl TrayCtx {
             append_item(menu, MenuId::OpenDashboard, self.state);
             append_item(menu, MenuId::TogglePause, self.state);
             append_item(menu, MenuId::OpenDataFolder, self.state);
+            append_item(menu, MenuId::About, self.state);
             // 自动更新检查发现新版本时插入一键更新项（日常检查由后台线程
             // 写 data\update-available.txt，见 main.rs）
             if let Some(ver) = update_available_version(&self.args.db) {
@@ -221,6 +223,12 @@ impl TrayCtx {
                         .creation_flags(DETACHED_PROCESS)
                         .spawn();
                 }
+            }
+            MenuId::About => {
+                let url: Vec<u16> = String::from("https://github.com/ardss/kynoptic ")
+                    .encode_utf16()
+                    .collect();
+                open_with_shell(&url);
             }
             MenuId::Quit => {
                 // 优雅关停:命令通道通知属主线程置停机旗标并 join writer,
