@@ -41,6 +41,9 @@ use tray::CollectorCmd;
 /// 静态量理由:心跳线程拿不到 owner 线程栈上的 Collector 实例（所有权不跨
 /// 线程）,与 core 的 LAST_FLUSH_EPOCH 同属进程级共享信号。
 static COLLECTOR_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// dashboard 服务健康旗标（0=未定,1=失败,2=正常）。dash 线程写，托盘 UI
+/// 定时读——Error 态图标此前是死代码，现在真正接线（定性审查）。
+static DASH_FAILED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// 采集停滞阈值（审查 P1）：flush 距今超过该秒数且采集器在跑,心跳打
 /// stalled:true。30s 写一轮心跳、正常批次间隔远小于此,300s ≈ 连续 10 个
@@ -166,6 +169,7 @@ fn main() {
                         let _ = std::fs::write(dir.join("dashboard-port.txt"), format!("{cand}\n"));
                     }
                 }
+                DASH_FAILED.store(2, std::sync::atomic::Ordering::Relaxed);
                 let _ = port_tx.send(Some(cand));
                 match kynoptic_dash::serve(&dash_db, cand, true) {
                     Ok(()) => return, // 正常退出路径（进程结束）
@@ -176,6 +180,7 @@ fn main() {
                 }
             }
             // 全部候选失败:port.txt 写 "unavailable",错误留档 dashboard-error.log
+            DASH_FAILED.store(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(dir) = dash_db.parent() {
                 let _ = std::fs::write(dir.join("dashboard-port.txt"), "unavailable\n");
                 if let Some(err) = last_err {

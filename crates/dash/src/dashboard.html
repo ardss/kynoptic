@@ -179,6 +179,8 @@
     <div style="font-size:12px; color:var(--dim);">
       <span class="l en">first</span><span class="l zh">首次在场</span> <span id="c-first">–</span>
       · <span class="l en">last</span><span class="l zh">最近在场</span> <span id="c-last">–</span>
+      · <span id="c-presence-delta"></span>
+      · <span id="c-presence-goal"></span>
     </div>
   </div>
   <div class="card">
@@ -186,6 +188,7 @@
     <div class="value" style="font-size:34px; color:var(--dim);" id="c-automation">–</div>
     <div style="font-size:12px; color:var(--dim);">
       <span class="l en">injected input, excluded from presence</span><span class="l zh">注入输入，不计入人在场</span>
+      · <span id="c-automation-delta"></span>
     </div>
   </div>
   <div class="card">
@@ -386,6 +389,13 @@
     <span class="l zh">更改保存到数据库旁的 settings.json，托盘采集器自动重启使其生效（约 1-2 秒）。
       开机自启动立即写入注册表 Run 项。</span>
   </div>
+  <div class="mon-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span class="muted" style="font-size:11px"><span class="l en">presets:</span><span class="l zh">预设：</span></span>
+    <button type="button" class="save" style="background:#2A3442" onclick="applyPreset('essential')"><span class="l en">Essential (14)</span><span class="l zh">基础（14）</span></button>
+    <button type="button" class="save" style="background:#2A3442" onclick="applyPreset('full')"><span class="l en">Full (40)</span><span class="l zh">全开（40）</span></button>
+    <button type="button" class="save" style="background:#2A3442" onclick="applyPreset('minimal')"><span class="l en">Minimal (4)</span><span class="l zh">最小（4）</span></button>
+    <span class="muted" style="font-size:11px"><span class="l en">sets checkboxes — click save to apply</span><span class="l zh">仅勾选，需点保存生效</span></span>
+  </div>
   <div class="settings-groups">
     <div class="settings-group">
       <h3><span class="l en">default enabled (14)</span><span class="l zh">默认启用（14）</span></h3>
@@ -569,7 +579,14 @@ async function loadStatus() {
   const utcRaw = s.last_event_ts.replace("T", " ") + " UTC";
   const d = new Date(s.last_event_ts);
   const shown = isNaN(d.getTime()) ? utcRaw : d.toLocaleString();
-  el.textContent = s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + dbStatusText(s);
+  // 三态状态（定性审查：采集死了 vs 没数据 vs 正常采集必须可区分）
+  const zh = document.documentElement.lang === "zh";
+  const age = (Date.now() - d.getTime()) / 1000;
+  let stateTxt;
+  if (age < 600) stateTxt = zh ? "采集中" : "collecting";
+  else if (age < 86400) stateTxt = zh ? "停滞（最后事件 " + Math.round(age/60) + " 分钟前）" : "stale (last event " + Math.round(age/60) + " min ago)";
+  else stateTxt = zh ? "无事件（采集器可能未运行）" : "no events (collector may be down)";
+  el.textContent = "[" + stateTxt + "] " + s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + dbStatusText(s);
   el.title = t("lastEvent") + " " + utcRaw;
   // 自动更新提示（托盘每日检查线程写入）：有新版本时全页面顶部横幅，
   // 指引用户用托盘菜单一键更新（不自动安装，本地采集软件保持用户掌控）。
@@ -671,6 +688,29 @@ async function loadOverview() {
       el.classList.remove("empty-note");
     }
   }
+  // 对比增量（定性审查：裸数字无上下文像报表）——vs 昨日同口径
+  const delta = (today, yest, el) => {
+    const e = document.getElementById(el);
+    if (!e) return;
+    if (collecting || typeof yest !== "number" || yest <= 0) { e.textContent = ""; return; }
+    const diff = today - yest;
+    if (Math.abs(diff) < 1) { e.textContent = zh ? "与昨日持平" : "same as yesterday"; return; }
+    const sign = diff > 0 ? "+" : "−";
+    e.textContent = sign + fmtDuration(Math.abs(diff)) + (zh ? " vs 昨日" : " vs yesterday");
+    e.style.color = diff > 0 ? "#3FB68B" : "#E06C75";
+  };
+  delta(pm, o.presence_yesterday, "c-presence-delta");
+  delta(am, o.automation_yesterday, "c-automation-delta");
+  // 目标进度（设置里承诺"控制总览卡"——现在兑现）
+  const gEl = document.getElementById("c-presence-goal");
+  if (gEl) {
+    const goal = LAST_SETTINGS ? (LAST_SETTINGS.daily_goal_minutes || 0) : 480;
+    if (!goal || collecting) gEl.textContent = "";
+    else {
+      const pct = Math.min(100, Math.round(pm / goal * 100));
+      gEl.textContent = zh ? "目标 " + pct + "%" : "goal " + pct + "%";
+    }
+  }
   document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
   document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;
@@ -678,8 +718,6 @@ async function loadOverview() {
   // 口径说明小字（overview.metrics_note）：字段缺失（旧后端）时静默留空
   const on = document.getElementById("overview-note");
   if (on) on.textContent = o.metrics_note || o.note || "";
-
-  const s = await jget("/api/summary");
 }
 /* ─── 洞察页：从原始数据挖掘出的叙事式发现 ─── */
 async function loadInsights() {
@@ -1356,6 +1394,24 @@ async function loadSettings() {
   document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
   settingsMsg("", true);
 }
+// 监控器预设（定性审查：40 复选框墙需要快捷入口）。仅改界面勾选，保存才生效。
+const PRESETS = {
+  essential: null, // default_enabled 集，运行时取 LAST_SETTINGS
+  full: null,      // 全部
+  minimal: ["window", "keyboard_hook", "mouse_hook", "session"]
+};
+function applyPreset(name) {
+  if (!LAST_SETTINGS) return;
+  let ids;
+  if (name === "full") ids = LAST_SETTINGS.monitors.map(m => m.id);
+  else if (name === "essential") ids = LAST_SETTINGS.monitors.filter(m => m.default_enabled).map(m => m.id);
+  else ids = PRESETS.minimal.filter(id => LAST_SETTINGS.monitors.some(m => m.id === id));
+  for (const m of LAST_SETTINGS.monitors) {
+    const box = document.getElementById("mon-" + m.id);
+    if (box) box.checked = ids.includes(m.id);
+  }
+  settingsMsg(t("restoredHint"), true);
+}
 // 恢复默认勾选（仅改界面，需再点保存）
 function restoreDefaults() {
   if (!LAST_SETTINGS) return;
@@ -1369,6 +1425,15 @@ async function saveSettings() {
   const btn = document.getElementById("settings-save");
   btn.disabled = true;
   try {
+    // 逐键原始记录是最敏感开关：关闭计数模式需显式确认（定性审查）
+    const zh0 = document.documentElement.lang === "zh";
+    if (!document.getElementById("set-counts").checked &&
+        LAST_SETTINGS && LAST_SETTINGS.input_counts_only) {
+      const ok = confirm(zh0
+        ? "即将开启逐键原始记录：将保存每一次按键的具体内容（不只次数）。确定继续吗？"
+        : "This enables raw per-keystroke logging: the content of every keypress will be stored (not just counts). Continue?");
+      if (!ok) { btn.disabled = false; return; }
+    }
     const enabled_monitors = [...document.querySelectorAll(".mon-toggle")]
       .filter(x => x.checked).map(x => x.dataset.id);
     const body = {

@@ -20,7 +20,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging as win;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
+    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
     TranslateMessage, GWLP_USERDATA, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP,
     WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
@@ -283,15 +283,39 @@ fn set_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayCtx;
+    // SAFETY: 窗口创建时经 GWLP_USERDATA 挂入的唯一 TrayCtx；Timer 分支需要
+    // 可变引用同步 Error/Running 图标。
+    let mut ctx: Option<&mut TrayCtx> = unsafe { ctx_ptr.as_mut() };
+    // Timer 分支需可变引用同步 Error/Running 图标
+    let mut ctx = ctx.as_mut();
+
     match msg {
         WM_TRAYICON => {
             if let Some(ctx) = ctx_ptr.as_mut() {
                 let m = lparam as u32;
                 if m == WM_RBUTTONUP || m == WM_CONTEXTMENU {
                     ctx.show_menu(hwnd);
-                } else if m == WM_LBUTTONDBLCLK {
-                    // WM_LBUTTONDBLCLK:双击直接开面板
+                } else if m == WM_LBUTTONDBLCLK || m == 0x0202 {
+                    // 单击/双击都直接开面板（交互审查：主操作不要求用户知道双击约定，左键=主行为是托盘惯例）
                     ctx.handle_command(hwnd, MenuId::OpenDashboard as u32);
+                }
+            }
+            0
+        }
+        0x0113 => {
+            // WM_TIMER：同步 dashboard 健康旗标到 Error/Running 图标
+            //（dash 线程不能直接碰 UI；托盘三态此前是死代码，定性审查接线）
+            let failed = crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed);
+            let want = match failed {
+                1 => Some(TrayState::Error),
+                2 => Some(TrayState::Running),
+                _ => None,
+            };
+            if let Some(w) = want {
+                if let Some(c) = ctx.as_mut() {
+                    if c.state != w && c.state != TrayState::Paused {
+                        c.set_state(hwnd, w);
+                    }
                 }
             }
             0
@@ -357,6 +381,8 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
             return false;
         }
         ShowWindow(hwnd, SW_HIDE);
+        // 2s 轮询 dash 健康旗标（0x0113 分支同步 Error/Running 图标）
+        SetTimer(hwnd, 1, 2000, None);
 
         let Some(icons) = TrayIcons::create() else {
             eprintln!("kynoptic-tray: icon drawing failed");

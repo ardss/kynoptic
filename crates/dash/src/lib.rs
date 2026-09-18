@@ -484,6 +484,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     let presence_minutes = presence_day.presence_minutes;
     let automation_minutes = presence_day.automation_minutes;
     let mixed_minutes = presence_day.mixed_minutes;
+    // 对比上下文（定性审查：Overview 数字无比较像裸报表）：昨日同口径三指标
+    let yesterday = queries::date_offset_str(-1);
+    let yday = queries::classify_minutes(conn, &yesterday, s.presence_bridge_minutes);
     let first_presence = presence_day
         .first_activity
         .map(Value::from)
@@ -543,6 +546,8 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "presence_minutes": presence_minutes,
         "automation_minutes": automation_minutes,
         "mixed_minutes": mixed_minutes,
+        "presence_yesterday": yday.presence_minutes,
+        "automation_yesterday": yday.automation_minutes,
         "metrics_note": "口径：纯人分钟计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
         "unattended_fg_minutes": unattended_fg_minutes,
         "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes - mixed_minutes)，负值截 0（暂无分钟级前台采样）",
