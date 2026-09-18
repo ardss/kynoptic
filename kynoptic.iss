@@ -128,7 +128,8 @@ begin
     if not WizardIsTaskSelected('autostart') then begin
       // Wave17：先 /F 重建指向本次安装目录（旧任务可能指向旧 {app} 的死
       // 路径），再 DISABLE——[Run] 已按勾选门控，DISABLE 不再被覆盖。
-      RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "Kynoptic Watchdog" /TR "''" + ExpandConstant('{app}') + '\kynoptic-watchdog.exe'' watchdog --once"');
+      RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "Kynoptic Watchdog" /TR "' + Chr(39) +
+      ExpandConstant('{app}') + '\kynoptic-watchdog.exe' + Chr(39) + ' watchdog --once"');
       RegDeleteValue(HKEY_CURRENT_USER,
         'Software\Microsoft\Windows\CurrentVersion\Run', 'Kynoptic');
     end;
