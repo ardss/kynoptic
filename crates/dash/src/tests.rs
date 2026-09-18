@@ -146,8 +146,16 @@ fn status_reflects_last_event_ts() {
     assert_eq!(v["today"], json!(queries::today_local_str()));
     assert_eq!(v["read_only"], json!(true));
     assert_eq!(v["bind"], json!("127.0.0.1"));
-    // 审查 P2：db_path 只回文件名，不暴露全路径
+    // 审查 P2：db_path 只回文件名，不暴露全路径；db_dir_kind 只给目录类别
     assert_eq!(v["db_path"], json!("x.db"));
+    assert!(
+        matches!(
+            v["db_dir_kind"].as_str(),
+            Some("exe-relative data") | Some("user data")
+        ),
+        "db_dir_kind 应为类别提示而非路径: {}",
+        v["db_dir_kind"]
+    );
 }
 
 // === overview ===
@@ -517,6 +525,56 @@ fn settings_post_vk_frequency_bool_and_audit_log() {
     let log = std::fs::read_to_string(&audit).unwrap();
     assert_eq!(log.lines().count(), 1, "无变更不写审计: {log}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn audit_oversized_record_becomes_placeholder_not_half_json() {
+    // 审查 P2：超限记录整条丢弃并写占位 JSON，不得在 512 字节处把记录劈成两半
+    let dir = tmpdir("audit-trunc");
+    let db = dir.join("kyn.db");
+    let audit = dir.join("settings-audit.log");
+    // categories 100 条 × 256 字节 name → 摘要只记条数，仍很小；改用超长路径
+    // 无从下手——直接构造大变更：100 条 categories 各 256 字节规则名不会进
+    // 摘要（只记条数），所以改从 append_settings_audit 层注入超大 summary。
+    let huge_summary = format!("\"x\":\"{}\"", "y".repeat(2048));
+    append_settings_audit(&db, &huge_summary);
+    // 再写一条正常记录，确认日志行序与完整性不受影响
+    append_settings_audit(&db, r#"{"autostart":[false,true]}"#);
+    let log = std::fs::read_to_string(&audit).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "{log}");
+    let v: Value = serde_json::from_str(lines[0].split_once('\t').unwrap().1)
+        .expect("占位记录必须是完整 JSON");
+    assert_eq!(v["truncated_record"], json!(true));
+    assert!(v["len"].as_u64().unwrap() > 512, "{log}");
+    let v2: Value =
+        serde_json::from_str(lines[1].split_once('\t').unwrap().1).expect("正常记录完整 JSON");
+    assert_eq!(v2["autostart"], json!([false, true]));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn date_echo_is_sanitized_in_errors() {
+    // 审查 P2：400 回显只留字母数字与 '-'，截 32 字符
+    assert_eq!(sanitize_date_echo("2026-01-02"), "2026-01-02");
+    // 过滤掉了字符 → 以省略号标注"被净化"
+    assert_eq!(
+        sanitize_date_echo("<script>alert(1)</script>"),
+        "scriptalert1script…"
+    );
+    let long = "a".repeat(64);
+    let out = sanitize_date_echo(&long);
+    assert!(out.chars().count() <= 33, "{out}"); // 32 + 省略号
+    assert!(out.ends_with('…'));
+    let (code, _, body) = route_req(
+        &mem_conn(),
+        "GET",
+        "/api/summary?date=<script>alert(1)</script>",
+        "",
+        std::path::Path::new("kyn.db"),
+    );
+    assert_eq!(code, 400);
+    assert!(!body.contains("<script>"), "原始输入不得原样回显: {body}");
 }
 
 // === fuzz 加固：设置面输入校验 ===

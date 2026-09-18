@@ -250,6 +250,15 @@ fn cmd_export(args: &[String]) -> Result<()> {
     }
     let out_path = PathBuf::from(&out);
 
+    // 复用 is_reparse_point 防线（审查 P2）：导出目标若被换成 symlink/junction，
+    // File::create 会写穿到链接目标（覆盖任意用户文件）。命中即报错退出。
+    if is_reparse_point(&out_path) {
+        return Err(Error::InvalidData(format!(
+            "{} 是符号链接/junction，拒绝写入（防目录穿越；如非你本人设置请排查）",
+            out_path.display()
+        )));
+    }
+
     // window_title 默认输出原文（本地数据完整优先）；--redact 显式开启才剥查询串
     let title_out = |t: &Option<String>| -> String {
         let t = t.clone().unwrap_or_default();
@@ -1387,6 +1396,14 @@ const WATCHDOG_LOG_FILE: &str = "watchdog.log";
 const HEARTBEAT_MAX_AGE_SECS: i64 = 180;
 /// 看门狗状态文件（exe 同目录，记录连续拉起失败计数与退避窗口）
 const WATCHDOG_STATE_FILE: &str = "watchdog-state.json";
+/// 看门狗互斥锁文件（exe 同目录，审查 P2：防两个 watchdog 进程并发
+/// 读-改-写 watchdog-state.json——temp 写 + rename 的原子替换虽不会留下
+/// 半截 JSON,但两个写者互相覆盖时失败计数/退避窗口仍会凭空回退,熔断
+/// 可被并发写绕过）。create_new 独占创建是原子裁决点。
+const WATCHDOG_LOCK_FILE: &str = "watchdog.lock";
+/// 锁文件新鲜期：mtime 距今不超过该秒数视为另一个实例活跃;超过则认定
+/// 上次进程崩溃未清理（所有正常退出路径都会删锁）,接管覆盖。
+const WATCHDOG_LOCK_STALE_SECS: u64 = 120;
 /// watchdog.log 轮转后缀（覆盖式改名 watchdog.log.old）
 const WATCHDOG_LOG_OLD_SUFFIX: &str = ".old";
 /// watchdog.log 轮转阈值：1MB
@@ -1425,21 +1442,52 @@ fn heartbeat_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(HEARTBEAT_FILE))
 }
 
-/// 心跳新鲜度判定：内容应为 RFC3339 时间戳，返回距今秒数。
-/// 缺失/解析失败返回 None（调用方按"过期"处理）；时钟回拨按 0 处理。
-fn heartbeat_age_secs(now: chrono::DateTime<Utc>, content: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(content.trim())
-        .ok()
-        .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+/// 心跳内容解析（审查 P1：内容升级为 JSON `{"pid","ts","flush","stalled"}`，
+/// 兼容旧版纯 RFC3339 文本）。返回 (内容时间戳, 是否 stalled)。
+/// JSON 解析失败按旧格式回退——两代 tray 滚动升级期互不误判。
+fn heartbeat_parse(content: &str) -> (Option<chrono::DateTime<Utc>>, bool) {
+    let trimmed = content.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let ts = v
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc));
+        let stalled = v.get("stalled").and_then(|s| s.as_bool()).unwrap_or(false);
+        (ts, stalled)
+    } else {
+        (
+            chrono::DateTime::parse_from_rfc3339(trimmed)
+                .ok()
+                .map(|d| d.with_timezone(&Utc)),
+            false,
+        )
+    }
 }
 
-/// 心跳是否过期（缺失/不可解析/超龄都算过期）。
+/// 心跳新鲜度判定：内容为 RFC3339 时间戳（或 JSON 的 ts 字段），返回距今秒数。
+/// 缺失/解析失败返回 None（调用方按"过期"处理）；时钟回拨按 0 处理。
+fn heartbeat_age_secs(now: chrono::DateTime<Utc>, content: &str) -> Option<i64> {
+    heartbeat_parse(content)
+        .0
+        .map(|t| (now - t).num_seconds().max(0))
+}
+
+/// 心跳是否过期（缺失/不可解析/超龄/stalled 都算过期）。
+/// 审查 P1：stalled=true 表示 tray 自报"采集器在跑但 writer 停滞超 300s"，
+/// 属采集挂死而非进程死亡——必须同样触发 kill/重启路径。
 fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
     match content {
-        Some(c) => match heartbeat_age_secs(now, c) {
-            Some(age) => age > HEARTBEAT_MAX_AGE_SECS,
-            None => true,
-        },
+        Some(c) => {
+            let (_, stalled) = heartbeat_parse(c);
+            if stalled {
+                return true;
+            }
+            match heartbeat_age_secs(now, c) {
+                Some(age) => age > HEARTBEAT_MAX_AGE_SECS,
+                None => true,
+            }
+        }
         None => true,
     }
 }
@@ -1479,11 +1527,40 @@ fn rotated_log_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name(name)
 }
 
-/// 大小超阈值时执行轮转（改名覆盖 .old，失败忽略——日志是尽力而为语义）。
+/// 大小超阈值时执行轮转（改名覆盖 .old，日志是尽力而为语义）。
+///
+/// 审查 P2：并发句柄下 rename 会失败——Windows 上任何进程（含另一个
+/// watchdog 实例）持有 append 打开的 watchdog.log 时改名即报错,旧实现
+/// 单次失败即放弃,文件永远超限增长。改为重试 3 次（间隔 250ms,给并发
+/// 句柄收尾窗口）;仍失败则退化为截断当前日志（OpenOptions truncate）——
+/// 丢历史但保住日志通道可用。轮转各阶段失败均打 stderr 留痕（计划任务
+/// 下无 console,尽力而为）。
 fn rotate_log_if_needed(log_path: &Path) {
     let size = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
-    if needs_log_rotation(size) {
-        let _ = std::fs::rename(log_path, rotated_log_path(log_path));
+    if !needs_log_rotation(size) {
+        return;
+    }
+    let target = rotated_log_path(log_path);
+    for attempt in 1..=3 {
+        match std::fs::rename(log_path, &target) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("watchdog: 日志轮转 rename 失败(第 {attempt}/3 次): {e}");
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    }
+    // rename 三次均失败（并发句柄持续锁住）：截断当前日志兜底,新内容由
+    // 调用方 watchdog_log 紧接着 append 写入,日志通道不中断。
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+    {
+        Ok(_) => eprintln!("watchdog: rename 失败,已退化为截断 watchdog.log"),
+        Err(e) => eprintln!("watchdog: 日志轮转完全失败(rename+truncate 均败): {e}"),
     }
 }
 
@@ -1514,6 +1591,45 @@ fn watchdog_state_path() -> PathBuf {
     exe_dir()
         .map(|d| d.join(WATCHDOG_STATE_FILE))
         .unwrap_or_else(|| PathBuf::from(WATCHDOG_STATE_FILE))
+}
+
+/// 看门狗锁文件路径（exe 同目录,与状态文件同锚点）
+fn watchdog_lock_path() -> PathBuf {
+    exe_dir()
+        .map(|d| d.join(WATCHDOG_LOCK_FILE))
+        .unwrap_or_else(|| PathBuf::from(WATCHDOG_LOCK_FILE))
+}
+
+/// 尝试获取看门狗锁（审查 P2）。返回 Some(锁路径) = 获得锁;None = 已有
+/// 活跃实例,调用方应静默退出（不打日志不写状态,避免与在跑实例互踩）。
+/// 规则:锁存在且 mtime < 120s → 另一实例活跃;锁存在且陈旧 → 上次崩溃
+/// 残留,删除接管;create_new 独占创建失败（竞态输了）→ 视为活跃。
+fn acquire_watchdog_lock() -> Option<PathBuf> {
+    let path = watchdog_lock_path();
+    if let Ok(meta) = std::fs::metadata(&path) {
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() < WATCHDOG_LOCK_STALE_SECS)
+            // mtime 不可得时保守视为活跃（宁可不跑,不能双跑）
+            .unwrap_or(true);
+        if fresh {
+            return None;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()
+        .map(|_| path)
+}
+
+/// 释放看门狗锁（尽力而为;正常退出路径都必须调用,含 --once 单次模式）。
+fn release_watchdog_lock(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// 读状态；文件缺失/损坏一律回退缺省（计数丢失可接受，不能因此拒绝工作）。
@@ -1556,6 +1672,8 @@ enum SpawnOutcome {
     Pending,
     /// 心跳在拉起后被刷新过（托盘确实跑起来过）
     Recovered,
+    /// 疑似观察窗横跨了系统睡眠——本轮跳过，不计失败（审查 P2）
+    SuspendSuspicion,
     /// 观察窗已过且心跳从未刷新（典型：托盘启动即崩）——记一次失败
     Failed,
 }
@@ -1569,14 +1687,28 @@ fn judge_spawn_outcome(
     if last_spawn_epoch == 0 {
         return SpawnOutcome::Recovered; // 无进行中的拉起
     }
+    // 审查 P2 判序修复：mtime 前进即成功，优先于观察窗判定。旧实现先看
+    // 90s 墙钟再验 mtime——wall clock 穿越睡眠照常流逝，"睡眠期间拉起、
+    // 醒来 mtime 明明已前进"也会先因 90s 未满被 Pending/误判。mtime 是墙
+    // 钟盖章，拉起后哪怕只前进 1 秒也证明托盘心跳线程活着。
+    if hb_mtime_epoch > hb_at_spawn_epoch {
+        return SpawnOutcome::Recovered;
+    }
     if now_epoch - last_spawn_epoch < SPAWN_GRACE_SECS {
         return SpawnOutcome::Pending;
     }
-    if hb_mtime_epoch > hb_at_spawn_epoch {
-        SpawnOutcome::Recovered
-    } else {
-        SpawnOutcome::Failed
+    // 审查 P2 睡眠误判守卫：mtime 未前进且墙钟已过观察窗时,若"拉起时刻的
+    // 心跳 mtime → 现在"的墙钟跨度远超观察窗（> 4×90s）,大概率是机器在
+    // 观察窗内睡了一觉（墙钟与文件时间一起跳变,托盘没机会写心跳）——
+    // 跳过本次判定不记失败。上限 24×（约 36 分钟）兜底:真正秒死的托盘在
+    // 无睡眠的长跨度下最终仍会走到 Failed,不会因本守卫永久豁免。
+    if hb_at_spawn_epoch > 0
+        && now_epoch - hb_at_spawn_epoch > SPAWN_GRACE_SECS * 4
+        && now_epoch - hb_at_spawn_epoch <= SPAWN_GRACE_SECS * 24
+    {
+        return SpawnOutcome::SuspendSuspicion;
     }
+    SpawnOutcome::Failed
 }
 
 /// 指数退避时长（纯函数）：失败次数未达阈值不退避（0）；达到后按档位
@@ -1663,6 +1795,14 @@ fn watchdog_tick(
                 SpawnDecision::SkipBackoff(r) => TickAction::SkipBackoff(r),
             }
         }
+        SpawnOutcome::SuspendSuspicion => {
+            // 审查 P2：疑似观察窗横跨系统睡眠——不记失败也不下结论,与
+            // Pending 同样跳过本轮;托盘若活着,醒来后心跳 mtime 前进,下一
+            // 轮自然走 Recovered。
+            log::warn!("疑似睡眠唤醒，跳过本次判定");
+            state.observation_skips = state.observation_skips.saturating_add(1);
+            TickAction::SkipObservation
+        }
         SpawnOutcome::Failed => {
             state.consecutive_failures += 1;
             state.last_spawn_epoch = 0;
@@ -1689,16 +1829,19 @@ fn mark_spawned(state: &mut WatchdogState, now_epoch: i64, hb_mtime: i64) {
 /// 睡眠唤醒守卫的复查判定（纯函数，单测覆盖）：首次发现异常后等待
 /// STALE_RECHECK_WAIT_SECS 再复查。
 ///
-/// 心跳读取三态语义（P1 修复"挂死 tray 永不重启"）：
-/// - `HeartbeatRead::Age` — 文件可读且内容是合法 RFC3339，携带距今年龄
+/// 心跳读取四态语义（P1 修复"挂死 tray 永不重启"；审查 P1 增补 Stalled）：
+/// - `HeartbeatRead::Age` — 文件可读、内容时间戳合法且未自报 stalled，携带距今年龄
+/// - `HeartbeatRead::Stalled` — 内容合法（JSON）但 stalled=true：tray 进程活着、
+///   心跳线程照常写,但采集 writer 停滞超 300s（采集挂死）——按过期处理
 /// - `HeartbeatRead::Missing` — 文件不存在
 /// - `HeartbeatRead::Unparseable` — 文件存在但解析失败
 ///
 /// 策略区分（tray 每 30s 全量重写心跳文件）：
 /// - 复查回到阈值内 = 睡眠唤醒假象，放行；
 /// - 复查仍超龄（无论是否继续增长）= 心跳 40s 未刷新且超龄，判挂死 kill；
+/// - 复查仍 Stalled = 采集持续停滞（core last_flush_epoch 不前进），判挂死 kill；
 /// - 复查仍 Missing = 写方已死或文件被删，未恢复，kill；
-/// - 复查仍 Unparseable = tray 只写合法 RFC3339，垃圾内容说明写路径损坏，未恢复，kill。
+/// - 复查仍 Unparseable = tray 只写合法内容，垃圾说明写路径损坏，未恢复，kill。
 ///
 /// 旧实现 `age_recheck > age_first && age_recheck > MAX` 在首查与复查都是
 /// i64::MAX（文件持续不可读）时恒假，挂死 tray 永不 kill（4-8 小时空洞）。
@@ -1708,6 +1851,8 @@ enum HeartbeatRead {
     Missing,
     /// 文件存在但内容非法
     Unparseable,
+    /// 内容合法但 tray 自报采集停滞（stalled=true）
+    Stalled,
     /// 合法时间戳，距今年龄（秒）
     Age(i64),
 }
@@ -1717,6 +1862,8 @@ fn recheck_should_kill(_first: HeartbeatRead, recheck: HeartbeatRead) -> bool {
         HeartbeatRead::Age(a) if a <= HEARTBEAT_MAX_AGE_SECS => false,
         // 仍超龄（含与首次持平的停滞）：两次间隔 40s 都异常,判挂死
         HeartbeatRead::Age(_) => true,
+        // 审查 P1：复查仍 stalled = 采集持续停滞（进程活着也没用）,判挂死
+        HeartbeatRead::Stalled => true,
         // 持续缺失/持续不可解析 = 未恢复（旧 bug 即漏掉这一分支）
         HeartbeatRead::Missing | HeartbeatRead::Unparseable => true,
     }
@@ -1724,14 +1871,19 @@ fn recheck_should_kill(_first: HeartbeatRead, recheck: HeartbeatRead) -> bool {
 
 /// 心跳读取分类（纯函数）：content=None 即文件缺失;解析失败归 Unparseable
 /// （首查按 Missing/Unparseable 都视同过期触发复查,区别只在日志与策略注释,
-/// recheck 判定两者等价）。
+/// recheck 判定两者等价）。审查 P1：JSON 内容 stalled=true 归 Stalled——
+/// 时间戳新鲜但采集挂死,同样走 kill/重启路径。
 fn classify_heartbeat(content: Option<&str>, now: chrono::DateTime<Utc>) -> HeartbeatRead {
     match content {
         None => HeartbeatRead::Missing,
-        Some(c) => match heartbeat_age_secs(now, c) {
-            Some(age) => HeartbeatRead::Age(age),
-            None => HeartbeatRead::Unparseable,
-        },
+        Some(c) => {
+            let (ts, stalled) = heartbeat_parse(c);
+            match ts {
+                Some(_) if stalled => HeartbeatRead::Stalled,
+                Some(t) => HeartbeatRead::Age((now - t).num_seconds().max(0)),
+                None => HeartbeatRead::Unparseable,
+            }
+        }
     }
 }
 
@@ -1778,6 +1930,13 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             .collect();
         let exit_flag = exit_flag_path();
         let mut state = load_watchdog_state();
+        // 审查 P2：并发 watchdog 互斥锁。拿不到锁 = 已有实例活跃,静默退出
+        //（不写日志不写状态——写了也会和在跑实例互相覆盖）。锁在所有退出
+        // 路径释放（含 --once 单次模式）。
+        let lock_path = match acquire_watchdog_lock() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
         loop {
             let now_epoch = Utc::now().timestamp();
             let running = unsafe {
@@ -1801,8 +1960,9 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 let first_stale = heartbeat_stale(Utc::now(), hb_read.as_deref());
                 if first_stale {
                     // 睡眠唤醒守卫：等待 40s 后复查（纯函数 recheck_should_kill）
+                    // 审查 P1：stalled=true（tray 自报采集停滞）也走此复查路径
                     watchdog_log(&format!(
-                        "心跳缺失/不可读或超龄(>{HEARTBEAT_MAX_AGE_SECS}s), 疑似睡眠唤醒/挂死, {STALE_RECHECK_WAIT_SECS}s 后复查"
+                        "心跳缺失/不可读/超龄(>{HEARTBEAT_MAX_AGE_SECS}s)/采集停滞(stalled), 疑似睡眠唤醒/挂死, {STALE_RECHECK_WAIT_SECS}s 后复查"
                     ));
                     std::thread::sleep(std::time::Duration::from_secs(STALE_RECHECK_WAIT_SECS));
                     let still_running = unsafe {
@@ -1937,6 +2097,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 }
             }
             if once {
+                release_watchdog_lock(&lock_path);
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_secs(15));
@@ -2469,29 +2630,73 @@ mod tests {
 
     #[test]
     fn judge_spawn_outcome_pending_recovered_failed() {
-        let hb_at_spawn = 1000;
+        // 基准取真实 unix 秒量级:审查 P2 的睡眠守卫以 4×观察窗(360s)为下界,
+        // 旧的 1000/2000 小整数会撞进守卫窗口被豁免,必须用真实尺度测 Failed。
+        let base = 1_700_000_000i64;
+        let hb_at_spawn = base;
         // 无进行中的拉起 → Recovered（无观察窗）
         assert!(matches!(
-            judge_spawn_outcome(0, 2000, 0, 0),
+            judge_spawn_outcome(0, base + 1000, 0, 0),
             SpawnOutcome::Recovered
         ));
         // 观察窗未到 → Pending（即使心跳没刷新也不下结论）
         assert!(matches!(
-            judge_spawn_outcome(2000, 2000 + SPAWN_GRACE_SECS - 1, 1000, hb_at_spawn),
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS - 1, base, hb_at_spawn),
             SpawnOutcome::Pending
+        ));
+        // 审查 P2 判序修复：mtime 在拉起后前进 → 立即 Recovered,哪怕墙钟
+        // 观察窗未满（旧实现先看 90s 墙钟,睡眠横跨观察窗时会误判）
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS - 30, base + 5, hb_at_spawn),
+            SpawnOutcome::Recovered
         ));
         // 观察窗已过 + 心跳被刷新过 → Recovered（托盘跑起来过）
         assert!(matches!(
-            judge_spawn_outcome(2000, 2000 + SPAWN_GRACE_SECS, 1001, hb_at_spawn),
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS, base + 1, hb_at_spawn),
             SpawnOutcome::Recovered
         ));
-        // 观察窗已过 + 心跳从未刷新（mtime 未变/文件缺失）→ Failed
+        // 观察窗已过 + 心跳从未刷新 + 跨度落在睡眠守卫窗口(4×,24×]内 →
+        // SuspendSuspicion（疑似观察窗横跨睡眠,跳过不记失败）。
+        // 注意跨度从 hb_at_spawn 起算：这里用 5×观察窗（在 (4×,24×] 内）。
         assert!(matches!(
-            judge_spawn_outcome(2000, 2000 + SPAWN_GRACE_SECS, hb_at_spawn, hb_at_spawn),
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 5, base, hb_at_spawn),
+            SpawnOutcome::SuspendSuspicion
+        ));
+        // 跨度恰在观察窗刚过但守卫下界之前（<4×）→ 正常结算 Failed
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 2, base, hb_at_spawn),
+            SpawnOutcome::Failed
+        ));
+        // 跨度超出守卫上限（> 24×观察窗）:真死托盘最终必须结算 Failed
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 30, base, hb_at_spawn),
             SpawnOutcome::Failed
         ));
         assert!(matches!(
-            judge_spawn_outcome(2000, 3000, 0, hb_at_spawn),
+            judge_spawn_outcome(base, base + 5000, 0, hb_at_spawn),
+            SpawnOutcome::Failed
+        ));
+    }
+
+    #[test]
+    fn judge_spawn_suspicion_window_bounds() {
+        // 审查 P2 睡眠守卫边界：跨度落在 (4×, 24×] 观察窗内跳过判定;
+        // hb_at_spawn==0（心跳从未存在的 stub 场景）不豁免,照常 Failed。
+        let base = 1_700_000_000i64;
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 4 + 1, base, base),
+            SpawnOutcome::SuspendSuspicion
+        ));
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 24, base, base),
+            SpawnOutcome::SuspendSuspicion
+        ));
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 24 + 1, base, base),
+            SpawnOutcome::Failed
+        ));
+        assert!(matches!(
+            judge_spawn_outcome(base, base + SPAWN_GRACE_SECS * 30, 0, 0),
             SpawnOutcome::Failed
         ));
     }
@@ -2683,6 +2888,41 @@ mod tests {
         assert!(matches!(
             classify_heartbeat(Some(&(now - Duration::seconds(5)).to_rfc3339()), now),
             HeartbeatRead::Age(5) | HeartbeatRead::Age(4)
+        ));
+    }
+
+    #[test]
+    fn classify_heartbeat_json_content_and_stalled() {
+        // 审查 P1：JSON 心跳（tray 新格式）——ts 提供年龄,stalled 决定分类
+        let now = Utc::now();
+        let fresh = (now - Duration::seconds(10)).to_rfc3339();
+        let healthy = format!(r#"{{"pid":1,"ts":"{fresh}","flush":0,"stalled":false}}"#);
+        assert!(matches!(
+            classify_heartbeat(Some(&healthy), now),
+            HeartbeatRead::Age(10) | HeartbeatRead::Age(9)
+        ));
+        // stalled=true：时间戳再新鲜也归 Stalled（采集挂死,按过期处理）
+        let stalled = format!(r#"{{"pid":1,"ts":"{fresh}","flush":123,"stalled":true}}"#);
+        assert_eq!(
+            classify_heartbeat(Some(&stalled), now),
+            HeartbeatRead::Stalled
+        );
+        // 旧版纯时间戳内容仍兼容
+        assert!(matches!(
+            classify_heartbeat(Some(&fresh), now),
+            HeartbeatRead::Age(10) | HeartbeatRead::Age(9)
+        ));
+        // heartbeat_stale 对 stalled 必须判过期（首查触发 40s 复查路径）
+        assert!(heartbeat_stale(now, Some(&stalled)));
+        assert!(!heartbeat_stale(now, Some(&healthy)));
+        // 复查仍 stalled → kill;首查 stalled、复查恢复 → 放行
+        assert!(recheck_should_kill(
+            HeartbeatRead::Stalled,
+            HeartbeatRead::Stalled
+        ));
+        assert!(!recheck_should_kill(
+            HeartbeatRead::Stalled,
+            HeartbeatRead::Age(5)
         ));
     }
 

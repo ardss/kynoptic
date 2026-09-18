@@ -4,8 +4,12 @@
 //! [`crate::collector::CollectorSettings::input_granularity`] 设为 [`InputGranularity::Minute`]
 //! 时，Hook 回调退化为纯原子计数（本模块 `record_*`），由采集器的聚合线程每秒
 //! drain 一次、按**本地分钟桶**折叠成每桶一行的 `input_agg` 计数型事件：
-//! - keyboard 行：`{"keys": K, "samples": S}`
-//! - mouse 行：`{"clicks": C, "scroll_ticks": T, "moves": M, "move_distance_px": D, "samples": S}`
+//! - keyboard 行：`{"keys": K, "samples": S, "final": F}`
+//! - mouse 行：`{"clicks": C, "scroll_ticks": T, "moves": M, "move_distance_px": D, "samples": S, "final": F}`
+//!
+//! `final`（审查 P1）：true = 该分钟已完整的终值行（由后续 drain 折叠）；
+//! false = 秒级快照/关停部分行。重启时据此判定"抑制"还是"合并续写"
+//! （见 [`clear_restart_suppression`]）。
 //!
 //! 下游计数查询（queries::*）对两种形态统一兼容（见 queries::KEYS_ROW_EXPR）。
 //! 计数语义保持：APM、活跃分钟、daily_agg 等只依赖计数，不受粒度影响；
@@ -54,6 +58,19 @@ fn set_minute_mode(on: bool) {
 }
 
 static KEYS: AtomicU64 = AtomicU64::new(0);
+/// 最近一次输入事件所在分钟（UTC 纪元分钟；0 = 无记录）。Hook 回调侧廉价
+/// 维护（一次 SystemTime::now + 一次原子 store），供聚合线程把 drain 到的
+/// 计数归入**事件时间分钟**而非 drain 执行分钟（审查：聚合线程停滞/换页
+/// 卡顿跨过分钟边界时，旧实现把上一分钟的计数记进新分钟桶，分钟图偏移）。
+static LAST_EVENT_EPOCH_MIN: AtomicU64 = AtomicU64::new(0);
+
+fn note_event_epoch_now() {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    LAST_EVENT_EPOCH_MIN.store(secs / 60, Ordering::Relaxed);
+}
 static CLICKS: AtomicU64 = AtomicU64::new(0);
 /// per-key 频次（vk code 0..255 各一个原子计数）。只存"每个键按了多少次"，
 /// 不存内容、顺序、时间戳——与计数红线同口径（WhatPulse 式键盘热力图数据源）。
@@ -112,6 +129,7 @@ pub fn record_key() {
     KEYS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
     KEY_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    note_event_epoch_now();
 }
 
 /// 键盘按下并带 vk code（minute 模式热力图路径）。
@@ -121,6 +139,7 @@ pub fn record_key_vk(vk: u32, injected: bool) {
     KEYS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
     KEY_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    note_event_epoch_now();
     if injected {
         INJECTED_KEYS.fetch_add(1, Ordering::Relaxed);
     }
@@ -135,6 +154,7 @@ pub fn record_key_vk(vk: u32, injected: bool) {
 pub fn record_click_button(button: usize, injected: bool) {
     CLICKS.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    note_event_epoch_now();
     if injected {
         INJECTED_CLICKS.fetch_add(1, Ordering::Relaxed);
     }
@@ -147,6 +167,7 @@ pub fn record_click_button(button: usize, injected: bool) {
 pub fn record_scroll(ticks: u64) {
     SCROLL_TICKS.fetch_add(ticks, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    note_event_epoch_now();
 }
 
 /// 鼠标移动（每事件记录：不做节流——原子计数无洪泛风险，且距离统计更准确）。
@@ -159,6 +180,7 @@ pub fn record_move(x: i32, y: i32) {
     }
     MOVES.fetch_add(1, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
+    note_event_epoch_now();
 }
 
 // ─── 聚合线程侧（每秒一次 drain；关停时 flush_partial） ───────────────────────
@@ -191,7 +213,7 @@ impl MinuteCounters {
             && self.samples == 0
     }
 
-    fn add(&mut self, o: MinuteCounters) {
+    fn add(&mut self, o: &MinuteCounters) {
         self.keys += o.keys;
         self.keys_samples += o.keys_samples;
         self.clicks += o.clicks;
@@ -201,11 +223,11 @@ impl MinuteCounters {
         self.moves += o.moves;
         self.move_dist_px += o.move_dist_px;
         self.samples += o.samples;
-        for (k, v) in o.vk {
-            if let Some(e) = self.vk.iter_mut().find(|(k2, _)| *k2 == k) {
-                e.1 += v;
+        for (k, v) in o.vk.iter() {
+            if let Some(e) = self.vk.iter_mut().find(|(k2, _)| *k2 == *k) {
+                e.1 += *v;
             } else {
-                self.vk.push((k, v));
+                self.vk.push((*k, *v));
             }
         }
         for i in 0..5 {
@@ -229,6 +251,22 @@ impl MinuteKey {
                 .and_then(|t| t.with_nanosecond(0))
                 .unwrap_or(now),
         }
+    }
+
+    /// 事件时间分钟：纪元分钟 -> 本地分钟桶，超过 `cap`（当前分钟，防时钟
+    /// 回拨/超前）时钳到 `cap`。纪元分钟 <= 0 视为无记录返回 None。
+    fn from_epoch_min(mins: i64, cap: &MinuteKey) -> Option<Self> {
+        if mins <= 0 {
+            return None;
+        }
+        chrono::DateTime::from_timestamp(mins * 60, 0).map(|t| {
+            let k = MinuteKey::of(t.with_timezone(&Local));
+            if k.start_local > cap.start_local {
+                *cap
+            } else {
+                k
+            }
+        })
     }
 
     fn timestamp_rfc3339(&self) -> String {
@@ -274,7 +312,12 @@ fn drain_atomics() -> MinuteCounters {
 }
 
 /// 把 `counters` 折叠为该分钟的 input_agg 事件（键盘/鼠标各一行，空桶跳过）。
-fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
+///
+/// `final_row`（审查 P1：硬杀后的部分分钟快照残行修复）：true = 该分钟已完整
+/// （由后续 drain 折叠的终值行）；false = 秒级快照 / flush_partial 的部分行。
+/// 随行落库为 `$.final`，供重启时判定"抑制"还是"合并续写"（见
+/// [`clear_restart_suppression`] 与 collector 启动查询）。
+fn events_for(key: MinuteKey, c: &MinuteCounters, final_row: bool) -> Vec<Event> {
     let mut out = Vec::with_capacity(2);
     if c.is_empty() {
         return out;
@@ -291,6 +334,7 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
             "samples": c.keys_samples,
             "keys_samples": c.keys_samples,
             "vk": vk_map,
+            "final": final_row,
         });
         if c.injected_keys > 0 {
             kd["injected_keys"] = serde_json::json!(c.injected_keys);
@@ -313,6 +357,7 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
             "clicks_middle": c.buttons[2],
             "clicks_side1": c.buttons[3],
             "clicks_side2": c.buttons[4],
+            "final": final_row,
         });
         if c.injected_clicks > 0 {
             md["injected_clicks"] = serde_json::json!(c.injected_clicks);
@@ -332,23 +377,29 @@ fn events_for(key: MinuteKey, c: &MinuteCounters) -> Vec<Event> {
 }
 
 /// 聚合线程每秒调用：把原子计数 drain 进当前分钟桶；
-/// 若已跨入新分钟，把上一个完整分钟折叠成 input_agg 事件返回。
+/// 若已跨入新分钟，把上一个完整分钟折叠成 input_agg 事件（`$.final: true`）。
+///
+/// 事件时间分桶（审查）：本批计数的落桶分钟取自 `LAST_EVENT_EPOCH_MIN`
+/// （钳到当前分钟），聚合线程停滞跨分钟时计数仍归入事件发生的那一分钟。
 pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
+    // 先取事件时间再 drain 原子计数（顺序保证两者对应同一批事件）
+    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
     let drained = drain_atomics();
     let cur = MinuteKey::of(now_local);
+    let evt_key = MinuteKey::from_epoch_min(last_evt as i64, &cur).unwrap_or(cur);
     let mut out = Vec::new();
     // 锁中毒不应静默清零输入统计（审查 P2）：取回内部数据继续
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
     {
         // 抑制判定绑定具体分钟（二轮审查：裸布尔在 rollover/None 分支清不掉）
-        let suppressing = matches!(&*sup, Some(k) if *k == cur);
+        let suppressing_cur = matches!(&*sup, Some(k) if *k == cur);
         match g.take() {
             Some((key, mut acc)) if key == cur => {
-                acc.add(drained);
+                acc.add(&drained);
                 // 秒级可见：只要本分钟有输入，就把累计值整行 UPSERT（下游幂等覆盖）
-                if !acc.is_empty() && !suppressing {
-                    out = events_for(key, &acc);
+                if !acc.is_empty() && !suppressing_cur {
+                    out = events_for(key, &acc, false);
                 }
                 *g = Some((key, acc));
             }
@@ -357,24 +408,41 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
                 // 旧实现比较 sup == cur，rollover 时被折叠的是上一分钟，
                 // 抑制永不命中 → 重启后被抑制分钟的计数照常写出）。
                 let suppressing = matches!(&*sup, Some(k) if *k == key);
+                let mut acc = acc;
+                // 事件时间分桶：本批事件若仍属于被折叠的分钟（线程停滞跨
+                // 分钟收集），并入后再折叠——计数落在事件时间分钟
+                let merged_into_fold = evt_key == key;
+                if merged_into_fold {
+                    acc.add(&drained);
+                }
                 // 被抑制分钟攒的计数**直接丢弃**——它们是重启后
                 // 的小值，写出去会把库里上一会话的大终值覆盖回小值
                 if !suppressing {
-                    out = events_for(key, &acc);
+                    out = events_for(key, &acc, true);
                 }
                 *sup = None;
-                *g = Some((cur, drained));
+                if evt_key == cur {
+                    *g = Some((cur, drained));
+                } else if merged_into_fold {
+                    *g = Some((cur, MinuteCounters::default()));
+                } else {
+                    // 迟到事件属于更早的未建桶分钟：为该分钟开桶
+                    *g = Some((evt_key, drained));
+                }
             }
             None => {
-                *g = Some((cur, drained));
+                *g = Some((evt_key, drained));
             }
         }
     }
     out
 }
 
-/// 关停兜底：把当前**未满**分钟的部分计数立即折叠成事件（不留到下一分钟）。
+/// 关停兜底：把当前**未满**分钟的部分计数立即折叠成事件（不留到下一分钟；
+/// 行带 `$.final: false`，重启时可识别为部分快照）。
 pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
+    // 先取事件时间再 drain 原子计数（与 drain 同序）
+    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
     let drained = drain_atomics();
     let cur = MinuteKey::of(now_local);
     // 统一锁获取顺序：先 PENDING 再 SUPPRESS（与 drain 一致，审查 P2：
@@ -388,12 +456,16 @@ pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
     }
     let (key, mut acc) = match g.take() {
         Some((k, a)) => (k, a),
-        None => (cur, MinuteCounters::default()),
+        // 无 pending 桶时按**最后一次活动的分钟**（钳到当前）落桶，避免
+        // 关停路径把最后几秒的计数归错分钟（事件时间分桶，审查）
+        None => MinuteKey::from_epoch_min(last_evt as i64, &cur)
+            .map(|k| (k, MinuteCounters::default()))
+            .unwrap_or((cur, MinuteCounters::default())),
     };
     // 极端兜底：pending 桶与当前分钟不一致（聚合线程刚 rollover 但事件
     // 尚未落库），以 pending 桶为准输出，避免把计数归错分钟。
-    acc.add(drained);
-    events_for(key, &acc)
+    acc.add(&drained);
+    events_for(key, &acc, false)
 }
 
 /// 重置全部聚合状态（采集器启动/重启时调用，避免跨会话串数）。
@@ -413,6 +485,7 @@ pub fn reset() {
     INJECTED_CLICKS.store(0, Ordering::Relaxed);
     KEY_SAMPLES.store(0, Ordering::Relaxed);
     PREV_POS.store(0, Ordering::Relaxed);
+    LAST_EVENT_EPOCH_MIN.store(0, Ordering::Relaxed);
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     *g = None;
 }
@@ -422,6 +495,18 @@ pub(crate) fn activate() {
     set_minute_mode(true);
     let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
     *sup = Some(MinuteKey::of(chrono::Local::now()));
+}
+
+/// 取消本会话的重启分钟抑制（合并续写模式，审查 P1：硬杀后部分分钟快照修复）。
+///
+/// 默认 [`activate`] 会抑制"当前分钟"——重启后秒级小快照会把库里已存的
+/// 大终值覆盖回小值。但若库里该分钟只有**部分快照**（`$.final` 非 true，
+/// 即上次会话被硬杀、终值从未写出），抑制会把那部分计数整体丢弃：此时应
+/// 改为合并续写。是否可抑制由 collector 启动时查库判定（`$.final` 为 true
+/// 或该分钟无行才保持抑制），判定通过后调用本函数解除。
+pub fn clear_restart_suppression() {
+    let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
+    *sup = None;
 }
 
 #[cfg(test)]
@@ -620,6 +705,79 @@ mod tests {
         assert!(
             evts.is_empty(),
             "空分钟不应写行（活跃分钟语义依赖行的存在）"
+        );
+    }
+
+    /// 审查 P1（硬杀部分快照修复）：`$.final` 区分"完整分钟终值"与
+    /// "秒级快照/关停部分行"，供重启时判定抑制还是合并续写。
+    #[test]
+    fn final_flag_distinguishes_complete_minute_from_partial() {
+        let _g = guard();
+        reset();
+        // 事件时间分桶语义下，事件落桶分钟由 LAST_EVENT_EPOCH_MIN 决定
+        //（record_* 写真实时钟，测试需显式注入事件时间）。
+        let t0 = local_min(2026, 6, 15, 10, 30);
+        let t0_min = (t0.with_timezone(&Utc).timestamp() / 60) as u64;
+        let t1 = local_min(2026, 6, 15, 10, 31);
+        let t1_min = (t1.with_timezone(&Utc).timestamp() / 60) as u64;
+        let t2 = local_min(2026, 6, 15, 10, 32);
+        let t2_min = (t2.with_timezone(&Utc).timestamp() / 60) as u64;
+
+        // 场景一：未满分钟关停 flush → $.final = false（部分快照）
+        record_key();
+        LAST_EVENT_EPOCH_MIN.store(t0_min, Ordering::Relaxed);
+        let evts = flush_partial(t0);
+        let kb = evts
+            .iter()
+            .find(|e| e.event_type == EventType::Keyboard)
+            .expect("keyboard row (partial)");
+        assert_eq!(
+            kb.event_data
+                .as_ref()
+                .unwrap()
+                .get("final")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "flush_partial 行必须是部分快照（final=false）"
+        );
+
+        // 场景二：10:31 的事件随 10:32 的 drain 折叠 → 终值行 final=true
+        record_key();
+        LAST_EVENT_EPOCH_MIN.store(t1_min, Ordering::Relaxed);
+        // 先跑一次 10:31 的 drain：建桶（部分可见行 final=false）
+        let _ = drain(t1);
+        // 10:32 的 drain 触发 rollover：10:31 折叠为终值
+        record_key();
+        LAST_EVENT_EPOCH_MIN.store(t2_min, Ordering::Relaxed);
+        let evts = drain(t2);
+        let kb = evts
+            .iter()
+            .find(|e| {
+                e.event_type == EventType::Keyboard
+                    && e.event_data
+                        .as_ref()
+                        .and_then(|d| d.get("final"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+            })
+            .expect("keyboard final row");
+        assert_eq!(
+            kb.event_data
+                .as_ref()
+                .unwrap()
+                .get("final")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "rollover 折叠的完整分钟必须是终值行（final=true）"
+        );
+        assert_eq!(
+            kb.event_data
+                .as_ref()
+                .unwrap()
+                .get("keys")
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "终值行计数必须等于该分钟的事件数"
         );
     }
 

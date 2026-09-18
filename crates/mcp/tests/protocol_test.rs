@@ -183,9 +183,14 @@ fn tools_call_timeline_and_limit_clamping() {
     assert_eq!(timeline["truncated"], json!(false));
     assert_eq!(timeline["segments"].as_array().unwrap().len(), 2);
 
-    // wait_for 超时语义
+    // wait_for 超时语义。审查 P2：EOF 后 serve 置位关停信号，后台线程可能在
+    // 首轮询点前观察到而以 status=shutdown 立即退出——两种状态都合法，
+    // 但都必须带 signal 回显。
     let wf = text_payload(&responses[1]);
-    assert_eq!(wf["status"], json!("timeout"));
+    assert!(
+        wf["status"] == json!("timeout") || wf["status"] == json!("shutdown"),
+        "{wf}"
+    );
     assert_eq!(wf["signal"], json!("thermal_hot"));
     cleanup(&path);
 }

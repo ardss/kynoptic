@@ -36,6 +36,17 @@ use std::thread;
 
 use tray::CollectorCmd;
 
+/// 采集器运行旗标（审查 P1）：采集器属主线程在 start_collection 成功后置
+/// true,Pause/Quit/启动失败时复位 false;心跳线程据此决定是否计算 stalled。
+/// 静态量理由:心跳线程拿不到 owner 线程栈上的 Collector 实例（所有权不跨
+/// 线程）,与 core 的 LAST_FLUSH_EPOCH 同属进程级共享信号。
+static COLLECTOR_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 采集停滞阈值（审查 P1）：flush 距今超过该秒数且采集器在跑,心跳打
+/// stalled:true。30s 写一轮心跳、正常批次间隔远小于此,300s ≈ 连续 10 个
+/// 心跳周期无落库,足以区分"空闲无输入"与"writer 挂死"。
+const HEARTBEAT_STALLED_SECS: i64 = 300;
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut parsed = match args::parse(&argv) {
@@ -96,7 +107,12 @@ fn main() {
     // close_ghost_sessions 会把"最新的 1 个幽灵"当当前 session 保留，随后
     // start_session 再建一个，重启后永远双 open（见 ghost.rs 模块注释）。
     if parsed.db.exists() {
-        let _ = ghost::close_all_open_sessions(&parsed.db);
+        // 审查 P2：清扫失败（DB 被锁/损坏）与"没有幽灵"必须区分——Err 时
+        // 留痕告警（托盘无 console，log 走文件 + stderr 兜底），不阻塞启动。
+        if let Err(e) = ghost::close_all_open_sessions(&parsed.db) {
+            log::warn!("启动幽灵 session 清扫失败: {e}");
+            eprintln!("kynoptic-tray: 启动幽灵 session 清扫失败: {e}");
+        }
     }
 
     // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘。
@@ -200,16 +216,37 @@ fn main() {
         }
     }
 
-    // 采集心跳:每 30s touch exe 同目录心跳文件(RFC3339 时间戳)。
+    // 采集心跳:每 30s touch exe 同目录心跳文件。
     // watchdog 除互斥体探活外还会检查心跳新鲜度——进程活着但采集主循环挂死
     // 时,心跳停止,watchdog 据此 kill 并重启(4-8 小时空洞的根因修复)。
     // 写失败静默忽略:心跳缺失只是退化为旧的探活行为,不影响采集本身。
+    //
+    // 审查 P1 心跳解耦修复:旧实现心跳线程无脑每 30s 写 RFC3339,采集主循环
+    // 挂死时心跳照常新鲜,"心跳新鲜 = 采集健康"被架空。现在内容升级为 JSON
+    // {"pid","ts","flush","stalled"}:flush 取 core 的 last_flush_epoch()(writer
+    // 每次成功落库刷新);采集运行中且 flush 停滞超 HEARTBEAT_STALLED_SECS(300s)
+    // 时打 stalled:true,watchdog 侧 classify_heartbeat 据此判为过期并 kill。
+    // 旧版纯时间戳内容仍被 watchdog 兼容解析(向后兼容,滚动升级期两代共存)。
     {
         let hb = paths::resolve_heartbeat();
         thread::Builder::new()
             .name("Heartbeat".into())
             .spawn(move || loop {
-                let _ = std::fs::write(&hb, chrono::Utc::now().to_rfc3339());
+                let now = chrono::Utc::now();
+                let flush = kynoptic_core::collector::last_flush_epoch();
+                let running = COLLECTOR_RUNNING.load(std::sync::atomic::Ordering::Relaxed);
+                // flush==0 = 本进程尚未落过库(启动初期正常),不误报;真正
+                // 挂死场景是 flush 曾前进后停滞,由 300s 阈值覆盖。
+                let stalled =
+                    running && flush > 0 && now.timestamp() - flush as i64 > HEARTBEAT_STALLED_SECS;
+                let content = format!(
+                    "{{\"pid\":{},\"ts\":\"{}\",\"flush\":{},\"stalled\":{}}}",
+                    std::process::id(),
+                    now.to_rfc3339(),
+                    flush,
+                    stalled
+                );
+                let _ = std::fs::write(&hb, content);
                 thread::sleep(std::time::Duration::from_secs(30));
             })
             .expect("心跳线程启动失败");
@@ -294,6 +331,8 @@ fn main() {
                             Ok(c) => {
                                 log::info!("采集器已启动({} 个监控器)", enabled.len());
                                 collector = Some(c);
+                                // 审查 P1：成功启动 = 心跳 stalled 判定的前提成立
+                                COLLECTOR_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
                                 // 恢复成功：清除持久化错误留档
                                 let _ = std::fs::remove_file(
                                     owner_db
@@ -328,6 +367,9 @@ fn main() {
                                     "采集器启动失败: {msg}，已写入 {}，60s 后重试",
                                     err_path.display()
                                 );
+                                // 审查 P1：未在跑就不得让心跳判定 stalled 依据成立
+                                COLLECTOR_RUNNING
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
                                 // 保持 None:下一轮再试
                             }
                         }
@@ -339,11 +381,14 @@ fn main() {
                             c.shutdown();
                         }
                         let _ = collector.take();
+                        // 审查 P1：Pause 后无采集器,心跳回到纯时间戳语义
+                        COLLECTOR_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                     CollectorCmd::Quit => {
                         if let Some(c) = collector.as_mut() {
                             c.shutdown();
                         }
+                        COLLECTOR_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                 }

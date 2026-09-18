@@ -119,7 +119,9 @@ pub fn today_action_breakdown(
 }
 
 pub fn active_minutes_today(conn: &Connection, today: &str, tomorrow: &str) -> i64 {
-    // 去重桶按本地分钟取，避免本地日跨 UTC 午夜时两端同名 HH:MM 被错误合并。
+    // 去重桶取完整本地分钟 "YYYY-MM-DD HH:MM"（审查：此前只取 HH:MM，DST
+    // 回拨日的 +1 重复小时两端同名 HH:MM 会被错误合并丢分钟；窗口只覆盖单个
+    // 本地日（±1 重复小时），带日期的完整分钟串去重既无跨日误合也无 DST 丢失）。
     // 口径统一（交叉审查 P1）：只认 keys/clicks 分钟（KEYS/CLICKS_ROW_EXPR > 0），
     // 剔除 move-only 分钟——与 active_minutes_by_date / day_totals /
     // daily_agg.recompute_day 同一口径，脚本级鼠标抖动无法刷活跃分钟。
@@ -128,7 +130,7 @@ pub fn active_minutes_today(conn: &Connection, today: &str, tomorrow: &str) -> i
         conn.query_row(
             &format!(
                 "SELECT COUNT(DISTINCT CASE WHEN {KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR} > 0 \
-                                            THEN substr(datetime(timestamp, ?1), 12, 5) END) \
+                                            THEN substr(datetime(timestamp, ?1), 1, 16) END) \
                  FROM events WHERE timestamp >= ?2 AND timestamp < ?3 \
                    AND event_type IN ('keyboard','mouse')"
             ),

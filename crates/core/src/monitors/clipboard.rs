@@ -2,6 +2,10 @@
 //!
 //! 通过 Win32 剪贴板 API 检测内容变化，
 //! 只记录内容类型的哈希摘要，不记录实际内容。
+//!
+//! 审查 P2（幻影事件防线）：
+//! - OpenClipboard 失败（被其他进程占用）不改变 last_digest，不产生事件；
+//! - 首轮轮询只建基线，不发"变化"事件。
 
 use crate::types::*;
 use serde_json::json;
@@ -29,11 +33,20 @@ impl Monitor for ClipboardMonitor {
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
-        let (content_type, digest, len) = read_clipboard_hash();
-
-        let prev = self.last_digest.take();
-        if prev.is_some() && prev == Some(digest) {
+        let prev = self.last_digest.get();
+        // 审查 P2：读不到剪贴板（OpenClipboard 被其他进程占用等）时保持上次
+        // 状态原样返回——旔回退 ("empty", 全零 digest) 会造成 digest 翻转，
+        // 产生幻影 Change 事件。
+        let Some((content_type, digest, len)) = read_clipboard_hash() else {
+            return;
+        };
+        // 首轮只建基线，不发事件（审查：第一轮 prev 为 None 时必然
+        // "翻转"，无条件发一条"剪贴板变化"是幻影事件）
+        if prev.is_none() {
             self.last_digest.set(Some(digest));
+            return;
+        }
+        if prev == Some(digest) {
             return;
         }
         self.last_digest.set(Some(digest));
@@ -49,30 +62,32 @@ impl Monitor for ClipboardMonitor {
     }
 }
 
-/// 读取剪贴板内容类型、哈希摘要与字节长度
-fn read_clipboard_hash() -> (String, [u8; 16], usize) {
+/// 读取剪贴板内容类型、哈希摘要与字节长度。
+/// 打不开剪贴板（OpenClipboard 失败）返回 None——调用方保持上次状态不变，
+/// 不把它当成"内容清空"处理。
+fn read_clipboard_hash() -> Option<(String, [u8; 16], usize)> {
     unsafe {
         let cf_unicode_text: u32 = 13;
 
         if OpenClipboard(0) == 0 {
-            return ("empty".into(), [0u8; 16], 0);
+            return None;
         }
 
         if IsClipboardFormatAvailable(cf_unicode_text) == 0 {
             CloseClipboard();
-            return ("non-text".into(), simple_hash(b"non-text"), 8);
+            return Some(("non-text".into(), simple_hash(b"non-text"), 8));
         }
 
         let handle = GetClipboardData(cf_unicode_text);
         if handle.is_null() {
             CloseClipboard();
-            return ("empty".into(), [0u8; 16], 0);
+            return Some(("empty".into(), [0u8; 16], 0));
         }
 
         let ptr = GlobalLock(handle);
         if ptr.is_null() {
             CloseClipboard();
-            return ("empty".into(), [0u8; 16], 0);
+            return Some(("empty".into(), [0u8; 16], 0));
         }
 
         // 计算长度
@@ -88,7 +103,7 @@ fn read_clipboard_hash() -> (String, [u8; 16], usize) {
         GlobalUnlock(handle);
         CloseClipboard();
 
-        ("text".into(), simple_hash(&bytes), byte_len)
+        Some(("text".into(), simple_hash(&bytes), byte_len))
     }
 }
 

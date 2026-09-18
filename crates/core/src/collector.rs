@@ -23,6 +23,21 @@ pub(crate) static WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// 看门狗连续观察到写失败的周期数（>=3 升级 log::error）。
 static CONSECUTIVE_WRITE_FAILURE_PERIODS: AtomicU64 = AtomicU64::new(0);
 
+/// 最近一次成功落库（write_batch 事务提交）的 unix 秒（0 = 尚未写过）。
+///
+/// 审查 P1：tray 心跳此前与采集健康完全解耦——采集主循环挂死时心跳线程
+/// 仍在每 30s 刷新文件，watchdog 的"心跳新鲜 = 采集健康"判定被架空。此
+/// 原子量是采集侧唯一可信的"我真的在写库"信号：writer 线程每次成功事务
+/// 后更新；tray 心跳线程读取它并在停滞超阈值时在心跳内容里打 stalled 标
+/// （消费方在 crates/cli/src/main.rs classify_heartbeat）。跨 crate 无法人
+/// 手 Collector 实例，故用进程级静态量（tray 与采集器同进程）。
+static LAST_FLUSH_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 最近一次成功落库的 unix 秒（0 = 本进程尚未写过任何批次）。
+pub fn last_flush_epoch() -> u64 {
+    LAST_FLUSH_EPOCH.load(Ordering::Relaxed)
+}
+
 pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
     match tx.try_send(event) {
         Ok(()) => {}
@@ -150,6 +165,14 @@ fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
     // 对应（失败行为 0），事务化后由 insert 层内部直接用于 agg 维护。
     let _rowids = db.insert_events_with_agg(batch);
     total_written.fetch_add(batch.len(), Ordering::Relaxed);
+    // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
+    LAST_FLUSH_EPOCH.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        Ordering::Relaxed,
+    );
 }
 
 fn writer_loop(
@@ -469,6 +492,35 @@ pub fn start_collection_with(settings: CollectorSettings, db_path: &str) -> Coll
     start_collection_custom(&enabled, settings, db_path)
 }
 
+/// 当前本地分钟在库里的 input_agg 行是否已是**完整终值**（`$.final` 为 true）。
+///
+/// 审查 P1：重启抑制的判定依据。返回 true（终值已写出）或 false（无行 /
+/// 只有部分快照）语义如下：
+/// - true → 保持抑制：新会话的秒级小快照会覆盖大终值，必须丢弃；
+/// - false 且无行 → 保持抑制（该分钟本来就没有数据，防小值覆盖）；
+/// - false 且有行（部分快照，上次会话被硬杀、终值从未写出）→ 解除抑制
+///   （合并续写），由调用方据此调用 `input_agg::clear_restart_suppression`。
+///
+/// 查询失败按 false 处理（保持抑制，宁可丢当前分钟部分计数不冒覆盖风险）。
+fn current_minute_row_is_final(db: &Database) -> bool {
+    // 与 input_agg 行时间戳同格式（分钟起点 epoch 取整 → UTC RFC3339）
+    let now_min = (chrono::Utc::now().timestamp() / 60) * 60;
+    let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(now_min, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    let reader = db.reader();
+    reader
+        .query_row(
+            "SELECT COALESCE(json_extract(event_data, '$.final'), 0) FROM events \
+             WHERE event_action = 'input_agg' AND timestamp = ?1 \
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&ts],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false)
+}
+
 /// 以显式启用集启动采集器（probe/诊断用）。
 /// 启用集为空或不含 hook id 时对应 Hook 不启动；其余行为与 [`start_collection_with`] 相同。
 pub fn start_collection_custom(
@@ -504,7 +556,32 @@ pub fn start_collection_custom(
     let tw = total_written.clone();
     let sd_writer = shutdown.clone();
     let ws_writer = writer_stop.clone();
-    let writer_handle = thread::Builder::new()
+
+    // 审查 P1：spawn 失败（panic-after-spawn 僵尸采集器修复）后的兜底清理。
+    // 构造一个"半成品" Collector 并走其 shutdown()——置停机旗标、停 hooks、
+    // join 已有聚合/writer 线程、flush_partial、end_session——保证任意阶段
+    // spawn 失败都不留僵尸线程/幽灵 session；panic 本身照常抛出（tray 的
+    // catch_unwind 路径不受影响），失败的 spawn 本就没有线程需要回收。
+    // （用宏而非闭包：闭包按引用捕获会把 db 借用拖到函数尾，与收尾的
+    // Collector { db, .. } 移动冲突。）
+    macro_rules! spawn_fail_collector {
+        ($writer:expr, $agg:expr, $hooks:expr) => {{
+            Collector {
+                db: db.clone(),
+                session_id,
+                total_written: total_written.clone(),
+                writer_handle: $writer,
+                agg_handle: $agg,
+                hooks: $hooks,
+                settings,
+                shutdown: shutdown.clone(),
+                writer_stop: writer_stop.clone(),
+            }
+            .shutdown();
+        }};
+    }
+
+    let writer_handle = match thread::Builder::new()
         .name("EventWriter".into())
         .spawn(move || {
             writer_loop(
@@ -516,8 +593,13 @@ pub fn start_collection_custom(
                 sd_writer,
                 ws_writer,
             );
-        })
-        .expect("Writer 启动失败");
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            spawn_fail_collector!(None, None, Vec::new());
+            panic!("Writer 启动失败: {e}");
+        }
+    };
 
     let monitors = create_monitors_for(enabled);
     let monitor_count = monitors.len();
@@ -526,10 +608,18 @@ pub fn start_collection_custom(
     for m in monitors {
         let tx = tx.clone();
         let sd = shutdown.clone();
-        thread::Builder::new()
+        match thread::Builder::new()
             .name(m.name().into())
             .spawn(move || run_monitor(m, tx, sd))
-            .expect("Monitor 线程启动失败");
+        {
+            Ok(_handle) => {}
+            Err(e) => {
+                // 停机旗标让已启动的 monitor 在下一轮检查点（<=1s）退出，
+                // writer_stop 让 writer 排空尾批退出，再关闭 session
+                spawn_fail_collector!(Some(writer_handle), None, Vec::new());
+                panic!("Monitor 线程启动失败: {e}");
+            }
+        }
     }
 
     // 输入粒度：minute 模式下 Hook 回调退化为原子计数，由独立聚合线程每秒
@@ -542,10 +632,18 @@ pub fn start_collection_custom(
     let mut agg_handle: Option<thread::JoinHandle<()>> = None;
     if minute_mode {
         input_agg::activate();
+        // 审查 P1：硬杀后的部分分钟快照修复。重启抑制只应丢弃"当前分钟已有
+        // 完整终值（$.final: true）或没有行"的会话重启小快照；若库里该分钟
+        // 只有部分快照（final 非 true，上次会话被强杀、终值从未写出），
+        // 抑制会把那部分计数整体丢掉——改为合并续写（解除抑制）。
+        if !current_minute_row_is_final(&db) {
+            input_agg::clear_restart_suppression();
+            log::info!("上一会话在当前分钟留有部分快照，重启抑制改为合并续写");
+        }
         let tx_agg = tx.clone();
         let sd_agg = shutdown.clone();
         agg_handle = Some(
-            thread::Builder::new()
+            match thread::Builder::new()
                 .name("InputAgg".into())
                 .spawn(move || {
                     // panic 防护（审查 P2）：drain/flush panic 不允许终结聚合
@@ -576,8 +674,13 @@ pub fn start_collection_custom(
                             }
                         }
                     }
-                })
-                .expect("InputAgg 聚合线程启动失败"),
+                }) {
+                Ok(h) => h,
+                Err(e) => {
+                    spawn_fail_collector!(Some(writer_handle), None, Vec::new());
+                    panic!("InputAgg 聚合线程启动失败: {e}");
+                }
+            },
         );
     }
 
@@ -608,7 +711,7 @@ pub fn start_collection_custom(
 
     let db_clone = db.clone();
     let sd_maint = shutdown.clone();
-    thread::Builder::new()
+    let maint_handle = thread::Builder::new()
         .name("Maintenance".into())
         .spawn(move || {
             // 每 DAILY_AGG_REFRESH_SECS（600s = 10 分钟）刷新一次 daily_agg
@@ -630,15 +733,19 @@ pub fn start_collection_custom(
                     db_clone.refresh_daily_agg();
                 }
             }
-        })
-        .expect("维护线程启动失败");
+        });
+    if let Err(e) = maint_handle {
+        // hooks/agg/writer 均已启动：全量兜底清理后再 panic（审查 P1）
+        spawn_fail_collector!(Some(writer_handle), agg_handle, hooks);
+        panic!("维护线程启动失败: {e}");
+    }
 
     // 丢弃/写失败看门狗（审查 P2 + P0）：writer 侧日志只在"还在正常收事件"时
     // 可见，写库卡死导致通道持续满载、或磁盘写满导致事件被降级跳过时都会完全
     // 静默。独立线程每 60 秒读一次全局 DROPPED_EVENTS 与 WRITE_FAILURES，
     // 任一增量 >0 即告警（写失败连续 3 个周期升级 error）——与 writer 状态解耦。
     let sd_watch = shutdown.clone();
-    thread::Builder::new()
+    let watch_handle = thread::Builder::new()
         .name("DropWatchdog".into())
         .spawn(move || loop {
             thread::sleep(Duration::from_secs(60));
@@ -646,8 +753,11 @@ pub fn start_collection_custom(
                 return;
             }
             log_dropped_events_watchdog();
-        })
-        .expect("丢弃看门狗线程启动失败");
+        });
+    if let Err(e) = watch_handle {
+        spawn_fail_collector!(Some(writer_handle), agg_handle, hooks);
+        panic!("丢弃看门狗线程启动失败: {e}");
+    }
 
     Collector {
         db,

@@ -415,6 +415,11 @@
     <input type="number" id="set-goal" min="0" max="1440" style="width:72px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
     <span class="muted" style="font-size:11px"><span class="l en">drives the goal ring on the overview card (default 480)</span><span class="l zh">控制总览卡的目标圆环（默认 480）</span></span>
   </div>
+  <div class="mon-row" style="display:flex;align-items:center;gap:8px">
+    <label for="set-port" style="white-space:nowrap"><span class="l en">dashboard port (1-65535):</span><span class="l zh">面板端口（1-65535）：</span></label>
+    <input type="number" id="set-port" min="1" max="65535" style="width:88px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
+    <span class="muted" style="font-size:11px"><span class="l en">local dashboard URL port (default 8422). takes effect after tray restart.</span><span class="l zh">本机面板访问端口（默认 8422）。重启托盘后生效。</span></span>
+  </div>
   <div class="mon-row">
     <input type="checkbox" id="set-counts" checked>
     <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended). UNCHECKING switches to raw per-keystroke logging — full key content is recorded.</span>
@@ -470,7 +475,9 @@ const T = {
         disconnected: "disconnected — retrying…",
         weekInsufficient: "not enough data for last week — comparison skipped",
         retry: "retry", loadFailed: "load failed: ",
-        colApp: "app", colEvents: "events (window switches, not duration)" },
+        colApp: "app", colEvents: "events (window switches, not duration)",
+        goalOff: "off (no goal set)", dbDirHint: "data: ",
+        portNote: "port change takes effect after tray restart" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
@@ -487,7 +494,9 @@ const T = {
         disconnected: "连接断开，正在重试…",
         weekInsufficient: "上周数据不足，已跳过对比",
         retry: "重试", loadFailed: "加载失败：",
-        colApp: "应用", colEvents: "按窗口切换事件数（非时长）" }
+        colApp: "应用", colEvents: "按窗口切换事件数（非时长）",
+        goalOff: "关闭（未设目标）", dbDirHint: "数据：",
+        portNote: "端口修改需重启托盘后生效" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -551,7 +560,7 @@ async function loadStatus() {
   // 否则一次瞬时断连后状态行永久红着"连接断开"。
   if (el) el.style.color = "";
   if (!s.last_event_ts) {
-    el.textContent = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + s.db_path;
+    el.textContent = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + dbStatusText(s);
     el.title = "";
     return;
   }
@@ -559,8 +568,16 @@ async function loadStatus() {
   const utcRaw = s.last_event_ts.replace("T", " ") + " UTC";
   const d = new Date(s.last_event_ts);
   const shown = isNaN(d.getTime()) ? utcRaw : d.toLocaleString();
-  el.textContent = s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + s.db_path;
+  el.textContent = s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + dbStatusText(s);
   el.title = t("lastEvent") + " " + utcRaw;
+}
+/* 审查 P2：/api/status 只回 db 文件名 + 目录类别（db_dir_kind），不再暴露
+   完整安装路径。状态行展示文件名并附目录性质提示（exe 同目录 / 其他）。 */
+function dbStatusText(s) {
+  const kind = s.db_dir_kind
+    ? t("dbDirHint") + (s.db_dir_kind === "exe-relative data" ? "exe dir" : "user dir")
+    : "";
+  return kind ? s.db_path + " (" + kind + ")" : s.db_path;
 }
 function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
 function prettyApp(a) {
@@ -960,7 +977,7 @@ async function loadReport() {
   const goal = st.daily_goal_minutes || 0;
   document.getElementById("r-goal").textContent = goal
     ? (today ? fmtMin(today.active_minutes) : "0m") + " / " + fmtMin(goal)
-    : "off";
+    : t("goalOff");
   const tw = tr.this_week || {}, lw = tr.last_week;
   // 口径说明小字（trends.note）：字段缺失时静默留空
   const tn = document.getElementById("trend-note");
@@ -1321,6 +1338,7 @@ async function loadSettings() {
   document.getElementById("set-autostart").checked = s.autostart;
   document.getElementById("set-bridge").value = (s.presence_bridge_minutes ?? 2);
   document.getElementById("set-goal").value = (s.daily_goal_minutes ?? 480);
+  document.getElementById("set-port").value = (s.dashboard_port ?? 8422);
   document.getElementById("set-counts").checked = s.input_counts_only;
   document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
   settingsMsg("", true);
@@ -1346,7 +1364,9 @@ async function saveSettings() {
       input_counts_only: document.getElementById("set-counts").checked,
       vk_frequency_enabled: document.getElementById("set-vkfreq").checked,
       presence_bridge_minutes: Math.max(0, Math.min(15, parseInt(document.getElementById("set-bridge").value || "2", 10) || 0)),
-      daily_goal_minutes: Math.max(0, Math.min(1440, parseInt(document.getElementById("set-goal").value || "480", 10) || 0))
+      daily_goal_minutes: Math.max(0, Math.min(1440, parseInt(document.getElementById("set-goal").value || "480", 10) || 0)),
+      // 审查：端口 0 会落库出"面板打不开"的设置，前端先夹到 1-65535（后端同样校验）
+      dashboard_port: Math.max(1, Math.min(65535, parseInt(document.getElementById("set-port").value || "8422", 10) || 8422))
     };
     const r = await fetch("/api/settings", {
       method: "POST",

@@ -591,8 +591,11 @@ pub(crate) fn late_night_key_count_in_range(
 ///
 /// 供 [`crate::anomaly`] 的 APM 突增检测作为历史基线。
 pub fn daily_agg_avg_apm_before(conn: &Connection, date: &str) -> f64 {
+    // 审查：apm_avg <= 0 的行（无输入的"零天"）参与平均会把基线稀释、
+    // 突增漏报——只对真正有输入的历史日均取平均；全部为 0 时 AVG 返回 NULL，
+    // COALESCE 落回 0.0（无基线不报警的既有语义不变）。
     conn.query_row(
-        "SELECT COALESCE(AVG(apm_avg), 0.0) FROM daily_agg WHERE date < ?1",
+        "SELECT COALESCE(AVG(apm_avg), 0.0) FROM daily_agg WHERE date < ?1 AND apm_avg > 0",
         params![date],
         |r| r.get::<_, f64>(0),
     )

@@ -375,8 +375,10 @@ fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i6
 /// 再进 SQL：timestamp 列全部由 `DateTime<Utc>::to_rfc3339()` 写入（`+00:00` 形），
 /// 边界若原样透传 `+08:00` 等显式偏移字面量，RFC3339 **字符串比较**的字典序
 /// 将不等于时间序（如 `+08:00` < `+00:00` 字典序为假的时间序），导致边界漏/多事件。
-/// 解析失败（非 RFC3339）时回退原样，保持既有行为。
-fn normalize_bound(v: &str, is_to: bool) -> String {
+/// 解析失败（非 RFC3339 且非裸日期）时报可读错误（与 get_summary 的日期错误
+/// 同约定），不再静默回退字符串比较——静默回退会让边界按字典序进 SQL，结果
+/// 错误且无提示。
+fn normalize_bound(v: &str, is_to: bool) -> Result<String, String> {
     let b = v.as_bytes();
     if b.len() == 10
         && b[4] == b'-'
@@ -385,7 +387,7 @@ fn normalize_bound(v: &str, is_to: bool) -> String {
     {
         if let Some((s, e)) = queries::local_day_range(v) {
             // from → 当日本地 00:00；to → 当日本地日末（即次日 00:00）
-            return if is_to { e } else { s };
+            return Ok(if is_to { e } else { s });
         }
     }
     match chrono::DateTime::parse_from_rfc3339(v) {
@@ -399,9 +401,11 @@ fn normalize_bound(v: &str, is_to: bool) -> String {
             } else {
                 t
             };
-            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+            Ok(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
         }
-        Err(_) => v.to_string(),
+        Err(_) => Err(format!(
+            "Bad date format: {v}, expected RFC3339 or YYYY-MM-DD（时间格式错，应为 RFC3339 或 YYYY-MM-DD）"
+        )),
     }
 }
 
@@ -426,8 +430,8 @@ pub fn timeline(
     if granularity != "minute" && granularity != "hour" {
         return Err("granularity only allows minute|hour（granularity 只允许 minute|hour）".into());
     }
-    let from = normalize_bound(from, false);
-    let to = normalize_bound(to, true);
+    let from = normalize_bound(from, false)?;
+    let to = normalize_bound(to, true)?;
     if from >= to {
         return Err(format!(
             "Invalid range: from ({from}) must be before to ({to})（时间范围无效：from 必须早于 to）"
@@ -524,8 +528,8 @@ pub fn timeline(
 /// 窗口 [from,to) 内各前台应用驻留秒数，降序返回（get_top_apps 数据面）。
 /// 驻留口径与 timeline 相同：switch 事件起点到下一 switch（末段到 to）。
 pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result<Value, String> {
-    let from = normalize_bound(from, false);
-    let to = normalize_bound(to, true);
+    let from = normalize_bound(from, false)?;
+    let to = normalize_bound(to, true)?;
     if from >= to {
         return Err(format!(
             "Invalid range: from ({from}) must be before to ({to})（时间范围无效：from 必须早于 to）"
@@ -747,11 +751,25 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
 
 /// 阻塞轮询信号（spec 要求走语义层规则引擎，v0.1 无规则引擎 → 每 2s 查库，
 /// 见 CODE_NOTES §5）。返回触发 payload 或 timeout 标记。
-pub fn wait_for(conn: &Connection, signal: &str, timeout_sec: u64) -> Result<Value, String> {
+/// `shutdown` 为 stdin EOF 关停信号（serve 退出读循环时置位）：轮询循环每次
+/// 醒来检查一次，让后台线程数秒内退出而非阻塞满 1800s 拖住 join。
+pub fn wait_for(
+    conn: &Connection,
+    signal: &str,
+    timeout_sec: u64,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> Result<Value, String> {
     let timeout = timeout_sec.clamp(1, 1800);
     let start = std::time::Instant::now();
     let poll = std::time::Duration::from_secs(2);
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(json!({
+                "signal": signal,
+                "status": "shutdown",
+                "elapsed_sec": start.elapsed().as_secs(),
+            }));
+        }
         if check_signal(conn, signal)? {
             return Ok(json!({
                 "signal": signal,
@@ -1172,42 +1190,44 @@ mod tests {
     }
 
     /// Z 形输入规范化为 `+00:00` 形（与库内 timestamp 存储格式一致）；
-    /// 非 RFC3339 回退原样不破坏既有行为。
+    /// 非 RFC3339 报可读错误（审查：静默回退字符串比较会让边界按字典序
+    /// 进 SQL，结果错误且无提示）。
     #[test]
     fn normalize_bound_canonicalizes_offsets() {
         assert_eq!(
-            normalize_bound("2026-09-17T00:00:00Z", true),
+            normalize_bound("2026-09-17T00:00:00Z", true).unwrap(),
             "2026-09-17T00:00:00+00:00"
         );
         assert_eq!(
-            normalize_bound("2026-09-17T00:00:00+08:00", true),
+            normalize_bound("2026-09-17T00:00:00+08:00", true).unwrap(),
             "2026-09-16T16:00:00+00:00"
         );
         // 带小数秒 → from 截到秒精度（与库内整秒字面量字典序可比）
         assert_eq!(
-            normalize_bound("2026-09-17T00:00:00.123+08:00", false),
+            normalize_bound("2026-09-17T00:00:00.123+08:00", false).unwrap(),
             "2026-09-16T16:00:00+00:00"
         );
         // to 带小数秒 → **向上取整到秒**（to 是排他上界，截断会漏段）
         assert_eq!(
-            normalize_bound("2026-09-17T00:00:00.123+08:00", true),
+            normalize_bound("2026-09-17T00:00:00.123+08:00", true).unwrap(),
             "2026-09-16T16:00:01+00:00"
         );
         assert_eq!(
-            normalize_bound("2026-09-17T00:00:00.999Z", true),
+            normalize_bound("2026-09-17T00:00:00.999Z", true).unwrap(),
             "2026-09-17T00:00:01+00:00"
         );
         // to 整秒不变
         assert_eq!(
-            normalize_bound("2026-09-17T00:00:00Z", true),
+            normalize_bound("2026-09-17T00:00:00Z", true).unwrap(),
             "2026-09-17T00:00:00+00:00"
         );
-        // 解析失败回退原样
-        assert_eq!(normalize_bound("garbage", false), "garbage");
+        // 解析失败 → 可读错误（与 get_summary 的日期错误同约定）
+        let err = normalize_bound("garbage", false).unwrap_err();
+        assert!(err.contains("Bad date format"), "{err}");
         // 裸日期路径不变
         let (s, e) = queries::local_day_range("2026-09-17").unwrap();
-        assert_eq!(normalize_bound("2026-09-17", false), s);
-        assert_eq!(normalize_bound("2026-09-17", true), e);
+        assert_eq!(normalize_bound("2026-09-17", false).unwrap(), s);
+        assert_eq!(normalize_bound("2026-09-17", true).unwrap(), e);
     }
 
     #[test]
@@ -1447,9 +1467,20 @@ mod tests {
     #[test]
     fn wait_for_times_out() {
         let conn = mem_conn();
-        let v = wait_for(&conn, "thermal_hot", 1).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let v = wait_for(&conn, "thermal_hot", 1, &stop).unwrap();
         assert_eq!(v["status"], json!("timeout"));
         assert_eq!(v["timeout_sec"], json!(1));
+    }
+
+    /// 审查 P2：EOF 关停信号置位后，wait_for 必须在下一轮询点立即退出
+    ///（status=shutdown），不得阻塞满 timeout。
+    #[test]
+    fn wait_for_exits_promptly_on_shutdown() {
+        let conn = mem_conn();
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let v = wait_for(&conn, "thermal_hot", 1800, &stop).unwrap();
+        assert_eq!(v["status"], json!("shutdown"));
     }
 
     #[test]
@@ -1486,6 +1517,7 @@ mod tests {
     #[test]
     fn wait_for_rejects_unknown_signal() {
         let conn = mem_conn();
-        assert!(wait_for(&conn, "bogus", 1).is_err());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert!(wait_for(&conn, "bogus", 1, &stop).is_err());
     }
 }

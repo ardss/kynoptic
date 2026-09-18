@@ -16,20 +16,31 @@ use serde_json::{json, Value};
 
 use crate::state;
 
-/// 与 spec 对齐的 MCP protocolVersion（initialize 回显客户端请求的版本，
-/// 客户端未带时回退到此默认值——Claude Desktop 当前为 2024-11-05 系）。
+/// 与 spec 对齐的 MCP protocolVersion（客户端未带版本或版本不受支持时，
+/// 以此默认值应答——Claude Desktop 当前为 2024-11-05 系）。
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// 服务端支持的 protocolVersion 列表（initialize 版本协商白名单）。
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26"];
+
+/// wait_for 后台线程并发上限（审查 P2：无限 fan-out 会被恶意/失控客户端
+/// 打爆线程数）。
+const MAX_CONCURRENT_WAIT_FOR: usize = 16;
 
 /// MCP server：持有数据库路径，逐请求开只读连接（v0.1 读多写零，开销可接受）。
 #[derive(Clone)]
 pub struct McpServer {
     pub db_path: String,
+    /// 审查 P2：stdin EOF 关停信号——serve 退出读循环时置位，wait_for 轮询
+    /// 每 2s 检查一次，后台线程数秒内退出，join 不被最长 1800s 的长轮询拖住。
+    pub shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpServer {
     pub fn new(db_path: impl Into<String>) -> Self {
         Self {
             db_path: db_path.into(),
+            shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -63,11 +74,14 @@ impl McpServer {
     }
 
     fn initialize(&self, params: &Value) -> Value {
-        let version = params
-            .get("protocolVersion")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_PROTOCOL_VERSION)
-            .to_string();
+        // 审查 P1：不再无条件回显客户端任意 protocolVersion 字符串——版本受
+        // 支持时原样回显；否则按 spec 以服务端自身支持的版本应答（spec 允许
+        // 服务端回复自己的版本，客户端据此决定是否继续）。
+        let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+        let version = match requested {
+            Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
+            _ => DEFAULT_PROTOCOL_VERSION,
+        };
         json!({
             "protocolVersion": version,
             "capabilities": { "tools": { "listChanged": false } },
@@ -203,7 +217,7 @@ impl McpServer {
                     .get("timeout_sec")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(300);
-                state::wait_for(&conn, signal, timeout)
+                state::wait_for(&conn, signal, timeout, &self.shutdown)
             }
             other => Err(format!(
                 "Unknown tool: {other} (available: {})（未知工具，可用: {}）",
@@ -360,6 +374,9 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
         }
     }
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    // 审查 P2：wait_for 并发上限 + EOF 关停信号。live_wait 统计在飞线程数，
+    // 超过 MAX_CONCURRENT_WAIT_FOR 直接回错（不再无限 fan-out 出线程）。
+    let live_wait = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for line in reader.lines() {
         let Ok(line) = line else {
             // 审查 P1：区分可恢复与终结错误——非 UTF-8 字节已消费可继续会话
@@ -388,33 +405,77 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
         // 进程僵住——仅这类长请求走后台线程；其余顺序处理保证 JSONL 响应有序。
         // 代价：wait_for 的响应可能在后续请求响应之后到达（乱序），客户端必须
         // 按 JSON-RPC id 关联（已写入 wait_for 工具 description）。
-        let is_long = serde_json::from_str::<Value>(&line)
-            .ok()
-            .and_then(|m| {
-                Some(
-                    m.get("method")?.as_str()? == "tools/call"
-                        && m.pointer("/params/name")?.as_str()? == "wait_for",
-                )
+        // 审查 P1：每行只解析一次，解析结果直接移交后台线程——旧实现线程内对
+        // 同一行二次 from_str，失败时静默丢响应（客户端按 id 挂等）。
+        let parsed = serde_json::from_str::<Value>(&line);
+        let is_tools_call = parsed
+            .as_ref()
+            .is_ok_and(|m| m.get("method").and_then(|v| v.as_str()) == Some("tools/call"));
+        let is_long = is_tools_call
+            && parsed.as_ref().is_ok_and(|m| {
+                m.get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("wait_for")
+            });
+        if is_tools_call
+            && !parsed
+                .as_ref()
+                .is_ok_and(|m| m.get("params").is_some_and(|p| p.is_object()))
+        {
+            // 审查 P1：tools/call 但 params 非对象时无法判定工具名（是否
+            // wait_for 形态的畸形调用），若同步执行可能跑满 30 分钟长轮询——
+            // 直接回 -32602 invalid params，不进任何执行路径。
+            let id = parsed.as_ref().ok().and_then(|m| m.get("id")).cloned();
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: tools/call params must be an object（tools/call 的 params 必须是对象）",
+                },
             })
-            .unwrap_or(false);
+            .to_string();
+            respond(&writer, &resp);
+            continue;
+        }
         if is_long {
+            // 审查 P2：并发 wait_for 超上限直接拒绝，防止线程无限 fan-out。
+            if live_wait.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONCURRENT_WAIT_FOR {
+                let id = parsed.as_ref().ok().and_then(|m| m.get("id")).cloned();
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": format!(
+                            "too many concurrent wait_for (max {MAX_CONCURRENT_WAIT_FOR})（并发 wait_for 超过上限 {MAX_CONCURRENT_WAIT_FOR}，请稍后重试）"
+                        ),
+                    },
+                })
+                .to_string();
+                respond(&writer, &resp);
+                continue;
+            }
+            let msg = parsed.expect("is_long 保证已成功解析");
             let server = server.clone();
             let writer = writer.clone();
+            let live = live_wait.clone();
+            live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             threads.push(
                 std::thread::Builder::new()
                     .name("mcp-wait".into())
                     .spawn(move || {
-                        if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                            if let Some(r) = server.handle(&msg) {
-                                respond(&writer, &r.to_string());
-                            }
+                        if let Some(r) = server.handle(&msg) {
+                            respond(&writer, &r.to_string());
                         }
+                        live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     })
                     .expect("mcp-wait spawn"),
             );
             continue;
         }
-        let response = match serde_json::from_str::<Value>(&line) {
+        let response = match parsed {
             // 审查 P1：JSON-RPC 2.0 批量请求（顶层数组）必须以数组回应——
             // 旧逻辑 get("id") 为 None 走通知路径整体吞掉，规范客户端会挂等。
             Ok(Value::Array(batch)) => {
@@ -436,6 +497,12 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
             respond(&writer, &r.to_string());
         }
     }
+    // 审查 P2：EOF 后置位关停信号——wait_for 轮询循环每 2s 检查一次
+    //（见 state::wait_for），后台线程数秒内退出，join 不再被最长 1800s
+    // 的长轮询拖住进程退出。
+    server
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     for t in threads {
         let _ = t.join();
     }
@@ -473,6 +540,18 @@ mod tests {
         // 未带版本 → 默认值
         let resp = srv
             .handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize" }))
+            .unwrap();
+        assert_eq!(
+            resp["result"]["protocolVersion"],
+            json!(DEFAULT_PROTOCOL_VERSION)
+        );
+        // 审查 P1：不支持的版本 → 以服务端自身支持的版本应答（spec 允许），
+        // 不回显任意客户端字符串
+        let resp = srv
+            .handle(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "initialize",
+                "params": { "protocolVersion": "1999-01-01" }
+            }))
             .unwrap();
         assert_eq!(
             resp["result"]["protocolVersion"],

@@ -17,26 +17,26 @@
 use std::path::Path;
 
 /// 闭合 db 里全部 `end_time IS NULL` 的 session。返回闭合数量。
-/// db 不存在 / 打不开 / 无写权限时返回 0（不阻塞 tray 启动）。注意：
-/// 不存在时直接返回——rusqlite 的 Connection::open 会建出空库文件，而建库
-/// 是采集器职责，绝不能在这里 touch 出一个空库。
-pub fn close_all_open_sessions(db_path: &Path) -> usize {
+///
+/// 审查 P2：返回值升级为 Result——"确实没有幽灵"（Ok(0)）与"DB 被锁 /
+/// 打不开 / 清扫中途出错"（Err，携带 rusqlite 错误消息）是两种完全不同的
+/// 状况，旧实现一律静默 0，库损坏/被占用时托盘启动无从告警。db 不存在仍
+/// 返回 Ok(0)——全新首装是正常路径。注意：不存在时直接返回——rusqlite 的
+/// Connection::open 会建出空库文件，而建库是采集器职责，绝不能在这里
+/// touch 出一个空库。
+pub fn close_all_open_sessions(db_path: &Path) -> Result<usize, String> {
     if !db_path.exists() {
-        return 0;
+        return Ok(0);
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
-        return 0;
-    };
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open 失败: {e}"))?;
     let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
-    let Ok(open_ids) = conn
+    let open_ids = conn
         .prepare("SELECT id FROM sessions WHERE end_time IS NULL ORDER BY id")
         .and_then(|mut s| {
             s.query_map([], |r| r.get::<_, i64>(0))
                 .map(|rows| rows.filter_map(|x| x.ok()).collect::<Vec<i64>>())
         })
-    else {
-        return 0;
-    };
+        .map_err(|e| format!("查询 open session 失败（库被锁/表损坏?）: {e}"))?;
     let mut closed = 0usize;
     for sid in open_ids {
         let end_time: Option<String> = conn
@@ -61,21 +61,22 @@ pub fn close_all_open_sessions(db_path: &Path) -> usize {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        if conn
+        // 审查 P2：单条 UPDATE 失败（库被锁/磁盘满）不再是静默跳过——
+        // 半清不除等于双 open 修复失效，必须上报给调用方告警。
+        let updated = conn
             .execute(
                 "UPDATE sessions SET end_time = ?1, total_events = ?2 WHERE id = ?3 AND end_time IS NULL",
                 rusqlite::params![end_time, n_events, sid],
             )
-            .map(|n| n > 0)
-            .unwrap_or(false)
-        {
+            .map_err(|e| format!("闭合 session {sid} 失败: {e}"))?;
+        if updated > 0 {
             closed += 1;
         }
     }
     if closed > 0 {
         log::info!("启动清扫：闭合了 {closed} 个遗留 open session");
     }
-    closed
+    Ok(closed)
 }
 
 #[cfg(test)]
@@ -123,7 +124,7 @@ mod tests {
             // 不 end_session：模拟强杀
         }
         // —— tray 启动清扫（本修复）——
-        assert_eq!(close_all_open_sessions(&db), 1);
+        assert_eq!(close_all_open_sessions(&db).unwrap(), 1);
         // —— 采集器启动路径（与 core collector 相同顺序）——
         {
             let d = kynoptic_core::db::Database::open(db.to_str().unwrap()).unwrap();
@@ -159,7 +160,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(close_all_open_sessions(&db), 2);
+        assert_eq!(close_all_open_sessions(&db).unwrap(), 2);
         let conn = rusqlite::Connection::open(&db).unwrap();
         assert_eq!(open_count(&conn), 0);
         // end_time = 该 session 最后一条事件时间；无事件的回退 start_time
@@ -184,11 +185,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 
-    /// db 不存在（全新首装）：静默 0，不建库不报错。
+    /// db 不存在（全新首装）：Ok(0)，不建库不报错。
     #[test]
     fn missing_db_is_noop() {
         let db = temp_db("missing");
-        assert_eq!(close_all_open_sessions(&db), 0);
+        assert_eq!(close_all_open_sessions(&db).unwrap(), 0);
         assert!(!db.exists(), "清扫不得建库（建库是采集器职责）");
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }

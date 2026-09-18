@@ -26,6 +26,11 @@ const MAX_EVENTS_PER_MINUTE: u32 = 20;
 const MAX_DETAIL_ENTRIES: usize = 32;
 /// pending 积压超过该数量立即冲刷
 const MAX_PENDING: usize = 256;
+/// pending 硬上限（审查 P2：超过即丢最旧——collect 间隔 5s，风暴下
+/// 无界积压会吃光内存，宁可丢数也要让丢失可见）
+const PENDING_CAP: usize = 4096;
+/// 原始变化通道容量（审查 P2：unbounded channel 在采集器卡死时同样无界增长）
+const RAW_CHANNEL_CAP: usize = 8192;
 /// watch 缓冲区大小
 const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -40,17 +45,49 @@ pub struct RawChange {
     pub seg: String,
 }
 
+/// 有界通道发送端 + 丢弃计数（审查 P2：try_send 失败不阻塞 watch 线程，
+/// 丢弃数累计进计数器，随下一条 file_activity 事件带回，丢失可见）。
+pub struct RawSender {
+    tx: crossbeam_channel::Sender<RawChange>,
+    /// 通道满被丢弃的原始变化条数（与 collect 共享）
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RawSender {
+    fn send(&self, change: RawChange) {
+        if self.tx.try_send(change).is_err() {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 struct State {
     started: bool,
     rx: Option<crossbeam_channel::Receiver<RawChange>>,
-    /// (入队时间, 变化)
-    pending: Vec<(Instant, RawChange)>,
+    /// 原始变化丢弃计数（watch 线程侧经 RawSender 累加；emit 时取走清零）
+    dropped_raw: Arc<std::sync::atomic::AtomicU64>,
+    /// (入队时间, 变化)，FIFO；超过 PENDING_CAP 丢最旧
+    pending: std::collections::VecDeque<(Instant, RawChange)>,
+    /// pending 硬上限溢出丢弃条数（emit 时随事件带回后清零）
+    dropped_pending: u64,
     /// 节流窗口起点
     window_start: Option<Instant>,
     /// 本窗口已产事件数
     window_count: u32,
     /// 因节流被丢弃的变化条数（随下一条事件带回后清零）
     truncated: u64,
+}
+
+impl State {
+    /// pending 入队，超过 PENDING_CAP 时丢最旧并计数（审查 P2）
+    fn push_pending(&mut self, change: (Instant, RawChange)) {
+        while self.pending.len() >= PENDING_CAP {
+            self.pending.pop_front();
+            self.dropped_pending += 1;
+        }
+        self.pending.push_back(change);
+    }
 }
 
 pub struct FileActivityMonitor {
@@ -63,7 +100,9 @@ impl Default for FileActivityMonitor {
             state: Mutex::new(State {
                 started: false,
                 rx: None,
-                pending: Vec::new(),
+                dropped_raw: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                pending: std::collections::VecDeque::new(),
+                dropped_pending: 0,
                 window_start: None,
                 window_count: 0,
                 truncated: 0,
@@ -86,10 +125,19 @@ impl Monitor for FileActivityMonitor {
 
         if !st.started {
             st.started = true;
-            let (raw_tx, raw_rx) = crossbeam_channel::unbounded();
+            // 审查 P2：有界通道（RAW_CHANNEL_CAP），watch 线程用 try_send，
+            // 丢弃计数进 dropped_raw，随下一条事件带回
+            let (raw_tx, raw_rx) = crossbeam_channel::bounded(RAW_CHANNEL_CAP);
             st.rx = Some(raw_rx);
             for (root_name, path) in watch_roots() {
-                spawn_watcher(&path, root_name, raw_tx.clone());
+                spawn_watcher(
+                    &path,
+                    root_name,
+                    RawSender {
+                        tx: raw_tx.clone(),
+                        dropped: Arc::clone(&st.dropped_raw),
+                    },
+                );
             }
         }
 
@@ -105,11 +153,11 @@ impl Monitor for FileActivityMonitor {
             None => Vec::new(),
         };
         for c in drained_raw {
-            st.pending.push((Instant::now(), c));
+            st.push_pending((Instant::now(), c));
         }
 
         // 去抖：最早的 pending 超过 2 秒（或积压过大）才合并产事件
-        let ready = match st.pending.first() {
+        let ready = match st.pending.front() {
             Some((t, _)) => t.elapsed() >= DEBOUNCE,
             None => false,
         };
@@ -117,7 +165,8 @@ impl Monitor for FileActivityMonitor {
             return;
         }
 
-        let drained: Vec<(Instant, RawChange)> = std::mem::take(&mut st.pending);
+        let drained: Vec<(Instant, RawChange)> =
+            std::mem::take(&mut st.pending).into_iter().collect();
         if drained.is_empty() {
             return;
         }
@@ -154,12 +203,18 @@ impl Monitor for FileActivityMonitor {
 
         let truncated = st.truncated;
         st.truncated = 0;
+        // 丢弃计数随事件带回（丢失可见），取走即清零
+        let dropped_raw = st.dropped_raw.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let dropped_pending = st.dropped_pending;
+        st.dropped_pending = 0;
 
         let event = Event::new(EventAction::FileActivity, EventType::Device).data(json!({
             "changes": details,
             "change_count": total,
             "roots": roots,
             "truncated": truncated,
+            "dropped_raw": dropped_raw,
+            "dropped_pending": dropped_pending,
         }));
         let _ = tx.try_send(event);
     }
@@ -193,7 +248,7 @@ fn user_profile_dir(sub: &str) -> String {
 
 /// 为一个目录树启动 watch 线程。线程随进程生命周期运行；
 /// watch 失败/溢出后自动重建。
-pub fn spawn_watcher(path: &str, root_name: &str, tx: crossbeam_channel::Sender<RawChange>) {
+pub fn spawn_watcher(path: &str, root_name: &str, tx: RawSender) {
     if path.is_empty() {
         return;
     }
@@ -206,12 +261,7 @@ pub fn spawn_watcher(path: &str, root_name: &str, tx: crossbeam_channel::Sender<
         .ok();
 }
 
-fn watch_loop(
-    path: &str,
-    root_name: &str,
-    tx: &crossbeam_channel::Sender<RawChange>,
-    stop: &AtomicBool,
-) {
+fn watch_loop(path: &str, root_name: &str, tx: &RawSender, stop: &AtomicBool) {
     loop {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -251,7 +301,7 @@ fn watch_loop(
                 let err = unsafe { GetLastError() };
                 if err == ERROR_NOTIFY_ENUM_DIR {
                     // 缓冲区溢出：快照不完整，通知上层后重建 watch
-                    let _ = tx.send(RawChange {
+                    tx.send(RawChange {
                         action: "overflow",
                         root: root_name.to_string(),
                         seg: String::new(),
@@ -261,7 +311,7 @@ fn watch_loop(
             }
             if returned == 0 {
                 // 部分系统上溢出表现为成功但 0 字节
-                let _ = tx.send(RawChange {
+                tx.send(RawChange {
                     action: "overflow",
                     root: root_name.to_string(),
                     seg: String::new(),
@@ -276,7 +326,7 @@ fn watch_loop(
                 let Some(seg) = first_path_segment(&name) else {
                     continue;
                 };
-                let _ = tx.send(RawChange {
+                tx.send(RawChange {
                     action: map_action(action),
                     root: root_name.to_string(),
                     seg,
@@ -408,6 +458,24 @@ mod tests {
         out
     }
 
+    /// 测试用 RawSender 构造（有界通道 + 丢弃计数，与生产 collect 同构）
+    fn test_sender() -> (
+        RawSender,
+        crossbeam_channel::Receiver<RawChange>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let (tx, rx) = crossbeam_channel::bounded(RAW_CHANNEL_CAP);
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        (
+            RawSender {
+                tx,
+                dropped: Arc::clone(&dropped),
+            },
+            rx,
+            dropped,
+        )
+    }
+
     #[test]
     fn parse_notify_buffer_minimal() {
         // 构造一条 FILE_NOTIFY_INFORMATION：action=1（ADDED），name="a.txt"
@@ -494,7 +562,7 @@ mod tests {
     fn temp_dir_real_round_trip() {
         let tmp = TempDir::new("roundtrip");
         let dir = tmp.0.to_string_lossy().to_string();
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx, _dropped) = test_sender();
 
         spawn_watcher(&dir, "testroot", tx);
 
@@ -551,7 +619,7 @@ mod tests {
             st.started = true;
             let (_t, r) = crossbeam_channel::unbounded();
             st.rx = Some(r);
-            st.pending.push((
+            st.push_pending((
                 Instant::now(),
                 RawChange {
                     action: "created",
@@ -588,7 +656,7 @@ mod tests {
         {
             let mut st = monitor.state.lock().unwrap();
             st.window_count = MAX_EVENTS_PER_MINUTE; // 配额耗尽
-            st.pending.push((
+            st.push_pending((
                 Instant::now() - Duration::from_secs(3),
                 RawChange {
                     action: "deleted",
@@ -608,7 +676,7 @@ mod tests {
         {
             let mut st = monitor.state.lock().unwrap();
             st.window_start = Some(Instant::now() - Duration::from_secs(61));
-            st.pending.push((
+            st.push_pending((
                 Instant::now() - Duration::from_secs(3),
                 RawChange {
                     action: "modified",
@@ -625,5 +693,77 @@ mod tests {
             let st = monitor.state.lock().unwrap();
             assert_eq!(st.truncated, 0);
         }
+    }
+
+    #[test]
+    fn pending_cap_drops_oldest_and_counts() {
+        let mut st = State {
+            started: true,
+            rx: None,
+            dropped_raw: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending: std::collections::VecDeque::new(),
+            dropped_pending: 0,
+            window_start: None,
+            window_count: 0,
+            truncated: 0,
+        };
+        // 灌满 PENDING_CAP 后再入队：最旧被丢、dropped_pending 计数
+        for i in 0..PENDING_CAP {
+            st.push_pending((
+                Instant::now(),
+                RawChange {
+                    action: "created",
+                    root: "desktop".into(),
+                    seg: format!("f{i}.txt"),
+                },
+            ));
+        }
+        assert_eq!(st.pending.len(), PENDING_CAP);
+        assert_eq!(st.dropped_pending, 0);
+        st.push_pending((
+            Instant::now(),
+            RawChange {
+                action: "created",
+                root: "desktop".into(),
+                seg: "new.txt".into(),
+            },
+        ));
+        assert_eq!(st.pending.len(), PENDING_CAP, "cap must hold");
+        assert_eq!(st.dropped_pending, 1, "oldest drop must be counted");
+        assert_eq!(
+            st.pending.front().unwrap().1.seg,
+            "f1.txt",
+            "oldest dropped"
+        );
+        assert_eq!(st.pending.back().unwrap().1.seg, "new.txt");
+    }
+
+    #[test]
+    fn raw_sender_counts_channel_overflows() {
+        let (tx, rx, dropped) = test_sender();
+        // 有界容量 8192：塞满后 try_send 失败应计入 dropped 而不阻塞
+        for i in 0..RAW_CHANNEL_CAP {
+            tx.send(RawChange {
+                action: "created",
+                root: "downloads".into(),
+                seg: format!("f{i}.txt"),
+            });
+        }
+        tx.send(RawChange {
+            action: "created",
+            root: "downloads".into(),
+            seg: "overflow.txt".into(),
+        });
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "overflow send must be counted as dropped"
+        );
+        // 通道仍可正常吸干
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, RAW_CHANNEL_CAP);
     }
 }

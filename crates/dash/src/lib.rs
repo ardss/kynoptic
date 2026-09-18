@@ -61,10 +61,31 @@ pub const DEFAULT_PORT: u16 = settings::DEFAULT_DASHBOARD_PORT;
 
 // ─── 数据面（&Connection / &Path 纯函数，可脱离 TCP 单测） ───────────────────
 
+/// 400 错误回显净化（审查 P2）：原始输入直接拼进错误消息会被反射回页面/日志
+/// （日志注入 + 存储型 XSS 的投放面）。只保留字母数字与 '-'，截到 32 字符，
+/// 超长以 "…" 结尾提示被净化。
+fn sanitize_date_echo(raw: &str) -> String {
+    let kept: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(32)
+        .collect();
+    if raw.len() > 32 || kept.len() != raw.chars().count() {
+        format!("{kept}…")
+    } else {
+        kept
+    }
+}
+
+/// 统一的日期参数错误消息（回显经 sanitize_date_echo 净化）。
+fn date_err(raw: &str, hint: &str) -> String {
+    format!("日期格式错: {}（应为 {hint}）", sanitize_date_echo(raw))
+}
+
 /// GET /api/summary?date= — 当日四卡数据。数字全部来自 DB。
 pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, String> {
-    let (start, end) = queries::local_day_range(date)
-        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD）"))?;
+    let (start, end) =
+        queries::local_day_range(date).ok_or_else(|| date_err(date, "YYYY-MM-DD"))?;
     let totals = queries::day_totals(conn, date);
     let top_app = queries::top_apps_today(conn, &start, &end, 1)
         .into_iter()
@@ -359,7 +380,8 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
-/// db_path 只返回文件名（审查 P2：全路径暴露安装目录/用户名等本机拓扑）。
+/// db_path 只返回文件名（审查 P2：全路径暴露安装目录/用户名等本机拓扑）；
+/// 另带 db_dir_kind 提示数据目录性质（exe 同目录 / 其他），不暴露具体路径。
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     json!({
         "today": queries::today_local_str(),
@@ -368,9 +390,22 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default(),
+        "db_dir_kind": db_dir_kind(db_path),
         "bind": "127.0.0.1",
         "read_only": true,
     })
+}
+
+/// 数据目录性质提示（审查 P2：只给类别，不给路径）。db 与当前 exe 同目录时
+/// 记 "exe-relative data"（安装版/便携版典型布局），否则记 "user data"。
+fn db_dir_kind(db_path: &Path) -> &'static str {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    match (db_path.parent(), exe_dir) {
+        (Some(db), Some(exe)) if db == exe => "exe-relative data",
+        _ => "user data",
+    }
 }
 
 // bridge_count 已下沉到 kynoptic-core（queries::bridge_count），dash/cli 共用。
@@ -473,9 +508,11 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         .map(|(a, v)| (a.clone(), *v));
     let fg_total_min: i64 = fg_dwell.values().sum::<i64>() / 60;
     // "机器替人值班"指标：有前台窗口但无任何输入（含桥接）的分钟数。
-    // 暂无分钟级前台采样，取保守近似：fg_dwell_min - (presence + automation)，
-    // 负值截 0（宁可低估不夸大）。口径随响应返回。
-    let unattended_fg_minutes = fg_total_min.saturating_sub(presence_minutes + automation_minutes);
+    // 暂无分钟级前台采样，取保守近似：fg_dwell_min - (presence + automation
+    // - mixed)（审查：混合分钟同时计入 presence 与 automation，直接相减会把
+    // 它们扣两遍——减并集只扣一次），负值截 0（宁可低估不夸大）。口径随响应返回。
+    let unattended_fg_minutes =
+        fg_total_min.saturating_sub((presence_minutes + automation_minutes - mixed_minutes).max(0));
 
     // "机器值班"第一小时误导防线：数据不满一整天时，该指标只是"开机至今减
     // 去活跃分钟"，人在场不 typing 也被累加。库中最早事件早于本地今日零点
@@ -498,7 +535,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "mixed_minutes": mixed_minutes,
         "metrics_note": "口径：纯人分钟计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
         "unattended_fg_minutes": unattended_fg_minutes,
-        "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes)，负值截 0（暂无分钟级前台采样）",
+        "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes - mixed_minutes)，负值截 0（暂无分钟级前台采样）",
         "has_full_day": has_full_day,
         "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,
@@ -608,8 +645,8 @@ pub fn api_hours(conn: &Connection, date: &str) -> std::result::Result<Value, St
         "" | "today" => queries::today_local_str(),
         d => d.to_string(),
     };
-    let (start, end) = queries::local_day_range(&date)
-        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
+    let (start, end) =
+        queries::local_day_range(&date).ok_or_else(|| date_err(&date, "YYYY-MM-DD 或 today"))?;
     let mut map = [0i64; 24];
     for (hour, cnt) in queries::hourly_counts_today(conn, &start, &end) {
         if (0..24).contains(&hour) {
@@ -804,6 +841,7 @@ pub fn api_input_at(
         std::collections::BTreeMap::new();
     let today_prefix = today.format("%Y-%m-%d").to_string();
     let mut hourly_today: [u64; 24] = [0; 24];
+    let minute_rows = rows.len();
 
     for (bucket, etype, data) in rows {
         let v: Value = match data.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
@@ -851,6 +889,89 @@ pub fn api_input_at(
         }
     }
 
+    // 审查：raw 粒度（opt-in 逐键）库里没有 input_agg 计数行，此前本接口
+    // 恒返回全 0。分钟行缺席时回退为 press/click 原始行聚合（keys = COUNT
+    // press，clicks = COUNT click；per-key 图按 $.vk_code 分组），并在响应里
+    // 标注 granularity 供前端区分口径。
+    let mut granularity = "minute";
+    if minute_rows == 0 {
+        granularity = "raw";
+        // 近 N 天每日 keys/clicks
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT substr(datetime(timestamp, ?1), 1, 10) AS d, event_type, COUNT(*) \
+             FROM events \
+             WHERE event_type IN ('keyboard','mouse') \
+               AND event_action IN ('press','click') AND timestamp >= ?2 \
+             GROUP BY d, event_type",
+        ) {
+            if let Ok(r) = stmt.query_map(params![&off, &since], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
+                for (d, etype, cnt) in r.flatten() {
+                    let cnt = cnt.max(0) as u64;
+                    let e = series.entry(d).or_default();
+                    if etype == "keyboard" {
+                        totals.keys += cnt;
+                        e.0 += cnt;
+                    } else if etype == "mouse" {
+                        totals.clicks += cnt;
+                        e.1 += cnt;
+                    }
+                }
+            }
+        }
+        // 今日逐时输入量（keys+clicks 口径与 minute 行一致）
+        if let Some((tstart, tend)) = queries::local_day_range(&today_prefix) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT CAST(substr(datetime(timestamp, ?1), 12, 2) AS INTEGER) AS hh, \
+                        event_type, COUNT(*) \
+                 FROM events \
+                 WHERE event_type IN ('keyboard','mouse') \
+                   AND event_action IN ('press','click') \
+                   AND timestamp >= ?2 AND timestamp < ?3 \
+                 GROUP BY hh, event_type",
+            ) {
+                if let Ok(r) = stmt.query_map(params![&off, &tstart, &tend], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                }) {
+                    for (hh, etype, cnt) in r.flatten() {
+                        let h = hh as usize;
+                        if h < 24 && (etype == "keyboard" || etype == "mouse") {
+                            hourly_today[h] += cnt.max(0) as u64;
+                        }
+                    }
+                }
+            }
+        }
+        // per-key 键频（raw：press 行 $.vk_code）
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT json_extract(event_data, '$.vk_code') AS vk, COUNT(*) \
+             FROM events \
+             WHERE event_type = 'keyboard' AND event_action = 'press' \
+               AND timestamp >= ?1 AND json_valid(event_data) \
+               AND json_extract(event_data, '$.vk_code') IS NOT NULL \
+             GROUP BY vk",
+        ) {
+            if let Ok(r) = stmt.query_map(params![&since], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (vk, cnt) in r.flatten() {
+                    if (0..=255).contains(&vk) && cnt > 0 {
+                        key_freq.insert(vk.to_string(), cnt as u64);
+                    }
+                }
+            }
+        }
+    }
+
     let days_out: Vec<Value> = series
         .iter()
         .map(|(d, (keys, clicks))| json!({"date": d, "keys": keys, "clicks": clicks}))
@@ -870,6 +991,7 @@ pub fn api_input_at(
     Ok(json!({
         "days": days,
         "input_devices": input_devices,
+        "granularity": granularity,
         "keys_total": totals.keys,
         "clicks_total": totals.clicks,
         "clicks_left": totals.left,
@@ -1206,8 +1328,8 @@ pub fn api_report_at(
         "" | "today" => queries::today_local_str(),
         d => d.to_string(),
     };
-    let (start, end) = queries::local_day_range(&date)
-        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
+    let (start, end) =
+        queries::local_day_range(&date).ok_or_else(|| date_err(&date, "YYYY-MM-DD 或 today"))?;
     let mut stmt = conn
         .prepare(
             "SELECT timestamp, COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') AS app, window_title              FROM events              WHERE event_type = 'window' AND event_action = 'switch'                AND timestamp >= ?1 AND timestamp < ?2              ORDER BY timestamp",
@@ -1357,16 +1479,25 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
     };
     let (k1, c1, m1) = sum7(0);
     let (k0, c0, m0) = sum7(7);
-    // 审查（DeepSeek）：上周数据不足（<3 个有数据日）时对比无意义——上周置空，
-    // 前端显示"上周数据不足，已跳过对比"而非误导性增长率
-    let last_week_days = (0..7)
-        .filter(|d| {
-            let day = (today - chrono::Duration::days(7 + *d as i64))
-                .format("%Y-%m-%d")
-                .to_string();
-            by_date.contains_key(day.as_str())
-        })
-        .count();
+    // 审查（DeepSeek）：周数据不足（<3 个有数据日）时对比无意义——本周与上周
+    // 同一口径置空，前端显示"数据不足，已跳过对比"而非误导性汇总/增长率。
+    // 本周此前无门槛：6 个缺日 + 1 天数据也会输出整周汇总，与 last_week 不对称。
+    let week_days = |offset: i64| -> usize {
+        (0..7)
+            .filter(|d| {
+                let day = (today - chrono::Duration::days(offset + i64::from(*d)))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                by_date.contains_key(day.as_str())
+            })
+            .count()
+    };
+    let (this_week_days, last_week_days) = (week_days(0), week_days(7));
+    let this_week = if this_week_days >= 3 {
+        json!({"keys": k1, "clicks": c1, "active_minutes": m1})
+    } else {
+        json!(null)
+    };
     let last_week = if last_week_days >= 3 {
         json!({"keys": k0, "clicks": c0, "active_minutes": m0})
     } else {
@@ -1374,7 +1505,7 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
     };
     json!({
         "daily": daily,
-        "this_week": {"keys": k1, "clicks": c1, "active_minutes": m1},
+        "this_week": this_week,
         "last_week": last_week,
         // 修复"人在场"假别名（第四口径）：曾经的 presence_minutes = active_minutes
         // 冒充在场（含注入、不桥接）。active_minutes 是 raw 输入口径（daily_agg
@@ -1390,8 +1521,8 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
         "" | "today" => queries::today_local_str(),
         d => d.to_string(),
     };
-    let (start, end) = queries::local_day_range(&date)
-        .ok_or_else(|| format!("日期格式错: {date}（应为 YYYY-MM-DD 或 today）"))?;
+    let (start, end) =
+        queries::local_day_range(&date).ok_or_else(|| date_err(&date, "YYYY-MM-DD 或 today"))?;
     let mut stmt = conn
         .prepare(
             "SELECT substr(datetime(timestamp, ?1), 12, 2) AS hh,                     COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') AS app,                     COUNT(*) AS cnt              FROM events              WHERE event_type = 'window' AND timestamp >= ?2 AND timestamp < ?3              GROUP BY hh, app",
@@ -1652,6 +1783,32 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     Ok(payload)
 }
 
+/// Windows reparse point 属性位（与 cli main.rs 的 is_reparse_point 同一套判据；
+/// dash crate 不依赖 cli，这里按同口径实现小份本地副本）。
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// 路径存在且是 symlink/junction（reparse point）。命中即拒绝写入：
+/// settings-audit.log 若被换成指向任意文件的链接，append 会写穿到目标处。
+fn is_reparse_point(p: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::symlink_metadata(p)
+            .map(|md| md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::symlink_metadata(p)
+            .map(|md| md.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+}
+
+/// 单条审计记录的字节上限（时间戳 + 摘要 JSON 正常远小于此值）
+const AUDIT_RECORD_CAP: usize = 512;
+
 /// POST /api/settings 审计行：RFC3339 时间 + 变更字段摘要（JSON），一行一条。
 /// 事件边界（任一字段被改）本身就是隐私敏感事件，必须留痕。
 fn append_settings_audit(db_path: &Path, summary: &str) {
@@ -1660,21 +1817,30 @@ fn append_settings_audit(db_path: &Path, summary: &str) {
         _ => std::path::PathBuf::from("."),
     };
     let line = format!("{}\t{}\n", Utc::now().to_rfc3339(), summary);
-    // 截断 512 字节（按 UTF-8 字符边界，避免切碎多字节字符）
-    let line: String = if line.len() > 512 {
-        let mut end = 512;
-        while end > 0 && !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n", &line[..end])
+    // 审查 P2：超限记录整条丢弃，不再硬截断——512 字节处下刀会把 JSON 记录
+    // 劈成两半，上游任何逐行 JSON 解析都会在残行上炸掉。改为写一条占位记录
+    // （{"truncated_record":true,"len":N}）保住"曾发生一次异常大的变更"这条
+    // 审计线索，同时保证日志里每行都是完整 JSON。
+    let line: String = if line.len() > AUDIT_RECORD_CAP {
+        format!(
+            "{}\t{{\"truncated_record\":true,\"len\":{}}}\n",
+            Utc::now().to_rfc3339(),
+            line.len().saturating_sub(1) // 去掉行尾换行计原始记录长度
+        )
     } else {
         line
     };
+    // reparse point 防线：目标已是 symlink/junction 时拒绝 append（防写穿）
+    let target = dir.join("settings-audit.log");
+    if is_reparse_point(&target) {
+        log::warn!("settings-audit.log 是符号链接/junction，拒绝写入（不影响设置保存）");
+        return;
+    }
     // 审计失败不影响主流程：设置已保存，日志尽力而为
     let result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("settings-audit.log"))
+        .open(&target)
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     if let Err(e) = result {
         log::warn!("settings-audit.log 写入失败（不影响设置保存）: {e}");

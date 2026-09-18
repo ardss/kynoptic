@@ -150,11 +150,18 @@ begin
     // 静默时跳过询问，默认保留数据（安全侧）。
     if UninstallSilent then
       DeleteDataOnUninstall := False
-    else
+    else begin
       DeleteDataOnUninstall :=
         (MsgBox('是否同时删除用户数据目录？' #13#10 + DataDir + #13#10#13#10 +
                 '（包含 kynoptic.db 与 settings.json，选"否"则保留数据）',
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES);
+      // 审查：用户选择删除后给一次不可逆警告（仅交互模式；数据一旦删除，
+      // 历史记录无法找回，重装也不会恢复）
+      if DeleteDataOnUninstall then
+        MsgBox('警告：删除后所有历史数据将无法找回，重新安装也不会恢复。' #13#10 +
+               '如需保留数据请取消本次卸载并重新选择"否"。',
+               mbInformation, MB_OK);
+    end;
 
     // 清理运行期残留文件（忽略不存在的情况）
     Leftovers[0] := AppDir + '\tray-exit.flag';

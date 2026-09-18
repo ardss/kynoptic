@@ -11,7 +11,7 @@
 //! 消费方：crates/dash（overview / timeline）、crates/cli（presence 子命令）。
 //! 禁止在消费方再写第四份口径——需要改动请只改这里。
 
-use chrono::{Local, Timelike, Utc};
+use chrono::{Local, Utc};
 use rusqlite::{params, Connection};
 
 /// 分钟级分类（overview 与 timeline 共用同一 SQL/判定）：
@@ -51,8 +51,14 @@ pub fn minute_classification(
 }
 
 /// 桥接计数：排序去重后的分钟序列里，相邻间隙 <= gap 分钟按"无输入阅读"
-/// 桥接成连续在场段，返回覆盖的分钟总数（经典 afk 模型：间隙按
-/// `(diff).min(gap+1)` 补步长，即最多补 gap 个缺失分钟）。
+/// 桥接成连续在场段，返回覆盖的分钟总数。
+///
+/// 审查复核（day-edge overcount 疑点）：每步计入的是「端点分钟本身 1」+
+/// 「桥接补洞 min(diff-1, gap)」，与 `min(diff, gap+1)` 恒等（diff>=1 时
+/// `min(diff, gap+1) == 1 + min(diff-1, gap)`），故总增量恒 <= 墙钟跨度 diff，
+/// 不存在 diff == gap+1 时多记一分钟的情形；整段总数也恒 <= 首末墙钟跨度。
+/// 不得改成裸 `min(gap, diff-1)`——那会把端点分钟本身丢掉，连续分钟序列
+/// （diff=1）计数停滞，详见 cli `bridge_count_bridges_small_gaps_only` 测试。
 pub fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
     if sorted_minutes.is_empty() {
         return 0;
@@ -86,55 +92,53 @@ pub struct PresenceDay {
 ///
 /// `local_day` 为 `YYYY-MM-DD` 本地日期；`bridge_min` 为桥接阈值
 /// （调用方从 settings 的 `presence_bridge_minutes` 读入，本函数钳到 0-15）。
+///
+/// 分钟键口径（审查：DST 回拨丢失修复）：一律用 **UTC 纪元分钟**
+/// （`timestamp / 60`）作为去重与桥接的线性分钟 id——此前 minute 模式按本地
+/// "HH:MM" 当日分钟数、raw 模式按 UTC 分钟串，回拨日的 +1 重复小时两趟
+/// 会被折叠到同一个本地钟面值而丢分钟。纪元分钟对两趟天然唯一、严格单调，
+/// 去重与桥接数学完全不变；首末活动在输出时再格式化回本地 "HH:MM"。
 pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> PresenceDay {
     let Some((start, end)) = super::local_day_range(local_day) else {
         return PresenceDay::default();
     };
-    let off = super::local_offset_modifier();
     let mut human: Vec<i64> = Vec::new();
     let mut automation: Vec<i64> = Vec::new();
     let mut mixed: i64 = 0;
-    let mut first_min: Option<String> = None;
-    let mut last_min: Option<String> = None;
-    // 本地分钟桶 "YYYY-MM-DD HH:MM" -> 当日第几分钟
-    let minute_of_day = |mb: &str| -> Option<i64> {
-        chrono::NaiveDateTime::parse_from_str(mb, "%Y-%m-%d %H:%M")
-            .ok()
-            .map(|t| i64::from(t.hour()) * 60 + i64::from(t.minute()))
-    };
-    if let Ok(mrows) = minute_classification(conn, &start, &end, &off) {
-        for (mb, human_hit, auto_hit) in mrows {
-            let mod_ = minute_of_day(&mb);
-            if human_hit {
-                if let Some(m) = mod_ {
-                    human.push(m);
-                }
-                if first_min.is_none() {
-                    first_min = Some(mb.clone());
-                }
-                last_min = Some(mb.clone());
-            }
-            if auto_hit {
-                if let Some(m) = mod_ {
-                    automation.push(m);
-                }
+    // minute 模式：按 UTC 纪元分钟分桶聚合（strftime('%s') 解析 RFC3339 的
+    // 时区后缀，两趟重复本地小时得到不同纪元分钟，不再互吞）。
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute_epoch, \
+                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0, \
+                MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0 \
+         FROM events \
+         WHERE timestamp >= ?1 AND timestamp < ?2 AND event_action = 'input_agg' \
+           AND json_valid(event_data) \
+         GROUP BY minute_epoch",
+    ) {
+        if let Ok(rows) = stmt.query_map(params![&start, &end], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        }) {
+            for (mepoch, human_hit, auto_hit) in rows.flatten() {
                 if human_hit {
-                    mixed += 1;
+                    human.push(mepoch);
+                }
+                if auto_hit {
+                    if human_hit {
+                        mixed += 1;
+                    }
+                    automation.push(mepoch);
                 }
             }
         }
     }
     // raw 模式（opt-in 逐键）：press/click 无法区分注入，按人算。
-    // 这里 substr 出的是 UTC 分钟串 "YYYY-MM-DDTHH:MM"，需转本地再取当日分钟。
-    let minute_of_day_utc = |minute_str: &str| -> Option<i64> {
-        use chrono::TimeZone;
-        chrono::NaiveDateTime::parse_from_str(minute_str, "%Y-%m-%dT%H:%M")
-            .ok()
-            .map(|t| {
-                let l = Local.from_utc_datetime(&t);
-                i64::from(l.hour()) * 60 + i64::from(l.minute())
-            })
-    };
+    // substr 出的是 UTC 分钟串 "YYYY-MM-DDTHH:MM"（DISTINCT 已去重；回拨日
+    // 两趟重复本地小时的 UTC 串本就不同，不会互吞），同样折算成纪元分钟。
     if let Ok(mut stmt) = conn.prepare(
         "SELECT DISTINCT substr(timestamp,1,16) FROM events \
          WHERE event_action IN ('press','click') \
@@ -142,21 +146,10 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
     ) {
         if let Ok(rows) = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0)) {
             for minute_str in rows.flatten() {
-                if let Some(m) = minute_of_day_utc(&minute_str) {
-                    human.push(m);
-                }
-                // 审查 P1：raw 模式（默认粒度）也要维护首末活动——此前只在
-                // minute 分类循环里更新，raw 库的 first/last 恒为 null。
-                // 本地化成与 minute 模式相同的 "YYYY-MM-DD HH:MM" 格式。
                 if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&minute_str, "%Y-%m-%dT%H:%M")
                 {
                     use chrono::TimeZone;
-                    let l = Local.from_utc_datetime(&t);
-                    let local_str = l.format("%Y-%m-%d %H:%M").to_string();
-                    if first_min.is_none() {
-                        first_min = Some(local_str.clone());
-                    }
-                    last_min = Some(local_str);
+                    human.push(Utc.from_utc_datetime(&t).timestamp() / 60);
                 }
             }
         }
@@ -167,17 +160,20 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
     automation.dedup();
     let bridge = i64::from(bridge_min.min(15));
     let presence = bridge_count(&human, bridge);
-    let fmt_hm = |mb: &str| -> Option<String> {
-        chrono::NaiveDateTime::parse_from_str(mb, "%Y-%m-%d %H:%M")
-            .ok()
-            .map(|t| t.format("%H:%M").to_string())
+    // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"（此前按
+    // 行序覆盖在乱序结果集上不可靠，纪元分钟取 min/max 语义精确）。
+    let fmt_epoch_hm = |m: i64| -> Option<String> {
+        chrono::DateTime::from_timestamp(m * 60, 0)
+            .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
     };
+    let first_activity = human.first().copied().and_then(fmt_epoch_hm);
+    let last_activity = human.last().copied().and_then(fmt_epoch_hm);
     PresenceDay {
         presence_minutes: presence,
         automation_minutes: automation.len() as i64,
         mixed_minutes: mixed,
-        first_activity: first_min.as_deref().and_then(fmt_hm),
-        last_activity: last_min.as_deref().and_then(fmt_hm),
+        first_activity,
+        last_activity,
     }
 }
 

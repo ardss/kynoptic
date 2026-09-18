@@ -3,8 +3,9 @@
 //! 设计依据（v0.1 发行方式 = GitHub Releases 裸二进制）：
 //! - 审查 P0：旧实现走 self_update 的 `{bin}-{version}-{target}.zip` 资产只换
 //!   kynoptic.exe 一个文件，造成 tray/watchdog 版本漂移。现改为手动流程：
-//!   下载 SHA256SUMS.txt + 三个裸 exe 资产（release 同时上传 zip 三件套供
-//!   手动下载），全部通过 SHA-256 校验后才替换。
+//!   下载 SHA256SUMS.txt + 三个裸 exe + SKILL.md 资产（release 同时上传 zip
+//!   三件套供手动下载），全部通过 SHA-256 校验后才替换；SKILL.md 在 exe 替换
+//!   成功后刷新到 exe 同目录（文档文件，失败仅告警不回滚）。
 //! - 审查 P0：替换前旧 exe 改名 `.bak` 保留；新 kynoptic.exe 启动失败时
 //!   从 `.bak` 整体还原。校验失败则整体放弃、不动任何旧文件。
 //! - tray 运行中替换失败时：先 taskkill 静默结束（CREATE_NO_WINDOW），
@@ -46,7 +47,20 @@ fn io_err(x: std::io::Error) -> crate::Error {
 }
 
 /// 便携版自更新必须整体替换的三件套（与 release.yml 的 update zip 一致）。
+/// 注意：[0] 必须是主 exe kynoptic.exe——替换顺序逻辑（先换 [1..] 再换 [0]）
+/// 依赖这一约定，勿改。
 const BIN_NAMES: [&str; 3] = ["kynoptic.exe", "kynoptic-tray.exe", "kynoptic-watchdog.exe"];
+/// 随更新分发的 SKILL.md（release 资产名；成功替换后落到 exe 同目录）。
+/// 校验/下载走 ASSET_NAMES（三件套 + SKILL.md），exe 替换仍只走 BIN_NAMES，
+/// 避免把文档文件塞进 BIN_NAMES[1..]+[0] 的进程解锁/启动验证流程。
+const SKILL_MD_NAME: &str = "SKILL.md";
+/// 完整资产清单（完整性检查与下载用）：三件套 + SKILL.md。
+const ASSET_NAMES: [&str; 4] = [
+    "kynoptic.exe",
+    "kynoptic-tray.exe",
+    "kynoptic-watchdog.exe",
+    SKILL_MD_NAME,
+];
 const SUMS_NAME: &str = "SHA256SUMS.txt";
 const REPO_OWNER: &str = "ardss";
 const REPO_NAME: &str = "kynoptic";
@@ -385,14 +399,15 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             // 非数字尾缀组件的比较不可靠）。self_update 0.41 的 Release 不暴露
             // prerelease 标志，用 semver 预发布约定（tag 含 '-'）判定。
             !r.version.contains('-')
-                && BIN_NAMES
+                && ASSET_NAMES
                     .iter()
                     .all(|n| r.assets.iter().any(|a| &a.name == n))
                 && r.assets.iter().any(|a| a.name == SUMS_NAME)
         })
         .ok_or_else(|| {
             crate::Error::InvalidData(
-                "GitHub Releases 上找不到完整的更新资产（三件套 + SHA256SUMS.txt）".to_string(),
+                "GitHub Releases 上找不到完整的更新资产（三件套 + SKILL.md + SHA256SUMS.txt）"
+                    .to_string(),
             )
         })?;
     let new_ver = release.version.trim_start_matches('v').to_string();
@@ -419,7 +434,10 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     let sums = parse_sums(&sums_text);
 
     let mut downloaded: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for name in BIN_NAMES {
+    // 下载走完整资产清单（含 SKILL.md）；SHA-256 校验循环遍历同一列表，
+    // 因此 SKILL.md 的哈希必须出现在 SHA256SUMS.txt（release.yml 已覆盖全部
+    // dist 文件），缺失或校验失败同样整体放弃。
+    for name in ASSET_NAMES {
         let path = tmp.path().join(name);
         download_file(&asset_url(name)?, &path)?;
         downloaded.push((name.to_string(), path));
@@ -473,6 +491,17 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         return Err(crate::Error::InvalidData(
             "新版本启动失败，已回滚到旧版本".to_string(),
         ));
+    }
+
+    // 6. SKILL.md 刷新到 exe 目录（已过 SHA-256 校验）。文档文件不做 .bak/
+    // 回滚——失败仅告警，不影响更新结果。
+    if let Some((_, src)) = downloaded.iter().find(|(n, _)| n.as_str() == SKILL_MD_NAME) {
+        match std::fs::copy(src, dir.join(SKILL_MD_NAME)) {
+            Ok(_) => println!("SKILL.md updated"),
+            Err(err) => warnings.push(format!(
+                "SKILL.md 刷新失败（{err}），可稍后用 skill install 重装"
+            )),
+        }
     }
 
     println!("updated to {new_ver}");
@@ -555,5 +584,16 @@ mod tests {
         let m = parse_sums(text);
         assert_eq!(m.get("kynoptic.exe").map(String::as_str), Some("aaaa"));
         assert_eq!(m.get("kynoptic-tray.exe").map(String::as_str), Some("bbbb"));
+    }
+
+    #[test]
+    fn asset_names_extend_bin_names_without_reordering() {
+        // 替换顺序逻辑依赖 BIN_NAMES[0] == 主 exe；ASSET_NAMES 只能在前缀之后
+        // 追加 SKILL.md，不得插入或重排三件套
+        assert_eq!(ASSET_NAMES[0], BIN_NAMES[0]);
+        for (i, n) in BIN_NAMES.iter().enumerate() {
+            assert_eq!(ASSET_NAMES[i], *n);
+        }
+        assert_eq!(ASSET_NAMES[BIN_NAMES.len()], SKILL_MD_NAME);
     }
 }
