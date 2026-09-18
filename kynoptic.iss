@@ -68,7 +68,7 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 ; 用户从托盘菜单主动退出则写旗标,watchdog 不拉起。随 autostart 任务一起安装。
 ; /F 覆盖建:换目录升级时旧任务指向旧 {app} 成为死任务,/F 保证任务重建后
 ; 必指向本次安装目录(审查 P1-10)。
-Filename: "schtasks"; Parameters: "/Create /F /SC MINUTE /MO 1 /TN ""Kynoptic Watchdog"" /TR ""'{app}\kynoptic-watchdog.exe' watchdog --once"""; Tasks: autostart; Flags: runhidden
+Filename: "schtasks"; Parameters: "/Create /F /SC MINUTE /MO 1 /TN ""Kynoptic Watchdog"" /TR ""'{app}\kynoptic-watchdog.exe' watchdog --once"""; Flags: runhidden
 
 [Code]
 // ============================ 通用辅助 ============================
@@ -101,17 +101,21 @@ begin
   if not RunHidden('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE') then
     Log('Watchdog task DISABLE skipped/failed');
   KillProcessSilently('kynoptic-watchdog.exe');
+  // 审查 P1：CloseApplications=force 与 PrepareToInstall 之间有窗口，watchdog
+  // 每 15s/每分钟都可能把托盘拉回来重新锁住 {app}\kynoptic-tray.exe，导致
+  // ignoreversion 复制失败且静默升级无声中止。这里显式补杀托盘。
+  KillProcessSilently('kynoptic-tray.exe');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then begin
     // 审查 P1-4：双写，避免升级场景半开半关。
-    // 勾选 autostart：注册表 Run 值由 [Registry] 段按任务勾选写入，
-    // 计划任务由 [Run] 段 /Create /F 重建（覆盖旧 DISABLE 僵尸/旧目录死任务）。
-    // 未勾选：清掉旧安装留下的 DISABLE 僵尸任务与残留 Run 值。
+    // 计划任务已无条件 /Create（静默安装不勾任务也会建——此前静默升级会
+    // 静默丢看门狗）。未勾选 autostart：任务转 DISABLE（防无人值守拉起），
+    // 并清掉旧安装残留的 Run 值。
     if not WizardIsTaskSelected('autostart') then begin
-      RunHidden('schtasks', '/Delete /F /TN "Kynoptic Watchdog"');
+      RunHidden('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE');
       RegDeleteValue(HKEY_CURRENT_USER,
         'Software\Microsoft\Windows\CurrentVersion\Run', 'Kynoptic');
     end;
@@ -127,7 +131,7 @@ procedure CurUninstallStepChanged(CurStep: TUninstallStep);
 var
   AppDir, DataDir: String;
   I: Integer;
-  Leftovers: array[0..4] of String;
+  Leftovers: array[0..11] of String;
 begin
   if CurStep = usUninstall then begin
     // 审查 P1-6：先静默杀掉 tray 与 watchdog，防止文件占用导致卸载残留
@@ -153,7 +157,14 @@ begin
     Leftovers[2] := AppDir + '\watchdog.log';
     Leftovers[3] := AppDir + '\tray-error.log';
     Leftovers[4] := AppDir + '\settings-audit.log';
-    for I := 0 to 4 do begin
+    Leftovers[5] := AppDir + '\watchdog.log.old';
+    Leftovers[6] := AppDir + '\watchdog-state.json';
+    Leftovers[7] := AppDir + '\dashboard-port.txt';
+    Leftovers[8] := AppDir + '\dashboard-error.log';
+    Leftovers[9] := AppDir + '\kynoptic-tray.exe.bak';
+    Leftovers[10] := AppDir + '\kynoptic.exe.bak';
+    Leftovers[11] := AppDir + '\kynoptic-watchdog.exe.bak';
+    for I := 0 to 11 do begin
       if FileExists(Leftovers[I]) then
         DeleteFile(Leftovers[I]);
     end;

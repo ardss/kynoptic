@@ -160,6 +160,9 @@ fn writer_loop(
     total_written: Arc<AtomicUsize>,
     // 退出条件已改为只认通道断开（生产者随停机旗标退出后自然 Disconnected）
     _shutdown: Arc<AtomicBool>,
+    // 关停兜底：聚合线程 join 后由 shutdown 置位，writer 排空尾批退出，
+    // 不再无限等待可能卡死的生产者断开通道（审查 P1）
+    writer_stop: Arc<AtomicBool>,
 ) {
     use std::panic;
 
@@ -175,6 +178,7 @@ fn writer_loop(
                 flush_interval,
                 &total_written,
                 &mut batch,
+                &writer_stop,
             )
         }));
         match result {
@@ -204,6 +208,7 @@ fn writer_loop_inner(
     flush_interval: Duration,
     total_written: &AtomicUsize,
     batch: &mut Vec<Event>,
+    stop_flag: &std::sync::atomic::AtomicBool,
 ) -> Option<usize> {
     use crossbeam_channel::{RecvTimeoutError, TryRecvError};
     use std::time::Instant;
@@ -211,6 +216,21 @@ fn writer_loop_inner(
     let mut last_flush = Instant::now();
 
     loop {
+        // 审查 P1：writer 退出不能只认通道 Disconnected——监控线程持 tx clone
+        // 且可能被卡死（如 clipboard OpenClipboard 被他进程长占），join 永远
+        // 等不到 Disconnected，shutdown 整体挂死。writer_stop 在聚合线程
+        // join（终值 flush 已入队）之后由 shutdown 置位，writer 到此做最终
+        // 排空落库再退出，不丢尾批。
+        if stop_flag.load(Ordering::Acquire) {
+            while let Ok(event) = rx.try_recv() {
+                batch.push(event);
+            }
+            let n = batch.len();
+            if n > 0 {
+                write_batch(db, batch, total_written);
+            }
+            return Some(n);
+        }
         loop {
             match rx.try_recv() {
                 Ok(event) => {
@@ -345,6 +365,9 @@ pub struct Collector {
     /// 本实例的停机旗标（每 Collector 一份：probe 会在同进程多次启停采集器，
     /// 全局静态旗标会把上一个实例的监控线程"复活"成僵尸）。
     shutdown: Arc<AtomicBool>,
+    /// writer 关停兜底旗标：聚合线程 join 后置位，writer 排空尾批退出
+    /// （监控线程卡死时不再挂死 shutdown）。
+    writer_stop: Arc<AtomicBool>,
 }
 
 impl Collector {
@@ -372,6 +395,10 @@ impl Collector {
         if let Some(h) = self.agg_handle.take() {
             let _ = h.join();
         }
+        // writer_stop 置位必须在聚合线程 join 之后：此时所有该落库的尾批
+        // （含终值 flush）都已入队，writer 排空退出即可。
+        self.writer_stop
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
         }
@@ -401,6 +428,8 @@ impl Drop for Collector {
             if let Some(h) = self.agg_handle.take() {
                 let _ = h.join();
             }
+            self.writer_stop
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Some(handle) = self.writer_handle.take() {
                 // 再 join writer：通道里残留的秒级小快照全部落库后，
                 // 直写部分分钟终值必然后发生，不会被旧快照覆盖
@@ -457,10 +486,15 @@ pub fn start_collection_custom(
 
     let (tx, rx) = bounded::<Event>(constants::CHANNEL_CAPACITY);
     let total_written = Arc::new(AtomicUsize::new(0));
+    // writer 关停兜底旗标：shutdown 在聚合线程 join 之后置位（终值 flush 已
+    // 入队），writer 排空尾批退出——不再依赖"全部生产者断开通道"这一可能
+    // 永远等不到的条件（监控线程卡死即挂死，审查 P1）。
+    let writer_stop = Arc::new(AtomicBool::new(false));
 
     let db_w = db.clone();
     let tw = total_written.clone();
     let sd_writer = shutdown.clone();
+    let ws_writer = writer_stop.clone();
     let writer_handle = thread::Builder::new()
         .name("EventWriter".into())
         .spawn(move || {
@@ -471,6 +505,7 @@ pub fn start_collection_custom(
                 Duration::from_secs(settings.write_flush_interval_secs.max(1)),
                 tw,
                 sd_writer,
+                ws_writer,
             );
         })
         .expect("Writer 启动失败");
@@ -614,6 +649,7 @@ pub fn start_collection_custom(
         hooks,
         settings,
         shutdown,
+        writer_stop,
     }
 }
 

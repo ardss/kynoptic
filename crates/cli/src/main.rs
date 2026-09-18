@@ -70,7 +70,7 @@ Subcommands:
   probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update                                      Self-update from GitHub releases
-  watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
+  watchdog [--once]                         Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary
 
 Global options (all subcommands unless noted):

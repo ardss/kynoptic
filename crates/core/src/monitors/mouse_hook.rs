@@ -163,16 +163,19 @@ impl EventHook for MouseHook {
         std::thread::Builder::new()
             .name("mouse_hook".into())
             .spawn(|| unsafe {
-                MOUSE_THREAD_ID.store(
-                    windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-                    Ordering::Release,
-                );
+                let my_tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+                MOUSE_THREAD_ID.store(my_tid, Ordering::Release);
 
                 let hook =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), std::ptr::null_mut(), 0);
                 if hook.is_null() {
                     log::error!("鼠标 Hook 安装失败");
-                    MOUSE_THREAD_ID.store(0, Ordering::Release);
+                    let _ = MOUSE_THREAD_ID.compare_exchange(
+                        my_tid,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
                     return;
                 }
                 MOUSE_HOOK.store(hook as u32, Ordering::Release);
@@ -185,8 +188,19 @@ impl EventHook for MouseHook {
                 }
 
                 UnhookWindowsHookEx(hook);
-                MOUSE_HOOK.store(0, Ordering::Release);
-                MOUSE_THREAD_ID.store(0, Ordering::Release);
+                // 代际竞态防护（同 keyboard_hook）：只清自己仍持有的槽位。
+                let _ = MOUSE_HOOK.compare_exchange(
+                    hook as u32,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                let _ = MOUSE_THREAD_ID.compare_exchange(
+                    my_tid,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 log::info!("mouse_hook 已停止");
             })
             .expect("mouse hook thread");

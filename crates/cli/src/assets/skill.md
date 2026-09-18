@@ -21,9 +21,9 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 **两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。开发在 K:\kynoptic（git 正本，G 盘已弃用），改完 `cargo build --release -p kynoptic -p kynoptic-tray` 后把二进制拷到安装目录重启托盘才生效。
 
 数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
-CLI 解析顺序：`KYNOPTIC_DB` 环境变量 > `--db <PATH>` 全局参数 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。
+CLI 解析顺序：`--db <PATH>` 全局参数 > `KYNOPTIC_DB` 环境变量 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。
 CLI 默认路径推导时会打印 `using db: <path>` 到 stderr——**注意核对**，防静默读到错误库。
-仪表盘：http://127.0.0.1:8422/（只读 HTTP；8422 被占会回退到下一个空闲端口，实际端口写在 data\dashboard-port.txt；服务没起来 panel 000 时先找托盘进程）。
+仪表盘：http://127.0.0.1:8422/（只读 HTTP；8422 被占会按 8422-8432 → 18422-18432 → 28422-28432 三段回退（可能落到 18422 段），实际端口写在 data\dashboard-port.txt；服务没起来 panel 000 时先找托盘进程）。
 
 ## 核心命令
 
@@ -42,8 +42,10 @@ kynoptic mcp [--db PATH]           # 启动 MCP 服务器（stdio）；--db 与 
 HTTP API（GET 全部只读）：
 `/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶）、
 `/api/insights`（6 张叙事卡）、`/api/report`、`/api/heatmap`、`/api/anomalies`（含 message_en）、
-`/api/settings`、`/api/status`、`/api/summary`、`/api/input`。
-写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:8422`（CSRF 三重校验的一部分），body 只传要改的字段。
+`/api/settings`、`/api/status`、`/api/summary`、`/api/input`、
+`/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours`（黄金时段）、
+`/api/apps_grid`、`/api/daily_top`。
+写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（CSRF 三重校验的一部分；Origin 必须与 dashboard-port.txt 里的实际端口一致），body 只传要改的字段。
 
 ## 口径铁律（引用数字前必读）
 

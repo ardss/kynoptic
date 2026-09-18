@@ -259,7 +259,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "get_current_status",
-            "description": "本机当前状态标量视图：cpu_pct/mem_pct/max_temp_c/battery_pct/foreground_app/idle_seconds/apm_5min/net_up/down_kbps",
+            "description": "本机当前状态标量视图：cpu_pct/mem_pct/max_temp_c/battery_pct/foreground_app/idle_seconds/apm_5min/net_up_kbps/net_down_kbps",
             "inputSchema": {
                 "type": "object",
                 "properties": {

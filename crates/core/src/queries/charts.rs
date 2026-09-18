@@ -749,11 +749,15 @@ pub fn app_history_totals(conn: &Connection, app: &str, before_date: &str) -> (i
             )
             .unwrap_or((0, 0));
     }
+    // 时区修正（审查 P1）：before_date 是本地日期，timestamp 是 UTC 字符串，
+    // 直接 substr 前缀比较会把本地当天 00:00–offset 段的事件错算成"更早日期"
+    // （UTC+8 下 skew 整个凌晨）。与其它回退路径同样用 local_offset_modifier。
+    let off = super::local_offset_modifier();
     conn.query_row(
-        "SELECT COUNT(*), COUNT(DISTINCT substr(timestamp, 1, 10)) \
+        "SELECT COUNT(*), COUNT(DISTINCT substr(datetime(timestamp, ?3), 1, 10)) \
          FROM events \
-         WHERE app_name = ?1 AND substr(timestamp, 1, 10) < ?2",
-        params![app, before_date],
+         WHERE app_name = ?1 AND substr(datetime(timestamp, ?3), 1, 10) < ?2",
+        params![app, before_date, off],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     )
     .unwrap_or((0, 0))

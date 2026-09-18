@@ -113,16 +113,19 @@ impl EventHook for KeyboardHook {
         std::thread::Builder::new()
             .name("keyboard_hook".into())
             .spawn(|| unsafe {
-                KB_THREAD_ID.store(
-                    windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-                    Ordering::Release,
-                );
+                let my_tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+                KB_THREAD_ID.store(my_tid, Ordering::Release);
 
                 let hook =
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), std::ptr::null_mut(), 0);
                 if hook.is_null() {
                     log::error!("键盘 Hook 安装失败");
-                    KB_THREAD_ID.store(0, Ordering::Release);
+                    let _ = KB_THREAD_ID.compare_exchange(
+                        my_tid,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
                     return;
                 }
                 KB_HOOK.store(hook as u32, Ordering::Release);
@@ -135,8 +138,13 @@ impl EventHook for KeyboardHook {
                 }
 
                 UnhookWindowsHookEx(hook);
-                KB_HOOK.store(0, Ordering::Release);
-                KB_THREAD_ID.store(0, Ordering::Release);
+                // 代际竞态防护：慢退出的旧线程若无条件清零静态槽，会把新线程
+                // 刚注册的 tid/hook 抹掉——下一次 stop() 变 no-op，writer join
+                // 永久挂死。只清自己仍然持有的槽位。
+                let _ =
+                    KB_HOOK.compare_exchange(hook as u32, 0, Ordering::AcqRel, Ordering::Acquire);
+                let _ =
+                    KB_THREAD_ID.compare_exchange(my_tid, 0, Ordering::AcqRel, Ordering::Acquire);
                 log::info!("keyboard_hook 已停止");
             })
             .expect("keyboard hook thread");

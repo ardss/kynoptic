@@ -409,10 +409,15 @@
     <input type="number" id="set-bridge" min="0" max="15" style="width:64px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
     <span class="muted" style="font-size:11px"><span class="l en">gaps of ≤N minutes without input still count as presence (reading)</span><span class="l zh">连续 N 分钟内无键鼠输入仍按"读屏"计入在场</span></span>
   </div>
+  <div class="mon-row" style="display:flex;align-items:center;gap:8px">
+    <label for="set-goal" style="white-space:nowrap"><span class="l en">daily goal (minutes):</span><span class="l zh">每日目标活跃分钟数：</span></label>
+    <input type="number" id="set-goal" min="0" max="1440" style="width:72px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
+    <span class="muted" style="font-size:11px"><span class="l en">drives the goal ring on the overview card (default 480)</span><span class="l zh">控制总览卡的目标圆环（默认 480）</span></span>
+  </div>
   <div class="mon-row">
     <input type="checkbox" id="set-counts" checked>
-    <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended; per-key detail off)</span>
-    <span class="l zh">仅按分钟计数保存键盘/鼠标输入（推荐；不记录逐键明细）</span></label>
+    <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended). UNCHECKING switches to raw per-keystroke logging — full key content is recorded.</span>
+    <span class="l zh">仅按分钟计数保存键盘/鼠标输入（推荐）。取消勾选将切换为逐键原始记录——记录完整按键内容，请谨慎关闭。</span></label>
   </div>
   <div class="mon-row">
     <input type="checkbox" id="set-vkfreq">
@@ -1276,6 +1281,7 @@ async function loadSettings() {
     s.monitors.filter(m => !m.default_enabled).map(row).join("");
   document.getElementById("set-autostart").checked = s.autostart;
   document.getElementById("set-bridge").value = (s.presence_bridge_minutes ?? 2);
+  document.getElementById("set-goal").value = (s.daily_goal_minutes ?? 480);
   document.getElementById("set-counts").checked = s.input_counts_only;
   document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
   settingsMsg("", true);
@@ -1300,7 +1306,8 @@ async function saveSettings() {
       autostart: document.getElementById("set-autostart").checked,
       input_counts_only: document.getElementById("set-counts").checked,
       vk_frequency_enabled: document.getElementById("set-vkfreq").checked,
-      presence_bridge_minutes: Math.max(0, Math.min(15, parseInt(document.getElementById("set-bridge").value || "2", 10) || 0))
+      presence_bridge_minutes: Math.max(0, Math.min(15, parseInt(document.getElementById("set-bridge").value || "2", 10) || 0)),
+      daily_goal_minutes: Math.max(0, Math.min(1440, parseInt(document.getElementById("set-goal").value || "480", 10) || 0))
     };
     const r = await fetch("/api/settings", {
       method: "POST",

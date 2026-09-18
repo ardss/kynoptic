@@ -249,6 +249,18 @@ fn download_file(url: &str, dest: &std::path::Path) -> crate::Result<()> {
 /// 静默强杀进程（taskkill，CREATE_NO_WINDOW 不弹 console 窗）
 #[cfg(windows)]
 fn kill_process(image: &str) -> bool {
+    // 自杀防护（审查 P2）：替换循环里包含主 exe（更新器自身）；rename 运行中
+    // 的 exe 在 Windows 上通常成功，只有失败兜底才走到杀进程——此时按镜像名
+    // 杀会把自己（及一切 kynoptic CLI 会话）中途击毙，托盘已换、回滚不再运行。
+    if let Ok(self_exe) = std::env::current_exe() {
+        if self_exe
+            .file_name()
+            .map(|n| n.to_string_lossy() == image)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000; // windows-sys Win32::System::Threading::CREATE_NO_WINDOW
     std::process::Command::new("taskkill")
@@ -368,9 +380,14 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     let release = releases
         .into_iter()
         .find(|r| {
-            BIN_NAMES
-                .iter()
-                .all(|n| r.assets.iter().any(|a| &a.name == n))
+            // prerelease 过滤（审查 P1）：workflow 对任何 v* tag 都出全量资产，
+            // 不过滤会让 0.1.x 稳定用户被"更到"beta/RC（version_cmp 对
+            // 非数字尾缀组件的比较不可靠）。self_update 0.41 的 Release 不暴露
+            // prerelease 标志，用 semver 预发布约定（tag 含 '-'）判定。
+            !r.version.contains('-')
+                && BIN_NAMES
+                    .iter()
+                    .all(|n| r.assets.iter().any(|a| &a.name == n))
                 && r.assets.iter().any(|a| a.name == SUMS_NAME)
         })
         .ok_or_else(|| {
@@ -425,6 +442,7 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     // 4. 替换：tray/watchdog 先换，主 exe 最后换（中途失败仍保有可运行主程序）
     let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut tray_killed = false;
     let mut order: Vec<&str> = BIN_NAMES[1..].to_vec();
     order.push(BIN_NAMES[0]);
     for name in order {
@@ -433,7 +451,10 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             .find(|(n, _)| n == name)
             .ok_or_else(|| crate::Error::InvalidData(format!("内部错误：缺少 {name}")))?;
         let dest = dir.join(name);
-        let (replaced, _) = replace_with_backup(&dest, src);
+        let (replaced, killed) = replace_with_backup(&dest, src);
+        if name == "kynoptic-tray.exe" && killed {
+            tray_killed = true;
+        }
         if replaced {
             backups.push((
                 dest.clone(),
@@ -459,6 +480,19 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         "旧版本已保留为同名 .bak 文件（{}\\*.bak），确认无误后可手动删除",
         dir.display()
     );
+    // 托盘因解锁被杀时负责拉起（审查 P1）：否则更新"成功"后用户托盘凭空
+    // 消失——便携版没有看门狗任务，没人会替我们重启它。
+    if tray_killed {
+        match std::process::Command::new(dir.join("kynoptic-tray.exe"))
+            .arg("--minimized")
+            .spawn()
+        {
+            Ok(_) => eprintln!("托盘已随更新自动重启"),
+            Err(err) => warnings.push(format!(
+                "托盘自动重启失败（{err}），请手动启动 kynoptic-tray.exe"
+            )),
+        }
+    }
     for w in warnings {
         eprintln!("警告: {w}");
     }

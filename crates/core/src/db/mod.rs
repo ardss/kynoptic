@@ -264,6 +264,10 @@ impl Database {
         }
 
         let writer = Connection::open(path)?;
+        // 审查 P1：writer 也必须带 busy_timeout/WAL——后台回填线程持有独立写
+        // 连接（BEGIN IMMEDIATE），热重载重启后新 writer 若 busy_timeout=0 会
+        // 立即 SQLITE_BUSY 降级丢批。
+        let _ = crate::db::schema::apply_pragmas(&writer);
         writer.execute_batch(SCHEMA)?;
         // 迁移失败硬失败（审查 P1）：宁可不启动，不带病运行
         run_migrations(&writer)?;
