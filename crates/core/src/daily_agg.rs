@@ -28,12 +28,14 @@ pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
             "SELECT
                 COALESCE(SUM({keys_row}), 0),
                 COALESCE(SUM({clicks_row}), 0),
-                (SELECT COUNT(DISTINCT substr(datetime(timestamp, ?3), 1, 16)) FROM events
-                 WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type IN ('keyboard','mouse'))
+                -- 口径（统一 2026-09，交叉审查 P1）：move-only 分钟不算活跃，
+                -- 与 active_minutes_by_date / day_totals / active_minutes_today
+                -- 同一口径（keys/clicks 才算活跃分钟）。
+                COUNT(DISTINCT CASE WHEN {keys_row} + {clicks_row} > 0
+                                    THEN substr(datetime(timestamp, ?3), 1, 16) END)
              FROM events
              WHERE timestamp >= ?1 AND timestamp < ?2
-               AND event_type IN ('keyboard','mouse')
-               AND event_action IN ('press','click','input_agg')",
+               AND event_type IN ('keyboard','mouse')",
             keys_row = crate::queries::KEYS_ROW_EXPR,
             clicks_row = crate::queries::CLICKS_ROW_EXPR,
         ),

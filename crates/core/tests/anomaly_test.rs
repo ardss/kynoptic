@@ -119,6 +119,47 @@ fn marathon_bridge_gap_2_vs_15_split_or_merge() {
     assert!(out15[0].message.contains("186"), "{}", out15[0].message);
 }
 
+/// 交叉审查 P2：马拉松起止时间必须按**本地时区**格式化——此前用 UTC，
+/// 本地 12:00 开始的马拉松在异常卡上显示为 UTC 04:00。
+#[test]
+fn marathon_time_range_is_local_not_utc() {
+    // 锚定当前时刻的整分钟，构造 180 连续分钟
+    use chrono::Timelike;
+    let start = chrono::Utc::now()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let m0 = start.timestamp() / 60;
+    let mins: Vec<String> = (0..180)
+        .map(|i| {
+            chrono::DateTime::from_timestamp((m0 + i) * 60, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%dT%H:%M")
+                .to_string()
+        })
+        .collect();
+    let out = marathon_from_minutes(&mins, 0);
+    assert_eq!(out.len(), 1);
+    let expect_start = start
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let expect_end = (start + chrono::Duration::minutes(179))
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    assert!(
+        out[0]
+            .detail
+            .contains(&format!("从 {expect_start} 到 {expect_end}")),
+        "起止时间必须是本地时区: {}",
+        out[0].detail
+    );
+    assert_eq!(out[0].at.as_deref(), Some(expect_start.as_str()));
+}
+
 // ─── 纯函数：new_app_surge_from_data ──────────────────────────────────────────
 
 #[test]

@@ -6,7 +6,7 @@
 //! 且用 `y*525_600 + mo*43_800 + d*1440` 估算（按 30 天/月），
 //! 跨月/跨年时会算错连续段判断。本模块改用 chrono 精确计算。
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 
 /// 把 ISO8601 时间戳（含或不含时区）转换为自纪元以来的分钟数。
 ///
@@ -37,6 +37,27 @@ pub fn minute_diff(start: &str, end: &str) -> i64 {
 /// 替代 anomaly.rs 原 `parse` 闭包。
 pub fn epoch_minutes_or_zero(s: &str) -> i64 {
     minutes_since_epoch(s).unwrap_or(0)
+}
+
+/// 把**本地钟面** "YYYY-MM-DDTHH:MM" 解析为真实纪元分钟（按本地时区解释，
+/// DST 缺失时刻回退 UTC 解释；解析失败返回 0）。
+///
+/// 与 [`epoch_minutes_or_zero`] 的差异：后者把 naive 串**视作 UTC**（对差值/
+/// 连续段判断足够），本函数供需要把分钟**还原成本地钟面显示**的管线
+/// （[`crate::anomaly::marathon_from_minutes`] 的起止时间）使用——解析与格式化
+/// 必须围绕同一时区基准，否则本地 12:00 会被显示成 UTC 04:00。
+pub fn local_epoch_minutes_or_zero(s: &str) -> i64 {
+    let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
+    else {
+        return 0;
+    };
+    use chrono::TimeZone;
+    match Local.from_local_datetime(&naive).earliest() {
+        Some(dt) => dt.timestamp() / 60,
+        // DST 空洞时刻：回退按 UTC 解释（仅影响展示，不影响连续段差值判断）
+        None => naive.and_utc().timestamp() / 60,
+    }
 }
 
 /// 在已知"每分钟活动"的时间序列(ISO 字符串)中，找出最长连续段及总 break 数。

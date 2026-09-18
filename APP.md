@@ -75,7 +75,28 @@ Windows 专用（依赖 windows-sys）；需要 MSVC 工具链。
 ## 数据库
 
 SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（事务执行，幂等）。
-概览：`0001_init`（采集基础表）、`0002_bucket_model`（开放 bucket 模型：schema_meta / buckets / event_types / agg_minute / agg_daily / current_state）、`0003` 起（perf/聚合读缓存覆盖索引等性能与派生缓存迁移）至 `0009`，逐个文件见 `crates/core/src/db/migrations/`。
+概览：`0001_init`（采集基础表）、`0002_bucket_model`（开放 bucket 模型：schema_meta / buckets / event_types / agg_minute / agg_daily / current_state）、`0003` 起（perf/聚合读缓存覆盖索引等性能与派生缓存迁移）至 `0010`，逐个文件见 `crates/core/src/db/migrations/`。
+
+### event_type/action → event_data JSON 键（采集器写入的主要负载）
+
+事件行主列为 `timestamp / event_type / event_action / app_name / window_title`，结构化负载在 `event_data` JSON 中（键随采集器版本演进，以代码为准）。高频 action 一览：
+
+| event_type / action | event_data 主要键 | 来源 |
+|---------------------|-------------------|------|
+| `keyboard` / `input_agg` | `keys`, `samples`, `keys_samples`, `vk`（逐键频次 map，需显式开启）, `injected_keys`（有注入时） | `core/src/input_agg.rs` |
+| `mouse` / `input_agg` | `clicks`, `scroll_ticks`, `moves`, `move_distance_px`, `samples`, `clicks_left/right/middle/side1/side2`, `injected_clicks`（有注入时） | `core/src/input_agg.rs` |
+| `window` / `switch` | `hwnd`, `title`, `pid`, `proc` | `monitors/window.rs` |
+| `system` / `heartbeat` | `memory`, `cpu_percent` | `monitors/system.rs` |
+| `system` / `battery_status` | `percent`, `status_code`, `status_text`, `charging`, `prev_charge`（变化时） | `monitors/battery.rs` |
+| `system` / `idle_start` / `idle_end` | `idle_seconds`, `threshold` | `monitors/idle.rs` |
+| `system` / `audio_state` | `volume`, `muted` | `monitors/audio.rs` |
+| `system` / `volume_change` | `old_volume`, `new_volume`, `muted` | `monitors/audio.rs` |
+| `system` / `brightness_change` | `brightness`, `old_brightness`, `new_brightness` | `monitors/brightness.rs` |
+| `session` / `lock` / `unlock` | `locked` | `monitors/session.rs` |
+| `session` / `display_change` | `prev_count`, `current_count` | `monitors/session.rs` |
+| `device` / `device_snapshot` | 硬件快照（含 `memory` 总量/可用、`disks` 容量等序列化字段） | `monitors/device.rs` |
+| `network` / `conn_snapshot` | 网络连接快照（序列化结构） | `monitors/network.rs` |
+| `process` / `process_snapshot` | 进程列表快照（序列化结构） | `monitors/process.rs` |
 
 数据库路径解析：环境变量 `KYNOPTIC_DB` > exe 同级 `data/kynoptic.db` > cwd 候选。
 

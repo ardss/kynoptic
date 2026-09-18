@@ -531,8 +531,8 @@ fn db_path_with_wal(db_path: &Path) -> std::path::PathBuf {
 /// 性能实证修复：旧实现扫 agg_minute 全史 GROUP BY（90 天库 cache miss
 /// 实测 ~1s，overview 连续有输入天数/streak 卡即读此数据）。改读
 /// daily_agg 日粒度派生缓存（date 为 PRIMARY KEY，一年最多 ~365 行，
-/// PK 直取 ms 级）。语义不变：value = 当日本地时区有键鼠输入的分钟数
-/// （daily_agg.active_minutes 与 agg_minute 去重分钟同源，见
+/// PK 直取 ms 级）。语义不变：value = 当日本地时区活跃分钟口径
+/// （keys/clicks，剔除纯移动；daily_agg.active_minutes 的口径见
 /// core/src/daily_agg.rs）。
 pub fn api_heatmap_at(conn: &Connection, weeks: u32, today: chrono::NaiveDate) -> Value {
     let weeks = weeks.clamp(1, 52);
@@ -1042,10 +1042,10 @@ fn insights_compute(
             best.2.map(fmt_day).unwrap_or_default(),
         );
         insights.push(json!({
-            "title_zh": "最长连续专注",
-            "title_en": "Longest focus streak",
-            "text_zh": format!("近 7 天你最长的连续在场是 {:.0} 分钟（{} ~ {}），期间没有任何超过 {} 分钟的离开。", best.0 / 60.0, rs, re, bridge_minutes),
-            "text_en": format!("Your longest continuous presence in the last 7 days was {:.0} minutes ({} ~ {}) with no gap over {} minutes.", best.0 / 60.0, rs, re, bridge_minutes),
+            "title_zh": "最长连续专注（约）",
+            "title_en": "Longest focus streak (approx.)",
+            "text_zh": format!("近 7 天你最长的连续在场约 {:.0} 分钟（{} ~ {}），期间没有任何超过 {} 分钟的离开。窗口切换事件数口径，与异常页马拉松计数可能相差 ±1。", best.0 / 60.0, rs, re, bridge_minutes),
+            "text_en": format!("Your longest continuous presence in the last 7 days was about {:.0} minutes ({} ~ {}) with no gap over {} minutes. Window-switch event counts may differ from the anomalies page by ±1.", best.0 / 60.0, rs, re, bridge_minutes),
         }));
     }
 
@@ -1098,12 +1098,13 @@ fn insights_compute(
         }
     }
 
-    // 4) 深夜活动占比
+    // 4) 深夜活动占比（口径与全站统一：[23:00, 次日 06:00)，含 23 点后
+    //    与凌晨两段；文案注明窗口与单位）
     let night = acts
         .iter()
         .filter(|(t, _)| {
             let h = t.with_timezone(&chrono::Local).hour();
-            h < 6
+            !(6..23).contains(&h)
         })
         .count();
     if night > 30 {
@@ -1111,8 +1112,8 @@ fn insights_compute(
         insights.push(json!({
             "title_zh": "深夜活动",
             "title_en": "Late-night activity",
-            "text_zh": format!("近 7 天有 {} 次键鼠输入发生在凌晨 0-6 点（占 {:.0}%）。", night, pct),
-            "text_en": format!("{} keyboard/mouse events in the last 7 days happened between 00:00-06:00 ({:.0}%).", night, pct),
+            "text_zh": format!("近 7 天有 {} 次键鼠输入发生在 23:00-06:00（含 23 点后与凌晨，占 {:.0}%）。", night, pct),
+            "text_en": format!("{} keyboard/mouse events in the last 7 days happened between 23:00-06:00 (evening after 23:00 plus early morning, {:.0}%).", night, pct),
         }));
     }
 

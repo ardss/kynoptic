@@ -22,23 +22,29 @@ pub struct Args {
     pub exit_flag: Option<PathBuf>,
 }
 
-/// 端口回退候选序列：preferred 起、逐个 +1，共 11 个（8422 被占时一路试到
-/// 8432）。纯函数，单测覆盖。preferred 之后的 10 个端口即"面板静默死亡"
-/// 的自救空间：回环上端口撞车（另一个服务占 8422）比换端口可接受得多。
-pub fn candidate_ports(preferred: u16) -> Vec<u16> {
-    (0..=10u16)
-        .filter_map(|i| preferred.checked_add(i))
-        .collect()
-}
+/// 每段连续候选个数
+pub const CANDIDATES_PER_BLOCK: u16 = 11;
 
-/// 在候选端口里挑第一个能 bind 127.0.0.1 的（探测 listener 立即 drop，
-/// 正式 bind 由 kynoptic_dash::serve 完成——存在极窄 TOCTOU 窗口，可接受：
-/// 单实例互斥体已保证没有第二个 kynoptic 抢同段端口）。
-/// 全部失败返回 None（调用方回退 preferred，由 serve 报原始错误）。
-pub fn pick_free_port(preferred: u16) -> Option<u16> {
-    candidate_ports(preferred)
-        .into_iter()
-        .find(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+/// 端口回退候选序列（P1 实测修复：Hyper-V/WSL 的 excludedportrange 常覆盖
+/// 8408-8507，旧的 8422 起逐个 +1 的 11 个候选会整段落进保留区，bind 全部
+/// 报 os error 10013，面板必死）。改为三段、段间 +10000 大步长跳出保留区：
+/// `8422-8432 → 18422-18432 → 28422-28432`。纯函数，单测覆盖。
+/// 段内回环撞车（另一个服务占 8422）比段内 +1 撞上保留区可接受得多。
+pub fn candidate_ports(preferred: u16) -> Vec<u16> {
+    let mut out = Vec::new();
+    for block in 0..3u32 {
+        let base = match (preferred as u32).checked_add(block * 10_000) {
+            Some(b) if b <= u16::MAX as u32 => b,
+            _ => break,
+        };
+        for i in 0..CANDIDATES_PER_BLOCK {
+            match base.checked_add(i as u32) {
+                Some(p) if p <= u16::MAX as u32 => out.push(p as u16),
+                _ => return out,
+            }
+        }
+    }
+    out
 }
 
 /// 解析托盘壳参数。db 缺省走 core 统一解析;未知选项报错。
@@ -94,20 +100,50 @@ pub fn parse(args: &[String]) -> Result<Args, Error> {
 mod tests {
     use super::*;
 
+    /// 挑第一个能 bind 的候选（探测即正式语义的测试替身;生产路径在
+    /// main.rs 的 dashboard 线程内紧贴 serve 执行同样的探测 bind）。
+    fn pick_free_port(preferred: u16) -> Option<u16> {
+        candidate_ports(preferred)
+            .into_iter()
+            .find(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+    }
+
     fn sv(args: &[&str]) -> Result<Args, Error> {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
     #[test]
-    fn port_fallback_candidates_are_contiguous_eleven() {
+    fn port_fallback_candidates_cross_big_stride_blocks() {
+        // P1 回归：Hyper-V/WSL excludedportrange 常覆盖 8408-8507，旧实现
+        // 8422-8432 连续 11 个候选整段落在保留区。新序列必须跨 +10000 大步长。
         let v = candidate_ports(8422);
-        assert_eq!(v.len(), 11);
-        assert_eq!(v[0], 8422);
-        assert_eq!(v[10], 8432);
+        assert_eq!(v.len(), 33);
+        assert_eq!(
+            &v[..11],
+            &(8422..=8432).collect::<Vec<u16>>(),
+            "第一段 8422-8432"
+        );
+        assert_eq!(
+            &v[11..22],
+            &(18422..=18432).collect::<Vec<u16>>(),
+            "第二段跨大步长"
+        );
+        assert_eq!(
+            &v[22..33],
+            &(28422..=28432).collect::<Vec<u16>>(),
+            "第三段再跨大步长"
+        );
+    }
+
+    #[test]
+    fn port_fallback_candidates_generic_shape() {
+        let v = candidate_ports(9000);
         assert_eq!(
             v,
-            (8422..=8432).collect::<Vec<u16>>(),
-            "必须从 preferred 起逐个 +1"
+            (9000..=9010)
+                .chain(19000..=19010)
+                .chain(29000..=29010)
+                .collect::<Vec<u16>>()
         );
     }
 
@@ -116,17 +152,52 @@ mod tests {
         // preferred 贴近 u16::MAX 时不得回绕到 0（回环低端口不允许偷偷占）
         let v = candidate_ports(u16::MAX);
         assert_eq!(v, vec![u16::MAX]);
+        // 高位 preferred：第二段 75000 超出 u16 即截断，不回绕低端口
+        let v = candidate_ports(65_000);
+        assert_eq!(v, (65_000..=65_010).collect::<Vec<u16>>());
     }
 
     #[test]
     fn pick_free_port_skips_occupied_and_reports_actual() {
-        // 占住 8422，pick 应跳到下一个端口；选出的端口可被再次 bind 前提是
-        // 先 drop 探测——这里只验证返回值 != 被占端口且落在候选集内
-        let blocker = std::net::TcpListener::bind(("127.0.0.1", 8432)).unwrap();
-        let picked = pick_free_port(8432).unwrap();
-        assert_ne!(picked, 8432, "被占端口必须跳过");
-        assert!(candidate_ports(8432).contains(&picked));
-        drop(blocker);
+        // 用临时 bind(0) 拿一个确定空闲的端口做 preferred,自己占住首位候选,
+        // pick 必须跳过它并返回候选集内的其他端口。（不写死 8422 段:测试机
+        // 的 excludedportrange 可能把候选段整个保留,bind 直接 10013。）
+        let preferred = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let preferred_port = preferred.local_addr().unwrap().port();
+        let picked = pick_free_port(preferred_port).unwrap();
+        assert_ne!(picked, preferred_port, "被占端口必须跳过");
+        assert!(candidate_ports(preferred_port).contains(&picked));
+        drop(preferred);
+    }
+
+    #[test]
+    fn pick_free_port_retries_across_stride_when_block_occupied() {
+        // 模拟保留区/占用：把第一段候选全部占住或不可 bind（excluded 范围
+        // bind 会报 10013——同样是"不可用"），pick 必须跨 +10000 大步长落到
+        // 第二段（旧实现 11 连号全失败返回 None → 面板静默死亡的路径）。
+        // 选一个满足 base+10010 <= u16::MAX 的空闲 preferred（跨段断言需要
+        // 第二段存在;临时端口 49152-65535 里高段不够跨步）
+        let (base, _keeper) = loop {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            if p as u32 + 10_000 + u32::from(CANDIDATES_PER_BLOCK) - 1 <= u32::from(u16::MAX) {
+                break (p, l);
+            }
+        };
+        drop(_keeper);
+        // 逐个封死第一段:bind 成功就持有（占用）,失败也视为不可用（保留区）
+        let mut blockers: Vec<std::net::TcpListener> = Vec::new();
+        for p in (base..base + CANDIDATES_PER_BLOCK).rev() {
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", p)) {
+                blockers.push(l);
+            }
+        }
+        let picked = pick_free_port(base).expect("第一段全占时必须跨段重试");
+        assert_eq!(
+            picked,
+            base + 10_000,
+            "应跨大步长落到第二段首位,实际 {picked}"
+        );
     }
 
     #[test]

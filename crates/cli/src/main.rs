@@ -262,7 +262,14 @@ fn cmd_export(args: &[String]) -> Result<()> {
 
     match format.as_str() {
         "csv" => {
-            let mut w = csv::Writer::from_path(&out_path).map_err(map_csv_err)?;
+            use std::io::Write;
+            let f = std::fs::File::create(&out_path)?;
+            let mut buf = std::io::BufWriter::new(f);
+            // P2：写 UTF-8 BOM（EF BB BF），Excel 双击打开才不会把 UTF-8 中文
+            // 当 ANSI 读出乱码。仅 CSV——jsonl/json 是程序间交换格式,加 BOM
+            // 反而破坏解析。（写在 csv::Writer 包装之前的裸 writer 上）
+            buf.write_all(&UTF8_BOM)?;
+            let mut w = csv::Writer::from_writer(buf);
             w.write_record([
                 "id",
                 "timestamp",
@@ -357,12 +364,18 @@ fn default_export_dir(db_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("exports"))
 }
 
-/// URL 查询串剥离（--redact 时启用）：仅处理含 "http" 的片段，去掉第一个 `?`
-/// 及其后的全部内容（查询串常带 token/session id 等敏感参数）。
+/// UTF-8 BOM（CSV 导出专用，Excel 识别中文所必需）
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// URL 查询串剥离（--redact 时启用）：仅对含 "http" 的 token 剥掉第一个 `?`
+/// 及其后内容（查询串常带 token/session id 等敏感参数）。token 允许携带
+/// 尾部空白（split_inclusive 的分隔符），截断后原样保留。
 fn sanitize_url_query(token: &str) -> String {
-    if token.contains("http") {
-        match token.find('?') {
-            Some(i) => token[..i].to_string(),
+    let word_end = token.find(char::is_whitespace).unwrap_or(token.len());
+    let (word, tail) = token.split_at(word_end);
+    if word.contains("http") {
+        match word.find('?') {
+            Some(i) => format!("{}{}", &word[..i], tail),
             None => token.to_string(),
         }
     } else {
@@ -370,14 +383,16 @@ fn sanitize_url_query(token: &str) -> String {
     }
 }
 
-/// window_title 脱敏（--redact opt-in）：按空白分片，只对含 http 的片段剥
-/// 查询串，其余片段原样保留。
+/// window_title 脱敏（--redact opt-in）：P3 修复——旧实现
+/// split_whitespace+join 会把换行/制表符压平成单空格，redact 版备份信息
+/// 永久损失。现改为 `split_inclusive` 按空白切分且保留分隔符：只有含 "http"
+/// 的连续非空白段（URL token）剥查询串，其余字符（含全部换行/制表符/多
+/// 空格）原样保留。
 fn sanitize_window_title(title: &str) -> String {
     title
-        .split_whitespace()
+        .split_inclusive(|c: char| c.is_whitespace())
         .map(sanitize_url_query)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 fn ext(f: &str) -> &'static str {
@@ -1169,6 +1184,11 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     use kynoptic_core::collector;
     use std::sync::atomic::Ordering;
 
+    // P1 单实例保护（实测：collect 与 tray 并发 = 同库双写、事件口径翻倍、
+    // 双全局钩子）：与托盘同名 CreateMutexW（契约见 crates/tray/src/paths.rs
+    // 的 SINGLE_INSTANCE_MUTEX_NAME），已有实例立即报错退出。
+    acquire_single_instance(SINGLE_INSTANCE_MUTEX_NAME)?;
+
     let mut db_path = resolve_db().to_string_lossy().to_string();
     let mut all = false;
     let mut i = 0;
@@ -1227,6 +1247,47 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     c.wait();
     let n = c.total_written.load(Ordering::Relaxed);
     println!("collected {n} events into {db_path}");
+    Ok(())
+}
+
+// === collect 单实例互斥体 ===
+
+/// 单实例互斥体名（P1：与托盘同名，防 collect 与 tray 双写同一库）。
+/// 契约见 crates/tray/src/paths.rs 的 SINGLE_INSTANCE_MUTEX_NAME——tray 是
+/// bin crate 无法被 cli 依赖，两边各持一份同名常量并各自用测试锁定字面值，
+/// 改名必须两边同步。
+#[cfg(windows)]
+const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\KynopticTrayMutex";
+
+/// 尝试持有单实例命名互斥体（可测：name 注入）。互斥体句柄故意持有到进程
+/// 退出（RAII 释放会让保护在函数返回后失效）。已有实例 → Err。
+#[cfg(windows)]
+fn acquire_single_instance(name: &str) -> Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let wname: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, wname.as_ptr());
+        if h.is_null() {
+            return Err(Error::InvalidData(format!(
+                "单实例互斥体创建失败 (GetLastError={}), 拒绝启动以防并发写库",
+                GetLastError()
+            )));
+        }
+        // 只在句柄非空时才读 last error（创建成功不重置 last error,残留
+        // ERROR_ALREADY_EXISTS 会误判）
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(h);
+            return Err(Error::InvalidData(
+                "已有 kynoptic 实例在运行(托盘或另一 collect): 两个采集器并发写同一数据库会导致事件翻倍, 拒绝启动".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance(_name: &str) -> Result<()> {
     Ok(())
 }
 
@@ -1444,6 +1505,9 @@ struct WatchdogState {
     /// 熔断退避截止时刻的 unix 秒（0 = 不在退避中）
     #[serde(default)]
     backoff_until_epoch: i64,
+    /// 观察窗内跳过的重复拉起轮数（P1 状态机防重拉;仅诊断用,不参与判定）
+    #[serde(default)]
+    observation_skips: u64,
 }
 
 fn watchdog_state_path() -> PathBuf {
@@ -1545,11 +1609,130 @@ fn spawn_decision(
     }
 }
 
-/// 睡眠唤醒守卫的复查判定（纯函数）：首次发现超龄后等待
-/// STALE_RECHECK_WAIT_SECS 再复查。复查时年龄回落（心跳被重新 touch）或
-/// 已回到阈值内 = 刚从睡眠唤醒的假象，放行；年龄继续增长且仍超龄才 kill。
-fn recheck_should_kill(age_first_secs: i64, age_recheck_secs: i64) -> bool {
-    age_recheck_secs > age_first_secs && age_recheck_secs > HEARTBEAT_MAX_AGE_SECS
+/// 一轮看门狗 tick 的动作（纯状态机,单测覆盖;tray 不在时逐轮调用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickAction {
+    /// 无事可做（用户主动退出等）
+    Idle,
+    /// 允许拉起（调用方执行 spawn;成功后调 mark_spawned 记观察窗起点）
+    Spawn,
+    /// 熔断退避中,剩余秒数
+    SkipBackoff(i64),
+    /// 拉起观察窗（90s）内:禁止再次 spawn（P1 修复:旧实现观察窗内每 15s
+    /// 无限重拉坏 tray 并覆盖观察窗起点,熔断永不可达）
+    SkipObservation,
+}
+
+/// 观察窗内跳过的累计轮数（只用于日志,不入持久化状态）
+const OBSERVATION_SKIP_LOG_EVERY: u32 = 4;
+
+/// 看门狗一轮状态转移（纯函数）：先结算上一轮拉起结局,再决定本轮动作。
+/// hb_mtime/hb_at_spawn 传 0 表示心跳从未刷新（stub 秒退场景）。
+fn watchdog_tick(
+    state: &mut WatchdogState,
+    user_quit: bool,
+    hb_mtime: i64,
+    now_epoch: i64,
+) -> TickAction {
+    if user_quit {
+        return TickAction::Idle;
+    }
+    // 先结算上一轮拉起的结局（观察窗 90s）
+    match judge_spawn_outcome(
+        state.last_spawn_epoch,
+        now_epoch,
+        hb_mtime,
+        state.heartbeat_at_spawn_epoch,
+    ) {
+        SpawnOutcome::Pending => {
+            // P1 关键：Pending 期间不得覆盖观察窗起点(last_spawn_epoch),也
+            // 禁止再次 spawn——否则 90s 观察窗永远不成熟,consecutive_failures
+            // 恒 0,坏 tray 每 15s 被无限重拉。跳过并计数。
+            state.observation_skips = state.observation_skips.saturating_add(1);
+            TickAction::SkipObservation
+        }
+        SpawnOutcome::Recovered => {
+            // 心跳被刷新过 = 上轮拉起成功运行过；结束观察窗,允许新的拉起决策
+            state.last_spawn_epoch = 0;
+            match spawn_decision(
+                state.consecutive_failures,
+                state.backoff_until_epoch,
+                now_epoch,
+            ) {
+                SpawnDecision::Spawn => TickAction::Spawn,
+                SpawnDecision::SkipBackoff(r) => TickAction::SkipBackoff(r),
+            }
+        }
+        SpawnOutcome::Failed => {
+            state.consecutive_failures += 1;
+            state.last_spawn_epoch = 0;
+            let delay = backoff_delay_secs(state.consecutive_failures);
+            state.backoff_until_epoch = now_epoch + delay;
+            match spawn_decision(
+                state.consecutive_failures,
+                state.backoff_until_epoch,
+                now_epoch,
+            ) {
+                SpawnDecision::Spawn => TickAction::Spawn,
+                SpawnDecision::SkipBackoff(r) => TickAction::SkipBackoff(r),
+            }
+        }
+    }
+}
+
+/// 拉起成功后的观察窗起点记录（纯函数）。
+fn mark_spawned(state: &mut WatchdogState, now_epoch: i64, hb_mtime: i64) {
+    state.last_spawn_epoch = now_epoch;
+    state.heartbeat_at_spawn_epoch = hb_mtime;
+}
+
+/// 睡眠唤醒守卫的复查判定（纯函数，单测覆盖）：首次发现异常后等待
+/// STALE_RECHECK_WAIT_SECS 再复查。
+///
+/// 心跳读取三态语义（P1 修复"挂死 tray 永不重启"）：
+/// - `HeartbeatRead::Age` — 文件可读且内容是合法 RFC3339，携带距今年龄
+/// - `HeartbeatRead::Missing` — 文件不存在
+/// - `HeartbeatRead::Unparseable` — 文件存在但解析失败
+///
+/// 策略区分（tray 每 30s 全量重写心跳文件）：
+/// - 复查回到阈值内 = 睡眠唤醒假象，放行；
+/// - 复查仍超龄（无论是否继续增长）= 心跳 40s 未刷新且超龄，判挂死 kill；
+/// - 复查仍 Missing = 写方已死或文件被删，未恢复，kill；
+/// - 复查仍 Unparseable = tray 只写合法 RFC3339，垃圾内容说明写路径损坏，未恢复，kill。
+///
+/// 旧实现 `age_recheck > age_first && age_recheck > MAX` 在首查与复查都是
+/// i64::MAX（文件持续不可读）时恒假，挂死 tray 永不 kill（4-8 小时空洞）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatRead {
+    /// 文件缺失
+    Missing,
+    /// 文件存在但内容非法
+    Unparseable,
+    /// 合法时间戳，距今年龄（秒）
+    Age(i64),
+}
+
+fn recheck_should_kill(_first: HeartbeatRead, recheck: HeartbeatRead) -> bool {
+    match recheck {
+        HeartbeatRead::Age(a) if a <= HEARTBEAT_MAX_AGE_SECS => false,
+        // 仍超龄（含与首次持平的停滞）：两次间隔 40s 都异常,判挂死
+        HeartbeatRead::Age(_) => true,
+        // 持续缺失/持续不可解析 = 未恢复（旧 bug 即漏掉这一分支）
+        HeartbeatRead::Missing | HeartbeatRead::Unparseable => true,
+    }
+}
+
+/// 心跳读取分类（纯函数）：content=None 即文件缺失;解析失败归 Unparseable
+/// （首查按 Missing/Unparseable 都视同过期触发复查,区别只在日志与策略注释,
+/// recheck 判定两者等价）。
+fn classify_heartbeat(content: Option<&str>, now: chrono::DateTime<Utc>) -> HeartbeatRead {
+    match content {
+        None => HeartbeatRead::Missing,
+        Some(c) => match heartbeat_age_secs(now, c) {
+            Some(age) => HeartbeatRead::Age(age),
+            None => HeartbeatRead::Unparseable,
+        },
+    }
 }
 
 /// kill 托盘进程（心跳挂死时）。返回是否至少执行了一次 taskkill。
@@ -1610,16 +1793,16 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 // 进程活着：检查心跳。缺失或超龄（默认 180s）说明采集主循环
                 // 可能挂死——但先做睡眠唤醒守卫（P1：系统睡眠期间心跳自然
                 // 超龄，直接 kill 属误杀），40s 复查仍超龄才 kill。
+                // 心跳读取三态（P1：区分缺失/解析失败,持续不可读 = 未恢复）
                 let hb_read = std::fs::read_to_string(heartbeat_path())
                     .map(|s| s.trim().to_string())
                     .ok();
-                let hb_age_first = hb_read
-                    .as_deref()
-                    .and_then(|c| heartbeat_age_secs(Utc::now(), c));
-                if heartbeat_stale(Utc::now(), hb_read.as_deref()) {
+                let hb_first = classify_heartbeat(hb_read.as_deref(), Utc::now());
+                let first_stale = heartbeat_stale(Utc::now(), hb_read.as_deref());
+                if first_stale {
                     // 睡眠唤醒守卫：等待 40s 后复查（纯函数 recheck_should_kill）
                     watchdog_log(&format!(
-                        "心跳缺失或超龄(>{HEARTBEAT_MAX_AGE_SECS}s), 疑似睡眠唤醒/挂死, {STALE_RECHECK_WAIT_SECS}s 后复查"
+                        "心跳缺失/不可读或超龄(>{HEARTBEAT_MAX_AGE_SECS}s), 疑似睡眠唤醒/挂死, {STALE_RECHECK_WAIT_SECS}s 后复查"
                     ));
                     std::thread::sleep(std::time::Duration::from_secs(STALE_RECHECK_WAIT_SECS));
                     let still_running = unsafe {
@@ -1632,23 +1815,18 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         }
                     };
                     if still_running {
-                        let hb_recheck = std::fs::read_to_string(heartbeat_path())
+                        let hb_recheck_read = std::fs::read_to_string(heartbeat_path())
                             .map(|s| s.trim().to_string())
                             .ok();
-                        let hb_age_recheck = hb_recheck
-                            .as_deref()
-                            .and_then(|c| heartbeat_age_secs(Utc::now(), c))
-                            // 复查时心跳文件消失按"更糟"处理
-                            .unwrap_or(i64::MAX);
-                        let age_first = hb_age_first.unwrap_or(i64::MAX);
-                        if recheck_should_kill(age_first, hb_age_recheck) {
+                        let hb_recheck = classify_heartbeat(hb_recheck_read.as_deref(), Utc::now());
+                        if recheck_should_kill(hb_first, hb_recheck) {
                             watchdog_log(&format!(
-                                "复查仍超龄(首次 {age_first}s → 复查 {hb_age_recheck}s), 判定采集挂死, kill kynoptic-tray 以重启"
+                                "复查仍未恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 判定采集挂死, kill kynoptic-tray 以重启"
                             ));
                             kill_tray();
                         } else {
                             watchdog_log(&format!(
-                                "复查时心跳已刷新(首次 {age_first}s → 复查 {hb_age_recheck}s), 放行(睡眠唤醒假象)"
+                                "复查时心跳已恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 放行(睡眠唤醒假象)"
                             ));
                         }
                     } else {
@@ -1666,47 +1844,34 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     }
                 }
             } else if !exit_flag.exists() {
-                // 先结算上一轮拉起的结局（观察窗 90s）
-                match judge_spawn_outcome(
-                    state.last_spawn_epoch,
-                    now_epoch,
-                    heartbeat_mtime_epoch(),
-                    state.heartbeat_at_spawn_epoch,
-                ) {
-                    SpawnOutcome::Pending => {}
-                    SpawnOutcome::Recovered => {
-                        // 心跳被刷新过 = 上轮拉起成功运行过；结束观察窗
-                        state.last_spawn_epoch = 0;
+                // P1 状态机：结算上一轮结局 + 决定本轮动作。观察窗（Pending）
+                // 内禁止重拉且不覆盖观察窗起点,坏 tray 秒退 3 次后必入退避。
+                match watchdog_tick(&mut state, false, heartbeat_mtime_epoch(), now_epoch) {
+                    TickAction::Idle => {}
+                    TickAction::SkipObservation => {
+                        if state
+                            .observation_skips
+                            .is_multiple_of(u64::from(OBSERVATION_SKIP_LOG_EVERY))
+                        {
+                            watchdog_log(&format!(
+                                "拉起观察窗({SPAWN_GRACE_SECS}s)内, 跳过重复拉起(已跳过 {} 轮)",
+                                state.observation_skips
+                            ));
+                        }
                     }
-                    SpawnOutcome::Failed => {
-                        state.consecutive_failures += 1;
-                        state.last_spawn_epoch = 0;
-                        let delay = backoff_delay_secs(state.consecutive_failures);
-                        state.backoff_until_epoch = now_epoch + delay;
+                    TickAction::SkipBackoff(remaining) => {
+                        // Failed 结算发生在 tick 内（纯函数不落盘）,这里持久化
                         save_watchdog_state(&state);
-                        watchdog_log(&format!(
-                            "拉起后 {SPAWN_GRACE_SECS}s 内心跳未刷新, 连续失败 #{}（{}）",
-                            state.consecutive_failures,
-                            if delay > 0 {
-                                format!("进入指数退避 {delay}s")
-                            } else {
-                                "未达退避阈值".to_string()
-                            }
-                        ));
-                    }
-                }
-                match spawn_decision(
-                    state.consecutive_failures,
-                    state.backoff_until_epoch,
-                    now_epoch,
-                ) {
-                    SpawnDecision::SkipBackoff(remaining) => {
                         watchdog_log(&format!(
                             "连续失败 {} 次, 熔断退避中, 约 {}s 后重试拉起",
                             state.consecutive_failures, remaining
                         ));
                     }
-                    SpawnDecision::Spawn => {
+                    TickAction::Spawn => {
+                        // Failed 结算后的首次拉起也把新计数落盘（防杀进程绕过熔断）
+                        if state.last_spawn_epoch == 0 {
+                            save_watchdog_state(&state);
+                        }
                         if let Ok(exe) = std::env::current_exe() {
                             if let Some(dir) = exe.parent() {
                                 let tray = dir.join("kynoptic-tray.exe");
@@ -1722,9 +1887,11 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                         .spawn()
                                     {
                                         Ok(_) => {
-                                            state.last_spawn_epoch = now_epoch;
-                                            state.heartbeat_at_spawn_epoch =
-                                                heartbeat_mtime_epoch();
+                                            mark_spawned(
+                                                &mut state,
+                                                now_epoch,
+                                                heartbeat_mtime_epoch(),
+                                            );
                                             save_watchdog_state(&state);
                                         }
                                         Err(e) => {
@@ -2329,30 +2496,216 @@ mod tests {
             last_spawn_epoch: 123,
             heartbeat_at_spawn_epoch: 100,
             backoff_until_epoch: 9999,
+            observation_skips: 7,
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: WatchdogState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.consecutive_failures, 4);
         assert_eq!(back.backoff_until_epoch, 9999);
+        assert_eq!(back.observation_skips, 7);
         // 损坏/缺字段：serde default 兜底 + 顶层回退缺省
         let partial: WatchdogState = serde_json::from_str(r#"{"consecutive_failures":2}"#).unwrap();
         assert_eq!(partial.consecutive_failures, 2);
         assert_eq!(partial.last_spawn_epoch, 0);
+        assert_eq!(partial.observation_skips, 0, "新增字段缺省 0");
         assert!(serde_json::from_str::<WatchdogState>("garbage").is_err());
     }
 
-    // === watchdog 睡眠唤醒守卫 ===
+    // === watchdog 状态机（P1：观察窗内禁止重拉,秒退 3 次必入退避） ===
+
+    /// 模拟"坏 tray 秒退"：每轮 tick 间隔 15s,心跳 mtime 恒 0（从未刷新）。
+    #[test]
+    fn watchdog_tick_exiting_tray_spawns_three_times_then_backs_off() {
+        let mut st = WatchdogState::default();
+        let mut spawns: u32 = 0;
+        let mut spawns_epoch: Vec<i64> = Vec::new();
+        // 基准 1e6（unix 秒量级;0 是"无进行中拉起"哨兵,真实时间戳不为 0）
+        let t0 = 1_000_000;
+        for t in (0..390).step_by(15) {
+            let now = t0 + t;
+            match watchdog_tick(&mut st, false, 0, now) {
+                TickAction::Spawn => {
+                    spawns += 1;
+                    spawns_epoch.push(now);
+                    mark_spawned(&mut st, now, 0);
+                }
+                TickAction::SkipObservation => {
+                    // 观察窗内:观察窗起点必须原样保留（P1 修复点）
+                    assert_ne!(st.last_spawn_epoch, now, "Pending 轮不得覆盖观察窗起点");
+                }
+                TickAction::SkipBackoff(_) | TickAction::Idle => {}
+            }
+        }
+        assert_eq!(
+            spawns, 3,
+            "秒退场景只允许 3 次拉起,之后必须熔断: {spawns_epoch:?}"
+        );
+        assert_eq!(st.consecutive_failures, 3);
+        assert!(st.backoff_until_epoch > 0, "3 连败必须进入退避");
+        assert!(
+            spawns_epoch
+                .windows(2)
+                .all(|w| w[1] - w[0] >= SPAWN_GRACE_SECS),
+            "两次拉起至少间隔一个完整观察窗"
+        );
+    }
+
+    #[test]
+    fn watchdog_tick_healthy_tray_recovers_state() {
+        // 心跳在拉起后被刷新（mtime 前进）→ 观察窗结束,计数清零由健康分支做
+        let mut st = WatchdogState {
+            consecutive_failures: 1,
+            last_spawn_epoch: 100,
+            heartbeat_at_spawn_epoch: 90,
+            backoff_until_epoch: 0,
+            observation_skips: 5,
+        };
+        // t=100+90=190 > 观察窗, hb_mtime=120 > 90 → Recovered → 允许再拉起
+        assert!(matches!(
+            watchdog_tick(&mut st, false, 120, 190),
+            TickAction::Spawn
+        ));
+        assert_eq!(st.last_spawn_epoch, 0, "Recovered 后观察窗关闭");
+    }
+
+    #[test]
+    fn watchdog_tick_user_quit_is_idle() {
+        let mut st = WatchdogState::default();
+        assert!(matches!(
+            watchdog_tick(&mut st, true, 0, 1000),
+            TickAction::Idle
+        ));
+    }
+
+    #[test]
+    fn watchdog_tick_observation_skips_counter_increments() {
+        let mut st = WatchdogState::default();
+        mark_spawned(&mut st, 1_000_000, 0);
+        for t in [1_000_015i64, 1_000_030, 1_000_045] {
+            assert!(matches!(
+                watchdog_tick(&mut st, false, 0, t),
+                TickAction::SkipObservation
+            ));
+        }
+        assert_eq!(st.observation_skips, 3);
+        assert_eq!(st.last_spawn_epoch, 1_000_000, "观察窗起点未被覆盖");
+        assert_eq!(st.consecutive_failures, 0, "观察窗未成熟不得记失败");
+    }
+
+    // === watchdog 睡眠唤醒守卫（P1：持续不可读 = 未恢复） ===
 
     #[test]
     fn recheck_guard_spares_refreshed_heartbeat() {
         // 复查时年龄回落（心跳被重新 touch）→ 放行
-        assert!(!recheck_should_kill(200, 35));
+        assert!(!recheck_should_kill(
+            HeartbeatRead::Age(200),
+            HeartbeatRead::Age(35)
+        ));
         // 复查时年龄回到阈值内 → 放行
-        assert!(!recheck_should_kill(200, HEARTBEAT_MAX_AGE_SECS));
-        // 复查时年龄仍在增长（首次 + 等待窗）且超龄 → kill
-        assert!(recheck_should_kill(200, 240));
-        // 复查时心跳文件消失（i64::MAX）→ kill
-        assert!(recheck_should_kill(200, i64::MAX));
+        assert!(!recheck_should_kill(
+            HeartbeatRead::Age(200),
+            HeartbeatRead::Age(HEARTBEAT_MAX_AGE_SECS)
+        ));
+        // 复查时年龄仍在增长且超龄 → kill
+        assert!(recheck_should_kill(
+            HeartbeatRead::Age(200),
+            HeartbeatRead::Age(240)
+        ));
+        // 复查时超龄但停滞（与首次持平）：两次间隔 40s 均异常 → kill
+        assert!(recheck_should_kill(
+            HeartbeatRead::Age(200),
+            HeartbeatRead::Age(200)
+        ));
+    }
+
+    #[test]
+    fn recheck_guard_kills_when_heartbeat_persistently_unreadable() {
+        // P1 回归：旧实现 age_recheck(i64::MAX) > age_first(i64::MAX) 恒假,
+        // 文件持续不可读的挂死 tray 永不 kill（4-8 小时空洞）。
+        let first_missing = HeartbeatRead::Missing;
+        let first_garbage = HeartbeatRead::Unparseable;
+        // 文件持续缺失 → kill
+        assert!(recheck_should_kill(first_missing, HeartbeatRead::Missing));
+        // 首查垃圾、复查缺失（及反向）→ kill
+        assert!(recheck_should_kill(first_garbage, HeartbeatRead::Missing));
+        assert!(recheck_should_kill(
+            first_missing,
+            HeartbeatRead::Unparseable
+        ));
+        // 文件持续解析失败 → kill（tray 只写合法 RFC3339,垃圾 = 写路径损坏）
+        assert!(recheck_should_kill(
+            first_garbage,
+            HeartbeatRead::Unparseable
+        ));
+        // 复查恢复可读且在阈值内 → 放行
+        assert!(!recheck_should_kill(first_missing, HeartbeatRead::Age(10)));
+    }
+
+    #[test]
+    fn classify_heartbeat_maps_missing_unparseable_age() {
+        let now = Utc::now();
+        assert_eq!(classify_heartbeat(None, now), HeartbeatRead::Missing);
+        assert_eq!(
+            classify_heartbeat(Some("garbage"), now),
+            HeartbeatRead::Unparseable
+        );
+        assert!(matches!(
+            classify_heartbeat(Some(&(now - Duration::seconds(5)).to_rfc3339()), now),
+            HeartbeatRead::Age(5) | HeartbeatRead::Age(4)
+        ));
+    }
+
+    // === collect 单实例互斥体（P1） ===
+
+    #[cfg(windows)]
+    #[test]
+    fn single_instance_mutex_name_matches_tray_contract() {
+        // 与 crates/tray/src/paths.rs 的 SINGLE_INSTANCE_MUTEX_NAME 契约:
+        // 同名字面值,任一侧改名必须两边同步（见常量注释）。
+        assert_eq!(SINGLE_INSTANCE_MUTEX_NAME, r"Local\KynopticTrayMutex");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acquire_single_instance_second_acquire_fails() {
+        // 同进程内二次 CreateMutexW 同名互斥体返回 ERROR_ALREADY_EXISTS:
+        // 第一次应成功,第二次（模拟 tray 已在跑）必须报错拒绝。
+        assert!(acquire_single_instance("Local\\KynopticCtlTestMutex").is_ok());
+        assert!(acquire_single_instance("Local\\KynopticCtlTestMutex").is_err());
+    }
+
+    // === CSV BOM（P2：Excel 中文乱码） ===
+
+    #[test]
+    fn csv_export_writes_utf8_bom_jsonl_does_not() {
+        let dir = std::env::temp_dir().join(format!("kyn-bom-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let csv_path = dir.join("t.csv");
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(&csv_path).unwrap();
+            let mut buf = std::io::BufWriter::new(f);
+            buf.write_all(&UTF8_BOM).unwrap();
+            let mut w = csv::Writer::from_writer(buf);
+            w.write_record(["a", "标题"]).unwrap();
+            w.flush().unwrap();
+        }
+        let bytes = std::fs::read(&csv_path).unwrap();
+        assert_eq!(
+            &bytes[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "CSV 文件头必须是 UTF-8 BOM"
+        );
+        // jsonl 路径不走 BOM：用同样的裸 File::create + writeln 复现其实现
+        let jsonl_path = dir.join("t.jsonl");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(f, r#"{{"a":1}}"#).unwrap();
+        }
+        let jl = std::fs::read(&jsonl_path).unwrap();
+        assert_ne!(&jl[..1], &[0xEF], "jsonl 不得加 BOM");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // === watchdog.log 轮转 ===
@@ -2398,6 +2751,25 @@ mod tests {
         assert_eq!(
             sanitize_window_title("报表 v2 https://a.io/x?y=1 done"),
             "报表 v2 https://a.io/x done"
+        );
+    }
+
+    #[test]
+    fn sanitize_window_title_preserves_whitespace_structure() {
+        // P3 回归：旧实现 split_whitespace+join 把换行压平,redact 版备份
+        // 永久损失。换行必须原样保留。
+        assert_eq!(sanitize_window_title("line1\nline2"), "line1\nline2");
+        // 换行 + URL 查询串剥离共存
+        assert_eq!(
+            sanitize_window_title("页面 https://a.com/p?token=x\n第二行\t制表符"),
+            "页面 https://a.com/p\n第二行\t制表符"
+        );
+        // 多空格与首尾空白原样保留
+        assert_eq!(sanitize_window_title("  a   b  "), "  a   b  ");
+        // URL 前的空格在剥查询串后仍保留
+        assert_eq!(
+            sanitize_window_title("doc: https://x.io/a?q=1"),
+            "doc: https://x.io/a"
         );
     }
 

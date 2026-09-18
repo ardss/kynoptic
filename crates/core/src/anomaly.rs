@@ -94,10 +94,14 @@ pub fn marathon_from_minutes(active_minutes: &[String], bridge_minutes: u32) -> 
         return Vec::new();
     }
     let bridge = i64::from(bridge_minutes.min(15));
-    // 解析为纪元分钟，排序去重后按 bridge 补洞
+    // 解析为纪元分钟，排序去重后按 bridge 补洞。
+    // **时区语义（交叉审查 P2）**：输入是本地钟面 "YYYY-MM-DDTHH:MM"
+    // （见 [`queries::active_minutes_by_date`]），按**本地时区**解释成真实纪元
+    // 分钟，末端 fmt 也转回本地——否则先 naive-as-UTC 解析再 UTC 格式化，
+    // 回退路径（历史 UTC 原串）会把本地 12:00 显示成 04:00。
     let mut mins: Vec<i64> = active_minutes
         .iter()
-        .map(|s| crate::time::epoch_minutes_or_zero(s))
+        .map(|s| crate::time::local_epoch_minutes_or_zero(s))
         .collect();
     mins.sort_unstable();
     mins.dedup();
@@ -117,10 +121,16 @@ pub fn marathon_from_minutes(active_minutes: &[String], bridge_minutes: u32) -> 
     }
     // 反推 start_min/end_min：扫描 bridged 找首个等于 longest 的连续段
     if let Some((s, e)) = locate_streak_minutes(&bridged, longest) {
-        // 纪元分钟 -> ISO "YYYY-MM-DDTHH:MM"（解析异常时回退空串，不 panic）
+        // 纪元分钟 -> ISO "YYYY-MM-DDTHH:MM"（**本地时区**，交叉审查 P2：
+        // 此前用 UTC 格式化，本地 12:00 的马拉松显示为 UTC 04:00；与 dash
+        // 其他显示统一。解析异常时回退空串，不 panic）
         let fmt = |m: i64| -> String {
             chrono::DateTime::from_timestamp(m * 60, 0)
-                .map(|t| t.format("%Y-%m-%dT%H:%M").to_string())
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%dT%H:%M")
+                        .to_string()
+                })
                 .unwrap_or_default()
         };
         vec![Anomaly {

@@ -20,6 +20,15 @@ pub const HEARTBEAT_FILE: &str = "kynoptic-heartbeat";
 /// 旗标路径覆盖环境变量(测试/多实例调试用)
 pub const EXIT_FLAG_ENV: &str = "KYNOPTIC_EXIT_FLAG";
 
+/// 单实例互斥体名（Local\ 前缀 = 当前登录会话内唯一）。
+///
+/// **与 `kynoptic collect` 的契约**：crates/cli/src/main.rs 的 cmd_collect 用
+/// 同名 CreateMutexW 做单实例保护——两个写者（tray 采集器 / CLI collect）绝
+/// 不能并发写同一 SQLite 库（实测双写导致事件翻倍 + 双全局钩子）。tray 是
+/// bin crate 无法被 cli 依赖，两边各持一份同名常量，各自用测试锁定字面值，
+/// 改名必须两边同步。
+pub const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\KynopticTrayMutex";
+
 /// 给定 exe 路径,推出旗标文件位置(纯函数,单测覆盖)。
 pub fn exit_flag_for_exe(exe: &Path) -> Option<PathBuf> {
     exe.parent().map(|d| d.join(EXIT_FLAG_FILE))
@@ -54,6 +63,13 @@ pub fn resolve_heartbeat() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_instance_mutex_name_is_the_shared_contract() {
+        // 与 crates/cli/src/main.rs 的 SINGLE_INSTANCE_MUTEX_NAME 契约:
+        // 同名字面值,任一侧改名必须两边同步(见常量注释)。
+        assert_eq!(SINGLE_INSTANCE_MUTEX_NAME, r"Local\KynopticTrayMutex");
+    }
 
     #[test]
     fn paths_anchor_to_exe_dir() {

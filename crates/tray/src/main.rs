@@ -50,7 +50,9 @@ fn main() {
     {
         use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
         use windows_sys::Win32::System::Threading::CreateMutexW;
-        let name: Vec<u16> = "Local\\KynopticTrayMutex\0".encode_utf16().collect();
+        let name: Vec<u16> = format!("{}\0", paths::SINGLE_INSTANCE_MUTEX_NAME)
+            .encode_utf16()
+            .collect();
         unsafe {
             // 只在句柄非空时才看 GetLastError:创建成功的新互斥体不重置
             // last error,残留的 ERROR_ALREADY_EXISTS 会造成误判秒退。
@@ -97,16 +99,106 @@ fn main() {
         let _ = ghost::close_all_open_sessions(&parsed.db);
     }
 
-    // dashboard 端口回退（P0：8422 被占 = 面板静默死亡）：在 spawn 服务线程
-    // 前选好实际端口，托盘菜单 Open Dashboard 也用同一个端口，不会打开死链接。
-    // port 0（随机空闲端口）语义保留，不走回退。
+    // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘。
+    // 健壮性:全新首装时本线程先于采集器跑,数据库文件还不存在,只读打开
+    // 必失败且托盘无控制台（错误不可见,外面就是"拒绝连接"）。因此先等库
+    // 文件就绪（至多 60s）,serve 失败再写日志文件,绝不静默消失。
+    //
+    // P1 端口回退重构（Hyper-V/WSL excludedportrange 实测覆盖 8408-8507,
+    // 旧实现启动即 pick、60s 后才 bind,候选又全落在保留区 → os error 10013
+    // 面板必死）:
+    //  (a) pick 挪进本线程、紧贴 serve 的 bind 之前（TOCTOU 窗口从 60s 压到
+    //      毫秒级）;
+    //  (b) bind 失败按 args::candidate_ports 的候选序列（三段跨 +10000 大步长）
+    //      继续重试,不再首选段全灭即放弃;
+    //  (c) dashboard-port.txt 只在真正 bind 成功后写;全部候选失败时写
+    //      "unavailable" 并把错误追加到 dashboard-error.log。
+    let dash_db = parsed.db.clone();
     let dash_port_requested = parsed.port;
-    let dash_port = if dash_port_requested == 0 {
-        0
-    } else {
-        args::pick_free_port(dash_port_requested).unwrap_or(dash_port_requested)
-    };
-    parsed.port = dash_port;
+    // 实际绑定端口回传主线程（托盘菜单 Open Dashboard 用同一端口,不打开死链）
+    let (port_tx, port_rx) = mpsc::channel::<Option<u16>>();
+    let _dash_handle = thread::Builder::new()
+        .name("Dashboard".into())
+        .spawn(move || {
+            for _ in 0..120 {
+                if dash_db.exists() {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(500));
+            }
+            // port 0（随机空闲端口）语义保留,不走候选回退。
+            let candidates: Vec<u16> = if dash_port_requested == 0 {
+                vec![0]
+            } else {
+                args::candidate_ports(dash_port_requested)
+            };
+            let mut last_err: Option<String> = None;
+            for &cand in &candidates {
+                // 探测 bind 紧贴 serve:成功即写 port.txt 并回传端口,再交 serve
+                // 正式 bind（探测 listener 立即 drop,毫秒级窗口;单实例互斥体
+                // 已排除第二个 kynoptic 抢端口）。serve 失败（含罕见 TOCTOU
+                // 撞车）按候选序列继续重试。
+                match std::net::TcpListener::bind(("127.0.0.1", cand)) {
+                    Ok(probe) => drop(probe),
+                    Err(e) => {
+                        last_err = Some(format!("bind 127.0.0.1:{cand}: {e}"));
+                        continue;
+                    }
+                }
+                if cand != 0 {
+                    if let Some(dir) = dash_db.parent() {
+                        let _ = std::fs::write(dir.join("dashboard-port.txt"), format!("{cand}\n"));
+                    }
+                }
+                let _ = port_tx.send(Some(cand));
+                match kynoptic_dash::serve(&dash_db, cand, true) {
+                    Ok(()) => return, // 正常退出路径（进程结束）
+                    Err(e) => {
+                        last_err = Some(format!("serve 127.0.0.1:{cand}: {e}"));
+                        continue;
+                    }
+                }
+            }
+            // 全部候选失败:port.txt 写 "unavailable",错误留档 dashboard-error.log
+            if let Some(dir) = dash_db.parent() {
+                let _ = std::fs::write(dir.join("dashboard-port.txt"), "unavailable\n");
+                if let Some(err) = last_err {
+                    let msg = format!(
+                        "[{}] dashboard 所有候选端口绑定失败: {err}\n",
+                        chrono::Utc::now().to_rfc3339()
+                    );
+                    eprint!("{msg}");
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("dashboard-error.log"))
+                    {
+                        let _ = f.write_all(msg.as_bytes());
+                    }
+                }
+            }
+            let _ = port_tx.send(None);
+        })
+        .expect("dashboard 线程启动失败");
+
+    // 等实际端口（探测 bind 就绪即回传,常见路径毫秒级;库文件缺失的冷启动
+    // 路径最多等 2s,超时则菜单退回请求端口——与旧行为一致,不阻塞托盘出现）。
+    match port_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Some(p)) => {
+            parsed.port = p;
+            if p != dash_port_requested && dash_port_requested != 0 {
+                let msg = format!(
+                    "面板已换端口：{dash_port_requested} 不可用，dashboard 改用 {p}（http://127.0.0.1:{p}，已写入 dashboard-port.txt）"
+                );
+                log::warn!("{msg}");
+                eprintln!("kynoptic-tray: {msg}");
+            }
+        }
+        _ => {
+            parsed.port = dash_port_requested;
+        }
+    }
 
     // 采集心跳:每 30s touch exe 同目录心跳文件(RFC3339 时间戳)。
     // watchdog 除互斥体探活外还会检查心跳新鲜度——进程活着但采集主循环挂死
@@ -121,52 +213,6 @@ fn main() {
                 thread::sleep(std::time::Duration::from_secs(30));
             })
             .expect("心跳线程启动失败");
-    }
-
-    // dashboard 服务线程:与采集器同生命周期;只读打开,失败仅记录不阻塞托盘。
-    // 健壮性:全新首装时本线程先于采集器跑,数据库文件还不存在,只读打开
-    // 必失败且托盘无控制台（错误不可见,外面就是"拒绝连接"）。因此先等库
-    // 文件就绪（至多 60s）,serve 失败再写日志文件,绝不静默消失。
-    let dash_db = parsed.db.clone();
-    let _dash_handle = thread::Builder::new()
-        .name("Dashboard".into())
-        .spawn(move || {
-            for _ in 0..120 {
-                if dash_db.exists() {
-                    break;
-                }
-                thread::sleep(std::time::Duration::from_millis(500));
-            }
-            match kynoptic_dash::serve(&dash_db, dash_port, true) {
-                Ok(()) => {}
-                Err(e) => {
-                    let msg = format!(
-                        "[{}] dashboard 服务退出: {e}\n",
-                        chrono::Utc::now().to_rfc3339()
-                    );
-                    eprint!("{msg}");
-                    if let Some(dir) = dash_db.parent() {
-                        let _ = std::fs::write(dir.join("dashboard-error.log"), &msg);
-                    }
-                }
-            }
-        })
-        .expect("dashboard 线程启动失败");
-
-    // 端口落盘 + 换端口提示（托盘壳刻意不弹气泡：tray.rs 铁律 NIF_INFO 永不
-    // 使用，退化为 log + 文件）。dashboard-port.txt 始终写实际端口，供排障与
-    // 外部工具读取；仅当相对请求端口发生变化时额外记一条显式告警。
-    if dash_port_requested != 0 {
-        if let Some(dir) = parsed.db.parent() {
-            let _ = std::fs::write(dir.join("dashboard-port.txt"), format!("{dash_port}\n"));
-        }
-        if dash_port != dash_port_requested {
-            let msg = format!(
-                "面板已换端口：{dash_port_requested} 被占用，dashboard 改用 {dash_port}（http://127.0.0.1:{dash_port}，已写入 dashboard-port.txt）"
-            );
-            log::warn!("{msg}");
-            eprintln!("kynoptic-tray: {msg}");
-        }
     }
 
     // 采集器属主线程:Collector 只在本线程构造/持有/关停(所有权不跨线程)
@@ -261,6 +307,12 @@ fn main() {
 
     // 设置变更监听：dashboard 保存设置 -> SETTINGS_EPOCH +1 -> 自动重启采集器，
     // 并把 autostart 同步到注册表 Run 项（保存即生效，无需手动重启进程）。
+    //
+    // P1 防抖修复（实测：30 次保存后 +19 线程 +300 句柄不回落）：旧实现每次
+    // 检测到变更立即 Start——设置页批量保存（拖动滑杆/逐项勾选）会 1 秒内连发
+    // 多次重启，每次 Start 泄漏未 join 的 monitor 线程与句柄。现在变更后须
+    // mtime/epoch 稳定 SETTING_DEBOUNCE_MS（2 秒）才触发一次重启，连续变更
+    // 合并为一次生效。
     let watch_db = parsed.db.clone();
     let watch_tx = cmd_tx.clone();
     let mut last_epoch = kynoptic_dash::settings_epoch();
@@ -273,19 +325,30 @@ fn main() {
             .ok()
     };
     let mut last_mtime = settings_mtime();
+    let mut debounce = Debounce::new();
+    // autostart 上次已同步值（P2：仅值实际变化才写注册表 Run 键）
+    let mut last_applied_autostart: Option<bool> = None;
     thread::Builder::new()
         .name("SettingsWatch".into())
         .spawn(move || loop {
-            thread::sleep(std::time::Duration::from_millis(1000));
+            thread::sleep(std::time::Duration::from_millis(250));
             let m = settings_mtime();
             let e = kynoptic_dash::settings_epoch();
-            let mtime_changed = m != last_mtime;
-            if e != last_epoch || mtime_changed {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if e != last_epoch || m != last_mtime {
                 last_epoch = e;
                 last_mtime = m;
+                // 变更（重）开防抖窗：连续保存不断顺延,稳定 2s 后才真正重启
+                debounce.on_change(now_ms);
+                continue;
+            }
+            if debounce.poll(now_ms) {
                 let st = kynoptic_dash::settings::load(&watch_db);
-                apply_autostart(st.autostart);
-                log::info!("设置已变更，自动重启采集器使其生效");
+                apply_autostart_if_changed(st.autostart, &mut last_applied_autostart);
+                log::info!("设置已变更（防抖合并后生效），自动重启采集器");
                 let _ = watch_tx.send(CollectorCmd::Start);
             }
         })
@@ -349,6 +412,55 @@ fn main() {
     let _ = std::fs::write(&exit_flag, chrono::Utc::now().to_rfc3339());
 }
 
+/// 设置变更防抖窗：mtime/epoch 稳定该时长后才触发采集器重启
+const SETTING_DEBOUNCE_MS: u64 = 2000;
+
+/// 设置变更防抖（纯逻辑,单测覆盖）。连续变更不断重开窗口,稳定
+/// SETTING_DEBOUNCE_MS 后 poll 返回 true 一次（触发一次重启）。
+struct Debounce {
+    last_change_ms: Option<u64>,
+}
+
+impl Debounce {
+    fn new() -> Self {
+        Self {
+            last_change_ms: None,
+        }
+    }
+
+    /// 检测到一次变更（重）开防抖窗。
+    fn on_change(&mut self, now_ms: u64) {
+        self.last_change_ms = Some(now_ms);
+    }
+
+    /// 无新变更时轮询：稳定超过防抖窗则触发一次并复位。返回是否应重启。
+    fn poll(&mut self, now_ms: u64) -> bool {
+        match self.last_change_ms {
+            Some(t) if now_ms.saturating_sub(t) >= SETTING_DEBOUNCE_MS => {
+                self.last_change_ms = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// autostart 是否需要写注册表（纯函数,单测覆盖）：上次已同步同一值则跳过。
+fn autostart_needs_write(enable: bool, last_applied: &Option<bool>) -> bool {
+    *last_applied != Some(enable)
+}
+
+/// autostart 仅在实际值变化时同步注册表 Run 键（P2：设置页每次保存都无谓
+/// 写注册表 + 刷 daily_agg 的风暴路径之一）。返回是否执行了写。
+fn apply_autostart_if_changed(enable: bool, last_applied: &mut Option<bool>) -> bool {
+    if !autostart_needs_write(enable, last_applied) {
+        return false;
+    }
+    apply_autostart(enable);
+    *last_applied = Some(enable);
+    true
+}
+
 /// 把 autostart 设置同步到注册表 Run 项（与 `kynoptic-ctl autostart` 同一键值）。
 fn apply_autostart(enable: bool) {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -372,5 +484,75 @@ fn apply_autostart(enable: bool) {
         }
     } else {
         let _ = key.delete_value(VALUE_NAME);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === 设置变更防抖（P1：30 次保存 +19 线程风暴） ===
+
+    #[test]
+    fn debounce_merges_burst_into_single_trigger() {
+        // 模拟批量保存：0ms/300/600/900/1200 连续 5 次变更（旧实现 = 5 次
+        // 采集器重启 = 5 份泄漏的 monitor 线程），稳定后只应触发 1 次。
+        let mut d = Debounce::new();
+        let mut triggers = 0;
+        for t in [0u64, 300, 600, 900, 1200] {
+            d.on_change(t);
+        }
+        // 窗口内轮询：不触发
+        for t in [1500u64, 3000, 3100] {
+            assert!(!d.poll(t), "稳定未满 2s 不应触发");
+        }
+        if d.poll(3200) {
+            triggers += 1;
+        }
+        // 复位后不再重复触发
+        assert!(!d.poll(3300));
+        assert_eq!(triggers, 1, "连续 5 次保存必须合并为 1 次重启");
+    }
+
+    #[test]
+    fn debounce_quiet_period_triggers_once_after_two_seconds() {
+        let mut d = Debounce::new();
+        d.on_change(10_000);
+        assert!(!d.poll(10_000 + SETTING_DEBOUNCE_MS - 1));
+        assert!(d.poll(10_000 + SETTING_DEBOUNCE_MS), "稳定 2s 即触发");
+        assert!(!d.poll(10_000 + SETTING_DEBOUNCE_MS + 1), "触发一次即复位");
+    }
+
+    #[test]
+    fn debounce_new_change_extends_window() {
+        let mut d = Debounce::new();
+        d.on_change(0);
+        // 窗口将满时又来一次变更：重开窗口
+        d.on_change(SETTING_DEBOUNCE_MS - 100);
+        assert!(
+            !d.poll(2 * SETTING_DEBOUNCE_MS - 200),
+            "顺延后的窗口未满不触发"
+        );
+        assert!(d.poll(2 * SETTING_DEBOUNCE_MS - 100 + SETTING_DEBOUNCE_MS));
+    }
+
+    // === autostart 仅值变化时写注册表（P2） ===
+
+    #[test]
+    fn autostart_write_skipped_when_value_unchanged() {
+        let mut last: Option<bool> = None;
+        assert!(autostart_needs_write(true, &last), "首次必须同步");
+        last = Some(true);
+        assert!(!autostart_needs_write(true, &last), "值未变化跳过注册表写");
+        assert!(autostart_needs_write(false, &last), "翻转必须写");
+        assert!(!autostart_needs_write(false, &Some(false)));
+    }
+
+    #[test]
+    fn apply_autostart_if_changed_noop_keeps_registry_untouched() {
+        // 已同步 true 期间重复收到 true：不触碰注册表（无注册表副作用路径）
+        let mut last: Option<bool> = Some(true);
+        assert!(!apply_autostart_if_changed(true, &mut last));
+        assert_eq!(last, Some(true));
     }
 }

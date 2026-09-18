@@ -204,6 +204,9 @@
   </div>
 </div>
 
+<!-- 后端口径说明（overview.metrics_note，双语已由后端给出），防御性渲染 -->
+<div id="overview-note" class="muted" style="font-size:12px;margin:4px 0 0"></div>
+
 <section>
   <h2><span class="l en">timeline — last 24 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 24 小时（在场 / 自动化 / 无人）</span></h2>
   <div id="timeline" class="muted">loading…</div>
@@ -276,6 +279,8 @@
 <section>
   <h2><span class="l en">28-day trend — keyboard/mouse minutes per day</span><span class="l zh">28 天趋势 — 每日键鼠输入分钟</span></h2>
   <div id="report-trend">loading…</div>
+  <!-- 后端口径说明（trends.note，双语已由后端给出），防御性渲染 -->
+  <div id="trend-note" class="muted" style="font-size:12px;margin-top:6px"></div>
 </section>
 </div>
 
@@ -459,7 +464,7 @@ const T = {
         disconnected: "disconnected — retrying…",
         weekInsufficient: "not enough data for last week — comparison skipped",
         retry: "retry", loadFailed: "load failed: ",
-        colApp: "app", colEvents: "events (count)" },
+        colApp: "app", colEvents: "events (window switches, not duration)" },
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
@@ -476,7 +481,7 @@ const T = {
         disconnected: "连接断开，正在重试…",
         weekInsufficient: "上周数据不足，已跳过对比",
         retry: "重试", loadFailed: "加载失败：",
-        colApp: "应用", colEvents: "事件数" }
+        colApp: "应用", colEvents: "按窗口切换事件数（非时长）" }
 };
 function t(key) { return T[document.documentElement.lang === "zh" ? "zh" : "en"][key]; }
 function esc(s) {
@@ -520,10 +525,18 @@ function applyLang(lang) {
 }
 function toggleLang() {
   applyLang(document.documentElement.lang === "zh" ? "en" : "zh");
-  // 设置页不刷新：语言切换不能覆盖未保存的勾选（与轮询豁免同一理由）
+  // 语言影响 fmtDuration/prettyApp/T 字典等渲染输出：必须清空渲染签名，
+  // 否则 payload 不变时防抖会跳过重渲染，Overview/时间线文案最长 30 秒
+  // 内仍停留在旧语言。
+  for (const k of Object.keys(RENDER_SIGS)) delete RENDER_SIGS[k];
+  // 设置页不刷新：语言切换不能覆盖未保存的勾选（与轮询豁免同一理由）；
+  // 设置页静态文案由 .l.en/.l.zh + html[lang] CSS 即时切换，无需重渲染。
   if (currentView === "settings") return;
   refreshAll().catch(() => {});
 }
+/* 手动验证：1) 打开面板停在 Overview，等数据渲染完成；2) 点右上角语言按钮
+   切换中/英——Overview 卡片与 24h 时间线图例应立即变为目标语言，无需等 30 秒
+   轮询；3) 切到"报告"页重复一次，热力图悬浮单位（min/分钟）应同步切换。 */
 /* ─── 状态行 / Overview ─── */
 async function loadStatus() {
   const s = await jget("/api/status");
@@ -606,6 +619,9 @@ async function loadOverview() {
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
   document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;
   document.getElementById("c-dbsize").textContent = fmtBytes((o.db_size_bytes || 0) + (o.db_wal_bytes || 0));
+  // 口径说明小字（overview.metrics_note）：字段缺失（旧后端）时静默留空
+  const on = document.getElementById("overview-note");
+  if (on) on.textContent = o.metrics_note || o.note || "";
 
   const s = await jget("/api/summary");
 }
@@ -908,6 +924,9 @@ async function loadReport() {
     ? (today ? fmtMin(today.active_minutes) : "0m") + " / " + fmtMin(goal)
     : "off";
   const tw = tr.this_week || {}, lw = tr.last_week;
+  // 口径说明小字（trends.note）：字段缺失时静默留空
+  const tn = document.getElementById("trend-note");
+  if (tn) tn.textContent = tr.note || "";
   document.getElementById("r-week").innerHTML = lw
     ? fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
       " (" + ((lw.active_minutes || 0) ? ((tw.active_minutes || 0) >= (lw.active_minutes || 0) ? "▲ +" : "▼ ") + Math.round(((tw.active_minutes || 0) - (lw.active_minutes || 0)) / (lw.active_minutes || 0) * 100) + "%" : "–") + ")</span>"

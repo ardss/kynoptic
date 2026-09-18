@@ -139,15 +139,22 @@ impl Database {
     }
 
     /// 降级路径公共体：单条独立事务（可选附带聚合维护），失败计数并跳过。
+    ///
+    /// 契约：返回 Vec 与 `events` **一一对应**——失败的行 push 0（rowid 0 在
+    /// agg 增量维护中被 max_event_rowid 守卫跳过，不会重复累计）。交叉审查
+    /// P4 修复：此前 lock_writer / 事务创建失败的 continue 路径不 push，返回
+    /// Vec 短于 events，违反 doc 契约（调用方按索引 zip 会错位）。
     fn insert_one_by_one_impl(&self, events: &[Event], with_agg: bool) -> Vec<i64> {
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
         for e in events {
             let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
                 note_write_failure(1);
+                rowids.push(0);
                 continue;
             };
             let Ok(tx) = conn.unchecked_transaction() else {
                 note_write_failure(1);
+                rowids.push(0);
                 continue;
             };
             // 降级路径 input_agg 行同样必须走 UPSERT（裸 INSERT 撞部分唯一
@@ -260,6 +267,44 @@ mod tests {
         let _ = db.insert_events_with_agg(&[Event::new(EventAction::Press, EventType::Keyboard)]);
         let after = crate::collector::WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "with_agg 降级路径也必须计数");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 交叉审查 P4 契约：降级路径返回的 rowid Vec 必须与 events **一一对应**
+    /// （失败行 push 0），任何失败路径都不得使返回值短于输入。
+    #[test]
+    fn one_by_one_rowids_len_always_matches_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-wflen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wf.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+
+        // 正常路径：长度一一对应
+        let events: Vec<Event> = (0..3)
+            .map(|_| Event::new(EventAction::Press, EventType::Keyboard))
+            .collect();
+        assert_eq!(db.insert_events(&events).len(), 3);
+        assert_eq!(db.insert_events_with_agg(&events).len(), 3);
+
+        // 全失败路径（DROP events 表 → 单条执行必然失败）：仍一一对应且全 0
+        db.with_writer(
+            |c| {
+                let _ = c.execute("DROP TABLE events", []);
+            },
+            || (),
+        );
+        let rowids = db.insert_events(&events);
+        assert_eq!(rowids, vec![0, 0, 0], "失败行必须 push 0 保持一一对应");
+        let rowids_agg = db.insert_events_with_agg(&events);
+        assert_eq!(rowids_agg, vec![0, 0, 0]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

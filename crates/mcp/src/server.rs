@@ -175,8 +175,14 @@ impl McpServer {
                 };
                 let (limit, clamped_limit) = parse_limit(args)?;
                 let mut v = state::anomalies(&conn, days, limit);
-                if let Some(n) = clamped_days.or(clamped_limit) {
+                // days 与 limit 可能同时超限：分别带 clamped_days / clamped_limit
+                //（clamped_to 兼容保留，语义 = days 的钳制值）
+                if let Some(n) = clamped_days {
+                    v["clamped_days"] = json!(n);
                     v["clamped_to"] = json!(n);
+                }
+                if let Some(n) = clamped_limit {
+                    v["clamped_limit"] = json!(n);
                 }
                 Ok(v)
             }
@@ -279,7 +285,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_timeline",
-            "description": "应用/窗口时间线段（前台应用占用段，应用名为空时回退窗口标题，皆空记 (unknown)）。裸日期 from/to 按本地日界解析；to 为日期时含当天全天；响应含 total_segments 与 truncation（超限时按事件时间升序丢弃最旧段，truncation=oldest-dropped）",
+            "description": "应用/窗口时间线段（前台应用占用段，应用名为空时回退窗口标题，皆空记 (unknown)）。裸日期 from/to 按本地日界解析；to 为日期时含当天全天。响应含 total_segments；超限时保留最新 limit 段（truncation=oldest-dropped，丢弃最旧段）并带 next_from（保留段最早 start）。分页推进规则：下一页以同一 from、to=next_from 再查，循环直到 truncated=false，各页拼接不重不漏；段 start 严格递增（同 timestamp 重复 switch 已去重）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -591,11 +597,24 @@ mod tests {
             json!(100)
         );
         let r = call(&srv, 2, "get_anomalies", json!({ "days": 500 }));
-        assert_eq!(
-            serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap()
-                ["clamped_to"],
-            json!(30)
+        let v = serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["clamped_to"], json!(30));
+        assert_eq!(v["clamped_days"], json!(30));
+        assert!(v.get("clamped_limit").is_none());
+        // days 与 limit 同时超限：两个钳制标记都要报（不能 or() 只报其一）
+        let r = call(
+            &srv,
+            3,
+            "get_anomalies",
+            json!({ "days": 500, "limit": 500 }),
         );
+        let v = serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["clamped_days"], json!(30));
+        assert_eq!(v["clamped_limit"], json!(100));
+        // get_anomalies 响应带 bridge_minutes（MCP 固定用 core 默认桥接值）
+        let r = call(&srv, 4, "get_anomalies", json!({}));
+        let v = serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["bridge_minutes"], json!(2));
     }
 
     #[test]

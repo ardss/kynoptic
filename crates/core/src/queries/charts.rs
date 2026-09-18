@@ -404,17 +404,23 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT substr(timestamp, 1, 16) AS minute \
+    // 口径与 agg 路径对齐（交叉审查 P1）：mouse input_agg 行可能只有 moves
+    // （纯移动无点击），不能凭"存在 input_agg 行"判活跃——必须按
+    // KEYS_ROW_EXPR + CLICKS_ROW_EXPR > 0 判定（keys/clicks 才算活跃分钟）。
+    // 分钟串同样与 agg 路径同构：本地钟面 "YYYY-MM-DDTHH:MM"（datetime 输出
+    // 为空格分隔，replace 成 "T"；此前回退路径返回 UTC 原串，异常卡上时区错位）。
+    let off = super::local_offset_modifier();
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT DISTINCT replace(substr(datetime(timestamp, ?3), 1, 16), ' ', 'T') AS minute \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
-           AND (event_type='keyboard' \
-                OR (event_type='mouse' AND event_action IN ('click','input_agg'))) \
+           AND event_type IN ('keyboard','mouse') \
+           AND ({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}) > 0 \
          ORDER BY minute",
-    ) else {
+    )) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map(params![start, end], |r| r.get::<_, String>(0)) else {
+    let Ok(rows) = stmt.query_map(params![start, end, off], |r| r.get::<_, String>(0)) else {
         return out;
     };
     for row in rows.flatten() {
@@ -434,7 +440,10 @@ pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
             "SELECT \
                 CAST(COALESCE(SUM(CASE WHEN bucket_id='input_keys' THEN COALESCE(sum_value,0) ELSE 0 END), 0) AS INTEGER), \
                 CAST(COALESCE(SUM(CASE WHEN bucket_id='input_clicks' THEN COALESCE(sum_value,0) ELSE 0 END), 0) AS INTEGER), \
-                COUNT(DISTINCT CASE WHEN bucket_id IN ('input_keys','input_clicks','input_moves') \
+                -- 口径（统一 2026-09，交叉审查 P1）：剔除 move-only 分钟，
+                -- 与 active_minutes_by_date / daily_agg.recompute_day /
+                -- active_minutes_today 同一口径（keys/clicks 才算活跃）。
+                COUNT(DISTINCT CASE WHEN bucket_id IN ('input_keys','input_clicks') \
                                     THEN printf('%02d:%02d', hour, minute) END) \
              FROM agg_minute WHERE date = ?1",
             params![date],
@@ -453,12 +462,14 @@ pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
     let Ok((keys, clicks, active_minutes)) = conn.query_row(
+        // 口径（统一 2026-09，交叉审查 P1）：move-only 分钟不算活跃，
+        // 与 active_minutes_by_date / daily_agg / active_minutes_today 同口径。
         &format!(
             "SELECT \
                 COALESCE(SUM({KEYS_ROW_EXPR}), 0), \
                 COALESCE(SUM({CLICKS_ROW_EXPR}), 0), \
-                (SELECT COUNT(DISTINCT substr(timestamp,1,16)) FROM events \
-                 WHERE timestamp >= ?1 AND timestamp < ?2 AND event_type IN ('keyboard','mouse')) \
+                COUNT(DISTINCT CASE WHEN {KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR} > 0 \
+                                    THEN substr(timestamp, 1, 16) END) \
              FROM events \
              WHERE timestamp >= ?1 AND timestamp < ?2 \
                AND event_type IN ('keyboard','mouse')"
@@ -621,8 +632,30 @@ pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
+    let off = super::local_offset_modifier();
+    top_burst_minutes_in_range(conn, &start, &end, min_count, &off)
+}
+
+/// [`top_burst_minutes`] 的机器无关核心：显式接收 UTC `[start, end)` 边界与
+/// 本地偏移修饰符（供单测注入固定 UTC+8 语义）。
+///
+/// **时区语义（交叉审查 P2）**：分钟串必须先把 UTC timestamp 换算成**本地**时刻
+/// （`datetime(timestamp, ?4)`）再截断——此前直接 `substr(timestamp,1,16)` 返回
+/// UTC 原串，本地 12:00 的突增在异常卡上显示为 UTC 04:00。与 agg 缓存路径
+/// （bucket 即本地分钟）及 dash 其他显示一致。
+pub(crate) fn top_burst_minutes_in_range(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    min_count: i64,
+    off_modifier: &str,
+) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
     let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT substr(timestamp, 1, 16), SUM({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}) AS n \
+        // datetime() 输出为 "YYYY-MM-DD HH:MM"（空格分隔），replace 成 "T" 与
+        // agg 缓存路径的分钟串格式保持一致（"YYYY-MM-DDTHH:MM"）。
+        "SELECT replace(substr(datetime(timestamp, ?4), 1, 16), ' ', 'T'), \
+         SUM({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}) AS n \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
            AND event_type IN ('keyboard', 'mouse') \
@@ -634,7 +667,7 @@ pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(
     )) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map(params![start, end, min_count], |r| {
+    let Ok(rows) = stmt.query_map(params![start, end, min_count, off_modifier], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) else {
         return out;
@@ -783,5 +816,105 @@ mod tests {
         press(&c, "2026-06-15T10:00:00+00:00"); // 本地 18:00 → 不计
         let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, 6, OFF8);
         assert_eq!(n, 2, "23:30 与 02:00 计入深夜，12:00/18:00 不计入");
+    }
+
+    // ─── 交叉审查 P1：四处 active 分钟口径一致性 ─────────────────────────────
+
+    use crate::db::agg as agg_mod;
+
+    /// 注入本地今日 UTC 边界内第 `mins` 分钟的 UTC RFC3339 时间戳。
+    fn ts_in_today(mins: i64) -> String {
+        let (start, _) = crate::queries::local_day_range(&crate::queries::today_local_str())
+            .expect("today 解析必然成功");
+        let base = chrono::DateTime::parse_from_rfc3339(&start).unwrap();
+        (base + chrono::Duration::minutes(mins)).to_rfc3339()
+    }
+
+    fn ins_ev(c: &Connection, ts: &str, t: &str, a: &str, data: Option<&str>) {
+        c.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, session_id) \
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            params![ts, t, a, data],
+        )
+        .unwrap();
+    }
+
+    /// 同一份数据下，四个 active 分钟来源必须相同（剔除 move-only 分钟）：
+    /// active_minutes_by_date / day_totals / daily_agg.recompute_day /
+    /// active_minutes_today。覆盖 events 回退路径与 agg 缓存路径两条。
+    #[test]
+    fn active_minutes_consistent_across_four_sources() {
+        let c = conn();
+        let today = crate::queries::today_local_str();
+
+        // 分钟 +10: press（活跃）；+20: click（活跃）；+30: keyboard input_agg
+        // keys=4（活跃）；+40: mouse input_agg 纯 moves（不活跃）；+50: raw
+        // mouse move（不活跃）。活跃分钟黄金值 = 3。
+        ins_ev(&c, &ts_in_today(10), "keyboard", "press", None);
+        ins_ev(&c, &ts_in_today(20), "mouse", "click", None);
+        ins_ev(
+            &c,
+            &ts_in_today(30),
+            "keyboard",
+            "input_agg",
+            Some(r#"{"keys":4,"samples":4}"#),
+        );
+        ins_ev(
+            &c,
+            &ts_in_today(40),
+            "mouse",
+            "input_agg",
+            Some(r#"{"moves":9,"move_distance_px":100,"samples":9}"#),
+        );
+        ins_ev(
+            &c,
+            &ts_in_today(50),
+            "mouse",
+            "move",
+            Some(r#"{"x":1,"y":2}"#),
+        );
+
+        let check_all = |label: &str| {
+            let by_date = super::active_minutes_by_date(&c, &today).len() as i64;
+            let totals = super::day_totals(&c, &today).active_minutes;
+            crate::daily_agg::recompute_day(&c, &today).unwrap();
+            let daily: i64 = c
+                .query_row(
+                    "SELECT active_minutes FROM daily_agg WHERE date = ?1",
+                    params![today],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let (t_start, t_end) = crate::queries::today_range();
+            let today_min = crate::queries::active_minutes_today(&c, &t_start, &t_end);
+            assert_eq!(
+                (by_date, totals, daily, today_min),
+                (3, 3, 3, 3),
+                "{label}: 四处 active 分钟必须一致且剔除 move-only（黄金值 3）"
+            );
+        };
+
+        check_all("events 回退路径");
+
+        // 建 agg 缓存后（agg 读路径）同解
+        agg_mod::rebuild_all(&c).unwrap();
+        check_all("agg 缓存路径");
+    }
+
+    // ─── 交叉审查 P2：突增分钟显示本地时间 ─────────────────────────────────────
+
+    /// UTC+8 下 UTC 04:00（本地 12:00）的突增分钟必须显示 "12:00"，
+    /// 修复前回退路径返回 UTC 原串 "2026-06-15T04:00"。
+    #[test]
+    fn top_burst_minutes_fallback_formats_local_time() {
+        let c = conn();
+        press(&c, "2026-06-15T04:00:00+00:00"); // 本地（UTC+8）2026-06-15 12:00
+        press(&c, "2026-06-15T04:00:30+00:00");
+        let out = top_burst_minutes_in_range(&c, RANGE.0, RANGE.1, 1, OFF8);
+        assert_eq!(
+            out,
+            vec![("2026-06-15T12:00".to_string(), 2)],
+            "回退路径必须输出本地时区分钟串"
+        );
     }
 }

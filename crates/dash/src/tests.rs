@@ -993,6 +993,37 @@ fn insights_golden_hours_requires_each_hour_at_least_quarter_of_total() {
 }
 
 #[test]
+fn insights_late_night_uses_23_to_6_window() {
+    let conn = mem_conn();
+    // 深夜窗口统一为 [23:00, 次日 06:00)：23:30 的输入必须计入（旧口径
+    // h < 6 会漏掉 23 点段），凌晨 05:00 同样计入；合计 60 > 30 门槛出卡。
+    for _ in 0..40 {
+        insert(&conn, &local_ts(-1, 23, 30), "keyboard", "press", None);
+    }
+    for _ in 0..20 {
+        insert(&conn, &local_ts(0, 5, 0), "keyboard", "press", None);
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    let card = v["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title_en"] == json!("Late-night activity"))
+        .expect("23:30 与 05:00 合计 60 次，深夜卡应存在");
+    let zh = card["text_zh"].as_str().unwrap();
+    let en = card["text_en"].as_str().unwrap();
+    assert!(zh.contains("23:00-06:00"), "文案应注明统一窗口: {zh}");
+    assert!(
+        zh.contains("60 次"),
+        "23 点段的 40 次应与凌晨 20 次合并计数: {zh}"
+    );
+    assert!(en.contains("23:00-06:00"), "en 侧同步: {en}");
+}
+
+#[test]
 fn insights_below_gate_with_today_data_shows_warming_up_card() {
     let conn = mem_conn();
     // 今日已有 10 条输入但未到 50 门槛：给"数据积累中"info 卡而非空列表

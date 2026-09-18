@@ -388,16 +388,33 @@ fn normalize_bound(v: &str, is_to: bool) -> String {
         }
     }
     match chrono::DateTime::parse_from_rfc3339(v) {
-        Ok(t) => t
-            .with_timezone(&Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        Ok(t) => {
+            let t = t.with_timezone(&Utc);
+            // to 边界带小数秒时**向上取整到秒**：向下截断会把 [floor(t), t)
+            // 之间的事件排除在外（to 是排他上界），漏掉本应属于窗口的段；
+            // from 是包含下界，截断即可，不受影响。
+            let t = if is_to && t.timestamp_subsec_nanos() > 0 {
+                t + chrono::Duration::seconds(1)
+            } else {
+                t
+            };
+            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+        }
         Err(_) => v.to_string(),
     }
 }
 
 /// 应用/窗口时间线段。granularity=minute 逐段返回；hour 把同一本地小时内
-/// 连续同应用段合并。返回完整 JSON：segments + total_segments + truncated
-/// （截断策略：按事件时间升序保留，超限丢最旧段，truncation="oldest-dropped"）。
+/// 连续同应用段合并。返回完整 JSON：segments + total_segments + truncated。
+///
+/// 截断与分页：按事件时间升序构建，超限时保留**最新** limit 段（丢弃的是
+/// 最旧段，truncation="oldest-dropped"）——符合"我刚才在用什么"的主要查询
+/// 意图。truncated=true 时响应带 `next_from`（保留段最早一段的 start）；
+/// 分页推进规则：客户端下一页以**同一 from、to=next_from** 再查一次即可
+/// 无缝续拉更早的段（段为 [start,end) 半开区间，next_from 恰是已取内容的
+/// 排他下界），循环直到 truncated=false，各页拼接不重不漏。段 start 严格
+/// 递增（同 timestamp 的重复 switch 在构建时去重），客户端按 start 推进
+/// 游标不会死循环。
 pub fn timeline(
     conn: &Connection,
     from: &str,
@@ -433,9 +450,25 @@ pub fn timeline(
         .collect();
 
     let to_t = chrono::DateTime::parse_from_rfc3339(&to).ok();
+    // 零时长段防御：同一 timestamp 连发两次 switch（如双事件同毫秒落库）会
+    // 产生 start 相同的零时长段，按段 start/end 推进游标的客户端会原地死循环。
+    // 去重：同 timestamp 只保留最后一个 switch（该时刻之后的前台应用以后者为准），
+    // 保证段 start 严格递增。
+    let mut rows_deduped: Vec<&(String, String)> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        if rows
+            .get(i + 1)
+            .map(|(next_ts, _)| next_ts == &row.0)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        rows_deduped.push(row);
+    }
+
     let mut segs: Vec<(String, String, String)> = Vec::new(); // (app,start,end)
-    for (i, (ts, app)) in rows.iter().enumerate() {
-        let end = rows
+    for (i, (ts, app)) in rows_deduped.iter().enumerate() {
+        let end = rows_deduped
             .get(i + 1)
             .map(|(next, _)| next.clone())
             .or_else(|| to_t.map(|t| t.to_rfc3339()))
@@ -455,13 +488,19 @@ pub fn timeline(
 
     let total_segments = segs.len();
     let truncated = total_segments > limit;
-    let out: Vec<Value> = segs
-        .into_iter()
-        .take(limit)
+    // 保留最新 limit 段（不是 take(limit) 的最旧段）：主要查询意图是"最近在用什么"
+    let skip = total_segments.saturating_sub(limit);
+    let next_from = if truncated {
+        Some(segs[skip].1.clone())
+    } else {
+        None
+    };
+    let out: Vec<Value> = segs[skip..]
+        .iter()
         .map(|(app, start, end)| {
-            let dur = chrono::DateTime::parse_from_rfc3339(&start)
+            let dur = chrono::DateTime::parse_from_rfc3339(start)
                 .ok()
-                .zip(chrono::DateTime::parse_from_rfc3339(&end).ok())
+                .zip(chrono::DateTime::parse_from_rfc3339(end).ok())
                 .map(|(a, b)| (b - a).num_seconds().max(0))
                 .unwrap_or(0);
             json!({
@@ -477,6 +516,7 @@ pub fn timeline(
         "total_segments": total_segments,
         "truncated": truncated,
         "truncation": if truncated { "oldest-dropped" } else { "none" },
+        "next_from": next_from.map(Value::String).unwrap_or(Value::Null),
     }))
 }
 
@@ -564,16 +604,26 @@ fn anomaly_message_en(kind: &str, fallback: &str) -> String {
 }
 
 /// 最近 `days` 天（含今日）的异常事件列表。
+///
+/// `bridge_minutes` 固定为 core 的 DEFAULT_PRESENCE_BRIDGE_MINUTES（2）：
+/// MCP 数据面恒用默认桥接值现算，面板走用户 settings 里可能改过的值，
+/// 两处数字可以不同——响应显式带回本工具实际使用的值，避免客户端误以为
+/// 与面板展示必然一致。
 pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
     let days = days.clamp(1, 30);
     let limit = clamp_limit(Some(limit));
+    let bridge_minutes = kynoptic_core::constants::DEFAULT_PRESENCE_BRIDGE_MINUTES as i64;
     let mut out: Vec<Value> = Vec::new();
     for i in 0..days {
         let date = queries::date_offset_str(-(i as i64));
         let list = kynoptic_core::anomaly::detect_all(conn, &date).unwrap_or_default();
         for a in list {
             if out.len() >= limit {
-                return json!({"anomalies": out, "truncated": true});
+                return json!({
+                    "anomalies": out,
+                    "truncated": true,
+                    "bridge_minutes": bridge_minutes,
+                });
             }
             let message_en = anomaly_message_en(&a.kind, &a.message);
             out.push(json!({
@@ -586,7 +636,11 @@ pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
             }));
         }
     }
-    json!({"anomalies": out, "truncated": false})
+    json!({
+        "anomalies": out,
+        "truncated": false,
+        "bridge_minutes": bridge_minutes,
+    })
 }
 
 // ─── E. wait_for ────────────────────────────────────────────────────────────
@@ -603,7 +657,11 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
     Ok(match signal {
         "late_night" => {
             let hour = Local::now().hour();
-            hour >= kynoptic_core::constants::LATE_NIGHT_HOUR_START
+            // 与 anomaly::detect 的 23:00-06:00 窗口同口径（双边界），
+            // 不能只判 >= 23——凌晨 0-5 点同样是深夜窗口
+            !(kynoptic_core::constants::LATE_NIGHT_END_HOUR
+                ..kynoptic_core::constants::LATE_NIGHT_HOUR_START)
+                .contains(&hour)
         }
         "low_battery" => {
             let Some(d) = latest_event_data(conn, EventType::System, EventAction::BatteryStatus)
@@ -893,7 +951,8 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["app"], json!("a"));
         assert_eq!(arr[0]["duration_sec"], json!(600));
-        // limit 钳制：limit=1 → 只回 1 段，带 total_segments + truncation 策略
+        // limit 钳制：limit=1 → 只回**最新** 1 段（app b），带 total_segments
+        // + truncation 策略 + next_from（下一页游标 = 保留段最早 start）
         let v = timeline(
             &conn,
             "2026-09-09T00:00:00+00:00",
@@ -905,7 +964,130 @@ mod tests {
         assert_eq!(v["truncated"], json!(true));
         assert_eq!(v["total_segments"], json!(2));
         assert_eq!(v["truncation"], json!("oldest-dropped"));
-        assert_eq!(v["segments"].as_array().unwrap().len(), 1);
+        assert_eq!(v["next_from"], json!("2026-09-09T01:10:00+00:00"));
+        let arr = v["segments"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["app"], json!("b"), "截断必须保留最新段而非最旧段");
+        // 未截断时 next_from 为 null
+        let v = timeline(
+            &conn,
+            "2026-09-09T00:00:00+00:00",
+            "2026-09-09T02:00:00+00:00",
+            "minute",
+            20,
+        )
+        .unwrap();
+        assert_eq!(v["next_from"], Value::Null);
+    }
+
+    /// 分页拼接：513 段（含同 timestamp 双 switch 产生的零时长段场景）
+    /// 两页拉取不重不漏；段 start 严格递增，按游标推进不会死循环。
+    #[test]
+    fn timeline_pagination_two_pages_covers_all_without_overlap() {
+        let conn = mem_conn();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-09-09T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts = |i: i64| (base + chrono::Duration::minutes(i)).to_rfc3339();
+        // 513 个 switch；其中 i=200 处同 timestamp 插两次（零时长段场景，去重后仍 513 段）
+        for i in 0..513 {
+            insert(
+                &conn,
+                &ts(i),
+                "window",
+                "switch",
+                Some(&format!("app{}", i % 7)),
+                None,
+            );
+        }
+        insert(&conn, &ts(200), "window", "switch", Some("dup"), None);
+        let to = ts(600);
+        // 第 1 页：保留最新 300 段
+        let p1 = timeline(&conn, &ts(0), &to, "minute", 300).unwrap();
+        assert_eq!(p1["total_segments"], json!(513));
+        assert_eq!(p1["truncated"], json!(true));
+        let s1 = p1["segments"].as_array().unwrap();
+        assert_eq!(s1.len(), 300);
+        assert_eq!(s1[0]["start"], json!(ts(213)), "必须保留最新段，丢最旧段");
+        // 第 2 页：同一 from、to = next_from
+        let next_from = p1["next_from"].as_str().unwrap().to_string();
+        assert_eq!(next_from, ts(213), "next_from = 保留段最早 start");
+        let p2 = timeline(&conn, &ts(0), &next_from, "minute", 300).unwrap();
+        assert_eq!(p2["truncated"], json!(false));
+        let s2 = p2["segments"].as_array().unwrap();
+        assert_eq!(s2.len(), 213);
+        // 拼接不重不漏：start 严格递增、共 513 段
+        let mut starts: Vec<&str> = s1
+            .iter()
+            .chain(s2.iter())
+            .map(|s| s["start"].as_str().unwrap())
+            .collect();
+        assert_eq!(starts.len(), 513);
+        starts.sort_unstable();
+        let n = starts.len();
+        starts.dedup();
+        assert_eq!(starts.len(), n, "段 start 不得重复（零时长段已合并/去重）");
+        for w in starts.windows(2) {
+            assert!(w[0] < w[1], "段 start 必须严格递增: {} vs {}", w[0], w[1]);
+        }
+        // 全量一次查询的段序与分页拼接一致（抽查首尾）
+        let all = timeline(&conn, &ts(0), &to, "minute", 1000).unwrap();
+        let sa = all["segments"].as_array().unwrap();
+        assert_eq!(sa.len(), 513);
+        assert_eq!(sa[0]["start"], json!(starts[0]));
+        assert_eq!(sa[512]["start"], json!(starts[512]));
+    }
+
+    /// 同 timestamp 双 switch 不产生零时长段（构建时去重）。
+    #[test]
+    fn timeline_dedupes_same_timestamp_switches() {
+        let conn = mem_conn();
+        insert(
+            &conn,
+            "2026-09-09T01:00:00+00:00",
+            "window",
+            "switch",
+            Some("a"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T01:30:00+00:00",
+            "window",
+            "switch",
+            Some("b"),
+            None,
+        );
+        insert(
+            &conn,
+            "2026-09-09T01:30:00+00:00",
+            "window",
+            "switch",
+            Some("c"),
+            None,
+        );
+        let v = timeline(
+            &conn,
+            "2026-09-09T00:00:00+00:00",
+            "2026-09-09T02:00:00+00:00",
+            "minute",
+            20,
+        )
+        .unwrap();
+        let arr = v["segments"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "同 timestamp 重复 switch 不得产生零时长段: {v}"
+        );
+        for s in arr {
+            assert!(s["duration_sec"].as_i64().unwrap() > 0, "{s}");
+        }
+        assert_eq!(
+            arr[1]["app"],
+            json!("c"),
+            "同 timestamp 保留最后一个 switch"
+        );
     }
 
     /// 裸日期 from/to 按**本地日界**解析：to 为日期时只含该本地日（不扩到次日），
@@ -997,10 +1179,24 @@ mod tests {
             normalize_bound("2026-09-17T00:00:00+08:00", true),
             "2026-09-16T16:00:00+00:00"
         );
-        // 带小数秒 → 截到秒精度（与库内整秒字面量字典序可比）
+        // 带小数秒 → from 截到秒精度（与库内整秒字面量字典序可比）
         assert_eq!(
             normalize_bound("2026-09-17T00:00:00.123+08:00", false),
             "2026-09-16T16:00:00+00:00"
+        );
+        // to 带小数秒 → **向上取整到秒**（to 是排他上界，截断会漏段）
+        assert_eq!(
+            normalize_bound("2026-09-17T00:00:00.123+08:00", true),
+            "2026-09-16T16:00:01+00:00"
+        );
+        assert_eq!(
+            normalize_bound("2026-09-17T00:00:00.999Z", true),
+            "2026-09-17T00:00:01+00:00"
+        );
+        // to 整秒不变
+        assert_eq!(
+            normalize_bound("2026-09-17T00:00:00Z", true),
+            "2026-09-17T00:00:00+00:00"
         );
         // 解析失败回退原样
         assert_eq!(normalize_bound("garbage", false), "garbage");
@@ -1219,6 +1415,29 @@ mod tests {
             }
             assert!(!check_signal(&conn, s).unwrap(), "{s}");
         }
+    }
+
+    /// late_night 信号必须与 anomaly::detect 的 23:00-06:00 窗口同口径
+    /// （双边界）：此前只判 hour >= 23，凌晨 0-5 点漏判。
+    #[test]
+    fn late_night_signal_matches_detect_window() {
+        let conn = mem_conn();
+        let hour = Local::now().hour();
+        let expected = !(kynoptic_core::constants::LATE_NIGHT_END_HOUR
+            ..kynoptic_core::constants::LATE_NIGHT_HOUR_START)
+            .contains(&hour);
+        assert_eq!(check_signal(&conn, "late_night").unwrap(), expected);
+    }
+
+    /// get_anomalies 响应必须带 bridge_minutes（MCP 用 core 默认桥接值 2）。
+    #[test]
+    fn anomalies_report_bridge_minutes() {
+        let conn = mem_conn();
+        let v = anomalies(&conn, 1, 20);
+        assert_eq!(
+            v["bridge_minutes"],
+            json!(kynoptic_core::constants::DEFAULT_PRESENCE_BRIDGE_MINUTES as i64)
+        );
     }
 
     #[test]

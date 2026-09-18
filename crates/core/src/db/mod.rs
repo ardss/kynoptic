@@ -319,7 +319,8 @@ impl Database {
                     }
                 });
         } else {
-            // 欠聚合核对（P1，廉价：两条聚合查询）：events 里应有聚合贡献的
+            // 欠聚合核对（P1，廉价：timestamp 下界 7 天 + 索引区间，见
+            // agg::under_agg_dates 的取舍说明）：events 里应有聚合贡献的
             // 原始行（press/click/switch）最大 id 超过该日 agg_minute 已记录的
             // max_event_rowid → 该日欠聚合（历史 kill 中断/存量遗留），后台
             // 逐小时重算自愈。增量路径已与 events 落库同事务（见

@@ -291,14 +291,25 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
 /// 只对比原始贡献行（不含 input_agg/move 等快照行）：快照行在增量维护中
 /// rowid 记 0，且重算路径写入桶内 MAX(id) 覆盖全部 keyboard/mouse/window 行，
 /// 因此重算后该指标必然收敛（不产生持续误报）。
+///
+/// **启动延迟（交叉审查 P3）**：本函数在 `Database::open` 主线程同步调用。
+/// 无下界时是 events 全表 GROUP BY 扫描（362 万行库上秒级启动回归）。这里加
+/// `timestamp >= cutoff` 的**日期下界**（自愈窗口 7 天）：谓词可走
+/// idx_events_timestamp 索引区间，只核对最近 7 天，启动核对降到毫秒级。
+/// **取舍（文档化）**：7 天前的欠聚合日期不再被启动/维护自愈——这类日期只能
+/// 来自事务化之前的历史遗留 kill，且日常使用中不会再看；需要修复历史数据时
+/// 显式调用 `rebuild_agg`（或删掉 agg_minute 触发懒回填）即可全量重建。
 pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
     let off = crate::queries::local_offset_modifier();
+    // 只核对最近 7 天（见上方取舍说明）；cutoff 用 UTC RFC3339 与 timestamp 列同构比较。
+    let cutoff = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
     let sql = format!(
         "SELECT e.d FROM (
            SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d, MAX(id) AS maxid
            FROM events
            WHERE event_type IN ('keyboard','mouse','window')
              AND event_action IN ('press','click','switch')
+             AND timestamp >= '{cutoff}'
            GROUP BY d
          ) e
          LEFT JOIN (
@@ -308,6 +319,7 @@ pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
          WHERE COALESCE(a.m, 0) < e.maxid
          ORDER BY e.d",
         off = off,
+        cutoff = cutoff,
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -969,6 +981,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after2, 2);
+    }
+
+    /// 交叉审查 P3：欠聚合核对只看最近 7 天（自愈窗口）。8 天前遗留的欠聚合
+    /// 日期不出现在核对结果里（历史遗留需显式 rebuild_agg，见函数 doc 取舍说明）。
+    #[test]
+    fn under_agg_dates_only_checks_recent_seven_days() {
+        let c = conn();
+        // 8 天前的 press（欠聚合，超出 7 天窗口）+ 今天的 press（欠聚合，窗口内）
+        let old = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        let recent = Utc::now().to_rfc3339();
+        ins(&c, &old, "keyboard", "press", None, None);
+        ins(&c, &recent, "keyboard", "press", None, None);
+
+        let dates = under_agg_dates(&c);
+        let old_local_date = (Utc::now() - chrono::Duration::days(8))
+            .with_timezone(&Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(
+            !dates.contains(&old_local_date),
+            "8 天前的欠聚合日期不应触发启动自愈（窗口 7 天）: {dates:?}"
+        );
+        assert_eq!(dates.len(), 1, "窗口内的今天仍应被核对出欠聚合: {dates:?}");
     }
 }
 
