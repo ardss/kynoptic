@@ -402,6 +402,15 @@ impl Collector {
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
         }
+        // 终值直写兜底（与 Drop 同款，审查 P1）：聚合线程的关停终值 flush 走
+        // 通道，若通道已满（writer 停滞场景）会被 try_send 丢弃且无人补偿。
+        // writer 退出后直写最后一份 partial，保证"最后一分钟不丢"语义成立。
+        if self.settings.input_granularity == InputGranularity::Minute {
+            let events = input_agg::flush_partial(chrono::Local::now());
+            if !events.is_empty() {
+                write_batch(&self.db, &events, &self.total_written);
+            }
+        }
 
         let total = self.total_written.load(Ordering::Relaxed) as i64;
         self.db.end_session(self.session_id, total, 0.0);

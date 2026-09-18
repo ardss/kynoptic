@@ -14,11 +14,11 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 
 ## 定位二进制与数据（按序尝试）
 
-1. `D:\Kynoptic\kynoptic.exe`（安装版默认位；换机后路径可能变，先确认盘符）
+1. `%LOCALAPPDATA%\Programs\Kynoptic\kynoptic.exe`（安装版默认位；开始菜单快捷方式指向同处）
 2. `kynoptic` 在 PATH（安装版会加）
-3. 开发正本 `K:\kynoptic\target\release\kynoptic.exe`（仓库克隆+便携构建，权威源）
+3. 便携版=解压/拷贝目录下的 kynoptic.exe（与 kynoptic-tray.exe 同目录，data\ 就在其旁）
 
-**两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。开发在 K:\kynoptic（git 正本，G 盘已弃用），改完 `cargo build --release -p kynoptic -p kynoptic-tray` 后把二进制拷到安装目录重启托盘才生效。
+**两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。数据一律在 exe 同级 data\kynoptic.db（安装与便携相同），dashboard 实际端口看 data\dashboard-port.txt。
 
 数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
 CLI 解析顺序：`--db <PATH>` 全局参数 > `KYNOPTIC_DB` 环境变量 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。

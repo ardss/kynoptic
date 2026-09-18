@@ -226,7 +226,22 @@ fn main() {
             // Pause 状态记忆（审查 P2：设置保存触发的 Start 不能解除用户的
             // 暂停——只有托盘菜单的 Resume 才解除）
             let mut paused = false;
-            while let Ok(cmd) = cmd_rx.recv() {
+            // 审查 P0：启动失败后不能只等下一条命令才重试——改为 60s 超时
+            // 醒来一次，采集器缺位且未暂停时自动重试（库被占/磁盘满恢复后
+            // 自愈，无需用户干预）。超时重试走 Resume 语义：collector 为 None
+            // 时 Resume 分支的"清掉上一实例"自然跳过。
+            loop {
+                let cmd = match cmd_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                    Ok(c) => c,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if collector.is_none() && !paused {
+                            CollectorCmd::Resume
+                        } else {
+                            continue;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 match cmd {
                     CollectorCmd::Start | CollectorCmd::Resume => {
                         if matches!(cmd, CollectorCmd::Resume) {
@@ -279,10 +294,41 @@ fn main() {
                             Ok(c) => {
                                 log::info!("采集器已启动({} 个监控器)", enabled.len());
                                 collector = Some(c);
+                                // 恢复成功：清除持久化错误留档
+                                let _ = std::fs::remove_file(
+                                    owner_db
+                                        .parent()
+                                        .unwrap_or(&owner_db)
+                                        .join("collector-error.log"),
+                                );
                             }
                             Err(_) => {
-                                eprintln!("采集器启动失败(DB 不可写?),采集暂停");
-                                // 保持 None:下次 Resume 再试
+                                // 审查 P0：启动失败此前只在 stdout 喊一嗓子（托盘
+                                // 无 console 等于没人看见），托盘照常活着、数据
+                                // 静默归零——正是"库损坏=无声空采"的用户可见形态。
+                                // 改为：持久化留档 + 每次刷新都重试。
+                                let msg = kynoptic_core::db::diagnose_open_failure(
+                                    std::path::Path::new(&db_str),
+                                );
+                                let err_path = owner_db
+                                    .parent()
+                                    .unwrap_or(&owner_db)
+                                    .join("collector-error.log");
+                                let _ = std::fs::write(
+                                    &err_path,
+                                    format!(
+                                        "[{}] 采集器启动失败: {}
+（每 60s 自动重试；dashboard 设置页可见此文件名）
+",
+                                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                        msg
+                                    ),
+                                );
+                                eprintln!(
+                                    "采集器启动失败: {msg}，已写入 {}，60s 后重试",
+                                    err_path.display()
+                                );
+                                // 保持 None:下一轮再试
                             }
                         }
                     }

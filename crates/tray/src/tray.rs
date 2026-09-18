@@ -61,6 +61,19 @@ struct TrayCtx {
     args: Args,
 }
 
+/// 实际 dashboard 端口：优先读 db 目录下 dashboard-port.txt（bind 成功才写）。
+fn dashboard_port_actual(fallback: u16) -> u16 {
+    let db = kynoptic_core::db::resolve_db_path();
+    if let Some(dir) = db.parent() {
+        if let Ok(txt) = std::fs::read_to_string(dir.join("dashboard-port.txt")) {
+            if let Ok(p) = txt.trim().parse::<u16>() {
+                return p;
+            }
+        }
+    }
+    fallback
+}
+
 impl TrayCtx {
     fn icon(&self) -> win::HICON {
         self.icons.for_state(self.state)
@@ -129,7 +142,11 @@ impl TrayCtx {
         };
         match id {
             MenuId::OpenDashboard => {
-                let url: Vec<u16> = format!("http://127.0.0.1:{}\0", self.args.port)
+                // 审查 P2：冷启动时 dashboard 可能晚于 2s 才落到回退段端口
+                //（如 18422），点菜单时以 dashboard-port.txt 为准，避免打开
+                // 请求端口的死链接。
+                let port = dashboard_port_actual(self.args.port);
+                let url: Vec<u16> = format!("http://127.0.0.1:{}\0", port)
                     .encode_utf16()
                     .collect();
                 open_with_shell(&url);

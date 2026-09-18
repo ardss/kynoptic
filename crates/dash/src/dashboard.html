@@ -202,6 +202,7 @@
       <span class="l en">window dwell minus human and automation input</span><span class="l zh">前台驻留减去人在场与自动化</span>
     </div>
   </div>
+  <div id="overview-day-note" class="muted" style="display:none;font-size:12px"></div>
 </div>
 
 <!-- 后端口径说明（overview.metrics_note，双语已由后端给出），防御性渲染 -->
@@ -616,12 +617,29 @@ async function loadOverview() {
   } else {
     uCard.style.display = "none";
   }
+  // 审查 P1：不满一天时全天汇总均为临时值——在总览明示，避免装机当天
+  // 看着全 0 以为坏了（has_full_day 要到次日本地午夜才翻 true）。
+  const dayNote = document.getElementById("overview-day-note");
+  if (dayNote) {
+    dayNote.textContent = hasFullDay ? "" : (zh
+      ? "数据从安装时刻开始积累；全天汇总（含机器值班）在次日才完整。"
+      : "Data accrues from install time; full-day totals (incl. unattended) complete tomorrow.");
+    dayNote.style.display = hasFullDay ? "none" : "";
+  }
+  // 审查 P1：首日/首小时空数字提示扩展到全部三张数字卡——此前只有
+  // 在场卡有，自动化/前台两张裸显 "0m"，像坏了而不是在积累。
+  const collecting = pm === 0 && (o.today_events || 0) < 50;
   const cp = document.getElementById("c-presence");
-  if (pm === 0 && (o.today_events || 0) < 50) {
-    cp.textContent = zh ? "从今天开始积累" : "collecting…";
-    cp.classList.add("empty-note");
-  } else {
-    cp.classList.remove("empty-note");
+  const ca = document.getElementById("c-automation");
+  const cf = document.getElementById("c-fgdwell");
+  for (const [el, val] of [[cp, fmtDuration(pm)], [ca, fmtDuration(ah * 60 + amm)], [cf, fmtDuration(fd)]]) {
+    if (collecting) {
+      el.textContent = zh ? "从今天开始积累" : "collecting…";
+      el.classList.add("empty-note");
+    } else {
+      el.textContent = val;
+      el.classList.remove("empty-note");
+    }
   }
   document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
@@ -734,6 +752,13 @@ async function loadHeatmap() {
   if (seq !== HM_SEQ) return; // 连点 12/26/52 周：只让最后一次的响应生效
   const el = document.getElementById("heatmap");
   const days = hm.days;
+  // 审查 P2：零值补零策略让新装机渲染一整面"全黑格子"，与"坏了"无法区分
+  // ——全 0 时明示"还没有数据"。
+  if (!days.some(d => d.value > 0)) {
+    el.innerHTML = '<span class="muted">' + (document.documentElement.lang === "zh"
+      ? "暂无热力数据（安装后开始积累）" : "no heatmap data yet (accrues after install)") + "</span>";
+    return;
+  }
   const max = Math.max(1, ...days.map(d => d.value));
   const cell = 14, gap = 3;
   const cols = Math.ceil(days.length / 7);
@@ -750,7 +775,7 @@ async function loadHeatmap() {
     const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
-      (level === 0 ? "#232B38" : "none") + (level === 0 ? "#232B38" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
+      (level === 0 ? "#232B38" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
   });
   svg += "</svg>";
   el.innerHTML = svg;

@@ -1823,7 +1823,14 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                             watchdog_log(&format!(
                                 "复查仍未恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 判定采集挂死, kill kynoptic-tray 以重启"
                             ));
-                            kill_tray();
+                            if !kill_tray() {
+                                // 审查 P2：杀失败（AV/权限）不留痕的话，后续每
+                                // 个 --once 周期都重复 40s 睡眠+复查，且托盘
+                                // 永远不会被真正重启。
+                                watchdog_log(
+                                    "kill kynoptic-tray 失败(taskkill 非零)，可能被安全软件拦截",
+                                );
+                            }
                         } else {
                             watchdog_log(&format!(
                                 "复查时心跳已恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 放行(睡眠唤醒假象)"
@@ -1895,10 +1902,34 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                             save_watchdog_state(&state);
                                         }
                                         Err(e) => {
-                                            eprintln!("watchdog: 拉起托盘失败: {e}");
+                                            // 审查 P2：spawn 失败此前只打 stderr
+                                            //（计划任务下无人看见），state 不动
+                                            // → 判定 Recovered → 下一分钟再 Spawn，
+                                            // 无限 1/min 循环且退出码恒 0。计入
+                                            // 失败走既有退避熔断。
+                                            let msg = format!("watchdog: 拉起托盘失败: {e}");
+                                            eprintln!("{msg}");
+                                            watchdog_log(&msg);
+                                            state.consecutive_failures += 1;
+                                            if state.consecutive_failures >= FAILURE_THRESHOLD {
+                                                let backoff =
+                                                    backoff_delay_secs(state.consecutive_failures);
+                                                state.backoff_until_epoch = now_epoch + backoff;
+                                                watchdog_log(&format!(
+                                                    "连续失败 {} 次，进入 {}s 退避",
+                                                    state.consecutive_failures, backoff
+                                                ));
+                                            }
+                                            save_watchdog_state(&state);
                                         }
                                     }
-                                    watchdog_log("托盘不在且非用户退出,已拉起");
+                                    if tray.exists() {
+                                        watchdog_log("托盘不在且非用户退出,已拉起");
+                                    } else {
+                                        // 审查 P2：托盘 exe 缺失此前每分钟静默
+                                        // 空转，不留任何痕迹。
+                                        watchdog_log("kynoptic-tray.exe 缺失，无法拉起");
+                                    }
                                 }
                             }
                         }

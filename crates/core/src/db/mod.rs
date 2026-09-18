@@ -146,7 +146,39 @@ pub fn ensure_primary_db(target: &Path) {
         if let Some(parent) = target.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::copy(&src, target);
+        // 审查 P1：WAL 模式下仅拷主文件会丢掉 -wal 里所有已提交事务，
+        // 且来源正在写时得到撕裂副本。三件一起拷，并把结果留痕（失败
+        // 不能静默——迁移"成功"但主库为空比失败更难查）。
+        for suffix in ["", "-wal", "-shm"] {
+            let mut from = src.clone().into_os_string();
+            from.push(suffix);
+            let from = std::path::PathBuf::from(from);
+            if !from.exists() {
+                continue;
+            }
+            let mut to = target.as_os_str().to_os_string();
+            to.push(suffix);
+            match fs::copy(&from, &to) {
+                Ok(_) => log::info!("迁移拷贝 {:?} -> {:?} 完成", from, to),
+                Err(e) => log::warn!("迁移拷贝 {:?} 失败: {e}", from),
+            }
+        }
+    }
+}
+
+/// 采集器启动失败时的诊断：尝试只读打开 + quick_check，把"库损坏"从
+/// 泛化的"DB 不可写?"里拆出来（审查 P0：托盘无 console，用户唯一可见
+/// 的线索就是留档文件里的这句话）。
+pub fn diagnose_open_failure(path: &std::path::Path) -> String {
+    match Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+            Ok(msg) if msg == "ok" => "数据库可读且完整；可能为权限/磁盘/文件占用问题".to_string(),
+            Ok(msg) => format!(
+                "数据库完整性检查失败: {msg}（建议先用副本尝试 kynoptic-aggrepair 或恢复备份）"
+            ),
+            Err(e) => format!("quick_check 执行失败: {e}"),
+        },
+        Err(e) => format!("数据库无法打开(只读): {e}"),
     }
 }
 

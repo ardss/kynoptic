@@ -67,10 +67,10 @@ there? The overview card does exactly that arithmetic:
 
 Download [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)
 from the latest release, run it, and launch Kynoptic from the Start menu.
-Collection starts automatically and the dashboard opens at
-`http://127.0.0.1:8422` in your browser (if 8422 is taken, the dashboard
-falls back to the next free port and records it in
-`data\dashboard-port.txt`).
+Collection starts automatically. Open the dashboard from the tray icon
+menu ("open dashboard"); it binds to `http://127.0.0.1:8422` by default
+(if 8422 is taken, it falls back to 18422/28422 segments and the actual
+port is recorded in `data\dashboard-port.txt`).
 
 **Option 2 — Build from source:**
 
