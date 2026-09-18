@@ -36,7 +36,10 @@ impl McpServer {
     /// 处理一条 JSON-RPC 消息。通知（无 id）返回 None，请求返回 Some(响应)。
     pub fn handle(&self, msg: &Value) -> Option<Value> {
         let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        // 审查 P1：客户端发给服务端的响应（有 id 无 method，如对服务端请求的
+        // 回复）必须静默吸收——旧逻辑 method 落 "" 走 method-not-found，往
+        // stdout 回 -32601 污染协议流。
+        let method = msg.get("method").and_then(|m| m.as_str())?;
         let params = msg.get("params").cloned().unwrap_or(json!({}));
 
         // 通知（无 id）：initialized 等一律静默吸收（MCP 无推送语义，v0.1 不发通知）
@@ -159,19 +162,25 @@ impl McpServer {
                 Ok(v)
             }
             "get_anomalies" => {
-                let days_raw = args.get("days").and_then(|v| v.as_i64());
-                if let Some(d) = days_raw {
-                    if d < 1 {
-                        return Err(
-                            "days must be >= 1（days 必须 >= 1，不接受 0 或负数）".to_string()
-                        );
+                // 审查 P2：days=1.5/"3"/true 这类错型此前静默回退 1 天，与
+                // limit 的硬错误约定矛盾——改为同样报错。
+                let days = match args.get("days") {
+                    None | Some(Value::Null) => 1usize,
+                    Some(v) => {
+                        let d = v.as_i64().ok_or_else(|| {
+                            "days must be an integer（days 必须是整数）".to_string()
+                        })?;
+                        if d < 1 {
+                            return Err(
+                                "days must be >= 1（days 必须 >= 1，不接受 0 或负数）".to_string()
+                            );
+                        }
+                        (d as usize).min(30)
                     }
-                }
-                let days = days_raw.unwrap_or(1).clamp(1, 30) as usize;
-                let clamped_days = if days_raw.unwrap_or(1) > 30 {
-                    Some(30)
-                } else {
-                    None
+                };
+                let clamped_days = match args.get("days") {
+                    Some(v) if v.as_i64().map(|d| d > 30).unwrap_or(false) => Some(30),
+                    _ => None,
                 };
                 let (limit, clamped_limit) = parse_limit(args)?;
                 let mut v = state::anomalies(&conn, days, limit);
@@ -353,8 +362,16 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else {
-            // 非 UTF-8 字节：按 parse error 回应并继续会话（审查 P1：
-            // 此前直接 break 静默退出，与畸形 JSON 的容错策略自相矛盾）
+            // 审查 P1：区分可恢复与终结错误——非 UTF-8 字节已消费可继续会话
+            //（按 parse error 回应）；真实 IO 错误（描述符损坏等）会永久重复
+            // 返回，继续循环就是 -32700 忙等打转，必须退出。
+            let is_utf8 = matches!(
+                line.as_ref().err(),
+                Some(err) if err.kind() == std::io::ErrorKind::InvalidData
+            );
+            if !is_utf8 {
+                break;
+            }
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -398,6 +415,16 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
+            // 审查 P1：JSON-RPC 2.0 批量请求（顶层数组）必须以数组回应——
+            // 旧逻辑 get("id") 为 None 走通知路径整体吞掉，规范客户端会挂等。
+            Ok(Value::Array(batch)) => {
+                let responses: Vec<Value> = batch.iter().filter_map(|m| server.handle(m)).collect();
+                if responses.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(responses))
+                }
+            }
             Ok(msg) => server.handle(&msg),
             Err(e) => Some(json!({
                 "jsonrpc": "2.0",

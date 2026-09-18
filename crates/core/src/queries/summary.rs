@@ -192,9 +192,20 @@ pub fn count_all_clicks(conn: &Connection) -> i64 {
 
 pub fn count_all_active_minutes(conn: &Connection) -> i64 {
     let off = super::local_offset_modifier();
+    // 审查 P1：minute 模式（input_agg 计数行）下没有 press/click 事件行，
+    // 全时活跃分钟此前恒为 0。统一用行级 CASE 表达式（raw 计数行 +
+    // input_agg 计数行两种形态）判活跃，本地分钟去重口径不变。
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(DISTINCT substr(datetime(timestamp, ?1), 1, 16)) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click')",
+            "SELECT COUNT(DISTINCT CASE WHEN \
+               (CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 \
+                     WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
+                       THEN COALESCE(json_extract(event_data, '$.keys'), 0) ELSE 0 END) + \
+               (CASE WHEN event_type='mouse' AND event_action='click' THEN 1 \
+                     WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+                       THEN COALESCE(json_extract(event_data, '$.clicks'), 0) ELSE 0 END) > 0 \
+             THEN substr(datetime(timestamp, ?1), 1, 16) END) \
+             FROM events WHERE event_type IN ('keyboard','mouse')",
             params![&off],
             get_count_i64,
         ),

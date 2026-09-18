@@ -546,6 +546,9 @@ function toggleLang() {
 async function loadStatus() {
   const s = await jget("/api/status");
   const el = document.getElementById("status-line");
+  // 审查 P1：markDisconnected 上过的红色必须在成功刷新时复位，
+  // 否则一次瞬时断连后状态行永久红着"连接断开"。
+  if (el) el.style.color = "";
   if (!s.last_event_ts) {
     el.textContent = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + s.db_path;
     el.title = "";
@@ -747,7 +750,7 @@ async function loadHeatmap() {
     const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
-      (level === 0 ? "#232B38" : "none") + '"><title>' + d.date + " — " + d.value + unit + "</title></rect>";
+      (level === 0 ? "#232B38" : "none") + (level === 0 ? "#232B38" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
   });
   svg += "</svg>";
   el.innerHTML = svg;
@@ -855,9 +858,12 @@ function dayOffset(n) {
     d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
   loadReport();
 }
+let REPORT_SEQ = 0;
 async function loadReport() {
+  const seq = ++REPORT_SEQ;
   const dateVal = document.getElementById("report-date").value;
   const d = await jget("/api/report" + (dateVal ? "?date=" + dateVal : ""));
+  if (seq !== REPORT_SEQ) return; // 审查 P1：连点日期/翻页，乱序返回的旧响应不得覆盖新数据
   const segs = d.segments || [];
   const apps = [...new Set(segs.map(x => x.app))].slice(0, 8);
   const W = 900, rowH = 22, padL = 130;
@@ -891,7 +897,7 @@ async function loadReport() {
   if (!segs.length) {
     const since = d.data_since || "";
     const hint = since
-      ? (dateVal && dateVal < since ? t("beforeData") + " " + since : t("noData"))
+      ? (dateVal && dateVal < since ? t("beforeData") + " " + esc(since) : t("noData"))
       : t("noData");
     document.getElementById("report-timeline").innerHTML = '<span class="muted">' + hint + "</span>";
   } else {
@@ -922,7 +928,9 @@ async function loadReport() {
         : "")
     : t("noData");
   const st = await jget("/api/settings");
+  if (seq !== REPORT_SEQ) return;
   const tr = await jget("/api/trends");
+  if (seq !== REPORT_SEQ) return;
   const today = (tr.daily || []).slice(-1)[0];
   const goal = st.daily_goal_minutes || 0;
   document.getElementById("r-goal").textContent = goal
@@ -963,9 +971,12 @@ async function loadReport() {
 }
 
 const APP_COLORS = ["#5BA8FF", "#3FB68B", "#E5C07B", "#E06C75", "#C678DD", "#56B6C2", "#2d5f94"];
+let APPS_SEQ = 0;
 async function loadApps() {
+  const seq = ++APPS_SEQ;
   const dateVal = document.getElementById("apps-date").value;
   const d = await jget("/api/apps_grid" + (dateVal ? "?date=" + dateVal : ""));
+  if (seq !== APPS_SEQ) return; // 同 loadReport：乱序防护
   const grid = d.grid || [];
   const W = 880, H = 200, padL = 36, padB = 22, padT = 8;
   const innerW = W - padL - 8, innerH = H - padT - padB;
@@ -1094,15 +1105,16 @@ function vkName(vk) {
 }
 async function loadInput() {
   const d = await jget("/api/input?days=7");
-  document.getElementById("i-keys").textContent = d.keys_total.toLocaleString();
-  document.getElementById("i-clicks").textContent = d.clicks_total.toLocaleString();
-  document.getElementById("i-scroll").textContent = d.scroll_ticks.toLocaleString();
+  // 审查 P2：字段级兜底——缺一个字段不能把整个 Input 页炸掉
+  document.getElementById("i-keys").textContent = (d.keys_total || 0).toLocaleString();
+  document.getElementById("i-clicks").textContent = (d.clicks_total || 0).toLocaleString();
+  document.getElementById("i-scroll").textContent = (d.scroll_ticks || 0).toLocaleString();
   document.getElementById("i-dist").textContent =
-    (d.move_distance_px / 96 / 39.37).toFixed(1) + " m";
+    ((d.move_distance_px || 0) / 96 / 39.37).toFixed(1) + " m";
   renderKeyboard(d.key_freq || {});
   renderMouse(d);
   document.getElementById("mouse-extra").textContent =
-    t("moves") + ": " + d.moves.toLocaleString() + "  ·  " +
+    t("moves") + ": " + (d.moves || 0).toLocaleString() + "  ·  " +
     t("scrollTicks") + ": " + (d.scroll_ticks || 0).toLocaleString();
   // 设备型号行（Raw Input 枚举：仅硬件能力元数据）
   const devs = d.input_devices || [];
@@ -1259,7 +1271,9 @@ async function loadHost() {
     .map(x => (x.drive || "?") + " " + (x.free_gb != null ? x.free_gb + "/" + x.total_gb + "G" : x.total_gb + "G"))
     .join("   ") || "–";
 }
+let SETTINGS_LOADED = false;
 async function loadSettings() {
+  SETTINGS_LOADED = true;
   loadHost().catch(() => {});
   const s = await jget("/api/settings");
   LAST_SETTINGS = s;
@@ -1371,6 +1385,10 @@ function showView(name) {
     tab.setAttribute("aria-selected", v === name ? "true" : "false");
   }
   clearViewError(name);
+  // 审查 P2：重进 settings 页（含点当前已激活页签）不再无条件重拉——
+  // loadSettings 会用服务端状态重建全部控件，未保存的修改会被静默清掉
+  //（与轮询豁免的保护意图一致）。
+  if (name === "settings" && SETTINGS_LOADED) return;
   refreshView(name).catch(e => showViewError(name, e.message));
 }
 async function refreshView(name) {

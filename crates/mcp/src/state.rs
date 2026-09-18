@@ -192,7 +192,8 @@ fn idle_seconds(conn: &Connection) -> Option<f64> {
         )
         .ok()?;
     let t = chrono::DateTime::parse_from_rfc3339(&ts).ok()?;
-    Some((Utc::now() - t.with_timezone(&Utc)).num_seconds() as f64)
+    // 审查 P2：时钟回拨/未来时间戳时负数 idle 会误导 LLM 消费者，钳到 0。
+    Some(((Utc::now() - t.with_timezone(&Utc)).num_seconds().max(0)) as f64)
 }
 
 /// 近 5 分钟每分钟输入次数（keys+clicks）/ 5，1 位小数。
@@ -702,9 +703,12 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
             d.get("disks")
                 .and_then(|v| v.as_array())
                 .map(|disks| {
-                    disks
-                        .iter()
-                        .any(|d| d.get("used_percent").and_then(|v| v.as_u64()).unwrap_or(0) >= 90)
+                    disks.iter().any(|d| {
+                        d.get("used_percent")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                            >= 90.0
+                    })
                 })
                 .unwrap_or(false)
         }

@@ -145,6 +145,19 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
                 if let Some(m) = minute_of_day_utc(&minute_str) {
                     human.push(m);
                 }
+                // 审查 P1：raw 模式（默认粒度）也要维护首末活动——此前只在
+                // minute 分类循环里更新，raw 库的 first/last 恒为 null。
+                // 本地化成与 minute 模式相同的 "YYYY-MM-DD HH:MM" 格式。
+                if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&minute_str, "%Y-%m-%dT%H:%M")
+                {
+                    use chrono::TimeZone;
+                    let l = Local.from_utc_datetime(&t);
+                    let local_str = l.format("%Y-%m-%d %H:%M").to_string();
+                    if first_min.is_none() {
+                        first_min = Some(local_str.clone());
+                    }
+                    last_min = Some(local_str);
+                }
             }
         }
     }

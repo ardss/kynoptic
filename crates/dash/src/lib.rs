@@ -959,12 +959,19 @@ fn insights_compute(
     let mut acts: Vec<(chrono::DateTime<chrono::FixedOffset>, String)> = Vec::new();
     let mut switches: Vec<(chrono::DateTime<chrono::FixedOffset>, String)> = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT timestamp, event_type, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE event_type IN ('window','keyboard','mouse')            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+        // 审查 P2：专注 streak 与 marathon 同口径——剔除 move-only 事件，
+        // 否则鼠标宏/自动晃动能"养"出假专注块（marathon 已挡，这里漏了）。
+        "SELECT timestamp, event_type, event_action, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE (event_type = 'window' OR (event_type = 'keyboard' AND event_action = 'press') OR (event_type = 'mouse' AND event_action != 'move'))            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
     ) {
         if let Ok(rows) = stmt.query_map(params![&start, &end], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         }) {
-            for (ts, et, app) in rows.flatten() {
+            for (ts, et, _action, app) in rows.flatten() {
                 if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
                     if et == "window" {
                         switches.push((t, app));
@@ -1083,10 +1090,11 @@ fn insights_compute(
             .entry(t.with_timezone(&chrono::Local).hour())
             .or_insert(0) += 1;
     }
-    if let Some((h, n)) = sw_hour
-        .iter()
+    // 审查 P2：并列时取最早小时——HashMap 迭代无序，同一数据两次请求
+    // 会给出不同的"最容易被打碎的时段"卡。
+    if let Some((h, n)) = (0..=23u32)
+        .filter_map(|h| sw_hour.get(&h).map(|n| (h, *n)))
         .max_by_key(|(_, n)| *n)
-        .map(|(h, n)| (*h, *n))
     {
         if n >= 20 {
             insights.push(json!({
