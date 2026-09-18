@@ -250,15 +250,6 @@ fn cmd_export(args: &[String]) -> Result<()> {
     }
     let out_path = PathBuf::from(&out);
 
-    // 复用 is_reparse_point 防线（审查 P2）：导出目标若被换成 symlink/junction，
-    // File::create 会写穿到链接目标（覆盖任意用户文件）。命中即报错退出。
-    if is_reparse_point(&out_path) {
-        return Err(Error::InvalidData(format!(
-            "{} 是符号链接/junction，拒绝写入（防目录穿越；如非你本人设置请排查）",
-            out_path.display()
-        )));
-    }
-
     // window_title 默认输出原文（本地数据完整优先）；--redact 显式开启才剥查询串
     let title_out = |t: &Option<String>| -> String {
         let t = t.clone().unwrap_or_default();

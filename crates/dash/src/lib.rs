@@ -1783,29 +1783,6 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     Ok(payload)
 }
 
-/// Windows reparse point 属性位（与 cli main.rs 的 is_reparse_point 同一套判据；
-/// dash crate 不依赖 cli，这里按同口径实现小份本地副本）。
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-/// 路径存在且是 symlink/junction（reparse point）。命中即拒绝写入：
-/// settings-audit.log 若被换成指向任意文件的链接，append 会写穿到目标处。
-fn is_reparse_point(p: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        std::fs::symlink_metadata(p)
-            .map(|md| md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::symlink_metadata(p)
-            .map(|md| md.file_type().is_symlink())
-            .unwrap_or(false)
-    }
-}
-
 /// 单条审计记录的字节上限（时间戳 + 摘要 JSON 正常远小于此值）
 const AUDIT_RECORD_CAP: usize = 512;
 
@@ -1830,13 +1807,8 @@ fn append_settings_audit(db_path: &Path, summary: &str) {
     } else {
         line
     };
-    // reparse point 防线：目标已是 symlink/junction 时拒绝 append（防写穿）
-    let target = dir.join("settings-audit.log");
-    if is_reparse_point(&target) {
-        log::warn!("settings-audit.log 是符号链接/junction，拒绝写入（不影响设置保存）");
-        return;
-    }
     // 审计失败不影响主流程：设置已保存，日志尽力而为
+    let target = dir.join("settings-audit.log");
     let result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
