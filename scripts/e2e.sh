@@ -281,6 +281,7 @@ fi
 rm -rf "$TMPD"
 
 # ── 汇总 ────────────────────────────────────────────────
+agent-browser close >/dev/null 2>&1   # 清理浏览器会话，不留后台进程
 echo "══ 结果: $PASS PASS / $FAIL FAIL ══"
 if [ "$FAIL" -gt 0 ]; then
     printf '  失败项: %s\n' "${FAILED_ITEMS[@]}"

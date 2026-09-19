@@ -493,3 +493,89 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod fault_injection_tests {
+    //! 第 24 轮故障注入演练：update-available.txt 投毒防御的行为钉子。
+    //! 契约（SKILL.md/审查记录）：读不到/内容怪 = 无更新，绝不 panic。
+    use super::{update_available_version, version_gt};
+
+    fn poisoned(content: &[u8]) -> Option<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-r24-poison-{}-{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("kynoptic.db");
+        std::fs::write(dir.join("update-available.txt"), content).unwrap();
+        let r = update_available_version(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn binary_garbage_is_no_update() {
+        assert_eq!(poisoned(&[0xFF, 0xFE, 0x00, 0x93]), None);
+    }
+
+    #[test]
+    fn empty_and_textual_junk_is_no_update() {
+        assert_eq!(poisoned(b""), None);
+        assert_eq!(poisoned(b"abc"), None);
+        assert_eq!(poisoned(b"x1234"), None); // 首字符非数字
+    }
+
+    #[test]
+    fn plausible_future_version_is_banner() {
+        // 唯一能挂出提示的形态：三段数字且 > 当前版本（0.2.0）
+        assert_eq!(poisoned(b"99.0.0\n").as_deref(), Some("99.0.0"));
+        assert_eq!(poisoned(b"v99.0.0").as_deref(), Some("99.0.0"));
+    }
+
+    #[test]
+    fn older_version_is_no_update() {
+        assert_eq!(poisoned(b"0.1.0"), None);
+        assert_eq!(poisoned(b"0.2.0"), None); // 等于当前版本不算新
+    }
+
+    #[test]
+    fn oversized_segment_overflow_parses_to_zero_not_banner() {
+        // >u64 的段 parse 失败按 0 处理 → 不满足 > 当前版本 → 不挂提示
+        assert_eq!(poisoned(b"99999999999999999999999999.0.0"), None);
+    }
+
+    #[test]
+    fn ten_megabyte_digit_wall_is_handled() {
+        let big = vec![b'9'; 10 * 1024 * 1024];
+        // 无点号 → 单段 parse 溢出为 0 → None；即便未来改成多段也不应 panic
+        assert_eq!(poisoned(&big), None);
+    }
+
+    #[test]
+    fn version_gt_semantics() {
+        assert!(version_gt("0.3.0", "0.2.0"));
+        assert!(version_gt("99.0.0", "0.2.0"));
+        assert!(!version_gt("0.2.0", "0.2.0"));
+        assert!(!version_gt("0.1.9", "0.2.0"));
+        // 短段按 0 补齐
+        assert!(version_gt("1.0", "0.99.9"));
+        // 预发布后缀忽略（-rc1），解析失败段按 0
+        assert!(version_gt("0.3.0-rc1", "0.2.0"));
+    }
+
+    #[test]
+    fn missing_file_and_missing_dir_are_no_update() {
+        let dir = std::env::temp_dir().join(format!("kyn-r24-poison-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("kynoptic.db");
+        assert_eq!(update_available_version(&db), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(update_available_version(&db), None); // 目录也没了
+    }
+}
