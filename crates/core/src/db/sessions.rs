@@ -5,12 +5,18 @@
 //! 当日聚合的刷新由上层（采集器关闭流程）显式触发，保持数据层只依赖 schema。
 
 use rusqlite::params;
+use std::sync::atomic::Ordering;
 
 use super::{lock_writer, Database};
 
 impl Database {
+    /// 当前采集会话 id（0 = 无会话）。writer 落库前用它补盖 event.session_id。
+    pub fn current_session_id(&self) -> i64 {
+        self.current_session.load(Ordering::Relaxed)
+    }
+
     pub fn start_session(&self) -> i64 {
-        self.with_writer(
+        let id = self.with_writer(
             |conn| {
                 let now = chrono::Utc::now().to_rfc3339();
                 conn.execute("INSERT INTO sessions (start_time) VALUES (?1)", [&now])
@@ -18,7 +24,11 @@ impl Database {
                 conn.last_insert_rowid()
             },
             || 0,
-        )
+        );
+        // P0 修复：登记当前会话 id，供 writer 落库时补盖 event.session_id
+        // （此前该列全为 NULL，ghost 清扫/total_events 全部失效）。
+        self.current_session.store(id, Ordering::Relaxed);
+        id
     }
 
     /// 结束会话。注意：不再在此触发 daily_agg 重算（消除 db → daily_agg 反向依赖）。
@@ -82,12 +92,11 @@ impl Database {
             }
         };
 
-        if open_ids.len() <= 1 {
-            return 0; // 0 或 1 个未关闭 session，无需清扫
-        }
-
-        // 保留最后一个（id 最大 = 最近的），其余视为幽灵
-        let ghost_ids: Vec<i64> = open_ids.iter().rev().skip(1).copied().collect();
+        // Wave22 P1 定案：启动清扫关闭**全部** open session——唯一调用方
+        //（collector 启动）清扫后立即 start_session 开新会话，旧的"保留
+        // 最新一个"会在每轮重启滞留一个永不关闭的僵尸 open session。
+        // 此时的 open session 全部属于上次进程，无一例外是幽灵。
+        let ghost_ids: Vec<i64> = open_ids.clone();
         let mut closed = 0usize;
 
         for sid in &ghost_ids {

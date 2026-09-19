@@ -213,5 +213,5 @@ end;
 Filename: "schtasks"; Parameters: "/Delete /F /TN ""Kynoptic Watchdog"""; Flags: runhidden; RunOnceId: "DelWatchdog"
 
 [CustomMessages]
-english.AutoStartTask =Start Kynoptic automatically at login (with crash watchdog)
-chinesesimplified.AutoStartTask =开机自动启动 Kynoptic（含崩溃自动拉起看门狗）
+english.AutoStartTask =Start Kynoptic automatically at login (includes the crash-watchdog task; unchecking disables both)
+chinesesimplified.AutoStartTask =开机自动启动 Kynoptic（含崩溃自动拉起看门狗任务；取消勾选则两者一并停用）

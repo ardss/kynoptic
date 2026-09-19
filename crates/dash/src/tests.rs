@@ -104,17 +104,23 @@ fn timeline_hours_clamped_and_range_excludes_old_events() {
     let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 12, 0))
         .unwrap()
         .with_timezone(&Utc);
-    // 远超 48h 前的事件不应出现
-    let old = (now - chrono::Duration::hours(100)).to_rfc3339();
+    // 8760h 窗口外的事件不应出现；窗口内的要出现
+    let old = (now - chrono::Duration::hours(9000)).to_rfc3339();
     insert(&conn, &old, "keyboard", "press", None);
+    let near = (now - chrono::Duration::hours(100)).to_rfc3339();
+    insert(&conn, &near, "keyboard", "press", None);
     let v = api_timeline_at(&conn, 9999, now, 2).unwrap();
-    assert_eq!(v["hours"], json!(48));
-    // 补零桶：即使整窗无数据也固定返回 48 个本地小时，全 0
+    assert_eq!(v["hours"], json!(8760), "Wave23：与 HTTP 层 clamp 对齐");
+    // 补零桶：固定返回窗口内全部本地小时（8760），全窗口对齐
     let buckets = v["buckets"].as_array().unwrap();
-    assert_eq!(buckets.len(), 48, "补零后恒为 48 桶: {v}");
-    assert!(buckets
+    assert_eq!(buckets.len(), 8760, "补零后恒为 8760 桶");
+    // press 行经 apps 分布通道呈现（human_min 只认 input_agg 行）：
+    // 恰有 1 个桶带应用事件（9000h 前的旧事件必须被排除）
+    let hit = buckets
         .iter()
-        .all(|b| b["human_min"] == json!(0) && b["auto_min"] == json!(0)));
+        .filter(|b| b["apps"].as_array().is_some_and(|a| !a.is_empty()))
+        .count();
+    assert_eq!(hit, 1, "窗口内应恰有 1 个带事件的桶");
     // DST 口径说明字段
     assert!(v["local_offset_seconds"].is_number());
     assert!(v["local_offset_note"].as_str().unwrap().contains("DST"));

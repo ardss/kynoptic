@@ -54,6 +54,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Wave18–22)
+
+- Scroll wheel now counts toward human presence (active reading is
+  presence; dashboard metrics note updated to match).
+- Settings lifecycle: a configured dashboard port is now actually used
+  as the preferred port (takes effect after tray restart); toggling
+  autostart in settings/CLI also creates or disables the watchdog
+  scheduled task (previously the task kept reviving a killed tray);
+  an empty monitor list is rejected instead of silently collecting
+  nothing.
+- Watchdog kills the tray by heartbeat PID (same directory) before
+  falling back to image-name matching, so a dev-copy watchdog can no
+  longer kill the installed tray.
+- Tray writes `data\tray.log` (1 MB, one `.old` rotation) — tray
+  warnings that previously went to an invisible stderr are now
+  inspectable; CLI/ctl/watchdog entry points log via `env_logger`.
+- Persistent store-write failures escalate to
+  `data\collector-error.log` for post-mortem forensics.
+
+### Fixed (Wave18–22)
+
+- API parameter contract: invalid `days`/`weeks`/`hours` values and
+  future dates now return 400 instead of being silently clamped or
+  served as authoritative-looking zeros; `/api/input` clamps `days`
+  to 90; `wait_for` (MCP) and `stats`/`export` (CLI) reject invalid
+  `--days` values.
+- Retention guard: with retention 0 (never delete, the default) the
+  maintenance pass no longer deleted all ended sessions.
+- Report/insights accuracy: the acts query no longer counts every
+  input minute (including injected/move-only) as an "act", which was
+  poisoning the focus/late-night/golden-hours/rhythm cards; report
+  focus blocks are rebuilt from human minutes (dwell chains produced
+  day-long fake focus); timeline bridging is window-wide (cross-hour
+  streaks no longer clipped); the late-night anomaly is date-only
+  instead of a fabricated 23:00 timestamp; report classification now
+  reads window-title tokens (github/youtube etc. were dead); the
+  CLI input-focus metric is explicitly labeled input-based.
+- Monitor correctness: CPU normalized across multi-core counts,
+  failed snapshots skipped instead of recorded as fake empty ones,
+  Win32 low-level keyboard/mouse hooks self-heal after Windows
+  silently removes them (LowLevelHooksTimeout).
+- Dashboard visuals: "(other)" gets a fixed gray (was stealing the
+  top app's color), empty-day apps grid shows a no-data hint, report
+  week card relabeled as a rolling 7-day window.
+
 ### Fixed (Wave17)
 
 - Dashboard: a duplicate `const zh` declaration broke the entire page

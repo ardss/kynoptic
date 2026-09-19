@@ -153,7 +153,9 @@ pub fn api_timeline_at(
     now: DateTime<Utc>,
     bridge_min: u32,
 ) -> std::result::Result<Value, String> {
-    let hours = hours.clamp(1, 48);
+    // Wave23：内部与 HTTP 层 clamp 对齐（原 48 与 8760 两层打架，
+    // hours=100 被静默截成 48）；小时桶聚合对大窗口成本可控
+    let hours = hours.clamp(1, 8760);
     // 边界按 UTC 计算后直接用于 WHERE（timestamp 列为 UTC RFC3339）
     let end = now;
     let start = now - chrono::Duration::hours(i64::from(hours));

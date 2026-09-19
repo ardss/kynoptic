@@ -37,11 +37,11 @@ kynoptic analyze --date YYYY-MM-DD  # 单日专注/碎片/异常分析
 kynoptic export --days 7 --out FILE [--format csv|jsonl] [--redact]
 kynoptic db stats                 # 行数/库大小
 kynoptic mcp [--db PATH]           # 启动 MCP 服务器（stdio）；--db 与 KYNOPTIC_DB 均可（--db 内部即经 KYNOPTIC_DB 传递）
-kynoptic update --check            # 只查不装：stdout "UPDATE <ver>" 或 "UP TO DATE"；托盘每日自动检查并把新版本写入 data\update-available.txt（菜单/面板同步提示，绝不自动安装）
+kynoptic update --check            # 只查不装：stdout "UPDATE <ver>" 或 "UP TO DATE (<cur>)"；托盘每日自动检查并把新版本写入 data\update-available.txt（菜单/面板同步提示，绝不自动安装）
 ```
 
 HTTP API（GET 全部只读）：
-`/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶）、
+`/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶；hours 有效上限 48，请求更大值会被静默取 48 而非 400）、
 `/api/insights`（6 张叙事卡）、`/api/report`、`/api/heatmap`、`/api/anomalies`（含 message_en）、
 `/api/settings`、`/api/status`、`/api/summary`、`/api/input`、
 `/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours`（黄金时段）、
@@ -75,7 +75,7 @@ HTTP API（GET 全部只读）：
 | "这周和上周比" | `/api/trends`（注意 active_minutes 是 raw 口径） |
 | "有没有异常" | `/api/anomalies`（APM 突增/深夜活动/马拉松会话） |
 | "把我的数据导出来" | `export --days N --out`；确认目标位置含敏感明文 |
-| "面板打不开" | tasklist 查 kynoptic-tray → curl 8422 → 看 heartbeat/watchdog.log → 杀掉后 `kynoptic-tray --minimized` 重启（先杀 watchdog 再动 tray） |
+| "面板打不开" | tasklist 查 kynoptic-tray → curl 8422 → 看 heartbeat/watchdog.log/data\tray.log → 杀掉后 `kynoptic-tray --minimized` 重启（先杀 watchdog 再动 tray） |
 | "让 AI 读取活动数据" | 配 MCP：命令 `kynoptic mcp`（stdio，`--db` 与 `KYNOPTIC_DB` 均可）；新机器记得设其一或把 db 放默认位 |
 
 ## 数据迁移（换机）

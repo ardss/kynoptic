@@ -181,10 +181,30 @@ fn create_monitors_for(
 }
 
 fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
+    // 审查 P0：Event::new 硬编码 session_id=None 且全链路无人回填，导致
+    // events.session_id 全库为 NULL、sessions.total_events/ghost 清扫失效。
+    // 落库前用 db 登记的当前会话 id 补盖（None 才盖，尊重显式赋值）。
+    let sid = db.current_session_id();
+    let batch: Vec<Event> = if sid != 0 {
+        batch
+            .iter()
+            .map(|e| {
+                if e.session_id.is_none() {
+                    let mut e = e.clone();
+                    e.session_id = Some(sid);
+                    e
+                } else {
+                    e.clone()
+                }
+            })
+            .collect()
+    } else {
+        batch.to_vec()
+    };
     // 聚合增量维护与 events 落库在同一事务内完成（审查 P1：两个独立事务之间
     // kill 会留下"events 有 agg 无"的欠聚合且永不自愈）；rowids 与 batch 一一
     // 对应（失败行为 0），事务化后由 insert 层内部直接用于 agg 维护。
-    let _rowids = db.insert_events_with_agg(batch);
+    let _rowids = db.insert_events_with_agg(&batch);
     total_written.fetch_add(batch.len(), Ordering::Relaxed);
     // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
     LAST_FLUSH_EPOCH.store(

@@ -30,7 +30,7 @@ computer".
 
 The dashboard is built on three metrics:
 
-- **Human presence** — minutes with real (non-injected) keyboard/mouse input.
+- **Human presence** — minutes with real (non-injected) keyboard/mouse/scroll input (scrolling counts as presence: active reading is human).
 - **Automation** — minutes where the only input was injected (scripts, agents).
 - **Foreground dwell** — minutes an application held the foreground window,
   regardless of input.

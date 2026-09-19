@@ -201,6 +201,12 @@ pub struct Database {
     reader_degraded: AtomicU64,
     /// 后台聚合回填完成信号（done, Condvar）。open 时无回填任务则立即置位。
     backfill_done: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// 当前采集会话 id（start_session 写入，0 = 尚未开始）。
+    /// 审查 P0：Event.session_id 此前永远是 None（types.rs Event::new 硬编码
+    /// None 且无人回填），全库 2.3 万事件 session_id 全为 NULL——ghost 清扫
+    /// 的"取该 session 最后事件时间/事件数"全部退化为 start_time/0，sessions
+    /// 表事实失效。writer 在落库前从此原子量补盖 session_id。
+    current_session: std::sync::atomic::AtomicI64,
 }
 
 /// RAII：回填线程退出时（无论成功/失败/panic）置完成信号。
@@ -333,6 +339,7 @@ impl Database {
             retention_days: constants::DEFAULT_RETENTION_DAYS,
             reader_degraded: AtomicU64::new(0),
             backfill_done,
+            current_session: std::sync::atomic::AtomicI64::new(0),
         })
     }
 

@@ -9,7 +9,7 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 它回答那些事后才冒出来的问题："上周二我用过的那个工具叫什么？""昨天下午两点笔记本为什么发烫？""这周我真正花在编辑器上的时间有多少？"——通过 CLI、本地面板或 MCP 提问。
 
 - 官网：<https://kynoptic.com>
-- 状态：v0.1，活跃开发中。API 仍可能变化。
+- 状态：v0.2，活跃开发中。API 仍可能变化。
 
 ## 机器在忙 ≠ 人在场
 
@@ -20,7 +20,7 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 
 仪表盘建立在三个指标上：
 
-- **人在场（human presence）**——有真实（非注入）键鼠输入的分钟数。
+- **人在场（human presence）**——有真实（非注入）键鼠/滚轮输入的分钟数（滚动计入在场：主动阅读也是"人"）。
 - **自动化（automation）**——只有注入输入的分钟数（脚本、agent）。
 - **前台驻留（foreground dwell）**——应用占据前台窗口的分钟数，与是否有输入无关。
 
@@ -47,8 +47,14 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 从最新 Release 下载
 [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)，
 运行安装，从开始菜单启动 Kynoptic。采集自动开始，仪表盘在浏览器
-`http://127.0.0.1:8422` 打开（若 8422 被占用，面板自动回退到下一个空闲
-端口，实际端口写入 `data\dashboard-port.txt`）。
+`http://127.0.0.1:8422` 打开（若 8422 段被占用，面板按
+8422-8432 → 18422-18432 → 28422-28432 三段依次回退，
+实际端口写入 `data\dashboard-port.txt`）。
+
+> **SmartScreen 提示：** 构建未做代码签名，首次运行 Windows 会弹出
+> "Windows 已保护你的电脑"。点击 **更多信息 → 仍要运行**（二进制可自行检验——
+> Release 页提供 SHA256 校验和，也可用 `cargo build --release` 从源码复现）。
+> 程序完全在本机运行，除每日一次的版本检查外不发起任何网络请求。
 
 **方式二——从源码构建：**
 
@@ -59,7 +65,7 @@ git clone https://github.com/ardss/kynoptic
 cd kynoptic
 cargo build --release -p kynoptic
 
-# 采集（前台运行，Ctrl+C 优雅停止；数据默认写 %LOCALAPPDATA%\kynoptic\kynoptic.db）
+# 采集（前台运行，Ctrl+C 优雅停止；数据默认写 <exe 目录>\data\kynoptic.db）
 target\release\kynoptic.exe collect --help     # 查看可用参数
 
 # 查询记录
@@ -114,7 +120,7 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 
 ## 隐私
 
-- 记录的数据默认永不离开你的机器。无账号、无遥测、无统计上报、无网络调用（用户主动触发 kynoptic update 访问 GitHub 除外）。
+- 记录的数据默认永不离开你的机器。无账号、无遥测、无统计上报、无网络调用（每天一次的版本检查访问 GitHub 除外；发现新版本只在托盘菜单提示，绝不自动安装）。
 - **键盘与鼠标只存每分钟计数——绝不存按键内容、键序与时间戳。**仪表盘键盘热力图
   使用逐键频次计数（每个键被按了多少次），是聚合统计而非内容。逐键频次
   **默认开启**（本地数据完整优先），可在设置中显式关闭（opt-out）。`export`
@@ -131,7 +137,7 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 | Crate | 职责 |
 |---|---|
 | `crates/core` | 采集器、事件管线、SQLite 存储、查询 |
-| `crates/cli` | `kynoptic` / `kynoptic-ctl` 命令行与本地面板 |
+| `crates/cli` | `kynoptic` / `kynoptic-ctl` 命令行 |
 | `crates/dash` | dashboard 服务与页面（CLI 与托盘共用） |
 | `crates/mcp` | MCP server（stdio） |
 | `crates/tray` | 托盘壳（纯 Win32，宿主采集器与本地面板） |
