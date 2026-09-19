@@ -1813,6 +1813,11 @@ fn settings_payload(s: &AppSettings) -> Value {
 /// 注册表内，否则 400。写盘后返回新设置；实际变更追加审计行到 settings-audit.log。
 pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
     let req: Value = serde_json::from_str(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
+    // fuzz 加固：顶层数组/标量/null 在 get() 上全部落空 → 既往静默 200 并空
+    // 转写 settings.json（顺带重排行尾）。显式 400，不留歧义。
+    if !req.is_object() {
+        return Err("请求体应为 JSON 对象".into());
+    }
     let mut next = settings::load(db_path);
     let prev = next.clone();
     if let Some(v) = req.get("enabled_monitors") {

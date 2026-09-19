@@ -136,7 +136,11 @@ pub fn settings_path(db_path: &Path) -> PathBuf {
 /// autostart 缺省探测——cli 版即用注册表 Run 项兜底）。
 pub fn try_load(db_path: &Path) -> Option<AppSettings> {
     let raw = std::fs::read_to_string(settings_path(db_path)).ok()?;
-    serde_json::from_str::<AppSettings>(&raw).ok()
+    // 极限注入审查：记事本"UTF-8 with BOM"保存会让 serde_json 解析失败，
+    // 整份设置被静默判损坏回落默认。剥掉 UTF-8 BOM 再解析（仅此一处容错；
+    // UTF-16 等其他编码仍按损坏处理，与 .corrupt.bak 兜底语义一致）。
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    serde_json::from_str::<AppSettings>(raw).ok()
 }
 
 /// 读取设置；文件不存在/损坏时返回缺省（autostart 先探测现有注册表

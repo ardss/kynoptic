@@ -638,6 +638,19 @@ fn settings_post_rejects_port_zero_and_out_of_range() {
 }
 
 #[test]
+fn settings_post_rejects_non_object_body() {
+    let dir = tmpdir("settings-non-object");
+    let db = dir.join("kyn.db");
+    // 顶层数组/标量/null 过去在 get() 上全部落空 → 静默 200 空转写；
+    // 现在必须 400（fuzz 加固回归）。
+    for body in ["[1,2,3]", "null", "\"str\"", "42", "true"] {
+        let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", body, &db);
+        assert_eq!(code, 400, "body {body} 必须被拒绝: {out}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn settings_post_dedups_enabled_monitors() {
     let dir = tmpdir("dedup");
     let db = dir.join("kyn.db");
