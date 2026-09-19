@@ -392,7 +392,12 @@ fn main() {
     let mut day_rows = Vec::new();
     {
         let mut stmt = target
-            .prepare("SELECT date, bucket_id, sum_value, count_value FROM agg_daily WHERE bucket_id LIKE 'app:%'")
+            // Wave19 P1：必须与 agg_minute 同口径只快照范围外——无过滤会把
+            // rebuild_all 刚重算的范围内 app 日聚合用旧污染值覆盖回去
+            .prepare(&format!(
+                "SELECT date, bucket_id, sum_value, count_value FROM agg_daily                  WHERE bucket_id LIKE 'app:%' AND NOT (date >= '{}' AND date <= '{}')",
+                args.from, args.to
+            ))
             .expect("快照 agg_daily 失败");
         let rows = stmt
             .query_map([], |r| {

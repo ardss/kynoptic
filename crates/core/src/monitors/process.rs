@@ -86,7 +86,9 @@ impl Monitor for ProcessMonitor {
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
-        let snapshot = collect_processes();
+        let Some(snapshot) = collect_processes() else {
+            return; // 快照失败：本轮无数据可写（ fingerprint/last_emitted 均不动 ）
+        };
         let key = snapshot_fingerprint(&snapshot);
 
         let unchanged = self
@@ -137,7 +139,7 @@ struct ProcessSnapshot {
     total_count: usize,
 }
 
-fn collect_processes() -> ProcessSnapshot {
+fn collect_processes() -> Option<ProcessSnapshot> {
     // CPU 百分比：原生 GetProcessTimes 差分（占满 1 核 = 100），内部已含
     // 指数移动平均（EMA α=0.3）平滑，见 query_cpu_percent_map 的 v0.1 注。
     let cpu_map = query_cpu_percent_map();
@@ -147,11 +149,9 @@ fn collect_processes() -> ProcessSnapshot {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return ProcessSnapshot {
-                top_cpu: vec![],
-                top_mem: vec![],
-                total_count: 0,
-            };
+            // Wave19 P0：快照失败必须让调用方跳过本轮——返回假"空系统"
+            // 快照会与真实指纹必然不同，落一条"进程全灭"的污染事件
+            return None;
         }
 
         let mut entry: PROCESSENTRY32W = zeroed();
@@ -206,11 +206,11 @@ fn collect_processes() -> ProcessSnapshot {
     let top_mem: Vec<ProcessInfo> = all.iter().take(10).cloned().collect();
 
     let total_count = all.len();
-    ProcessSnapshot {
+    Some(ProcessSnapshot {
         top_cpu,
         top_mem,
         total_count,
-    }
+    })
 }
 
 fn should_skip(name: &str) -> bool {
@@ -314,7 +314,14 @@ fn query_cpu_percent_map() -> HashMap<u32, f64> {
                 for (pid, total) in &times {
                     let delta_pct = match (elapsed, prev_snapshot.get(pid)) {
                         (e, Some(prev_t)) if e > 0.0 => {
-                            ((total.saturating_sub(*prev_t) as f64 / 10_000_000.0) / e * 100.0)
+                            // GetProcessTimes 是全核累计：8 核满载 = 800%。
+                            // 除以逻辑核数归一成"占整机百分比"（Wave19 P0：
+                            // 原来钳到 100 让多核进程排名失真）
+                            let cores = std::thread::available_parallelism()
+                                .map(|n| n.get() as f64)
+                                .unwrap_or(1.0);
+                            (((total.saturating_sub(*prev_t) as f64 / 10_000_000.0) / e * 100.0)
+                                / cores)
                                 .clamp(0.0, 100.0)
                         }
                         _ => 0.0,
@@ -326,10 +333,12 @@ fn query_cpu_percent_map() -> HashMap<u32, f64> {
                     smoothed.borrow_mut().insert(*pid, ema);
                     out.insert(*pid, ema);
                 }
-                // 淘汰已退出进程
+                // 淘汰已退出进程（Wave19 P1：prev_times 同步清理，否则
+                // 进程 churn 会无限残留条目）
                 smoothed
                     .borrow_mut()
                     .retain(|pid, _| times.contains_key(pid));
+                prev_times.retain(|pid, _| times.contains_key(pid));
                 out
             })
         })

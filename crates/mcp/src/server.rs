@@ -213,10 +213,14 @@ impl McpServer {
                 let signal = args.get("signal").and_then(|v| v.as_str()).ok_or_else(|| {
                     "Missing required argument: signal（缺少必填参数 signal）".to_string()
                 })?;
-                let timeout = args
-                    .get("timeout_sec")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(300);
+                // Wave19：非法值报错而非静默回落（与 limit/days 政策一致）
+                let timeout = match args.get("timeout_sec") {
+                    None => 300,
+                    Some(v) => v.as_u64().ok_or_else(|| {
+                        "Invalid timeout_sec: must be a non-negative integer（timeout_sec 须为非负整数）"
+                            .to_string()
+                    })?,
+                };
                 state::wait_for(&conn, signal, timeout, &self.shutdown)
             }
             other => Err(format!(

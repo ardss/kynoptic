@@ -2067,7 +2067,9 @@ pub fn route_req(
             let days = match qval("days") {
                 None => 7,
                 Some(v) => match v.parse::<u32>() {
-                    Ok(d) => d,
+                    // 上限 90：input 端点把整段 input_agg 行全量拉进内存
+                    //（Wave19：365 天 ≈ 52 万行 JSON，秒级响应+数百 MB 内存）
+                    Ok(d) => d.clamp(1, 90),
                     Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
                 },
             };

@@ -526,11 +526,24 @@ impl Database {
         };
         log::info!("正在执行 WAL 检查点...");
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        log::info!("正在压缩数据库...");
-        if let Err(e) = conn.execute_batch("VACUUM;") {
-            log::error!("VACUUM 失败: {e}");
+        // Wave19 性能审查：retention=0 下库是 append-only，空闲页极少，
+        // 每日 VACUUM 收益≈0 却要重写整库（1 年 4.5GB = 每天 ~13GB 白烧
+        // IO + 等量瞬时磁盘峰值）。空闲页占比 < 10% 直接跳过。
+        let freelist: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_count: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap_or(1);
+        if page_count > 0 && (freelist as f64 / page_count as f64) >= 0.10 {
+            log::info!("正在压缩数据库（空闲页 {freelist}/{page_count}）...");
+            if let Err(e) = conn.execute_batch("VACUUM;") {
+                log::error!("VACUUM 失败: {e}");
+            } else {
+                log::info!("数据库压缩完成");
+            }
         } else {
-            log::info!("数据库压缩完成");
+            log::debug!("VACUUM 跳过：空闲页占比不足 10%（append-only 正常态）");
         }
         // VACUUM 全程经 WAL 重写（把 WAL 再次撑大），故检查点必须放在 VACUUM 之后，
         // 否则"维护后库大小"被未截断的 WAL 虚增近一倍（perf-write 2026-09 实测）。

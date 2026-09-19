@@ -156,7 +156,14 @@ fn cmd_stats(args: &[String]) -> Result<()> {
             }
             "--days" => {
                 i += 1;
-                days = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                // Wave19：非法值报错而非静默回落（与 presence/analyze 同政策）
+                days = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| Error::InvalidData("--days 需要一个正整数".into()))?;
+                if days < 1 {
+                    return Err(Error::InvalidData("--days 需要 >=1".into()));
+                }
             }
             _ => {}
         }
@@ -209,7 +216,13 @@ fn cmd_export(args: &[String]) -> Result<()> {
         match args[i].as_str() {
             "--days" => {
                 i += 1;
-                days = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(7);
+                days = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| Error::InvalidData("--days 需要一个正整数".into()))?;
+                if days < 1 {
+                    return Err(Error::InvalidData("--days 需要 >=1".into()));
+                }
             }
             "--format" => {
                 i += 1;

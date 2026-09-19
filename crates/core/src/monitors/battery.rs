@@ -11,6 +11,8 @@ use std::time::Duration;
 pub struct BatteryMonitor {
     prev_charge: Cell<u8>,
     prev_status: Cell<u8>,
+    /// Wave19：255 现在保留给"驱动上报未知"，首读哨兵改用独立标志
+    initialized: Cell<bool>,
 }
 
 impl Default for BatteryMonitor {
@@ -18,6 +20,7 @@ impl Default for BatteryMonitor {
         Self {
             prev_charge: Cell::new(255),
             prev_status: Cell::new(255),
+            initialized: Cell::new(false),
         }
     }
 }
@@ -37,7 +40,8 @@ impl Monitor for BatteryMonitor {
         let prev_status_val = self.prev_status.get();
 
         // 首次初始化或无电池
-        if prev_charge == 255 {
+        if !self.initialized.get() {
+            self.initialized.set(true);
             self.prev_charge.set(status.charge_pct);
             self.prev_status.set(status.status_code);
             if status.battery_flag != 0x80 {
@@ -114,10 +118,10 @@ fn get_battery_status() -> BatteryStatus {
         let mut sps: SYSTEM_POWER_STATUS = zeroed();
         GetSystemPowerStatus(&mut sps);
 
+        // 255 = 驱动上报"未知"，钳到 100 之外统一按无数据 255 语义保留
+        //（Wave19：映射成 0% 会落假"电量耗尽"事件）
         let charge = if sps.battery_life_percent > 100 {
-            100
-        } else if sps.battery_life_percent == 255 {
-            0
+            255
         } else {
             sps.battery_life_percent
         };

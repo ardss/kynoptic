@@ -54,7 +54,7 @@ HTTP API（GET 全部只读）：
 - `stats`/`heatmap`/`summary` 的 active/输入分钟是 **raw 口径**（含注入、不桥接），与 presence 语义不同，**不要混用或互相换算**。
 - timeline 的 `human_min` 是桥接后值（另有 `human_min_unbridged`）。
 - MCP 共六工具：`get_current_status` / `get_summary` / `get_timeline` / `get_top_apps` / `get_anomalies` / `wait_for`。
-- MCP get_summary 的 active_minutes 已过滤 heartbeat/snapshot，与 dashboard summary 同源；`compared_to` 是对比基准日（默认 date-1，基准日无数据时该对比字段为空而非 0 增长）。
+- MCP get_summary 的 keys/clicks 从原始 events 现算（dashboard /api/summary 读 agg_minute 缓存）——聚合缓存滞后/修复期间两边可能有小差异，权威口径以 dashboard 为准；active_minutes 已过滤 heartbeat/snapshot，与 dashboard 同源；`compared_to` 是对比基准日（默认 date-1，基准日无数据时该对比字段为空而非 0 增长）。
 - MCP get_timeline 的裸日期 from/to 按**本地日界**解析，to 为日期时含当天全天；响应带 `total_segments` 与截断策略（超限丢弃最旧段，`truncation=oldest-dropped`）。
 
 ## 安全规则（优先级高于效率）

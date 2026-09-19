@@ -319,6 +319,10 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
                         root: root_name.to_string(),
                         seg: String::new(),
                     });
+                } else {
+                    // Wave19 P1：持续性失败（权限/句柄失效）若立即 break
+                    // 重开 watch 会形成每秒上千次的忙循环——退避后再重试
+                    std::thread::sleep(Duration::from_secs(5));
                 }
                 break;
             }
