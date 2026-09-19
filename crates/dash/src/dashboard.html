@@ -14,7 +14,10 @@
     --fg: #E4EBF4; --dim: #93A1B3; --faint: #7A8AA0;
     /* 语义色 */
     --brand: #5BA8FF; --accent-ink: #06121F;
-    --ok: #43D6A0; --warn: #F5B454; --bad: #FF6B6B;
+    --ok: #3FB68B; --warn: #F5B454; --bad: #FF6B6B;
+    /* 时间线三态与降色 */
+    --human: #5BA8FF; --auto: #E0A24A; --down: #E06C75;
+    --surface-btn: #2A3442;
     --amber: #F5B454; /* 兼容旧引用 */
     --radius: 10px; --radius-s: 6px;
     --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -40,6 +43,7 @@
   }
   h1::before { content: ""; display: none; }
   .muted { color: var(--dim); }
+  .note { font-size: 12px; color: var(--dim); }
   header { margin-bottom: 18px; position: relative; padding-bottom: 14px;
            border-bottom: 1px solid var(--border-soft); }
   header::after { /* 签名元素：状态光带 */
@@ -79,6 +83,7 @@
                  overflow: visible; text-overflow: clip; white-space: normal;
                  overflow-wrap: break-word; }
   .card .value.small { font-size: 15px; font-weight: 400; }
+  .card .value.xl { font-size: 34px; }
   /* 空状态字号：用 class 切换而不是 inline fontSize（离开空状态后可恢复） */
   .card .value.empty-note { font-size: 20px; }
   /* 区块 */
@@ -118,6 +123,9 @@
   .kb g:hover rect, .kb rect:hover { stroke: var(--brand); stroke-width: 2; }
   .badge { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px;
            padding: 0 7px; color: var(--warn); background: rgba(245,180,84,0.08); }
+  /* 页签红色角标（异常页：未读 alert 级异常数） */
+  .tab-badge { display: none; margin-left: 6px; padding: 0 6px; border-radius: 999px;
+               background: var(--bad); color: #fff; font-size: 10.5px; font-weight: 700; }
   .settings-actions { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
   /* 按钮体系：主按钮实心，次按钮描边 */
   button.save { background: var(--brand); color: var(--accent-ink); border: 1px solid var(--brand);
@@ -125,9 +133,9 @@
                 font-weight: 600; cursor: pointer; transition: filter .15s; }
   button.save:hover { filter: brightness(1.12); }
   button.save:disabled { opacity: 0.5; cursor: default; }
-  button.save[style*="#2A3442"], button.save[style*="background:#2A3442"] {
-    background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); font-weight: 400; }
-  button.save[style*="background:#2A3442"]:hover { border-color: var(--brand); color: var(--brand); }
+  button.save.btn-ghost {
+    background: var(--surface-btn); color: var(--fg); border: 1px solid var(--border); font-weight: 400; }
+  button.save.btn-ghost:hover { border-color: var(--brand); color: var(--brand); }
   /* 日期快捷按钮选中态：跟随所选日期（今天/昨天/前天） */
   button.save.day-btn.active { border-color: var(--brand); color: var(--brand); font-weight: 600;
                                box-shadow: inset 0 -2px 0 var(--brand); }
@@ -159,6 +167,7 @@
   /* 窄屏：大数字降字号并允许换行，避免 "13 小时 …" 被省略号截断 */
   @media (max-width: 760px) {
     .card .value { font-size: 26px; white-space: normal; overflow: visible; text-overflow: clip; }
+    .card .value.xl { font-size: 26px; }
   }
 </style>
 </head>
@@ -174,18 +183,18 @@
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights" onclick="showView('insights')"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge"></span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
 </header>
 
-<div id="view-overview">
+<div id="view-overview" role="tabpanel" aria-label="Overview / 运行信息">
 
 <div class="cards">
   <div class="card">
     <div class="label"><span class="l en">presence today</span><span class="l zh">今日在场</span></div>
-    <div class="value" style="font-size:34px;" id="c-presence">–</div>
-    <div style="font-size:12px; color:var(--dim);">
+    <div class="value xl" id="c-presence">–</div>
+    <div class="note">
       <span class="l en">first</span><span class="l zh">首次活跃</span> <span id="c-first">–</span>
       · <span class="l en">last</span><span class="l zh">最近活跃</span> <span id="c-last">–</span>
       · <span id="c-presence-delta"></span>
@@ -194,24 +203,24 @@
   </div>
   <div class="card">
     <div class="label"><span class="l en">automation today</span><span class="l zh">今日自动化</span></div>
-    <div class="value" style="font-size:34px; color:var(--dim);" id="c-automation">–</div>
-    <div style="font-size:12px; color:var(--dim);">
+    <div class="value xl" style="color:var(--dim);" id="c-automation">–</div>
+    <div class="note">
       <span class="l en">operations produced by automation tools or scripts</span><span class="l zh">自动化脚本或工具产生的操作</span>
       · <span id="c-automation-delta"></span>
     </div>
   </div>
   <div class="card">
     <div class="label"><span class="l en">foreground app time today</span><span class="l zh">今日前台应用时长</span></div>
-    <div class="value" style="font-size:34px;" id="c-fgdwell">–</div>
-    <div style="font-size:12px; color:var(--dim);">
+    <div class="value xl" id="c-fgdwell">–</div>
+    <div class="note">
       <span id="c-fgdwell-note"></span>
       <span class="l en">longest fg app</span><span class="l zh">最长前台应用</span>: <span id="c-fgtop">–</span>
     </div>
   </div>
   <div class="card" id="card-unattended" style="display:none">
     <div class="label"><span class="l en">unattended today (foreground window active, no human, no automation)</span><span class="l zh">今日无人（前台有窗口，人不在场也不自动化）</span></div>
-    <div class="value" style="font-size:34px; color:var(--dim);" id="c-unattended">–</div>
-    <div style="font-size:12px; color:var(--dim);">
+    <div class="value xl" style="color:var(--dim);" id="c-unattended">–</div>
+    <div class="note">
       <span class="l en">foreground app time − (presence ∪ automation); conservative approximation, negatives clamped to 0</span><span class="l zh">前台应用时长 −（在场 ∪ 自动化），保守近似，负值记 0</span>
     </div>
   </div>
@@ -241,7 +250,7 @@
 </section>
 </div>
 
-<div id="view-report" style="display:none">
+<div id="view-report" role="tabpanel" aria-label="Report / 报告" style="display:none">
 <div class="cards">
   <div class="card"><div class="label"><span class="l en">presence minutes / goal</span><span class="l zh">在场分钟 / 目标</span></div><div class="value" id="r-goal">–</div></div>
   <div class="card"><div class="label"><span class="l en">last 7 days vs prior 7</span><span class="l zh">近 7 天 vs 前 7 天（滚动窗口，非日历周）</span></div><div class="value small" id="r-week">–</div></div>
@@ -251,9 +260,9 @@
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
     <input type="date" id="report-date" class="date-input" onchange="syncDayBtns(); loadReport()" onclick="this.showPicker && this.showPicker()">
-    <button class="save day-btn" id="day-btn-0" style="margin-left:8px;background:#2A3442" onclick="pickDay(0)"><span class="l en">today</span><span class="l zh">今天</span></button>
-    <button class="save day-btn" id="day-btn-1" style="margin-left:8px;background:#2A3442" onclick="pickDay(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
-    <button class="save day-btn" id="day-btn-2" style="margin-left:8px;background:#2A3442" onclick="pickDay(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-0" style="margin-left:8px;background:var(--surface-btn)" onclick="pickDay(0)"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-1" style="margin-left:8px;background:var(--surface-btn)" onclick="pickDay(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-2" style="margin-left:8px;background:var(--surface-btn)" onclick="pickDay(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
   <div id="report-timeline">loading…</div>
   <div id="report-legend" class="muted" style="margin-top:6px"></div>
@@ -298,7 +307,7 @@
 </section>
 </div>
 
-<div id="view-apps" style="display:none">
+<div id="view-apps" role="tabpanel" aria-label="Apps / 应用" style="display:none">
 <section>
   <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
   <div id="top-apps" class="muted">loading…</div>
@@ -318,7 +327,7 @@
 </section>
 </div>
 
-<div id="view-input" style="display:none">
+<div id="view-input" role="tabpanel" aria-label="Input / 输入" style="display:none">
 <div class="cards">
   <div class="card"><div class="label"><span class="l en">keys — 7d</span><span class="l zh">按键 — 7 天</span></div><div class="value" id="i-keys">–</div></div>
   <div class="card"><div class="label"><span class="l en">clicks — 7d</span><span class="l zh">点击 — 7 天</span></div><div class="value" id="i-clicks">–</div></div>
@@ -364,11 +373,11 @@
 </section>
 </div>
 
-<div id="view-insights" style="display:none">
+<div id="view-insights" role="tabpanel" aria-label="Insights / 洞察" style="display:none">
   <div id="insights-list"></div>
 </div>
 
-<div id="view-anomalies" style="display:none">
+<div id="view-anomalies" role="tabpanel" aria-label="Anomalies / 异常" style="display:none">
   <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Deviation from your own 7-day same-hour baseline — no cloud, no universal thresholds.</span><span class="l zh">基于你自己近 7 天同时段历史基线的偏差检测——没有云端、没有通用阈值，异常只相对你自己的常态。</span></div>
 <section>
   <h2><span class="l en">anomalies — last 7 days</span><span class="l zh">异常 — 近 7 天</span></h2>
@@ -376,7 +385,7 @@
 </section>
 </div>
 
-<div id="view-settings" style="display:none">
+<div id="view-settings" role="tabpanel" aria-label="Settings / 设置" style="display:none">
 
 <section>
   <h2><span class="l en">this machine</span><span class="l zh">这台电脑</span></h2>
@@ -400,9 +409,9 @@
   </div>
   <div class="mon-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span class="muted" style="font-size:11px"><span class="l en">presets:</span><span class="l zh">预设：</span></span>
-    <button type="button" class="save" style="background:#2A3442" onclick="applyPreset('essential')"><span class="l en">Essential (14)</span><span class="l zh">基础（14）</span></button>
-    <button type="button" class="save" style="background:#2A3442" onclick="applyPreset('full')"><span class="l en">Full (40)</span><span class="l zh">全开（40）</span></button>
-    <button type="button" class="save" style="background:#2A3442" onclick="applyPreset('minimal')"><span class="l en">Minimal (4)</span><span class="l zh">最小（4）</span></button>
+    <button type="button" class="save btn-ghost" style="background:var(--surface-btn)" onclick="applyPreset('essential')"><span class="l en">Essential (14)</span><span class="l zh">基础（14）</span></button>
+    <button type="button" class="save btn-ghost" style="background:var(--surface-btn)" onclick="applyPreset('full')"><span class="l en">Full (40)</span><span class="l zh">全开（40）</span></button>
+    <button type="button" class="save btn-ghost" style="background:var(--surface-btn)" onclick="applyPreset('minimal')"><span class="l en">Minimal (4)</span><span class="l zh">最小（4）</span></button>
     <span class="muted" style="font-size:11px"><span class="l en">sets checkboxes — click save to apply</span><span class="l zh">仅勾选，需点保存生效</span></span>
   </div>
   <div class="settings-groups">
@@ -454,7 +463,7 @@
 </section>
 <section>
   <div class="settings-actions">
-    <button class="save" style="background:#2A3442" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
+    <button class="save btn-ghost" style="background:var(--surface-btn)" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
   <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
     <span id="settings-msg" aria-live="polite"></span>
   </div>
@@ -474,8 +483,7 @@
 
 <script>
 "use strict";
-const PALETTE = ["#5BA8FF", "#FFB454", "#3fb950", "#bc8cff", "#39c5cf", "#93A1B3"];
-/* 热力图五档色阶：深底色 → 品牌蓝 #4EA1FF */
+/* 热力图五档色阶：深底色 → 顶档 #5BA8FF（HM_LEVELS 末位，即"更多"端） */
 const HM_LEVELS = ["#0B0F16", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
 /* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS） */
 const T = {
@@ -567,10 +575,12 @@ function toggleLang() {
   for (const k of Object.keys(RENDER_SIGS)) delete RENDER_SIGS[k];
   // 设置页不刷新：语言切换不能覆盖未保存的勾选（与轮询豁免同一理由）；
   // 设置页静态文案由 .l.en/.l.zh + html[lang] CSS 即时切换，无需重渲染。
-  if (currentView === "settings") return;
+  // 但状态行不含勾选状态，必须立即按新语言重渲染（用缓存 last 数据），
+  // 否则要等下一轮 30s 轮询才切换语言（P2 回归：状态行滞留旧语言）。
+  if (currentView === "settings") { loadStatus().catch(() => {}); return; }
   // 启动即拉一次设置：Overview 目标环用真实目标而非硬编码；失败不影响首屏
-loadSettings().catch(() => {});
-refreshAll().catch(() => {});
+  loadSettings().catch(() => {});
+  refreshAll().catch(() => {});
 }
 /* 手动验证：1) 打开面板停在 Overview，等数据渲染完成；2) 点右上角语言按钮
    切换中/英——Overview 卡片与 24h 时间线图例应立即变为目标语言，无需等 30 秒
@@ -713,7 +723,7 @@ async function loadOverview() {
     if (Math.abs(diff) < 1) { e.textContent = zh ? "与昨日持平" : "same as yesterday"; return; }
     const sign = diff > 0 ? "+" : "−";
     e.textContent = sign + fmtDuration(Math.abs(diff)) + (zh ? " vs 昨日" : " vs yesterday");
-    e.style.color = diff > 0 ? "#3FB68B" : "#E06C75";
+    e.style.color = diff > 0 ? "var(--ok)" : "var(--down)";
   };
   delta(pm, o.presence_yesterday, "c-presence-delta");
   delta(am, o.automation_yesterday, "c-automation-delta");
@@ -773,13 +783,13 @@ async function loadTimeline() {
     away: zh ? "无人" : "away"
   };
   /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
-  const TL_COLORS = { human: "#5BA8FF", auto: "#E0A24A", away: "#1a2230" };
+  const TL_COLORS = { human: "var(--human)", auto: "var(--auto)", away: "#1a2230" };
   const MIXED_NOTE = zh ? " · 这一小时人和自动化脚本都有操作" : " · mixed minutes (human + automation) count for both";
-  el.innerHTML = '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
+  el.innerHTML = '<div class="note" style="margin-bottom:6px">'
     + '<span style="color:' + TL_COLORS.human + '">■</span> ' + L.human + '　'
     + '<span style="color:' + TL_COLORS.auto + '">■</span> ' + L.auto + '　'
     + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
-    + '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
+    + '<div class="note" style="margin-bottom:6px">'
     + (zh
       ? "在场 = 有键鼠或滚轮操作；自动化 = 自动化脚本的操作；无人 = 屏幕上有窗口但两者都没有。"
       : "Presence = keyboard/mouse/scroll activity; automation = actions by automation tools; unattended = a window in the foreground with neither.")
@@ -977,7 +987,7 @@ function renderKeyboard(freq) {
 }
 // 24h × Top 应用堆叠条（选定日期）+ 近 14 天每日 Top3
 // ─── 报告页：色带时间轴 / 类别占比 / 专注块 / 目标 / 趋势 ───
-const CAT_COLORS = { "开发":"#5BA8FF", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#E06C75",
+const CAT_COLORS = { "开发":"#39c5cf", "浏览":"#3FB68B", "通讯":"#E5C07B", "娱乐":"#d16b8f",
   "文档":"#C678DD", "设计":"#56B6C2", "其他":"#7A8AA0" };
 /* 类别中英映射：键为后端中文类别名，按当前语言显示 */
 const CAT_NAMES = { "开发": ["Development", "开发"], "浏览": ["Browsing", "浏览"],
@@ -1018,7 +1028,7 @@ async function loadReport() {
   const W = 900, rowH = 22, padL = 130;
   const H = 30 + apps.length * rowH + 26;
   const px = m => padL + m / 1440 * (W - padL - 12);
-  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="day timeline per app / 日时间轴（应用色带）">';
   for (let hr = 0; hr <= 24; hr += 3) {
     const x = px(hr * 60);
     svg += '<line x1="' + x + '" y1="16" x2="' + x + '" y2="' + (H - 18) +
@@ -1120,7 +1130,7 @@ async function loadReport() {
     const W = 880, H = 150, padL = 36, padB = 22, padT = 8;
     const innerH = H - padT - padB, innerW = W - padL - 8;
     const bw = innerW / tr.daily.length;
-    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
+    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="28-day keyboard/mouse minutes trend / 28 天键鼠分钟趋势">';
     for (let g = 1; g <= 3; g++) {
       const y = padT + innerH - innerH * g / 3;
       svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
@@ -1164,7 +1174,7 @@ async function loadApps() {
   // (other) 固定灰，不占主色（Wave20 P2：原按数组序上色让 other 拿主色、
   // Top 应用错位）
   grid.forEach((g, i) => { colorOf[g.app] = g.app === "(other)" ? "#6B7683" : APP_COLORS[i % APP_COLORS.length]; });
-  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="hourly stacked app usage / 逐时应用堆叠柱状图">';
   for (let g = 0; g <= 4; g++) {
     const y = padT + innerH - innerH * g / 4;
     svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
@@ -1181,7 +1191,7 @@ async function loadApps() {
       yCur -= bh;
       svg += '<rect x="' + (padL + hr * bw + 2) + '" y="' + yCur + '" width="' + (bw - 4) +
         '" height="' + Math.max(bh, 2) + '" rx="1.5" fill="' + (colorOf[g.app] || "#888") +
-        '"><title>' + hr + ":00 — " + esc(g.app) + " (" + v + ')</title></rect>';
+        '"><title>' + hr + ":00 — " + esc(g.app) + " (" + v.toLocaleString() + ')</title></rect>';
     }
     if (hr % 3 === 0) {
       svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
@@ -1202,7 +1212,7 @@ async function loadApps() {
         '<span class="app-track" style="flex:1"><span class="app-bar" style="width:' +
         (t.count / cmax * 100).toFixed(2) + "%;background:" + (t.app === "(other)" ? "#6B7683" : APP_COLORS[i]) + '"></span></span>' +
         '<span style="width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
-        esc(t.app) + '">' + esc(prettyApp(t.app)) + ' <span class="muted">(' + t.count + ")</span></span>").join("") +
+        esc(t.app) + '">' + esc(prettyApp(t.app)) + ' <span class="muted">(' + t.count.toLocaleString() + ")</span></span>").join("") +
       "</div>").join("")
     : '<span class="muted">' + t("noData") + "</span>";
 }
@@ -1348,7 +1358,7 @@ async function loadInput() {
       const bh = v / mx * innerH;
       const x = padL + hr * bw + 2, y = padT + innerH - bh;
       svg += '<rect x="' + x + '" y="' + y + '" width="' + (bw - 4) + '" height="' + Math.max(bh, v > 0 ? 2 : 0) +
-        '" rx="2" fill="#5BA8FF"><title>' + hr + ":00 — " + v.toLocaleString() + '</title></rect>';
+        '" rx="2" fill="#3b82c4"><title>' + hr + ":00 — " + v.toLocaleString() + '</title></rect>';
       if (hr % 3 === 0) {
         svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
           '" fill="#93A1B3" font-size="11" text-anchor="middle">' + hr + "</text>";
@@ -1386,6 +1396,14 @@ async function loadInput() {
 async function loadAnomalies() {
   const a = await jget("/api/anomalies?days=7");
   const el = document.getElementById("anomalies");
+  // 页签角标：/api/status 不含异常计数，这里用现有 /api/anomalies 载荷统计
+  // alert 级条数（红 chip）；为零时隐藏。仅在异常页载入/刷新时更新。
+  const badge = document.getElementById("anom-badge");
+  if (badge) {
+    const alerts = (a.anomalies || []).filter(x => x.severity === "alert").length;
+    badge.textContent = alerts > 99 ? "99+" : String(alerts);
+    badge.style.display = alerts > 0 ? "" : "none";
+  }
   if (!a.anomalies.length) { el.innerHTML = '<li class="muted">' + t("noAnomalies") + "</li>"; return; }
   // 严重级别排序：alert 最高，排最前；同级别内按时刻先后
   const SEV_ORDER = { alert: 0, critical: 1, warn: 2, info: 3 };
@@ -1623,9 +1641,14 @@ function toggleOps(ev) {
 }
 function showView(name) {
   currentView = name;
+  // 防御：任何 view/tab 元素缺失都不能让异常逃出 showView——否则会落在
+  // refreshView 之前，页签能显示但 loader 永不触发、也无控制台报错可查
+  //（正是"切换后 loading… 永不解析、数据 API 零请求"这类回归的形态）。
   for (const v of ["overview", "apps", "report", "insights", "input", "anomalies", "settings"]) {
-    document.getElementById("view-" + v).style.display = v === name ? "" : "none";
+    const view = document.getElementById("view-" + v);
+    if (view) view.style.display = v === name ? "" : "none";
     const tab = document.getElementById("tab-" + v);
+    if (!tab) continue;
     tab.classList.toggle("active", v === name);
     tab.setAttribute("aria-selected", v === name ? "true" : "false");
   }
@@ -1672,7 +1695,11 @@ refreshAll().catch(e => showViewError(currentView, e.message));
 // 只在进入页签和保存成功时（loadSettings/saveSettings 内部）重新加载。
 setInterval(() => {
   if (document.hidden) return;
-  if (currentView === "settings") return;
+  if (currentView === "settings") {
+    // 设置页仍要续跳状态行（不触碰表单勾选，轮询豁免只保护视图重渲染）
+    loadStatus().catch(() => markDisconnected());
+    return;
+  }
   if (currentView !== "overview") {
     loadStatus().catch(() => markDisconnected());
     return;
