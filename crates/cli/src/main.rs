@@ -2165,6 +2165,14 @@ fn find_subcommand(args: &[String]) -> Option<usize> {
 }
 
 fn main() -> ExitCode {
+    // 日志全景审查 P1：CLI 此前从不初始化 logger（env_logger 挂在依赖里
+    // 却没人 init），db 迁移/维护/欠聚合自愈/dash 服务的所有 log::warn!/
+    // error! 全部落空。console 子命令补 stderr 输出（默认 warn 起，RUST_LOG
+    // 可调）；`kynoptic mcp` 走 stdout 协议不受影响（env_logger 写 stderr）。
+    // collect 子命令内部的 env_logger try_init 在此之后会静默让位。
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init()
+        .ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // --version/-V：update.rs 的 verify_launch 依赖 exit 0 判定自更新成功
     if args.iter().any(|a| a == "--version" || a == "-V") {

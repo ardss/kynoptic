@@ -25,6 +25,7 @@
 //! 用法:kynoptic-tray [--db PATH] [--port N] [--all]
 
 mod args;
+mod filelog;
 mod ghost;
 mod icons;
 mod paths;
@@ -72,6 +73,24 @@ fn main() {
             parsed.port = st.dashboard_port;
         }
     }
+
+    // 文件 logger（日志全景审查 P0）：必须先于一切 log::* 调用安装——
+    // 此前托盘进程从未初始化 logger，main.rs/ghost.rs/dash 里的 warn!/error!
+    // 全部静默丢弃，违反"后台错误必须落文件"铁律。写 <db 目录>\tray.log
+    // （1MB 轮转 .old）；此后 collector 内部的 env_logger try_init 会静默
+    // 让位，全进程日志统一落本文件。
+    filelog::init(
+        parsed
+            .db
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("tray.log"),
+    );
+    log::info!(
+        "kynoptic-tray 启动: db={} port={}",
+        parsed.db.display(),
+        parsed.port
+    );
 
     // 单实例互斥体:防双开,同时是 watchdog 的存活探针
     {
