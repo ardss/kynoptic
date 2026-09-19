@@ -235,7 +235,7 @@
 <div id="view-report" style="display:none">
 <div class="cards">
   <div class="card"><div class="label"><span class="l en">keyboard/mouse input vs goal</span><span class="l zh">键鼠输入分钟 / 目标</span></div><div class="value" id="r-goal">–</div></div>
-  <div class="card"><div class="label"><span class="l en">this week vs last</span><span class="l zh">本周 vs 上周</span></div><div class="value small" id="r-week">–</div></div>
+  <div class="card"><div class="label"><span class="l en">last 7 days vs prior 7</span><span class="l zh">近 7 天 vs 前 7 天（滚动窗口，非日历周）</span></div><div class="value small" id="r-week">–</div></div>
 </div>
 
 <section>
@@ -1079,13 +1079,23 @@ async function loadApps() {
   const d = await jget("/api/apps_grid" + (dateVal ? "?date=" + dateVal : ""));
   if (seq !== APPS_SEQ) return; // 同 loadReport：乱序防护
   const grid = d.grid || [];
+  if (!grid.length && !(d.hourly_total || []).some(v => v > 0)) {
+    // Wave20 P2：全 0 日不再渲染只有坐标轴的空 SVG
+    document.getElementById("apps-grid-chart").innerHTML = '<span class="muted">' +
+      (document.documentElement.lang === "zh" ? "该日无应用数据" : "no app data for this day") + "</span>";
+    document.getElementById("apps-legend").innerHTML = "";
+    document.getElementById("daily-top").innerHTML = '<span class="muted">…</span>';
+    return;
+  }
   const W = 880, H = 200, padL = 36, padB = 22, padT = 8;
   const innerW = W - padL - 8, innerH = H - padT - padB;
   const ht = d.hourly_total || [];
   const hmax = Math.max(1, ...ht);
   const bw = innerW / 24;
   const colorOf = {};
-  grid.forEach((g, i) => { colorOf[g.app] = APP_COLORS[i % APP_COLORS.length]; });
+  // (other) 固定灰，不占主色（Wave20 P2：原按数组序上色让 other 拿主色、
+  // Top 应用错位）
+  grid.forEach((g, i) => { colorOf[g.app] = g.app === "(other)" ? "#6B7683" : APP_COLORS[i % APP_COLORS.length]; });
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">';
   for (let g = 0; g <= 4; g++) {
     const y = padT + innerH - innerH * g / 4;
@@ -1122,7 +1132,7 @@ async function loadApps() {
     ? rows.map(r => '<div class="mon-row"><span class="muted" style="width:84px">' + esc(r.date) + "</span>" +
       (r.top || []).map((t, i) =>
         '<span class="app-track" style="flex:1"><span class="app-bar" style="width:' +
-        (t.count / cmax * 100).toFixed(2) + "%;background:" + APP_COLORS[i] + '"></span></span>' +
+        (t.count / cmax * 100).toFixed(2) + "%;background:" + (t.app === "(other)" ? "#6B7683" : APP_COLORS[i]) + '"></span></span>' +
         '<span style="width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
         esc(t.app) + '">' + esc(t.app) + ' <span class="muted">(' + t.count + ")</span></span>").join("") +
       "</div>").join("")
