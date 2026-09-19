@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-19
+
+### Fixed
+
+Eleven review waves (16-26) of parallel deep audits: about 120 fixes with
+zero data-loss findings left open. Highlights:
+
+- Session identity: events.session_id is now stamped (was 100% NULL).
+- Watchdog safety: heartbeat pid extraction hardened and the pid's image
+  name verified before any kill; the image-name global-kill fallback was
+  removed (it could kill unrelated kynoptic-tray processes); system sleep
+  no longer looks like a stall.
+- Timeline API: /api/timeline hours clamped to 744 (31 days); year-scale
+  views belong to the heatmap (daily_agg, milliseconds).
+- Retention cleanup prunes pre-aggregation tables in the same
+  transaction as raw events so heatmap/trends can never show deleted
+  months.
+- MCP: read-only connections no longer run WAL pragma (all tools failed
+  on non-WAL databases); SQL errors are no longer reported as empty
+  results.
+- Release: fixed the double v-prefix download link that 404'd on every
+  release; workspace-level version; aggrepair/ctl now ship in the
+  installer.
+- Settings: POST /api/settings rejects non-object bodies; UTF-8 BOM in
+  settings.json no longer silently resets all settings.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
