@@ -189,6 +189,8 @@ pub fn api_timeline_at(
         std::collections::HashMap::new();
     let mut human_min_of: std::collections::HashMap<String, Vec<i64>> =
         std::collections::HashMap::new();
+    // 整窗人侧分钟（epoch 分钟）——供跨小时桥接（Wave20 P1）
+    let mut all_human_min: Vec<i64> = Vec::new();
     let mrows = queries::minute_classification(conn, &start.to_rfc3339(), &end.to_rfc3339(), &off)?;
     for (minute_bucket, human, auto) in mrows {
         let hour_bucket = minute_bucket.replacen(' ', "T", 1)[..13].to_string();
@@ -199,6 +201,7 @@ pub fn api_timeline_at(
                     .entry(hour_bucket.clone())
                     .or_default()
                     .push(i64::from(t.hour()) * 60 + i64::from(t.minute()));
+                all_human_min.push(t.and_utc().timestamp() / 60);
             }
             let e = minute_kind.entry(hour_bucket.clone()).or_insert((0, 0));
             e.0 += 1;
@@ -216,6 +219,32 @@ pub fn api_timeline_at(
         let bucket = bucket.replacen(' ', "T", 1);
         by_bucket.entry(bucket).or_default().push((app, cnt));
     }
+    // 整窗桥接展开：把 human 分钟之间的间隙（<= bridge）填上，得到"在场
+    // 分钟全集"，再按小时归位。分钟坐标用本地 NaiveDateTime 以对齐小时桶。
+    let bridge_gap = i64::from(bridge_min.min(15));
+    let mut expanded: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    {
+        all_human_min.sort_unstable();
+        all_human_min.dedup();
+        let human_set: std::collections::HashSet<i64> = all_human_min.iter().copied().collect();
+        for &m in &all_human_min {
+            *expanded
+                .entry(local_hour_of_epoch_min(m, &off))
+                .or_default() += 1;
+            // 向后填洞：m+1..=m+gap 属于桥接分钟
+            let mut n = m + 1;
+            while n <= m + bridge_gap
+                && !human_set.contains(&n)
+                && all_human_min.last().is_some_and(|&last| n <= last)
+            {
+                *expanded
+                    .entry(local_hour_of_epoch_min(n, &off))
+                    .or_default() += 1;
+                n += 1;
+            }
+        }
+    }
+    let bridged_per_hour = expanded;
     // 补零桶：固定返回窗口内全部本地小时，无数据小时 human/auto 全 0，
     // 前端可区分"没开机"与"开机没碰"。
     let mut buckets: Vec<Value> = Vec::new();
@@ -230,17 +259,14 @@ pub fn api_timeline_at(
             .collect();
         let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
         let unbridged = human as i64;
-        // 桥接：同一小时内的人在场分钟排序后按 bridge 阈值桥接（与 overview
-        // presence 同一权威口径 queries::bridge_count，阈值读 settings）。
-        let bridged = human_min_of
-            .get(&hour)
-            .map(|mins| {
-                let mut sorted = mins.clone();
-                sorted.sort_unstable();
-                sorted.dedup();
-                queries::bridge_count(&sorted, i64::from(bridge_min.min(15)))
-            })
-            .unwrap_or(0);
+        // 桥接（Wave20 P1）：先在整段窗口上桥接（跨小时连续段不再被小时
+        // 边界截断，与 overview presence 总和一致），再把桥接后的分钟按
+        // 所属小时归位。
+        let bridged = bridged_per_hour
+            .iter()
+            .filter(|(h, _)| h.as_str() == hour)
+            .map(|(_, n)| *n)
+            .sum::<i64>();
         buckets.push(json!({
             "hour": hour,
             "apps": list,
@@ -268,6 +294,18 @@ pub fn api_timeline_at(
 /// 但允许测试注入时刻；当前时刻下两者一致）。
 /// DST 隐患（审查 P2）：这里用单一偏移换算整段历史查询；跨夏令时的桶
 /// 可能偏 ±1 小时。timeline 响应已带 local_offset_seconds/note 说明口径。
+/// epoch 分钟 -> 本地小时桶 "YYYY-MM-DDTHH"（与 minute_classification 同一偏移）。
+fn local_hour_of_epoch_min(epoch_min: i64, off: &str) -> String {
+    // datetime(ts, off) 与 SQLite 同口径：先拼 RFC3339 再本地化
+    let ts = chrono::DateTime::from_timestamp(epoch_min * 60, 0)
+        .unwrap_or_default()
+        .with_timezone(&Local)
+        .format("%Y-%m-%dT%H")
+        .to_string();
+    let _ = off; // chrono Local 已含当前偏移（与调用侧 local_offset_modifier_at 同源）
+    ts
+}
+
 fn local_offset_modifier_at(now: DateTime<Utc>) -> String {
     let secs = now.with_timezone(&Local).offset().local_minus_utc() as i64;
     format!(
@@ -1153,7 +1191,11 @@ fn insights_compute(
     if let Ok(mut stmt) = conn.prepare(
         // 审查 P2：专注 streak 与 marathon 同口径——剔除 move-only 事件，
         // 否则鼠标宏/自动晃动能"养"出假专注块（marathon 已挡，这里漏了）。
-        "SELECT timestamp, event_type, event_action, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE (event_type = 'window' OR (event_type = 'keyboard' AND event_action = 'press') OR (event_type = 'mouse' AND event_action != 'move'))            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+        // Wave20 P0：旧条件 `mouse AND action != 'move'` 在 minute 聚合模式下
+        // 把每一行 input_agg（含纯移动、纯注入分钟）都当"一次输入"——
+        // 最长专注/深夜/黄金/节律四张卡全部失真。人侧行级判定：
+        // raw press/click 各算一条；input_agg 行仅当 keys/clicks 减注入后 > 0。
+        "SELECT timestamp, event_type, event_action, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE (event_type = 'window'             OR (event_type = 'keyboard' AND event_action = 'press')             OR (event_type = 'mouse' AND event_action = 'click')             OR (event_type IN ('keyboard','mouse') AND event_action = 'input_agg' AND json_valid(event_data)                 AND COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)                   + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) > 0))            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
     ) {
         if let Ok(rows) = stmt.query_map(params![&start, &end], |r| {
             Ok((
@@ -1470,18 +1512,40 @@ pub fn api_report_at(
         .map(|(name, min)| json!({"category": name, "minutes": min}))
         .collect();
 
-    // 4) 专注块：相邻段间隙 <= presence_bridge 分钟（读 settings，全站
-    //    "连续性"口径一致）合并，总长 >=20min
+    // 4) 专注块：从"人在场分钟"出发（Wave20 P0：旧实现把 dwell 段间隙
+    //    合并——dwell 段天然首尾相接，于是当天第一次到最后一次窗口切换
+    //    全部连成一个"专注块"，离场/挂机时间全被算进去）。现在与 overview
+    //    同一 classify 口径：人侧输入分钟为珠，间隙 <= bridge 分钟桥接，
+    //    总长 >=20min 成块。
     let bridge_min = s.presence_bridge_minutes.min(15) as usize;
+    let off = local_offset_modifier_at(chrono::Utc::now());
+    let mut human_minutes: Vec<usize> = queries::minute_classification(conn, &start, &end, &off)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(bucket, human, _auto)| {
+            if !human {
+                return None;
+            }
+            chrono::NaiveDateTime::parse_from_str(&bucket, "%Y-%m-%d %H:%M")
+                .ok()
+                .map(|t| {
+                    let ds = day_start.with_timezone(&chrono::Local).naive_local();
+                    let m = ((t - ds).num_minutes().max(0) as usize).min(1439);
+                    m
+                })
+        })
+        .collect();
+    human_minutes.sort_unstable();
+    human_minutes.dedup();
     let mut blocks: Vec<(usize, usize)> = Vec::new();
-    for (_, a, b) in &segs {
+    for m in &human_minutes {
         if let Some(last) = blocks.last_mut() {
-            if a.saturating_sub(last.1) <= bridge_min {
-                last.1 = (*b).max(last.1);
+            if m.saturating_sub(last.1) <= bridge_min {
+                last.1 = m + 1;
                 continue;
             }
         }
-        blocks.push((*a, *b));
+        blocks.push((*m, m + 1));
     }
     let focus: Vec<Value> = blocks
         .iter()

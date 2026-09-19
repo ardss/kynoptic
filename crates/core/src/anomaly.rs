@@ -45,7 +45,9 @@ pub fn late_night_from_count(late_night_keys: i64, date: &str) -> Vec<Anomaly> {
                 "在 {} {}点之后仍有 ≥{} 次按键（阈值）。建议早点休息。",
                 date, LATE_NIGHT_HOUR_START, LATE_NIGHT_MIN_KEYS
             ),
-            at: Some(format!("{}T{:02}:00", date, LATE_NIGHT_HOUR_START)),
+            // Wave20 P1：窗口含 0-6 点（属 date 前夜的跨午夜段），标成
+            // dateT23:00 会得到"尚未发生"的未来时刻——降为日期粒度
+            at: None,
         }]
     } else {
         Vec::new()
