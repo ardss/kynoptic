@@ -95,11 +95,6 @@ pub fn resolve_db_path() -> PathBuf {
 ///
 /// 开发期可能因 cwd 不同产生两份 DB（cargo run 写根 data/，tauri dev 写 src-tauri/data/）。
 /// 本函数在目标路径不存在但某处存在旧库时，把旧库复制过来（取行数最多的那份），
-/// 避免历史数据丢失。目标已存在则什么都不做。
-
-/// 采集器启动失败时的诊断：尝试只读打开 + quick_check，把"库损坏"从
-/// 泛化的"DB 不可写?"里拆出来（审查 P0：托盘无 console，用户唯一可见
-/// 的线索就是留档文件里的这句话）。
 pub fn diagnose_open_failure(path: &std::path::Path) -> String {
     match Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {

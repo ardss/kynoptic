@@ -1927,13 +1927,11 @@ fn kill_tray() -> bool {
             .unwrap_or_default()
             .join("kynoptic-heartbeat"),
     ) {
-        if let Some(pid) = txt.split("\"pid\":").nth(1).and_then(|rest| {
-            rest.split(|c| c == ',' || c == '}')
-                .next()?
-                .trim()
-                .parse::<u32>()
-                .ok()
-        }) {
+        if let Some(pid) = txt
+            .split("\"pid\":")
+            .nth(1)
+            .and_then(|rest| rest.split([',', '}']).next()?.trim().parse::<u32>().ok())
+        {
             let out = Command::new("taskkill")
                 .args(["/F", "/PID", &pid.to_string(), "/T"])
                 .stdin(Stdio::null())
