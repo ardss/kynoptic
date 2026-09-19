@@ -19,8 +19,9 @@ use crate::Result;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Anomaly {
-    pub kind: String,     // "late_night" | "apm_burst" | "marathon" | "new_app_surge"
-    pub severity: String, // "info" | "warn" | "alert"
+    pub kind: String,       // "late_night" | "apm_burst" | "marathon" | "new_app_surge"
+    pub kind_label: String, // 中文友好标签，供仪表盘直接展示（"深夜活动"等）
+    pub severity: String,   // "info" | "warn" | "alert"
     pub message: String,
     pub detail: String,
     pub at: Option<String>, // 关联时间戳
@@ -39,6 +40,7 @@ pub fn late_night_from_count(late_night_keys: i64, date: &str) -> Vec<Anomaly> {
     if late_night_keys >= LATE_NIGHT_MIN_KEYS {
         vec![Anomaly {
             kind: "late_night".into(),
+            kind_label: "深夜活动".into(),
             severity: "warn".into(),
             message: format!("深夜活动：{} 按键", late_night_keys),
             detail: format!(
@@ -68,6 +70,7 @@ pub fn apm_burst_from_data(burst_minutes: &[(String, i64)], hist_avg: f64) -> Ve
         if ratio >= APM_BURST_MULTIPLIER {
             out.push(Anomaly {
                 kind: "apm_burst".into(),
+                kind_label: "APM 突增".into(),
                 severity: "alert".into(),
                 message: format!(
                     "APM 突增：{} 达到 {:.0}（历史均值 {:.0} 的 {:.1}x）",
@@ -137,8 +140,9 @@ pub fn marathon_from_minutes(active_minutes: &[String], bridge_minutes: u32) -> 
         };
         vec![Anomaly {
             kind: "marathon".into(),
+            kind_label: "长时间连续在场".into(),
             severity: "info".into(),
-            message: format!("马拉松会话：连续活跃 {} 分钟", longest),
+            message: format!("连续在场 {} 分钟（长时间无离开）", longest),
             detail: format!("从 {} 到 {} 持续输入无休息。", fmt(s), fmt(e)),
             at: Some(fmt(s)),
         }]
@@ -205,6 +209,7 @@ where
             // 历史中从未见过，但今天事件较多 → 标记为"新应用"
             out.push(Anomaly {
                 kind: "new_app_surge".into(),
+                kind_label: "新应用激增".into(),
                 severity: "info".into(),
                 message: format!("新应用首次出现：{}（{} 事件）", app, n_today),
                 detail: "这是该应用首次出现在历史中".into(),
@@ -220,6 +225,7 @@ where
         if ratio >= NEW_APP_SURGE_MULTIPLIER {
             out.push(Anomaly {
                 kind: "new_app_surge".into(),
+                kind_label: "新应用激增".into(),
                 severity: "warn".into(),
                 message: format!(
                     "应用使用突增：{}（今天 {}，日均 {:.0}，{:.1}x）",

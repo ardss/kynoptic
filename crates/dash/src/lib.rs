@@ -259,7 +259,8 @@ pub fn api_timeline_at(
         let apps = by_bucket.remove(&hour).unwrap_or_default();
         let list: Vec<Value> = top5_with_other(apps)
             .into_iter()
-            .map(|(app, n)| json!({"app": app, "events": n}))
+            // 与 insights 卡一致：展示名剔除 ".exe" 后缀（如 "ZCode.exe" -> "ZCode"）
+            .map(|(app, n)| json!({"app": app.trim_end_matches(".exe"), "events": n}))
             .collect();
         let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
         let unbridged = human as i64;
@@ -354,6 +355,17 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// 异常 kind -> 中文友好标签（仪表盘直接展示，避免渲染原始 kind 码）。
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "late_night" => "深夜活动",
+        "apm_burst" => "APM 突增",
+        "marathon" => "长时间连续在场",
+        "new_app_surge" => "新应用激增",
+        _ => "异常",
+    }
+}
+
 /// 异常 kind + 中文 message -> 参数化英文文案（前端 message_en）。
 /// 与中文模板同源：分钟数 / 倍率 / 应用名等数字全部带上，信息量对齐。
 /// kynoptic-mcp 的同名函数只给静态模板；dash 侧拿到完整 message 后重新
@@ -378,9 +390,9 @@ fn anomaly_message_en(kind: &str, message: &str, at: Option<&str>) -> String {
                 fmt_num(n.get(1).copied().unwrap_or(0.0)),
             )
         }
-        // "马拉松会话：连续活跃 {longest} 分钟"
+        // "连续在场 {longest} 分钟（长时间无离开）"
         "marathon" => format!(
-            "Marathon session: {} minutes of continuous activity without breaks",
+            "Continuous presence: {} minutes without leaving",
             fmt_num(message_numbers(message).first().copied().unwrap_or(0.0))
         ),
         // "应用使用突增：{app}（今天 {n}，日均 {avg}，{ratio:.1}x）"
@@ -430,9 +442,11 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
             }
             let at = a.at.clone();
             let message_en = anomaly_message_en(&a.kind, &a.message, at.as_deref());
+            let kind_label = kind_label(&a.kind);
             out.push(json!({
                 "date": date,
                 "kind": a.kind,
+                "kind_label": kind_label,
                 "severity": a.severity,
                 "message": a.message,
                 "message_en": message_en,
@@ -645,9 +659,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "mixed_minutes": mixed_minutes,
         "presence_yesterday": yday.presence_minutes,
         "automation_yesterday": yday.automation_minutes,
-        "metrics_note": "口径：人分钟（键/点击/滚轮，剔注入）计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
+        "metrics_note": "口径：在场=人分钟（键/点击/滚轮，剔除自动化注入的输入）；自动化=纯自动化分钟；混合分钟同时计入两者；无人=前台有窗口但人不在场也不自动化。",
         "unattended_fg_minutes": unattended_fg_minutes,
-        "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes - mixed_minutes)，负值截 0（暂无分钟级前台采样）",
+        "unattended_fg_method": "保守近似：前台应用时长 −（在场 + 自动化 − 混合分钟），负值记 0",
         "has_full_day": has_full_day,
         "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,
@@ -1287,9 +1301,9 @@ fn insights_compute(
             best.2.map(fmt_day).unwrap_or_default(),
         );
         insights.push(json!({
-            "title_zh": "最长连续专注（约）",
-            "title_en": "Longest focus streak (approx.)",
-            "text_zh": format!("近 7 天你最长的连续在场约 {:.0} 分钟（{} ~ {}），期间没有任何超过 {} 分钟的离开。窗口切换事件数口径，与异常页马拉松计数可能相差 ±1。", best.0 / 60.0, rs, re, bridge_minutes),
+            "title_zh": "最长连续在场（约）",
+            "title_en": "Longest presence streak (approx.)",
+            "text_zh": format!("近 7 天你最长的连续在场约 {:.0} 分钟（{} ~ {}），期间没有任何超过 {} 分钟的离开。窗口切换事件数口径，与异常页连续在场计数可能相差 ±1。", best.0 / 60.0, rs, re, bridge_minutes),
             "text_en": format!("Your longest continuous presence in the last 7 days was about {:.0} minutes ({} ~ {}) with no gap over {} minutes. Window-switch event counts may differ from the anomalies page by ±1.", best.0 / 60.0, rs, re, bridge_minutes),
         }));
     }
@@ -1314,10 +1328,10 @@ fn insights_compute(
             .map(|(a, h)| format!("{} {:.1}h", a.trim_end_matches(".exe"), h / 3600.0))
             .collect();
         insights.push(json!({
-            "title_zh": "应用驻留时长 Top3",
-            "title_en": "Top 3 apps by dwell time",
-            "text_zh": format!("按窗口驻留推算：{}", names.join("，")),
-            "text_en": format!("By window dwell: {}", names.join(", ")),
+            "title_zh": "前台应用时长 Top3",
+            "title_en": "Top 3 apps by foreground time",
+            "text_zh": format!("按窗口切换推算：{}", names.join("，")),
+            "text_en": format!("Estimated from window switches: {}", names.join(", ")),
         }));
     }
 
@@ -1653,7 +1667,7 @@ pub fn api_trends_at(conn: &Connection, today: chrono::NaiveDate) -> Value {
         // 修复"人在场"假别名（第四口径）：曾经的 presence_minutes = active_minutes
         // 冒充在场（含注入、不桥接）。active_minutes 是 raw 输入口径（daily_agg
         // 派生缓存）；真正的"人在场"权威口径请看 /api/overview。
-        "note": "active_minutes 为 raw 输入分钟口径（每日有键鼠输入的分钟数，来自 daily_agg 派生缓存，不剔注入、不桥接）；人在场（human presence）请看 /api/overview / active_minutes is the raw input-minute metric (from the daily_agg cache, not injected-filtered, not bridged); for human presence see /api/overview",
+        "note": "active_minutes 为 raw 输入分钟口径（每日有键鼠输入的分钟数，来自 daily_agg 派生缓存，不剔注入、不桥接）；在场（human presence）请看 /api/overview / active_minutes is the raw input-minute metric (from the daily_agg cache, not injected-filtered, not bridged); for human presence see /api/overview",
     })
 }
 

@@ -1017,7 +1017,7 @@ fn overview_counts_mixed_minutes_for_both_presence_and_automation() {
     assert_eq!(v["automation_minutes"], json!(2), "{v}");
     assert_eq!(v["mixed_minutes"], json!(1), "{v}");
     assert!(v["unattended_fg_minutes"].is_number());
-    assert!(v["metrics_note"].as_str().unwrap().contains("mixed"));
+    assert!(v["metrics_note"].as_str().unwrap().contains("混合分钟"));
 }
 
 // === insights：节律卡（首末输入 + 单事件日标注） ===
@@ -1073,8 +1073,8 @@ fn insights_dwell_caps_single_segment_at_30_minutes() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["title_en"] == json!("Top 3 apps by dwell time"))
-        .expect("驻留卡应存在");
+        .find(|i| i["title_en"] == json!("Top 3 apps by foreground time"))
+        .expect("前台应用时长卡应存在");
     let en = dwell_card["text_en"].as_str().unwrap();
     assert!(en.contains("appA 0.5h"), "72h 空档应截断为 30 分钟: {en}");
     assert!(!en.contains("72"), "不得出现未封顶时长: {en}");
@@ -1235,8 +1235,8 @@ fn anomalies_message_en_covers_all_kinds() {
         "message_en 应带上分钟: {burst}"
     );
 
-    let marathon = anomaly_message_en("marathon", "马拉松会话：连续活跃 195 分钟", None);
-    assert!(marathon.contains("Marathon"), "{marathon}");
+    let marathon = anomaly_message_en("marathon", "连续在场 195 分钟（长时间无离开）", None);
+    assert!(marathon.contains("Continuous presence"), "{marathon}");
     assert!(
         marathon.contains("195"),
         "message_en 应带上分钟数: {marathon}"
