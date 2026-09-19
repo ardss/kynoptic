@@ -32,7 +32,6 @@ const BROWSER_EXES: &[&str] = &[
     "avguate.exe",
     "saayaa.exe",
     "twchrome.exe",
-    "chitubox.exe",
     "centbrowser.exe",
     "yandex.exe",
 ];

@@ -8,7 +8,7 @@ use serde_json::json;
 use std::cell::Cell;
 use std::mem::zeroed;
 use std::time::Duration;
-use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 /// 空闲阈值：5 分钟无输入视为空闲
@@ -68,8 +68,9 @@ fn get_idle_seconds() -> u64 {
             return 0;
         }
 
-        let ticks = GetTickCount64();
-        let idle_ms = ticks.saturating_sub(lii.dwTime as u64);
+        // dwTime 是 32 位 tick 计数，49.7 天回绕；用 32 位 wrapping_sub 在同模域
+        // 内做差，避免回绕后把空闲时长算成天文数字（伪 IdleStart）。
+        let idle_ms = GetTickCount().wrapping_sub(lii.dwTime) as u64;
         idle_ms / 1000
     }
 }

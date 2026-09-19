@@ -58,7 +58,9 @@ try {
         };
 
         let mut emitted = self.emitted_keys.take().unwrap_or_default();
-        emitted.clear(); // 每轮清空旧 key
+        // 持久化去重：此前每轮 clear() 导致同一批日历事件每 300s 重复落库。
+        // key 含 state，事件状态推进（upcoming→ongoing→ending）仍会产生新事件；
+        // key 总量受可见事件数约束，增长可忽略。
 
         for line in output.trim().lines() {
             if line.trim().is_empty() {
