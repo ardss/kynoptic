@@ -35,7 +35,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Timelike;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -160,7 +160,18 @@ pub fn api_timeline_at(
     let hours = hours.clamp(1, 744);
     // 边界按 UTC 计算后直接用于 WHERE（timestamp 列为 UTC RFC3339）
     let end = now;
-    let start = now - chrono::Duration::hours(i64::from(hours));
+    // Wave28 P0：窗口终点取当前本地整点（floor 到小时），起点 = 终点 −
+    // (hours−1) 小时。旧实现按 now−hours 起步、整点步进循环 cur<end，
+    // 恰好把"当前小时"整桶丢掉（cur+1h==end），仪表盘最新一行可滞后
+    // 近 2 小时。现在恒返回恰好 hours 个桶，最后一桶是进行中的当前小时。
+    let end_local_raw = end.with_timezone(&Local);
+    let end_hour = end_local_raw
+        .date_naive()
+        .and_hms_opt(end_local_raw.hour(), 0, 0)
+        .and_then(|n| Local.from_local_datetime(&n).single())
+        .unwrap_or(end_local_raw);
+    let start_hour = end_hour - chrono::Duration::hours(i64::from(hours - 1));
+    let start = start_hour.with_timezone(&Utc);
     let off = local_offset_modifier_at(now);
 
     let mut stmt = conn
@@ -205,7 +216,14 @@ pub fn api_timeline_at(
                     .entry(hour_bucket.clone())
                     .or_default()
                     .push(i64::from(t.hour()) * 60 + i64::from(t.minute()));
-                all_human_min.push(t.and_utc().timestamp() / 60);
+                // Wave28 P0：minute_bucket 是本地墙上钟（SQL datetime(ts, off) 的输出）。
+                // 旧实现 and_utc() 把本地钟当 UTC，而桥接分钟归位
+                // （local_hour_of_epoch_min 用 Local）又加回偏移，整批桥接分钟
+                // 偏移 ±8h——实测 9 个小时桶 human_min 假 0、1 个桶吞掉别桶
+                // 的桥接分钟。必须按本地时区换算 epoch。
+                if let Some(lt) = Local.from_local_datetime(&t).single() {
+                    all_human_min.push(lt.timestamp() / 60);
+                }
             }
             let e = minute_kind.entry(hour_bucket.clone()).or_insert((0, 0));
             e.0 += 1;
@@ -252,9 +270,9 @@ pub fn api_timeline_at(
     // 补零桶：固定返回窗口内全部本地小时，无数据小时 human/auto 全 0，
     // 前端可区分"没开机"与"开机没碰"。
     let mut buckets: Vec<Value> = Vec::new();
-    let mut cur = start.with_timezone(&Local);
-    let end_local = end.with_timezone(&Local);
-    while cur < end_local {
+    let mut cur = start_hour;
+    let end_local = end_hour;
+    while cur <= end_local {
         let hour = cur.format("%Y-%m-%dT%H").to_string();
         let apps = by_bucket.remove(&hour).unwrap_or_default();
         let list: Vec<Value> = top5_with_other(apps)

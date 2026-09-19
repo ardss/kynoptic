@@ -77,9 +77,15 @@ fn timeline_buckets_by_local_hour_with_top5_and_other() {
         .with_timezone(&Utc);
     let v = api_timeline_at(&conn, 12, now, 2).unwrap();
     let buckets = v["buckets"].as_array().unwrap();
-    // 补零桶：固定返回窗口内全部 12 个本地小时（无数据小时 human/auto 全 0）
+    // Wave28 语义：恒返回 12 个桶，终点=当前本地小时整点（T12，进行中），
+    // 起点=终点−11h（T01）。无数据小时 human/auto 全 0。
     assert_eq!(buckets.len(), 12, "12 小时窗口全量补零: {v}");
-    assert_eq!(buckets[0]["hour"], json!("2026-09-09T00"));
+    assert_eq!(buckets[0]["hour"], json!("2026-09-09T01"));
+    assert_eq!(
+        buckets[11]["hour"],
+        json!("2026-09-09T12"),
+        "最后一桶必须是当前（进行中的）本地小时"
+    );
     assert_eq!(buckets[0]["human_min"], json!(0));
     assert_eq!(buckets[0]["auto_min"], json!(0));
     assert_eq!(buckets[0]["apps"].as_array().unwrap().len(), 0);
