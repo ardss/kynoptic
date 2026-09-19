@@ -243,7 +243,12 @@ fn cmd_export(args: &[String]) -> Result<()> {
         i += 1;
     }
     let db_path = resolve_db();
-    let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
+    // 极限注入审查：--days 9223372036854775807 曾在 chrono TimeDelta::days
+    // panic（out of bounds）。钳到 20 万天（≈547 年，早于任何可能的数据，
+    // 也在 DateTime 表示范围内）= 等效全量导出；days<1 已在解析处拒绝。
+    let days = days.min(200_000);
+    let cutoff =
+        (Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000))).to_rfc3339();
     let conn = open_db(&db_path)?;
     // 流式导出（审查 P2：不再把全表载入内存）
     use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
@@ -613,7 +618,11 @@ fn cmd_db(args: &[String]) -> Result<()> {
                     "删除原始事件被拒绝: 天数必须 >= 30 且显式带 --yes".into(),
                 ));
             }
-            let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
+            // 极限注入审查：同 export——极大 days 曾 panic（TimeDelta::days
+            // out of bounds）。钳到 20 万天，cutoff 落到远古，语义不变（全删）。
+            let days = days.min(200_000);
+            let cutoff = (Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000)))
+                .to_rfc3339();
             let ns = queries::delete_closed_sessions_before(&conn, &cutoff)?;
             let n = if with_events {
                 queries::delete_events_before(&conn, &cutoff)?
@@ -1924,47 +1933,76 @@ fn classify_heartbeat(content: Option<&str>, now: chrono::DateTime<Utc>) -> Hear
     }
 }
 
-/// kill 托盘进程（心跳挂死时）。返回是否至少执行了一次 taskkill。
+/// 从心跳文本提取 `"pid":<u32>`（r25 混沌演练抽出为纯函数 + 单测）。
+/// 仅接受十进制数字；带引号/负数/超 u32 一律 None——这些宽松解析失败的
+/// 情况曾被用来回落按映像名全局击杀（实测误杀任意同名进程，见 kill_tray）。
+fn heartbeat_pid(txt: &str) -> Option<u32> {
+    txt.split("\"pid\":")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next()?.trim().parse::<u32>().ok())
+}
+
+/// 该 pid 当前运行的映像名是否确为 kynoptic-tray.exe（查 tasklist，
+/// 防止心跳文件被篡改后把任意 pid 当击杀目标——r25 实测：心跳里写什么
+/// pid 就杀什么进程）。
+#[cfg(target_os = "windows")]
+fn pid_is_tray(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains("kynoptic-tray.exe")
+        })
+        .unwrap_or(false)
+}
+
+/// kill 托盘进程（心跳挂死时）。返回是否确实执行了一次成功的 taskkill。
+///
+/// r25 混沌演练 P0 修复：旧实现 (1) 心跳缺 pid 时回落 `taskkill /IM
+/// kynoptic-tray.exe /T`——按映像名全局击杀，会误杀其他目录部署的托盘
+/// （多实例并存/沙箱实验场景实测致生产托盘被杀）；(2) 解析到 pid 后
+/// 不校验映像名直接杀——心跳文件被篡改即可击杀任意进程（实测杀掉无关
+/// 进程）；(3) 用 `.status().is_ok()` 判成败——taskkill 退出码非零
+/// （目标不存在/被拦截）也报成功，掩盖击杀失败。现改为：pid 必须存在、
+/// 映像名必须是 kynoptic-tray.exe、以 taskkill 真实退出码为准，任一不
+/// 满足都返回 false（watchdog 留痕"kill 失败"，下一轮重试）。
 #[cfg(target_os = "windows")]
 fn kill_tray() -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Wave22 P1：优先按心跳文件里的 PID 精确击杀——心跳与本 watchdog 同目录，
-    // 属于"我们管理的那个托盘"。按映像名全局杀会误伤其他目录部署的托盘
-    //（开发副本 vs 安装版并存时互杀）。无 PID 再退回映像名（兼容旧心跳）。
-    if let Ok(txt) = std::fs::read_to_string(
+    // 心跳与本 watchdog 同目录，属于"我们管理的那个托盘"
+    let Ok(txt) = std::fs::read_to_string(
         std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|d| d.to_path_buf()))
             .unwrap_or_default()
             .join("kynoptic-heartbeat"),
-    ) {
-        if let Some(pid) = txt
-            .split("\"pid\":")
-            .nth(1)
-            .and_then(|rest| rest.split([',', '}']).next()?.trim().parse::<u32>().ok())
-        {
-            let out = Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string(), "/T"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
-                .status();
-            if out.is_ok() {
-                return true;
-            }
-        }
+    ) else {
+        return false;
+    };
+    let Some(pid) = heartbeat_pid(&txt) else {
+        return false;
+    };
+    if !pid_is_tray(pid) {
+        return false;
     }
-    let out = Command::new("taskkill")
-        .args(["/F", "/IM", "kynoptic-tray.exe", "/T"])
+    Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string(), "/T"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    out.is_ok()
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn cmd_watchdog(args: &[String]) -> Result<()> {
@@ -3030,6 +3068,42 @@ mod tests {
     }
 
     // === collect 单实例互斥体（P1） ===
+
+    // r25 混沌演练：心跳 pid 提取的对抗输入（防篡改心跳→误杀任意进程）
+    #[cfg(windows)]
+    #[test]
+    fn heartbeat_pid_accepts_only_plain_numbers() {
+        let now = Utc::now();
+        let fresh = now.to_rfc3339();
+        assert_eq!(
+            heartbeat_pid(&format!(r#"{{"pid":123,"ts":"{fresh}"}}"#)),
+            Some(123)
+        );
+        // 带空格的数字（JSON 常见排版）仍可解析
+        assert_eq!(
+            heartbeat_pid(&format!(r#"{{"pid": 123, "ts":"{fresh}"}}"#)),
+            Some(123)
+        );
+        // 字符串 pid：拒绝（旧实现会因此回落映像名全局击杀）
+        assert_eq!(
+            heartbeat_pid(&format!(r#"{{"pid":"123","ts":"{fresh}"}}"#)),
+            None
+        );
+        // 负数 / 超 u32 / 缺字段：拒绝
+        assert_eq!(
+            heartbeat_pid(&format!(r#"{{"pid":-1,"ts":"{fresh}"}}"#)),
+            None
+        );
+        assert_eq!(
+            heartbeat_pid(&format!(r#"{{"pid":99999999999,"ts":"{fresh}"}}"#)),
+            None
+        );
+        assert_eq!(heartbeat_pid(&format!(r#"{{"ts":"{fresh}"}}"#)), None);
+        // 旧版纯时间戳文本（无 pid）：None
+        assert_eq!(heartbeat_pid(&fresh), None);
+        // 尾随 } 截断正常
+        assert_eq!(heartbeat_pid(r#"{"pid":42}"#), Some(42));
+    }
 
     #[cfg(windows)]
     #[test]

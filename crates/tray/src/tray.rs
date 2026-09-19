@@ -569,6 +569,25 @@ mod fault_injection_tests {
     }
 
     #[test]
+    fn zero_version_and_malformed_prefixes_are_no_update() {
+        // r25 混沌演练补充：三态机边界
+        // "0.0.0" 是合法三段数字但 <= 当前版本 → 无更新
+        assert_eq!(poisoned(b"0.0.0"), None);
+        // 当前版本自身（带 v 前缀）→ 相等不算新
+        assert_eq!(poisoned(b"v0.2.0"), None);
+        // v 与版本号之间混入空格：trim 后 trim_start_matches('v') 只剥 'v'
+        // 本身，剩下的 " 0.2.0" 首字符非数字 → 按内容怪处理（无更新）
+        assert_eq!(poisoned(b"v 0.2.0"), None);
+        // 前导空白会被 trim() 吃掉：仍能解析并正常比较
+        assert_eq!(poisoned(b"  v99.0.0\n").as_deref(), Some("99.0.0"));
+        // v 前缀重复：trim_start_matches 贪婪剥离，"vv0.2.0" → "0.2.0" = 当前
+        assert_eq!(poisoned(b"vv0.2.0"), None);
+        // 制表符/换行混排 = 内容怪
+        assert_eq!(poisoned(b"\t99.0.0\r\n").as_deref(), Some("99.0.0"));
+        assert_eq!(poisoned(b"9\t9.0.0"), None);
+    }
+
+    #[test]
     fn missing_file_and_missing_dir_are_no_update() {
         let dir = std::env::temp_dir().join(format!("kyn-r24-poison-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

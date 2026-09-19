@@ -86,6 +86,11 @@ fn parse_args() -> Args {
 /// 复制 db 三件套（db / -wal / -shm）到 %TEMP%/kynoptic-aggrepair-<tag>/，
 /// 返回副本 db 路径。服务在写也能复制：副本由 SQLite 打开时用 wal 恢复到
 /// 复制时刻的快照。
+///
+/// r25 混沌演练修复：-wal/-shm 与 db 不同，正被写的库上 -shm 经常持有
+/// 系统级锁（实测 os error 33），旧实现 panic 直接退出 101。shm 本就不
+/// 参与快照恢复（SQLite 打开副本时会重建），wal 复制失败也只是快照点
+/// 旧一点——两者都降级为警告，只有主库复制失败才 panic。
 fn copy_db(src: &Path, tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("kynoptic-aggrepair-{tag}"));
     let _ = fs::remove_dir_all(&dir);
@@ -97,7 +102,13 @@ fn copy_db(src: &Path, tag: &str) -> PathBuf {
         let s = PathBuf::from(format!("{src_str}{suffix}"));
         if s.exists() {
             let d = PathBuf::from(format!("{}{suffix}", dst.to_string_lossy()));
-            fs::copy(&s, &d).unwrap_or_else(|e| panic!("复制 {:?} 失败: {e}", s));
+            match fs::copy(&s, &d) {
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "警告: 复制 {:?} 失败（{e}），忽略——不影响副本库的 WAL 恢复",
+                    s
+                ),
+            }
         }
     }
     dst
