@@ -387,7 +387,8 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 fn sanitize_url_query(token: &str) -> String {
     let word_end = token.find(char::is_whitespace).unwrap_or(token.len());
     let (word, tail) = token.split_at(word_end);
-    if word.contains("http") {
+    // Wave24：大小写不敏感（HTTP:// 大写协议此前整段漏脱敏）
+    if word.to_lowercase().contains("http") {
         match word.find('?') {
             Some(i) => format!("{}{}", &word[..i], tail),
             None => token.to_string(),
@@ -573,9 +574,21 @@ fn cmd_db(args: &[String]) -> Result<()> {
             // abc 全部变成危险的全量删除）。
             let mut with_events = false;
             let mut days_arg: Option<i64> = None;
-            for a in &args[1..] {
+            // Wave24：兼容 `--days N` flag 写法（此前 positional-only，
+            // 写 --days 会把 flag 本身当天数报误导性错误）
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "--yes" => with_events = true,
+                    "--days" => {
+                        let v = it.next().ok_or_else(|| {
+                            Error::InvalidData("cleanup: --days 需要一个天数".into())
+                        })?;
+                        days_arg =
+                            Some(v.parse().map_err(|_| {
+                                Error::InvalidData(format!("cleanup: 无效天数 {v:?}"))
+                            })?);
+                    }
                     v => {
                         days_arg =
                             Some(v.parse().map_err(|_| {

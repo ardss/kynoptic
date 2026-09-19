@@ -154,8 +154,10 @@ pub fn api_timeline_at(
     bridge_min: u32,
 ) -> std::result::Result<Value, String> {
     // Wave23：内部与 HTTP 层 clamp 对齐（原 48 与 8760 两层打架，
-    // hours=100 被静默截成 48）；小时桶聚合对大窗口成本可控
-    let hours = hours.clamp(1, 8760);
+    // hours=100 被静默截成 48）。Wave24 放大实测：8760 桶在年量级库上
+    // 3-4s + 2.2MB 响应，而小时粒度年视图本无使用场景——收口 744（31 天），
+    // 更长跨度请用 /api/heatmap（daily_agg 预聚合，4ms）。
+    let hours = hours.clamp(1, 744);
     // 边界按 UTC 计算后直接用于 WHERE（timestamp 列为 UTC RFC3339）
     let end = now;
     let start = now - chrono::Duration::hours(i64::from(hours));
@@ -2060,7 +2062,7 @@ pub fn route_req(
             let hours = match qval("hours") {
                 None => 12,
                 Some(v) => match v.parse::<u32>() {
-                    Ok(h) => h.clamp(1, 8760),
+                    Ok(h) => h.clamp(1, 744),
                     Err(_) => {
                         return (
                             400,

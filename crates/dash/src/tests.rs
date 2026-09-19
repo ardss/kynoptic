@@ -104,16 +104,20 @@ fn timeline_hours_clamped_and_range_excludes_old_events() {
     let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 12, 0))
         .unwrap()
         .with_timezone(&Utc);
-    // 8760h 窗口外的事件不应出现；窗口内的要出现
+    // 744h（31 天）窗口外的事件不应出现；窗口内的要出现
     let old = (now - chrono::Duration::hours(9000)).to_rfc3339();
     insert(&conn, &old, "keyboard", "press", None);
     let near = (now - chrono::Duration::hours(100)).to_rfc3339();
     insert(&conn, &near, "keyboard", "press", None);
     let v = api_timeline_at(&conn, 9999, now, 2).unwrap();
-    assert_eq!(v["hours"], json!(8760), "Wave23：与 HTTP 层 clamp 对齐");
-    // 补零桶：固定返回窗口内全部本地小时（8760），全窗口对齐
+    assert_eq!(
+        v["hours"],
+        json!(744),
+        "Wave24：与 HTTP 层 clamp 对齐（744=31 天）"
+    );
+    // 补零桶：固定返回窗口内全部本地小时
     let buckets = v["buckets"].as_array().unwrap();
-    assert_eq!(buckets.len(), 8760, "补零后恒为 8760 桶");
+    assert_eq!(buckets.len(), 744, "补零后恒为 744 桶");
     // press 行经 apps 分布通道呈现（human_min 只认 input_agg 行）：
     // 恰有 1 个桶带应用事件（9000h 前的旧事件必须被排除）
     let hit = buckets
