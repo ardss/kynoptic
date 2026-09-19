@@ -129,7 +129,8 @@ fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     kynoptic_core::db::apply_pragmas(&conn)?;
     conn.execute_batch(kynoptic_core::db::SCHEMA)?;
-    let _ = kynoptic_core::db::run_migrations(&conn); // schema 建库路径已含迁移；此处仅兜底
+    // Wave22 P1：不再吞迁移错误——带病运行会让 stats 静默报旧 schema 的数
+    kynoptic_core::db::run_migrations(&conn)?;
     Ok(conn)
 }
 

@@ -88,6 +88,7 @@ fn current_version(conn: &Connection) -> i64 {
 /// 旧版吞错会让库带病运行——schema_version 卡住导致下次启动重跑迁移
 /// 再失败，或唯一索引缺失使 input_agg UPSERT 全链路静默归零）。
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    heal_half_applied_0002(conn)?;
     let mut applied = current_version(conn);
     for (idx, (name, sql)) in MIGRATIONS.iter().enumerate() {
         let version = (idx + 1) as i64;
@@ -112,6 +113,40 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         }
         log::info!("已应用迁移 {name} (v{version})");
         applied = version;
+    }
+    Ok(())
+}
+
+/// Wave22 P1：修复被 2026-09-09 之前的非事务版二进制"半应用"过 0002 的
+/// 库——legacy_pet_signals 已建（改名成功）而 schema_version 卡在 2 以下，
+/// 重跑 0002 的无条件 RENAME 会撞名硬失败且永远无法自愈。
+/// 处置：pet_signals 若为空表（同次迁移的 CREATE IF NOT EXISTS 壳）则删壳
+/// 让 RENAME 重放成功；若壳里有行则不动、报错指引用户（永不删数据）。
+fn heal_half_applied_0002(conn: &Connection) -> rusqlite::Result<()> {
+    let has: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'              AND name IN ('pet_signals','legacy_pet_signals')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n == 2)?;
+    if !has {
+        return Ok(());
+    }
+    let rows: i64 = conn.query_row(
+        "SELECT COALESCE((SELECT COUNT(*) FROM pet_signals), 0)",
+        [],
+        |r| r.get(0),
+    )?;
+    if rows == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS pet_signals;")?;
+        log::info!("0002 自愈：移除空壳 pet_signals（legacy 归档已在位）");
+    } else {
+        return Err(rusqlite::Error::InvalidColumnType(
+            0,
+            "pet_signals".into(),
+            rusqlite::types::Type::Null,
+        ));
     }
     Ok(())
 }
