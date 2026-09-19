@@ -53,6 +53,26 @@ pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
 /// 看门狗单次检查（纯逻辑，便于测试升级策略）：通道丢弃与写失败任一增量 >0
 /// 都打 log::warn（带数值与类型）；写失败连续 3 个周期出现则升级 log::error。
 /// 返回更新后的连续写失败周期数。
+/// Wave22 P1：写失败升级为 error 时同步留档到 data 目录（磁盘满场景下
+/// tray.log 同样写不进；恢复后第一份错误可留痕）。
+fn archive_write_failure(msg: &str) {
+    use std::io::Write;
+    let Some(dir) = crate::db::resolve_db_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+    else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("collector-error.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(f, "[{}] {}", chrono::Utc::now().to_rfc3339(), msg);
+}
+
 fn watchdog_tick(dropped: u64, write_failures: u64, consecutive_wf: &mut u64) -> u64 {
     if dropped > 0 {
         log::warn!("通道已满，过去 60 秒丢弃了 {} 个事件", dropped);
@@ -65,6 +85,7 @@ fn watchdog_tick(dropped: u64, write_failures: u64, consecutive_wf: &mut u64) ->
         );
         if *consecutive_wf >= 3 {
             log::error!("{}", msg);
+            archive_write_failure(&msg);
         } else {
             log::warn!("{}", msg);
         }

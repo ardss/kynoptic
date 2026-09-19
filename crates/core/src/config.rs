@@ -13,6 +13,9 @@ struct ConfigFile {
 }
 
 struct AppCategoryConfig {
+    /// Wave22：classify_app 删除后 entries 仅存档（旧配置文件兼容读取），
+    /// 不再有消费方
+    #[allow(dead_code)]
     entries: Vec<(Vec<String>, &'static str)>,
     diary: HashMap<String, String>,
 }
@@ -57,21 +60,8 @@ fn load() -> &'static AppCategoryConfig {
     })
 }
 
-/// 对应用名进行分类
-pub fn classify_app(app: &str) -> &'static str {
-    let lower = app.to_lowercase();
-    let lower = lower.trim_end_matches(".exe");
-    let cfg = load();
-    for (patterns, label) in &cfg.entries {
-        for p in patterns {
-            if lower.contains(p.as_str()) {
-                return label;
-            }
-        }
-    }
-    "other"
-}
-
+// Wave22：classify_app 已删除——零调用的第二套分类命名（与 settings
+// categories 引擎并存必被误接）。唯一权威分类是 CategoryRule::matches。
 /// 获取日记中应用对应的中文活动描述
 pub fn diary_activity(app: &str) -> Option<&str> {
     let lower = app.to_lowercase();
@@ -83,49 +73,6 @@ pub fn diary_activity(app: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classify_known_categories() {
-        assert_eq!(classify_app("steam.exe"), "game");
-        assert_eq!(classify_app("Code.exe"), "development");
-        assert_eq!(classify_app("chrome.exe"), "browser");
-        assert_eq!(classify_app("WeChat.exe"), "communication");
-        assert_eq!(classify_app("vlc.exe"), "media");
-        assert_eq!(classify_app("photoshop.exe"), "design");
-        assert_eq!(classify_app("WINWORD.EXE"), "writing");
-        // 注意：windowsterminal 同时出现在 development 和 terminal 列表，
-        // order 中 development 优先，故归为 development（开发者终端场景）。
-        // terminal 类别实际只覆盖 bash/wsl 等未与 development 重叠的项。
-        assert_eq!(classify_app("bash.exe"), "terminal");
-        assert_eq!(classify_app("wsl.exe"), "terminal");
-    }
-
-    #[test]
-    fn classify_unknown_is_other() {
-        assert_eq!(classify_app("randomapp.exe"), "other");
-        assert_eq!(classify_app(""), "other");
-    }
-
-    #[test]
-    fn classify_case_insensitive_and_strips_exe() {
-        // 大小写不敏感
-        assert_eq!(classify_app("STEAM"), "game");
-        assert_eq!(classify_app("Steam.exe"), "game");
-        assert_eq!(classify_app("steam"), "game");
-    }
-
-    #[test]
-    fn classify_precedence_game_over_terminal() {
-        // order 数组中 game 在 terminal 之前，故 javaw 应归为 game
-        // （javaw 出现在 game 列表，不在 terminal 列表，验证不误归类即可）
-        assert_eq!(classify_app("javaw.exe"), "game");
-    }
-
-    #[test]
-    fn classify_substring_match() {
-        // 分类基于 contains 子串匹配
-        assert_eq!(classify_app("my-custom-chrome-wrapper.exe"), "browser");
-    }
 
     #[test]
     fn diary_activity_known() {

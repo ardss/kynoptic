@@ -142,7 +142,10 @@ mod tests {
         log.write_record(Level::Warn, "test", "维护日志可见性验证");
         let content = std::fs::read_to_string(dir.join("tray.log")).unwrap();
         assert!(content.contains("WARN"), "级别必须在行内: {content}");
-        assert!(content.contains("维护日志可见性验证"), "消息必须落文件: {content}");
+        assert!(
+            content.contains("维护日志可见性验证"),
+            "消息必须落文件: {content}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

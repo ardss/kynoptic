@@ -1917,6 +1917,35 @@ fn kill_tray() -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Wave22 P1：优先按心跳文件里的 PID 精确击杀——心跳与本 watchdog 同目录，
+    // 属于"我们管理的那个托盘"。按映像名全局杀会误伤其他目录部署的托盘
+    //（开发副本 vs 安装版并存时互杀）。无 PID 再退回映像名（兼容旧心跳）。
+    if let Ok(txt) = std::fs::read_to_string(
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_default()
+            .join("kynoptic-heartbeat"),
+    ) {
+        if let Some(pid) = txt.split("\"pid\":").nth(1).and_then(|rest| {
+            rest.split(|c| c == ',' || c == '}')
+                .next()?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        }) {
+            let out = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string(), "/T"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+            if out.is_ok() {
+                return true;
+            }
+        }
+    }
     let out = Command::new("taskkill")
         .args(["/F", "/IM", "kynoptic-tray.exe", "/T"])
         .stdin(Stdio::null())

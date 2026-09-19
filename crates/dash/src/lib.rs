@@ -1457,8 +1457,8 @@ pub fn api_report_at(
     let day_start = chrono::DateTime::parse_from_rfc3339(&start).map_err(|e| e.to_string())?;
 
     // 1) dwell 分段（分钟坐标）
-    let mut segs: Vec<(String, usize, usize)> = Vec::new(); // (app, start_min, end_min)
-    for (i, (ts, app, _title)) in rows.iter().enumerate() {
+    let mut segs: Vec<(String, String, usize, usize)> = Vec::new(); // (app, title, start_min, end_min)
+    for (i, (ts, app, title)) in rows.iter().enumerate() {
         let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else {
             continue;
         };
@@ -1478,18 +1478,24 @@ pub fn api_report_at(
         }
         // 同应用连续段合并
         if let Some(last) = segs.last_mut() {
-            if last.0 == *app && start_min.saturating_sub(last.1) <= 1 {
-                last.2 = end_min;
+            if last.0 == *app && start_min.saturating_sub(last.3) <= 1 {
+                last.3 = end_min;
                 continue;
             }
         }
-        segs.push((app.clone(), start_min, end_min));
+        segs.push((
+            app.clone(),
+            title.clone().unwrap_or_default(),
+            start_min,
+            end_min,
+        ));
     }
 
-    // 2) 分类
-    let classify = |app: &str| -> String {
+    // 2) 分类（Wave22 P1：title 此前恒传空串——依赖标题 token 的规则如
+    // github/youtube 在 app_name 非空时永远够不着。现在双通道都喂给规则）
+    let classify = |app: &str, title: &str| -> String {
         for rule in &s.categories {
-            if rule.matches(app, "") {
+            if rule.matches(app, title) {
                 return rule.name.clone();
             }
         }
@@ -1497,15 +1503,15 @@ pub fn api_report_at(
     };
     let segments: Vec<Value> = segs
         .iter()
-        .map(|(app, a, b)| {
-            json!({"app": app, "category": classify(app), "start_min": a, "end_min": b})
+        .map(|(app, title, a, b)| {
+            json!({"app": app, "category": classify(app, title), "start_min": a, "end_min": b})
         })
         .collect();
 
     // 3) 类别占比（分钟）
     let mut cat_min: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for (app, a, b) in &segs {
-        *cat_min.entry(classify(app)).or_default() += (b - a) as i64;
+    for (app, title, a, b) in &segs {
+        *cat_min.entry(classify(app, title)).or_default() += (b - a) as i64;
     }
     let categories: Vec<Value> = cat_min
         .iter()

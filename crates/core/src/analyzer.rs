@@ -12,7 +12,10 @@ use crate::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 
-/// 一段"专注"区间：>= 5 分钟连续键盘/鼠标活动，且中途窗口切换次数 < 阈值
+/// 一段"输入专注"区间：>= 5 分钟连续键盘/鼠标活动，且中途窗口切换次数 < 阈值。
+/// Wave22 P0 口径标注：这是 **键鼠输入分钟** 口径（无桥接、切换上限），
+/// 与 dashboard /api/report 的"在场专注块"（human 分钟 + 桥接 + 无切换上限）
+/// 是**两个不同指标**，数值不可互换；消费方文案须写明"输入专注"。
 #[derive(Debug, Serialize, Clone)]
 pub struct FocusSegment {
     pub start: String,     // ISO8601
