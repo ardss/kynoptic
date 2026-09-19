@@ -41,9 +41,11 @@ pub const SIGNALS: &[&str] = &[
 ];
 
 /// 打开工具面用的数据库连接（只读语义：不建表不迁移——库由采集器/ctl 创建）。
+/// 用只读 PRAGMA 子集：apply_pragmas 的 journal_mode=WAL 是写操作，
+/// 只读连接上会失败（见 schema.rs 注）。
 pub fn open_reader(path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    kynoptic_core::db::apply_pragmas(&conn)?;
+    kynoptic_core::db::apply_pragmas_readonly(&conn)?;
     Ok(conn)
 }
 
@@ -70,7 +72,7 @@ pub fn current_status(conn: &Connection, groups: Option<&[String]>) -> Result<Va
         _ => vec!["system".into(), "activity".into()],
     };
 
-    let state = read_current_state(conn);
+    let state = read_current_state(conn)?;
     let mut out = serde_json::Map::new();
     for g in &group_list {
         match g.as_str() {
@@ -115,20 +117,27 @@ pub fn current_status(conn: &Connection, groups: Option<&[String]>) -> Result<Va
     Ok(Value::Object(out))
 }
 
-/// 读 current_state 表为 key→JSON map（表可能不存在/为空——容错返回空 map）。
-fn read_current_state(conn: &Connection) -> std::collections::HashMap<String, Value> {
+/// 读 current_state 表为 key→JSON map。
+/// 审查 P1：表不存在（v0.1 采集器未建/未写）属正常空态；但 prepare/query
+/// 的真实 SQL 错误不得吞成空 map（会伪装成"无状态数据"）——向上传播为工具错误。
+fn read_current_state(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Value>, String> {
     let mut map = std::collections::HashMap::new();
-    let Ok(mut stmt) = conn.prepare("SELECT key, value FROM current_state") else {
-        return map;
-    };
-    if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
-        for (k, v) in rows.flatten() {
-            // value 列存 TEXT，优先解析为 JSON 标量，失败则原样字符串
-            let val = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
-            map.insert(k, val);
-        }
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM current_state")
+        .map_err(|e| format!("Failed to read current_state: {e}（读取 current_state 失败）"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| format!("Failed to read current_state: {e}（读取 current_state 失败）"))?;
+    for row in rows {
+        let (k, v) = row
+            .map_err(|e| format!("Failed to read current_state: {e}（读取 current_state 失败）"))?;
+        // value 列存 TEXT，优先解析为 JSON 标量，失败则原样字符串
+        let val = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
+        map.insert(k, val);
     }
-    map
+    Ok(map)
 }
 
 fn state_cpu(conn: &Connection, state: &std::collections::HashMap<String, Value>) -> Option<f64> {
@@ -295,28 +304,33 @@ fn metric_in_range(conn: &Connection, metric: &str, start: &str, end: &str) -> R
         "keys" => queries::count_keys_in_range(conn, start, end) as f64,
         "clicks" => queries::count_clicks_in_range(conn, start, end) as f64,
         "active_minutes" => queries::active_minutes_today(conn, start, end) as f64,
-        "apps" => distinct_apps(conn, start, end) as f64,
-        "focus_segments" => focus_segments(conn, start, end) as f64,
+        "apps" => distinct_apps(conn, start, end)? as f64,
+        "focus_segments" => focus_segments(conn, start, end)? as f64,
         _ => return Err(format!("Unknown metric: {metric}（未知指标: {metric}）")),
     };
     Ok(v)
 }
 
-fn distinct_apps(conn: &Connection, start: &str, end: &str) -> i64 {
-    conn.query_row(
+/// 审查 P1：SQL 错误不得吞成 0（伪装成"无应用使用"）——prepare/查询错误
+/// 向上传播；仅 COUNT 空结果集（QueryReturnedNoRows）按 0 处理。
+fn distinct_apps(conn: &Connection, start: &str, end: &str) -> Result<i64, String> {
+    match conn.query_row(
         "SELECT COUNT(DISTINCT app_name) FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND app_name IS NOT NULL AND app_name <> ''",
         params![start, end],
         |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0)
+    ) {
+        Ok(n) => Ok(n),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(format!("Failed to count distinct apps: {e}（统计应用数失败）")),
+    }
 }
 
-fn focus_segments(conn: &Connection, start: &str, end: &str) -> usize {
+fn focus_segments(conn: &Connection, start: &str, end: &str) -> Result<usize, String> {
     // analyze_day 按日期字符串查询；这里区间可能非整天（昨日同期），
     // 用分钟活动现算 ≥5min 连续段数（与 analyzer 同阈值 5）。
     let mut segs = 0;
     let mut streak = 0i32;
-    for (_m, keys, clicks) in minute_activity(conn, start, end) {
+    for (_m, keys, clicks) in minute_activity(conn, start, end)? {
         if keys > 0 || clicks > 0 {
             streak += 1;
         } else {
@@ -329,16 +343,22 @@ fn focus_segments(conn: &Connection, start: &str, end: &str) -> usize {
     if streak >= 5 {
         segs += 1;
     }
-    segs
+    Ok(segs)
 }
 
 /// 任意 [start,end) 区间的逐分钟活动 (minute, keys, clicks)，分钟升序。
 /// 与 queries::minute_stats_by_date 同口径（UTC 存储 timestamp 截到分钟），
 /// 但接受显式边界（供昨日同期等非整天区间使用）。
-fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i64, i64)> {
+/// 审查 P1：prepare/query_map 失败不得静默返回空（伪装成"无活动"），向上传播。
+fn minute_activity(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+) -> Result<Vec<(String, i64, i64)>, String> {
     let mut out = Vec::new();
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT substr(timestamp, 1, 16) AS minute, \
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(timestamp, 1, 16) AS minute, \
                 SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 \
                          WHEN event_type='keyboard' AND event_action='input_agg' \
                            THEN COALESCE(json_extract(event_data, '$.keys'), 0) ELSE 0 END), \
@@ -349,21 +369,23 @@ fn minute_activity(conn: &Connection, start: &str, end: &str) -> Vec<(String, i6
            AND event_type IN ('keyboard','mouse') \
            AND event_action IN ('press','click','input_agg') \
          GROUP BY minute ORDER BY minute",
-    ) else {
-        return out;
-    };
-    if let Ok(rows) = stmt.query_map(params![start, end], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        )
+        .map_err(|e| format!("Failed to query minute activity: {e}（查询分钟活动失败）"))?;
+    let rows = stmt
+        .query_map(params![start, end], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query minute activity: {e}（查询分钟活动失败）"))?;
+    for row in rows {
+        out.push(
+            row.map_err(|e| format!("Failed to query minute activity: {e}（查询分钟活动失败）"))?,
+        );
     }
-    out
+    Ok(out)
 }
 
 // ─── C. get_timeline / get_top_apps ────────────────────────────────────────
@@ -721,7 +743,7 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
             let Some((s, e)) = queries::local_day_range(&date) else {
                 return Ok(false);
             };
-            let minutes: Vec<String> = minute_activity(conn, &s, &e)
+            let minutes: Vec<String> = minute_activity(conn, &s, &e)?
                 .into_iter()
                 .filter(|(_m, keys, clicks)| *keys > 0 || *clicks > 0)
                 .map(|(m, _, _)| m)

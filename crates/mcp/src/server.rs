@@ -112,11 +112,26 @@ impl McpServer {
             .map_err(|e| format!("Failed to open database: {e}（打开数据库失败: {e}）"))?;
         match name {
             "get_current_status" => {
-                let groups = args.get("groups").and_then(|g| g.as_array()).map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect::<Vec<_>>()
-                });
+                // 审查 P2：groups 含非字符串元素（如 [123]）此前被 filter_map
+                // 静默丢弃 → 意外回落默认分组；与 limit/days 同政策，报错。
+                let groups = match args.get("groups") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(a)) => {
+                        let mut list = Vec::with_capacity(a.len());
+                        for v in a {
+                            let s = v.as_str().ok_or_else(|| {
+                                format!("groups must be an array of strings, got {v}（groups 必须是字符串数组）")
+                            })?;
+                            list.push(s.to_string());
+                        }
+                        Some(list)
+                    }
+                    Some(v) => {
+                        return Err(format!(
+                            "groups must be an array of strings, got {v}（groups 必须是字符串数组）"
+                        ))
+                    }
+                };
                 state::current_status(&conn, groups.as_deref())
             }
             "get_summary" => {

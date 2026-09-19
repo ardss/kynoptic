@@ -71,6 +71,22 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// 只读连接的 PRAGMA 子集（MCP 工具面 open_reader 用）。
+///
+/// 审查 P1：`journal_mode=WAL` 是**写操作**，在 SQLITE_OPEN_READ_ONLY 连接上
+/// 对任何尚未处于 WAL 的库都会失败（attempt to write a readonly database），
+/// 导致该库上所有工具报 "Failed to open database"。此处只保留纯读安全的
+/// 调优项（cache_size/temp_store/mmap_size/busy_timeout），
+/// 跳过 journal_mode 与 synchronous（后者随 journal_mode 一起无意义）。
+pub fn apply_pragmas_readonly(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "PRAGMA cache_size=-8000;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA mmap_size=268435456;
+         PRAGMA busy_timeout=5000;",
+    )
+}
+
 /// 读取当前 schema 版本（metadata.schema_version，0 表示全新库）。
 fn current_version(conn: &Connection) -> i64 {
     conn.query_row(
