@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-19
+
+### Fixed
+
+- Timeline: bridged presence minutes were shifted by the timezone offset
+  (most hourly buckets showed 0 presence despite activity), and the
+  current in-progress hour was missing from the response.
+- Dashboard UX: terminology unified (presence/automation/unattended/
+  foreground time) in plain language; mixed hours no longer rendered as
+  unattended; stuck "loading..." placeholders replaced with proper empty
+  states; KPI values no longer truncated; date buttons follow the
+  selected day; design tokens unified (one orange/green/gray per
+  meaning, presence-blue exclusive); anomalies tab alert badge;
+  accessibility labels on views and charts.
+
 ## [0.2.1] - 2026-09-19
 
 ### Fixed
