@@ -42,6 +42,12 @@ impl Database {
     pub fn cleanup_old_sessions(&self) -> usize {
         self.with_writer(
             |conn| {
+                // Wave22 P0：retention=0（默认）= 永不删除——cleanup_old_events
+                // 有此守卫而这里漏了，导致每次维护把全部已结束 session 删光，
+                // 直接违反"永不删数据"铁律。
+                if self.retention_days <= 0 {
+                    return 0;
+                }
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(self.retention_days);
                 let cutoff_str = cutoff.to_rfc3339();
                 conn.execute(

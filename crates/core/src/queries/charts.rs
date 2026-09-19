@@ -506,7 +506,7 @@ pub fn top_app_window_in_range(
          FROM events \
          WHERE timestamp >= ?1 AND timestamp <= ?2 \
            AND event_type IN ('window', 'keyboard', 'mouse') \
-           AND app_name IS NOT NULL \
+           AND COALESCE(app_name, '') <> '' \
          GROUP BY app_name, window_title \
          ORDER BY COUNT(*) DESC \
          LIMIT 1",
