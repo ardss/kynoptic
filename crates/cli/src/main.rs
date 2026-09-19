@@ -731,6 +731,19 @@ fn cmd_ghost() -> Result<()> {
 }
 
 // === autostart ===
+/// Wave20 P0：CLI autostart 开关同步写 settings.json——否则托盘下次启动
+/// 按 settings 的 autostart 把注册表 Run 键写回去（CLI disable 被静默撤销）。
+fn sync_settings_autostart(enable: bool) {
+    let db = kynoptic_core::db::resolve_db_path();
+    let mut st = crate::settings::load(&db);
+    if st.autostart != enable {
+        st.autostart = enable;
+        if let Err(e) = crate::settings::save(&db, &st) {
+            eprintln!("⚠ settings.json 同步失败: {e}（托盘启动时可能回写注册表）");
+        }
+    }
+}
+
 fn cmd_autostart(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     // 始终指向 digital-pulse.exe（同目录或 src-tauri\target\debug）
@@ -738,11 +751,13 @@ fn cmd_autostart(args: &[String]) -> Result<()> {
     match sub {
         "enable" => {
             autostart::enable(&app_exe, &["--minimized"])?;
+            sync_settings_autostart(true);
             println!("✓ 开机自启动已启用 (注册表 Run)");
             println!("  → {} --minimized", app_exe.display());
         }
         "disable" => {
             autostart::disable()?;
+            sync_settings_autostart(false);
             println!("✓ 开机自启动已禁用");
         }
         "status" => {

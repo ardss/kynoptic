@@ -171,7 +171,18 @@ pub fn save(db_path: &Path, settings: &AppSettings) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    // Wave20 P1：tmp 名带 pid+纳秒——此前固定名在"托盘启动同步写"与
+    // "dash 线程 POST 写"并发时互相截断，rename 出半截 JSON → 全部配置
+    // 静默回退默认。
+    let uniq = format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = path.with_file_name(uniq);
     let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)

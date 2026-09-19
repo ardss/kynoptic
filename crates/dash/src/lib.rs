@@ -1820,6 +1820,11 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         if let Some(bad) = settings::first_invalid_id(&ids) {
             return Err(format!("未知监控器 id: {bad}"));
         }
+        if ids.is_empty() {
+            // Wave20 P1：空集 = 绿色"采集中"图标下的无声空采。要暂停请用
+            // 托盘菜单 Pause（状态可见）。
+            return Err("enabled_monitors 不能为空（暂停请用托盘菜单）".into());
+        }
         // fuzz 加固：去重保序（重复 id 不改变语义，不必落库冗余条目）
         let mut seen = std::collections::HashSet::new();
         ids.retain(|id| seen.insert(id.clone()));

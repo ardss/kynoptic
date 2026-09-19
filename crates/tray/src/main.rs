@@ -54,6 +54,7 @@ const HEARTBEAT_STALLED_SECS: i64 = 1800; // 30min：必须大于最慢的周期
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let port_from_args = argv.iter().any(|a| a == "--port");
     let mut parsed = match args::parse(&argv) {
         Ok(a) => a,
         Err(e) => {
@@ -61,6 +62,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Wave20 P1：settings.json 的 dashboard_port 此前是死字段——无 --port
+    // 时以设置值为首选端口（仍走既有候选回退；改动需重启托盘生效，设置
+    // 页已有提示文案）。
+    if !port_from_args {
+        let st = kynoptic_dash::settings::load(&parsed.db);
+        if st.dashboard_port != parsed.port {
+            parsed.port = st.dashboard_port;
+        }
+    }
 
     // 单实例互斥体:防双开,同时是 watchdog 的存活探针
     {
@@ -706,6 +717,18 @@ fn apply_autostart(enable: bool) {
         }
     } else {
         let _ = key.delete_value(VALUE_NAME);
+    }
+    // Wave20 P0：autostart 双写源统一——看门狗计划任务随开关一起
+    // ENABLE/DISABLE，否则设置页关了 autostart 后计划任务仍每分钟把
+    // 被杀的托盘复活（"关了还弹回来"）。
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let flag = if enable { "/ENABLE" } else { "/DISABLE" };
+        let _ = std::process::Command::new("schtasks")
+            .args(["/Change", "/TN", "Kynoptic Watchdog", flag])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
     }
 }
 
