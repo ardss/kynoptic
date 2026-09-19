@@ -2633,6 +2633,25 @@ mod tests {
     }
 
     #[test]
+    fn presence_metrics_counts_scroll_wheel_as_human() {
+        // Wave21 定案：滚轮滚动 = 人在主动阅读，计入人在场
+        let conn = setup_presence_db();
+        insert_event(
+            &conn,
+            "2026-09-13T10:00:30+08:00",
+            "mouse",
+            "input_agg",
+            r#"{"clicks":0,"scroll_ticks":42}"#,
+        );
+        let (start, end) = queries::local_day_range("2026-09-13").unwrap();
+        let _ = (start, end);
+        let day = queries::classify_minutes(&conn, "2026-09-13", 2);
+        assert_eq!(day.presence_minutes, 1, "纯滚轮分钟必须计入人在场");
+        assert_eq!(day.automation_minutes, 0);
+        assert_eq!(day.first_activity.as_deref(), Some("10:00"));
+    }
+
+    #[test]
     fn presence_metrics_empty_day_is_zero() {
         let conn = setup_presence_db();
         let (start, end) = queries::local_day_range("2026-09-13").unwrap();

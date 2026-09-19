@@ -641,7 +641,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "mixed_minutes": mixed_minutes,
         "presence_yesterday": yday.presence_minutes,
         "automation_yesterday": yday.automation_minutes,
-        "metrics_note": "口径：纯人分钟计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
+        "metrics_note": "口径：人分钟（键/点击/滚轮，剔注入）计入 presence；纯自动化计入 automation；混合分钟同时计入两者（mixed_minutes）。",
         "unattended_fg_minutes": unattended_fg_minutes,
         "unattended_fg_method": "保守近似：fg_dwell_min - (presence_minutes + automation_minutes - mixed_minutes)，负值截 0（暂无分钟级前台采样）",
         "has_full_day": has_full_day,

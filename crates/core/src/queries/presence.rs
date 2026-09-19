@@ -4,8 +4,11 @@
 //! - human（人在场）= 真实键鼠：`keys - injected_keys + clicks - injected_clicks > 0`；
 //! - auto（自动化）= 注入输入：`injected_keys + injected_clicks > 0`；
 //! - 混合分钟两者同时为真，**同时计入** presence 与 automation（mixed 单独返回）；
+//! - 人在场输入含滚轮滚动（Wave21 定案：滚轮=人在主动阅读，属"真实键鼠"）；
 //! - 相邻在场分钟间隙 <= bridge 分钟按"无输入阅读"桥接（读 settings 的
-//!   `presence_bridge_minutes`，0-15，默认 2）；
+//!   `presence_bridge_minutes`，0-15，默认 2）。桥接**可以**跨纯自动化分钟
+//!   延伸（Wave21 定案：人在机器前看 agent 干活时自己不敲键盘，仍属在场；
+//!   纯无人值守场景由 unattended 指标扣减表达）；
 //! - raw 模式（opt-in 逐键）press/click 无法区分注入，按人算。
 //!
 //! 消费方：crates/dash（overview / timeline）、crates/cli（presence 子命令）。
@@ -28,7 +31,7 @@ pub fn minute_classification(
     let mut stmt = conn
         .prepare(
             "SELECT substr(datetime(timestamp, ?1), 1, 16) AS minute_bucket, \
-                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0, \
+                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.scroll_ticks'),0)) > 0, \
                     MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0 \
              FROM events \
              WHERE timestamp >= ?2 AND timestamp < ?3 AND event_action = 'input_agg' \
@@ -109,7 +112,7 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
     // 时区后缀，两趟重复本地小时得到不同纪元分钟，不再互吞）。
     if let Ok(mut stmt) = conn.prepare(
         "SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute_epoch, \
-                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0, \
+                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.scroll_ticks'),0)) > 0, \
                 MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0)) > 0 \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 AND event_action = 'input_agg' \
@@ -141,7 +144,7 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
     // 两趟重复本地小时的 UTC 串本就不同，不会互吞），同样折算成纪元分钟。
     if let Ok(mut stmt) = conn.prepare(
         "SELECT DISTINCT substr(timestamp,1,16) FROM events \
-         WHERE event_action IN ('press','click') \
+         WHERE event_action IN ('press','click','scroll') \
            AND timestamp >= ?1 AND timestamp < ?2",
     ) {
         if let Ok(rows) = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0)) {
