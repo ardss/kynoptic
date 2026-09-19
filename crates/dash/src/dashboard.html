@@ -65,7 +65,7 @@
   .tab.active { color: var(--fg); background: var(--panel-2);
                 box-shadow: inset 0 -2px 0 var(--brand); }
   /* 卡片 */
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 18px; }
   .card {
     background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
     padding: 12px 16px; transition: border-color .15s;
@@ -75,7 +75,9 @@
                  letter-spacing: 0.12em; font-weight: 600; }
   .card .value { font-family: var(--font-data); font-size: 24px; font-weight: 600;
                  margin-top: 4px; letter-spacing: -0.01em;
-                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                 /* 允许换行而不是省略号截断：时长值 "4 小时 15 分" 被切在数字中间更糟 */
+                 overflow: visible; text-overflow: clip; white-space: normal;
+                 overflow-wrap: break-word; }
   .card .value.small { font-size: 15px; font-weight: 400; }
   /* 空状态字号：用 class 切换而不是 inline fontSize（离开空状态后可恢复） */
   .card .value.empty-note { font-size: 20px; }
@@ -126,6 +128,9 @@
   button.save[style*="#2A3442"], button.save[style*="background:#2A3442"] {
     background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); font-weight: 400; }
   button.save[style*="background:#2A3442"]:hover { border-color: var(--brand); color: var(--brand); }
+  /* 日期快捷按钮选中态：跟随所选日期（今天/昨天/前天） */
+  button.save.day-btn.active { border-color: var(--brand); color: var(--brand); font-weight: 600;
+                               box-shadow: inset 0 -2px 0 var(--brand); }
   :is(button, .tab, input, .lang-toggle):focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
   #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: var(--bad); }
   #settings-msg { transition: opacity .6s ease; }
@@ -146,6 +151,10 @@
         margin: 0 2px; vertical-align: -1px; }
   /* 时间线全零小时：斜纹空块 */
   .tl-idle { background: repeating-linear-gradient(45deg, #141a24 0 6px, #1a2230 6px 12px); }
+  /* "▸ 采集状态" 折叠头：确保按钮在所有层之上、整行可点（修复点击无响应） */
+  #ops-toggle { position: relative; z-index: 1; width: 100%; text-align: left;
+                pointer-events: auto; user-select: none; }
+  #ops-toggle .caret { display: inline-block; transition: transform .15s; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
   /* 窄屏：大数字降字号并允许换行，避免 "13 小时 …" 被省略号截断 */
   @media (max-width: 760px) {
@@ -174,20 +183,20 @@
 
 <div class="cards">
   <div class="card">
-    <div class="label"><span class="l en">human presence today</span><span class="l zh">今日人在场</span></div>
+    <div class="label"><span class="l en">presence today</span><span class="l zh">今日在场</span></div>
     <div class="value" style="font-size:34px;" id="c-presence">–</div>
     <div style="font-size:12px; color:var(--dim);">
-      <span class="l en">first</span><span class="l zh">首次在场</span> <span id="c-first">–</span>
-      · <span class="l en">last</span><span class="l zh">最近在场</span> <span id="c-last">–</span>
+      <span class="l en">first</span><span class="l zh">首次活跃</span> <span id="c-first">–</span>
+      · <span class="l en">last</span><span class="l zh">最近活跃</span> <span id="c-last">–</span>
       · <span id="c-presence-delta"></span>
       · <span id="c-presence-goal"></span>
     </div>
   </div>
   <div class="card">
-    <div class="label"><span class="l en">automation activity today</span><span class="l zh">今日自动化活动</span></div>
+    <div class="label"><span class="l en">automation today</span><span class="l zh">今日自动化</span></div>
     <div class="value" style="font-size:34px; color:var(--dim);" id="c-automation">–</div>
     <div style="font-size:12px; color:var(--dim);">
-      <span class="l en">injected input, excluded from presence</span><span class="l zh">注入输入，不计入人在场</span>
+      <span class="l en">minutes injected by automation tools; mixed minutes (human + automation) count for both</span><span class="l zh">自动化工具注入的分钟；与人同时在场的混合分钟双方都计</span>
       · <span id="c-automation-delta"></span>
     </div>
   </div>
@@ -196,14 +205,14 @@
     <div class="value" style="font-size:34px;" id="c-fgdwell">–</div>
     <div style="font-size:12px; color:var(--dim);">
       <span id="c-fgdwell-note"></span>
-      <span class="l en">top</span><span class="l zh">最长驻留</span>: <span id="c-fgtop">–</span>
+      <span class="l en">longest fg app</span><span class="l zh">最长前台应用</span>: <span id="c-fgtop">–</span>
     </div>
   </div>
   <div class="card" id="card-unattended" style="display:none">
-    <div class="label"><span class="l en">machine unattended today</span><span class="l zh">今日机器值班（无人）</span></div>
+    <div class="label"><span class="l en">unattended today (foreground window active, no human, no automation)</span><span class="l zh">今日无人（前台有窗口，人不在场也不自动化）</span></div>
     <div class="value" style="font-size:34px; color:var(--dim);" id="c-unattended">–</div>
     <div style="font-size:12px; color:var(--dim);">
-      <span class="l en">window dwell minus human and automation input</span><span class="l zh">前台驻留减去人在场与自动化</span>
+      <span class="l en">foreground app time − (presence ∪ automation); conservative approximation, negatives clamped to 0</span><span class="l zh">前台应用时长 −（在场 ∪ 自动化），保守近似，负值记 0</span>
     </div>
   </div>
 </div>
@@ -219,7 +228,7 @@
 
 <section>
   <div style="display:flex; align-items:baseline; justify-content:space-between;">
-    <h2 style="cursor:pointer"><button type="button" id="ops-toggle" aria-expanded="false" aria-controls="ops-body" onclick="toggleOps()" style="background:none;border:none;padding:0 0 0 10px;border-left:2px solid var(--brand);color:inherit;font:inherit;font-weight:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer;"><span class="l en">▸ collection status</span><span class="l zh">▸ 采集状态</span></button></h2>
+    <h2 style="cursor:pointer" onclick="toggleOps()"><button type="button" id="ops-toggle" aria-expanded="false" aria-controls="ops-body" onclick="toggleOps(event)" style="background:none;border:none;padding:0 0 0 10px;border-left:2px solid var(--brand);color:inherit;font:inherit;font-weight:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer;"><span class="l en"><span class="caret">▸</span> collection status</span><span class="l zh"><span class="caret">▸</span> 采集状态</span></button></h2>
   </div>
   <div id="ops-body" style="display:none">
     <div class="cards">
@@ -234,17 +243,17 @@
 
 <div id="view-report" style="display:none">
 <div class="cards">
-  <div class="card"><div class="label"><span class="l en">keyboard/mouse input vs goal</span><span class="l zh">键鼠输入分钟 / 目标</span></div><div class="value" id="r-goal">–</div></div>
+  <div class="card"><div class="label"><span class="l en">presence minutes / goal</span><span class="l zh">在场分钟 / 目标</span></div><div class="value" id="r-goal">–</div></div>
   <div class="card"><div class="label"><span class="l en">last 7 days vs prior 7</span><span class="l zh">近 7 天 vs 前 7 天（滚动窗口，非日历周）</span></div><div class="value small" id="r-week">–</div></div>
 </div>
 
 <section>
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
-    <input type="date" id="report-date" class="date-input" onchange="loadReport()" onclick="this.showPicker && this.showPicker()">
-    <button class="save" style="margin-left:8px" onclick="document.getElementById('report-date').value=todayStr(); loadReport()"><span class="l en">today</span><span class="l zh">今天</span></button>
-    <button class="save" style="margin-left:8px;background:#2A3442" onclick="dayOffset(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
-    <button class="save" style="margin-left:8px;background:#2A3442" onclick="dayOffset(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
+    <input type="date" id="report-date" class="date-input" onchange="syncDayBtns(); loadReport()" onclick="this.showPicker && this.showPicker()">
+    <button class="save day-btn" id="day-btn-0" style="margin-left:8px;background:#2A3442" onclick="pickDay(0)"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save day-btn" id="day-btn-1" style="margin-left:8px;background:#2A3442" onclick="pickDay(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
+    <button class="save day-btn" id="day-btn-2" style="margin-left:8px;background:#2A3442" onclick="pickDay(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
   <div id="report-timeline">loading…</div>
   <div id="report-legend" class="muted" style="margin-top:6px"></div>
@@ -417,12 +426,12 @@
 <section>
   <h2><span class="l en">settings — input privacy</span><span class="l zh">设置 — 输入隐私</span></h2>
   <div class="mon-row" style="display:flex;align-items:center;gap:8px">
-    <label for="set-bridge" style="white-space:nowrap"><span class="l en">presence reading-grace (minutes, 0-15):</span><span class="l zh">人在场无输入宽限分钟（0-15）：</span></label>
+    <label for="set-bridge" style="white-space:nowrap"><span class="l en">presence grace minutes (0-15):</span><span class="l zh">在场宽限分钟（0-15）：</span></label>
     <input type="number" id="set-bridge" min="0" max="15" style="width:64px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
-    <span class="muted" style="font-size:11px"><span class="l en">gaps of ≤N minutes without input still count as presence (reading)</span><span class="l zh">连续 N 分钟内无键鼠输入仍按"读屏"计入在场</span></span>
+    <span class="muted" style="font-size:11px"><span class="l en">still counts as presence after N consecutive minutes without keyboard/mouse input</span><span class="l zh">连续 N 分钟无键鼠输入仍计为在场</span></span>
   </div>
   <div class="mon-row" style="display:flex;align-items:center;gap:8px">
-    <label for="set-goal" style="white-space:nowrap"><span class="l en">daily goal (minutes):</span><span class="l zh">每日目标活跃分钟数：</span></label>
+    <label for="set-goal" style="white-space:nowrap"><span class="l en">daily presence goal (minutes):</span><span class="l zh">每日目标在场分钟数：</span></label>
     <input type="number" id="set-goal" min="0" max="1440" style="width:72px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
     <span class="muted" style="font-size:11px"><span class="l en">drives the goal ring on the overview card (default 480)</span><span class="l zh">控制总览卡的目标圆环（默认 480）</span></span>
   </div>
@@ -478,13 +487,13 @@ const T = {
         unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window).",
         restoredHint: "reset to defaults on screen — click save to apply.",
         beforeData: "no data before",
-        fgdwellNote: "estimated from window dwell; includes unattended time",
+        fgdwellNote: "estimated from window switches; includes unattended time",
         unattendedWarmup: "shown after a full day of data",
         noEventsYet: "(no events yet)", lastEvent: "last event:", readOnly: "read-only",
-        hourIdle: "no events",
+        hourIdle: "idle (no events)",
         focusOmitted: "blocks over 4h omitted — they may include away/idle periods (see timeline)",
         disconnected: "disconnected — retrying…",
-        weekInsufficient: "not enough data for last week — comparison skipped",
+        weekInsufficient: "not enough data for a 7-day comparison ({n} day(s) collected)",
         retry: "retry", loadFailed: "load failed: ",
         colApp: "app", colEvents: "events (window switches, not duration)",
         goalOff: "off (no goal set)", dbDirHint: "data: ",
@@ -497,13 +506,13 @@ const T = {
         unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
         restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
         beforeData: "该日期早于数据起点",
-        fgdwellNote: "按窗口驻留推算，含人不在场时段",
+        fgdwellNote: "按窗口切换推算，含人不在场时段",
         unattendedWarmup: "数据满一天后展示",
         noEventsYet: "（尚无事件）", lastEvent: "最近事件：", readOnly: "只读",
-        hourIdle: "无事件",
+        hourIdle: "空闲（无事件）",
         focusOmitted: "存在超长块，可能包含离开/挂机时段（详见时间线）",
         disconnected: "连接断开，正在重试…",
-        weekInsufficient: "上周数据不足，已跳过对比",
+        weekInsufficient: "数据不足 7 天（已积累 {n} 天）",
         retry: "重试", loadFailed: "加载失败：",
         colApp: "应用", colEvents: "按窗口切换事件数（非时长）",
         goalOff: "关闭（未设目标）", dbDirHint: "数据：",
@@ -530,9 +539,10 @@ function fmtUptime(sec) {
   if (sec === null || sec === undefined) return t("noSession");
   const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
         m = Math.floor(sec % 3600 / 60);
-  if (d > 0) return d + "d " + h + "h";
-  if (h > 0) return h + "h " + m + "m";
-  return m + "m";
+  const zh = document.documentElement.lang === "zh";
+  if (d > 0) return zh ? d + " 天 " + h + " 小时" : d + "d " + h + "h";
+  if (h > 0) return zh ? h + " 小时 " + m + " 分" : h + "h " + m + "m";
+  return zh ? m + " 分" : m + "m";
 }
 /* 统一时长口径：入参分钟，输出按当前语言格式化（Y=0 时省略分钟） */
 function fmtDuration(minutes) {
@@ -615,7 +625,10 @@ function dbStatusText(s) {
 function pct(v) { return v === null || v === undefined ? "–" : v.toFixed(0) + "%"; }
 function prettyApp(a) {
   const t = String(a).replace(/\.exe$/i, "");
-  return (document.documentElement.lang === "zh" && t === "(unknown)") ? "(未知)" : t;
+  const zh = document.documentElement.lang === "zh";
+  if (zh && t === "(unknown)") return "(未知)";
+  if (t === "(other)") return zh ? "（其他）" : t;
+  return t;
 }
 
 /* 30s 轮询防抖：payload 与上次完全一致时跳过 innerHTML 重渲染，
@@ -649,7 +662,7 @@ async function loadOverview() {
   document.getElementById("c-fgdwell-note").textContent = t("fgdwellNote") + ". ";
   document.getElementById("c-fgtop").textContent = o.fg_top || "–";
   // 后端正在加 unattended_fg_minutes：防御性判空，字段存在才显示第四卡。
-  // 第一小时误导防线（has_full_day=false）：数据不满一天时"机器值班"只是
+  // 第一小时误导防线（has_full_day=false）：数据不满一天时"无人"只是
   // "开机减活跃"，人在场不 typing 也被累加——显示空态文案而不是误导数字。
   // 字段缺失（旧后端）时 hasFullDay 默认 true，保持旧行为。
   const um = o.unattended_fg_minutes;
@@ -672,7 +685,7 @@ async function loadOverview() {
   const dayNote = document.getElementById("overview-day-note");
   if (dayNote) {
     dayNote.textContent = hasFullDay ? "" : (zh
-      ? "数据从安装时刻开始积累；全天汇总（含机器值班）在次日才完整。"
+      ? "数据从安装时刻开始积累；全天汇总（含无人）在次日才完整。"
       : "Data accrues from install time; full-day totals (incl. unattended) complete tomorrow.");
     dayNote.style.display = hasFullDay ? "none" : "";
   }
@@ -761,21 +774,32 @@ async function loadTimeline() {
   };
   /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
   const TL_COLORS = { human: "#5BA8FF", auto: "#E0A24A", away: "#1a2230" };
+  const MIXED_NOTE = zh ? " · 混合分钟（人+自动化）双方都计" : " · mixed minutes (human + automation) count for both";
   el.innerHTML = '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
     + '<span style="color:' + TL_COLORS.human + '">■</span> ' + L.human + '　'
     + '<span style="color:' + TL_COLORS.auto + '">■</span> ' + L.auto + '　'
     + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
+    + '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
+    + (zh
+      ? "口径：在场=人分钟（键/点击/滚轮，剔除自动化注入）；自动化=纯自动化分钟；混合分钟双方都计；无人=前台有窗口但人不在场。各行单位为分钟。"
+      : "Definition: presence = human minutes (keys/clicks/scroll, injected input excluded); automation = pure automation minutes; mixed minutes count for both; unattended = a foreground window with no human presence. Each row is in minutes.")
+    + '</div>'
     + tl.buckets.map(b => {
-    // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节
+    // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节。
+    // human 与 auto 在混合分钟上重叠：色带只能单层堆叠，混合部分画成在场，
+    // 自动化段只画未重叠的纯自动化分钟；无人按 max(human, auto) 扣，避免
+    // 整小时全是混合分钟时被误判成无人（auto 曾被钳到 60-human 导致）。
     const human = Math.min(60, b.human_min || 0);
-    const auto = Math.min(60 - human, b.auto_min || 0);
-    const away = Math.max(0, 60 - human - auto);
+    const rawAuto = Math.min(60, b.auto_min || 0);
+    const auto = Math.max(0, rawAuto - human);
+    const away = Math.max(0, 60 - Math.max(human, rawAuto));
+    const mixed = human > 0 && rawAuto > 0;
     const pct1 = (v) => (v / 60 * 100).toFixed(1);
     const evCount = (b.apps || []).reduce((a, x) => a + (x.events || 0), 0);
 
     const apps = b.apps.map(x => prettyApp(x.app) + " x" + x.events).join(", ");
-    // 全零小时：无任何事件，渲染为斜纹灰块，tooltip 说明"无事件"
-    if (evCount === 0 && human === 0 && auto === 0) {
+    // 全零小时：无任何事件，渲染为斜纹灰块，tooltip 说明"空闲（无事件）"
+    if (evCount === 0 && human === 0 && rawAuto === 0) {
       return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
         '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13).replace("T", " ")) + "</span>" +
         '<span style="flex:1;display:flex;height:16px;border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
@@ -787,9 +811,11 @@ async function loadTimeline() {
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
       '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13).replace("T", " ")) + "</span>" +
       '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
-        '<span style="width:' + pct1(human) + '%;background:' + TL_COLORS.human + '" title="' + L.human + " " + fmtDuration(human) + '"></span>' +
-        '<span style="width:' + pct1(auto) + '%;background:' + TL_COLORS.auto + '" title="' + L.auto + " " + fmtDuration(auto) + '"></span>' +
-        '<span style="width:' + pct1(away) + '%;background:' + TL_COLORS.away + '" title="' + L.away + " " + fmtDuration(away) + '"></span>' +
+        '<span style="width:' + pct1(human) + '%;background:' + TL_COLORS.human + '" title="' + L.human + " " + fmtDuration(human) + (mixed ? MIXED_NOTE : "") + '"></span>' +
+        '<span style="width:' + pct1(auto) + '%;background:' + TL_COLORS.auto + '" title="' + L.auto + " " + fmtDuration(rawAuto) + (mixed ? MIXED_NOTE : "") + '"></span>' +
+        (away > 0
+          ? '<span style="width:' + pct1(away) + '%;background:' + TL_COLORS.away + '" title="' + L.away + " " + fmtDuration(away) + '"></span>'
+          : "") +
       '</span>' +
       '<span style="width:34%;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(apps) + '">' + esc(apps) + '</span>' +
       "</div>";
@@ -837,13 +863,16 @@ async function loadHeatmap() {
   const W = 40 + cols * (cell + gap) + 8, H = 7 * (cell + gap) + 16;
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
   // Wave20 P1：列是"今天回溯"对齐的，首行星期 = 第一格的星期，按真实
-  // 日期推（原固定 Mon/Wed/Fri/Sun 在非周一开头的窗口里全列错位）
+  // 日期推（原固定 Mon/Wed/Fri/Sun 在非周一开头的窗口里全列错位）。
+  // 全部 7 行都标星期，中文用单字（日一二三四五六），英文用单字母。
   const firstDow = days.length ? new Date(days[0].date + "T00:00:00").getDay() : 1; // 0=Sun
-  const dowNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  [1, 3, 5, 0].forEach(offset => { // Mon/Wed/Fri/Sun 列
-    const r = (offset - firstDow + 7) % 7;
-    svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="#93A1B3" font-size="10" text-anchor="end">' + dowNames[offset] + "</text>";
-  });
+  const zhHm = document.documentElement.lang === "zh";
+  const dowNames = zhHm ? ["日", "一", "二", "三", "四", "五", "六"]
+                        : ["S", "M", "T", "W", "T", "F", "S"];
+  for (let r = 0; r < 7; r++) {
+    const dow = (firstDow + r) % 7;
+    svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="#93A1B3" font-size="10" text-anchor="end">' + dowNames[dow] + "</text>";
+  }
   days.forEach((d, i) => {
     const col = Math.floor(i / 7), row = i % 7;
     const x = 40 + col * (cell + gap), y = row * (cell + gap);
@@ -854,7 +883,15 @@ async function loadHeatmap() {
       (level === 0 ? "#232B38" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
   });
   svg += "</svg>";
-  el.innerHTML = svg;
+  // 近空热力图：非空格极少时提示"数据积累中"，与全 0 空态区分开
+  const nonEmpty = days.filter(d => d.value > 0).length;
+  let hint = "";
+  if (nonEmpty > 0 && nonEmpty <= Math.max(7, Math.ceil(days.length / 8))) {
+    hint = '<div class="muted" style="font-size:12px;margin-top:6px">' +
+      (zhHm ? "数据积累中，仅最近 " + nonEmpty + " 天有记录"
+            : "data still accruing — only the most recent " + nonEmpty + " day(s) have records") + "</div>";
+  }
+  el.innerHTML = svg + hint;
 }
 /* ─── Top Apps 横向条形榜 ─── */
 async function loadTopApps() {
@@ -955,8 +992,19 @@ function catLabel(name) {
 function fmtMin(m) { return fmtDuration(m); } /* 收敛到 fmtDuration */
 function dayOffset(n) {
   const d = new Date(Date.now() - n * 86400000);
-  document.getElementById("report-date").value =
-    d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+/* 日期快捷按钮选中态：跟随所选日期（今天/昨天/前天 + 日期输入框） */
+function syncDayBtns() {
+  const v = document.getElementById("report-date").value;
+  for (let i = 0; i < 3; i++) {
+    const b = document.getElementById("day-btn-" + i);
+    if (b) b.classList.toggle("active", v === dayOffset(i));
+  }
+}
+function pickDay(n) {
+  document.getElementById("report-date").value = dayOffset(n);
+  syncDayBtns();
   loadReport();
 }
 let REPORT_SEQ = 0;
@@ -1034,17 +1082,37 @@ async function loadReport() {
   if (seq !== REPORT_SEQ) return;
   const today = (tr.daily || []).slice(-1)[0];
   const goal = st.daily_goal_minutes || 0;
-  document.getElementById("r-goal").textContent = goal
-    ? fmtMin(today ? today.active_minutes : 0) + " / " + fmtMin(goal)
+  // 口径统一：目标卡用"在场分钟"（与总览环同一字段 presence_minutes），
+  // 仅当日（今天）能取到；历史日期退回 trends 的 raw active_minutes 并注明差异。
+  let presenceMin = null, rawNote = "";
+  if (!dateVal || dateVal === TODAY_STR) {
+    try {
+      const ov = await jget("/api/overview");
+      if (seq !== REPORT_SEQ) return;
+      if (typeof ov.presence_minutes === "number") {
+        presenceMin = ov.presence_minutes;
+        const raw = today ? (today.active_minutes || 0) : 0;
+        if (Math.abs(raw - presenceMin) >= 1) {
+          rawNote = " <span class='muted' style='font-size:12px'>(" +
+            (document.documentElement.lang === "zh"
+              ? "原始输入分钟 " + fmtMin(raw) : "raw input minutes " + fmtMin(raw)) + ")</span>";
+        }
+      }
+    } catch (e) { /* overview 失败时退回 raw，不打断整页渲染 */ }
+  }
+  if (presenceMin === null) presenceMin = today ? (today.active_minutes || 0) : 0;
+  document.getElementById("r-goal").innerHTML = goal
+    ? fmtMin(presenceMin) + " / " + fmtMin(goal) + rawNote
     : t("goalOff");
   const tw = tr.this_week || {}, lw = tr.last_week;
+  const daysAcc = (tr.daily || []).filter(x => (x.active_minutes || 0) > 0).length;
   // 口径说明小字（trends.note）：字段缺失时静默留空
   const tn = document.getElementById("trend-note");
   if (tn) tn.textContent = tr.note || "";
   document.getElementById("r-week").innerHTML = lw
     ? fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
       " (" + ((lw.active_minutes || 0) ? ((tw.active_minutes || 0) >= (lw.active_minutes || 0) ? "▲ +" : "▼ ") + Math.round(((tw.active_minutes || 0) - (lw.active_minutes || 0)) / (lw.active_minutes || 0) * 100) + "%" : "–") + ")</span>"
-    : "<span class='muted'>" + t("weekInsufficient") + "</span>";
+    : "<span class='muted'>" + t("weekInsufficient").replace("{n}", daysAcc) + "</span>";
   const tmax = Math.max(1, ...(tr.daily || []).map(x => x.active_minutes || 0));
   const el = document.getElementById("report-trend");
   if (!(tr.daily || []).length) { el.innerHTML = '<span class="muted">' + t("noData") + "</span>"; }
@@ -1124,7 +1192,7 @@ async function loadApps() {
   document.getElementById("apps-grid-chart").innerHTML = svg;
   document.getElementById("apps-legend").innerHTML = grid
     .map(g => '<span style="margin-right:14px"><span class="sw" style="background:' +
-      (colorOf[g.app] || "#888") + '"></span>' + esc(g.app) + "</span>").join("");
+      (colorOf[g.app] || "#888") + '"></span>' + esc(prettyApp(g.app)) + "</span>").join("");
   const dt = await jget("/api/daily_top?days=14");
   const rows = (dt.days_out || []).slice().reverse();
   const cmax = Math.max(1, ...rows.flatMap(r => (r.top || []).map(t => t.count)));
@@ -1134,7 +1202,7 @@ async function loadApps() {
         '<span class="app-track" style="flex:1"><span class="app-bar" style="width:' +
         (t.count / cmax * 100).toFixed(2) + "%;background:" + (t.app === "(other)" ? "#6B7683" : APP_COLORS[i]) + '"></span></span>' +
         '<span style="width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
-        esc(t.app) + '">' + esc(t.app) + ' <span class="muted">(' + t.count + ")</span></span>").join("") +
+        esc(t.app) + '">' + esc(prettyApp(t.app)) + ' <span class="muted">(' + t.count + ")</span></span>").join("") +
       "</div>").join("")
     : '<span class="muted">' + t("noData") + "</span>";
 }
@@ -1158,6 +1226,20 @@ function vendorName(vid) {
 }
 function renderMouse(d) {
   const svg = document.getElementById("mouse-svg");
+  // 空态：7 天内无任何点击/滚轮/移动时隐藏黑盒渲染，明示"暂无数据"而不是画一个全黑鼠标
+  const wrap = svg.parentElement;
+  let emptyHint = document.getElementById("mouse-empty-hint");
+  if (!emptyHint) {
+    emptyHint = document.createElement("div");
+    emptyHint.id = "mouse-empty-hint";
+    emptyHint.className = "muted";
+    emptyHint.style.display = "none";
+    wrap.parentElement.insertBefore(emptyHint, wrap);
+  }
+  const noInput = !(d.clicks_total || 0) && !(d.scroll_ticks || 0) && !(d.moves || 0);
+  emptyHint.style.display = noInput ? "" : "none";
+  wrap.style.display = noInput ? "none" : "";
+  if (noInput) { svg.innerHTML = ""; return; }
   // 真实硬件拓扑：任一鼠标报告按键数 >= 5 才画侧键（物理建模，不画不存在的键）
   const mice = (d.input_devices || []).filter(x => x.kind === "mouse");
   const maxButtons = Math.max(0, ...mice.map(m => m.buttons || 0));
@@ -1370,10 +1452,14 @@ async function loadHost() {
   const o = await jget("/api/overview");
   const h = o.host || {};
   document.getElementById("h-model").textContent = h.model || "–";
-  document.getElementById("h-cpu").textContent = h.cpu || "–";
+  const cpuEl = document.getElementById("h-cpu");
+  cpuEl.textContent = h.cpu || "–";
+  cpuEl.title = h.cpu || ""; // 长型号截断时悬浮看全名
   let gpuTxt = (h.gpus || []).join(" + ") || "–";
   if (h.gpu_usage_pct != null && gpuTxt !== "–") gpuTxt += " (" + h.gpu_usage_pct + "%)";
-  document.getElementById("h-gpu").textContent = gpuTxt;
+  const gpuEl = document.getElementById("h-gpu");
+  gpuEl.textContent = gpuTxt;
+  gpuEl.title = (h.gpus || []).join("\n"); // 多卡/长名截断时悬浮看全名
   const mt = h.mem_total_gb, mu = h.mem_used_gb;
   document.getElementById("h-mem").textContent =
     (mu != null && mt) ? mu.toFixed(1) + " / " + mt + " GB (" + pct(o.mem_pct) + ")" : (mt ? mt + " GB" : "–");
@@ -1382,9 +1468,15 @@ async function loadHost() {
   document.getElementById("h-disk").textContent = c
     ? (c.drive || "") + " " + (c.free_gb != null ? c.free_gb + " / " : "") + (c.total_gb != null ? c.total_gb + " GB" : "")
     : "–";
-  document.getElementById("h-disks").textContent = disks
-    .map(x => (x.drive || "?") + " " + (x.free_gb != null ? x.free_gb + "/" + x.total_gb + "G" : x.total_gb + "G"))
-    .join("   ") || "–";
+  // 多磁盘逐盘 chip 化："C 170/476G F 145/931G" 一行挤在一起难读
+  document.getElementById("h-disks").innerHTML = disks.length
+    ? disks.map(x => {
+        const label = (x.drive || "?") + " " +
+          (x.free_gb != null ? x.free_gb + "/" + x.total_gb + "G" : x.total_gb + "G");
+        return '<span style="display:inline-block;border:1px solid var(--border);border-radius:999px;' +
+          'padding:2px 10px;margin:2px 8px 2px 0;font-size:12.5px;white-space:nowrap">' + esc(label) + "</span>";
+      }).join("")
+    : "–";
 }
 let SETTINGS_LOADED = false;
 async function loadSettings() {
@@ -1517,12 +1609,17 @@ function clearViewError(name) {
   const el = document.getElementById("view-error-" + name);
   if (el) el.remove();
 }
-/* 采集状态折叠：键盘可达（button + aria-expanded） */
-function toggleOps() {
+/* 采集状态折叠：键盘可达（button + aria-expanded）。
+   h2 整行可点 + 按钮 onclick 阻止冒泡，避免双层触发互相抵消。 */
+function toggleOps(ev) {
+  if (ev && ev.stopPropagation) ev.stopPropagation();
   const b = document.getElementById("ops-body");
   const willShow = b.style.display === "none";
   b.style.display = willShow ? "" : "none";
   document.getElementById("ops-toggle").setAttribute("aria-expanded", willShow ? "true" : "false");
+  document.querySelectorAll("#ops-toggle .caret").forEach(c => {
+    c.style.transform = willShow ? "rotate(90deg)" : "";
+  });
 }
 function showView(name) {
   currentView = name;
@@ -1567,6 +1664,7 @@ for (const id of ["report-date", "apps-date"]) {
   const el = document.getElementById(id);
   if (el && !el.value) el.value = TODAY_STR;
 }
+syncDayBtns(); // 初始高亮"今天"，与所选日期一致
 refreshAll().catch(e => showViewError(currentView, e.message));
 // 30s 轮询：document.hidden 或当前视图非 overview 时跳过重渲染（只更新状态行），
 // 避免全量重渲染摧毁悬停状态、并在后台标签页浪费请求。
