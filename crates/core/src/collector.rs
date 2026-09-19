@@ -180,31 +180,23 @@ fn create_monitors_for(
     crate::registry::create_monitors_for(enabled)
 }
 
-fn write_batch(db: &Database, batch: &[Event], total_written: &AtomicUsize) {
+fn write_batch(db: &Database, batch: &mut [Event], total_written: &AtomicUsize) {
     // 审查 P0：Event::new 硬编码 session_id=None 且全链路无人回填，导致
     // events.session_id 全库为 NULL、sessions.total_events/ghost 清扫失效。
     // 落库前用 db 登记的当前会话 id 补盖（None 才盖，尊重显式赋值）。
+    // 审查 P2：改为就地补盖（按 &mut 拿 batch），不再 clone 整个 Vec。
     let sid = db.current_session_id();
-    let batch: Vec<Event> = if sid != 0 {
-        batch
-            .iter()
-            .map(|e| {
-                if e.session_id.is_none() {
-                    let mut e = e.clone();
-                    e.session_id = Some(sid);
-                    e
-                } else {
-                    e.clone()
-                }
-            })
-            .collect()
-    } else {
-        batch.to_vec()
-    };
+    if sid != 0 {
+        for e in batch.iter_mut() {
+            if e.session_id.is_none() {
+                e.session_id = Some(sid);
+            }
+        }
+    }
     // 聚合增量维护与 events 落库在同一事务内完成（审查 P1：两个独立事务之间
     // kill 会留下"events 有 agg 无"的欠聚合且永不自愈）；rowids 与 batch 一一
     // 对应（失败行为 0），事务化后由 insert 层内部直接用于 agg 维护。
-    let _rowids = db.insert_events_with_agg(&batch);
+    let _rowids = db.insert_events_with_agg(batch);
     total_written.fetch_add(batch.len(), Ordering::Relaxed);
     // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
     LAST_FLUSH_EPOCH.store(
@@ -255,7 +247,7 @@ fn writer_loop(
                 // 残余 batch 先落库（panic 可能发生在 flush 之前的任意点）
                 if !batch.is_empty() {
                     log::warn!("Writer panic 后 flush 残余 batch {} 条", batch.len());
-                    write_batch(&db, &batch, &total_written);
+                    write_batch(&db, &mut batch, &total_written);
                     batch.clear();
                 }
                 log::error!("Writer 线程 panic: {:?}，1 秒后重启", e);
@@ -432,6 +424,10 @@ pub struct Collector {
     /// writer 关停兜底旗标：聚合线程 join 后置位，writer 排空尾批退出
     /// （监控线程卡死时不再挂死 shutdown）。
     writer_stop: Arc<AtomicBool>,
+    /// 通道接收端尾柄（审查 P2）：writer 排空退出后，迟到的生产者（关停
+    /// 竞态下尚未退出的 hook/monitor 最后一次 collect）仍可能把事件送入
+    /// 通道而无人消费。shutdown join writer 后用它做最后一次排空落库。
+    rx_tail: Option<crossbeam_channel::Receiver<Event>>,
 }
 
 impl Collector {
@@ -469,10 +465,25 @@ impl Collector {
         // 终值直写兜底（与 Drop 同款，审查 P1）：聚合线程的关停终值 flush 走
         // 通道，若通道已满（writer 停滞场景）会被 try_send 丢弃且无人补偿。
         // writer 退出后直写最后一份 partial，保证"最后一分钟不丢"语义成立。
+        // 先排空通道残留（见下），partial 终值必须后落库才能覆盖旧快照。
+        // 审查 P2：writer 已排空退出，但迟到的生产者（关停竞态下 hook/monitor
+        // 尚未退出的最后一次 collect/send）可能仍在通道里留下事件——此后无人
+        // 消费即永久丢失。join 之后用保留的接收端尾柄做最后一次排空落库；
+        // 写失败已由 insert 层计入 WRITE_FAILURES（DropWatchdog 告警）。
+        if let Some(rx) = self.rx_tail.take() {
+            let mut tail: Vec<Event> = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                tail.push(ev);
+            }
+            if !tail.is_empty() {
+                log::info!("writer 退出后排空通道残留 {} 条", tail.len());
+                write_batch(&self.db, &mut tail, &self.total_written);
+            }
+        }
         if self.settings.input_granularity == InputGranularity::Minute {
-            let events = input_agg::flush_partial(chrono::Local::now());
+            let mut events = input_agg::flush_partial(chrono::Local::now());
             if !events.is_empty() {
-                write_batch(&self.db, &events, &self.total_written);
+                write_batch(&self.db, &mut events, &self.total_written);
             }
         }
 
@@ -507,10 +518,21 @@ impl Drop for Collector {
                 // 再 join writer：通道里残留的秒级小快照全部落库后，
                 // 直写部分分钟终值必然后发生，不会被旧快照覆盖
                 let _ = handle.join();
+                // Drop 路径同样排空 writer 退出后迟到的通道残留（审查 P2）
+                if let Some(rx) = self.rx_tail.take() {
+                    let mut tail: Vec<Event> = Vec::new();
+                    while let Ok(ev) = rx.try_recv() {
+                        tail.push(ev);
+                    }
+                    if !tail.is_empty() {
+                        log::info!("writer 退出后排空通道残留 {} 条", tail.len());
+                        write_batch(&self.db, &mut tail, &self.total_written);
+                    }
+                }
                 if self.settings.input_granularity == InputGranularity::Minute {
-                    let events = input_agg::flush_partial(chrono::Local::now());
+                    let mut events = input_agg::flush_partial(chrono::Local::now());
                     if !events.is_empty() {
-                        write_batch(&self.db, &events, &self.total_written);
+                        write_batch(&self.db, &mut events, &self.total_written);
                     }
                 }
             }
@@ -594,6 +616,9 @@ pub fn start_collection_custom(
     log::info!("Session {} 已创建", session_id);
 
     let (tx, rx) = bounded::<Event>(constants::CHANNEL_CAPACITY);
+    // 接收端尾柄：writer 线程拿走 rx，shutdown 在 join writer 之后用这份
+    // clone 排空迟到的生产者残留（审查 P2，见 Collector.rx_tail 文档）。
+    let rx_tail = rx.clone();
     let total_written = Arc::new(AtomicUsize::new(0));
     // writer 关停兜底旗标：shutdown 在聚合线程 join 之后置位（终值 flush 已
     // 入队），writer 排空尾批退出——不再依赖"全部生产者断开通道"这一可能
@@ -624,6 +649,8 @@ pub fn start_collection_custom(
                 settings,
                 shutdown: shutdown.clone(),
                 writer_stop: writer_stop.clone(),
+                // spawn 失败路径没有 writer 线程消费 rx，交给 shutdown 的排空兜底
+                rx_tail: Some(rx_tail.clone()),
             }
             .shutdown();
         }};
@@ -817,6 +844,7 @@ pub fn start_collection_custom(
         settings,
         shutdown,
         writer_stop,
+        rx_tail: Some(rx_tail),
     }
 }
 

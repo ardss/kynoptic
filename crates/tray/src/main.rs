@@ -285,8 +285,12 @@ fn main() {
                 let running = COLLECTOR_RUNNING.load(std::sync::atomic::Ordering::Relaxed);
                 // flush==0 = 本进程尚未落过库(启动初期正常),不误报;真正
                 // 挂死场景是 flush 曾前进后停滞,由 1800s 阈值覆盖。
-                let stalled =
-                    running && flush > 0 && now.timestamp() - flush as i64 > HEARTBEAT_STALLED_SECS;
+                // 审查 P1:gap 按墙钟计算,系统休眠唤醒后第一拍 gap 巨大但采集
+                // 并未挂死,误报 stalled 会被 watchdog kill/重启托盘。gap 超过
+                // 4 小时(14400s)视为"机器睡过,不是停滞"——不报 stalled,
+                // 等下一拍(30s 后)flush 正常前进即自然恢复。
+                let gap = now.timestamp() - flush as i64;
+                let stalled = running && flush > 0 && gap > HEARTBEAT_STALLED_SECS && gap < 14400;
                 let content = format!(
                     "{{\"pid\":{},\"ts\":\"{}\",\"flush\":{},\"stalled\":{}}}",
                     std::process::id(),

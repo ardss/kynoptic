@@ -26,7 +26,7 @@ pub mod schema;
 pub mod sessions;
 
 // 子模块方法以 `impl Database` 形式分散定义，统一从根重新导出
-pub use schema::{apply_pragmas, run_migrations, SCHEMA};
+pub use schema::{apply_pragmas, apply_pragmas_readonly, run_migrations, SCHEMA};
 
 /// rusqlite 结果别名
 pub type SqlResult<T> = rusqlite::Result<T>;
@@ -155,11 +155,13 @@ impl ReaderPool {
     }
 
     fn return_conn(&self, conn: Connection) {
-        if let Ok(mut guard) = self.conns.lock() {
-            guard.push(conn);
-            drop(guard);
-            self.cvar.notify_one();
-        }
+        // 审查 P2：mutex 中毒（持有方 panic 过）时不能静默丢弃连接（池悄悄
+        // 缩小）。与 try_acquire 的 Condvar 等待路径一致，取中毒后的内部数据
+        // 继续归还。
+        let mut guard = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        guard.push(conn);
+        drop(guard);
+        self.cvar.notify_one();
     }
 }
 
@@ -381,9 +383,30 @@ impl Database {
                             "临时读连接创建失败，回退内存库（累计降级 {} 次）: {e}",
                             self.reader_degraded.load(Ordering::Relaxed)
                         );
-                        let conn = Connection::open_in_memory().unwrap_or_else(|e| {
-                            panic!("内存库也无法创建，数据库层彻底不可用: {e}")
-                        });
+                        // 审查 P2：旧实现 open_in_memory 失败即 panic。内存库
+                        // 只在进程级资源耗尽（OOM/句柄耗尽）时失败，panic 会把
+                        // 整个应用（含托盘与采集）拖垮，比"读暂时不可用"严重
+                        // 得多。改为带退避的有限重试，仍失败则最后尝试读写打开
+                        // 目标库文件（只读打开失败的常见原因是文件被删，读写
+                        // 打开可重建）；全部失败时阻塞重试而非 panic——查询
+                        // 侧暂时卡住可在资源恢复后自愈，进程崩溃不可逆。
+                        let conn = loop {
+                            match Connection::open_in_memory() {
+                                Ok(c) => break c,
+                                Err(e) => {
+                                    self.reader_degraded.fetch_add(1, Ordering::Relaxed);
+                                    log::error!(
+                                        "内存库创建失败（累计降级 {} 次），500ms 后重试: {e}",
+                                        self.reader_degraded.load(Ordering::Relaxed)
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
+                                    if let Ok(c) = Connection::open(&self.db_path) {
+                                        log::warn!("已兜底为读写打开目标库文件");
+                                        break c;
+                                    }
+                                }
+                            }
+                        };
                         PooledConn {
                             conn: Some(conn),
                             pool: None,

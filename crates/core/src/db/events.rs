@@ -36,6 +36,11 @@ fn note_write_failure(n: u64) {
     crate::collector::WRITE_FAILURES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// 降级逐条后判断"整批全败"（rowid 全 0 即无一成功落库），供整批兜底重试。
+fn all_failed(rowids: &[i64], expected: usize) -> bool {
+    rowids.len() == expected && rowids.iter().all(|&r| r == 0)
+}
+
 /// 单条事件落库（input_agg 行走 UPSERT，其余 INSERT）。返回该行的 events
 /// rowid（input_agg 聚合行无稳定新 rowid，返回 0，与旧 insert_events 语义一致）。
 fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
@@ -100,10 +105,45 @@ impl Database {
 
         match self.insert_events_with_agg_tx(events) {
             Ok(rowids) => rowids,
-            Err(e) => {
-                note_write_failure(1);
-                log::error!("批量插入（含聚合维护）失败，降级为逐条: {e}");
-                self.insert_events_with_agg_one_by_one(events)
+            Err(first) => {
+                // 审查 P1：外部写者（backfill/agg-heal 分块）可能持有写锁超过
+                // writer 的 busy_timeout，整批事务 SQLITE_BUSY 失败并不代表数据
+                // 有问题；这批事件已从通道 pop 出，降级逐条若同样全撞 busy 就
+                // 是永久丢失（丢已 pop 的事件即数据丢失，非可丢弃错误）。先睡
+                // 500ms 让外部写者的当前块写完，整批重试一次，仍失败才降级逐条。
+                log::warn!("批量插入（含聚合维护）失败，500ms 后整批重试一次: {first}");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                match self.insert_events_with_agg_tx(events) {
+                    Ok(rowids) => rowids,
+                    Err(e) => {
+                        note_write_failure(1);
+                        log::error!("批量插入（含聚合维护）重试仍失败，降级为逐条: {e}");
+                        let rowids = self.insert_events_with_agg_one_by_one(events);
+                        // 审查 P1：逐条也全败（busy 风暴未退，整批已 pop 出通道）
+                        // → 最后再整批兜底重试一次，避免整块事件永久丢失。
+                        // （纯 input_agg 批成功时 rowid 也全为 0，会多一次幂等
+                        // UPSERT 重试，无害。）
+                        if all_failed(&rowids, events.len()) {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            match self.insert_events_with_agg_tx(events) {
+                                Ok(rowids2) => {
+                                    log::info!(
+                                        "逐条降级全败后整批兜底重试成功（{} 条）",
+                                        events.len()
+                                    );
+                                    return rowids2;
+                                }
+                                Err(e2) => {
+                                    log::error!(
+                                        "整批兜底重试仍失败，{} 条事件丢失: {e2}",
+                                        events.len()
+                                    );
+                                }
+                            }
+                        }
+                        rowids
+                    }
+                }
             }
         }
     }
@@ -203,11 +243,35 @@ impl Database {
             |conn| {
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(self.retention_days);
                 let cutoff_str = cutoff.to_rfc3339();
-                match conn.execute("DELETE FROM events WHERE timestamp < ?1", [&cutoff_str]) {
+                // agg 三表的 date 一律为**本地时区**日历日 "YYYY-MM-DD"（db/agg.rs
+                // apply_event 用 Local.format("%Y-%m-%d")，update_agg 用
+                // substr(datetime(timestamp, off),1,10)），故清理边界同样取 cutoff
+                // 时刻对应的本地日历日。
+                let cutoff_date = cutoff
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                // 原始与聚合必须同事务一并清理：热力图/趋势只读 daily_agg，
+                // 若只删 events 留下过期聚合行，聚合视图会展示已被清理的日期，
+                // 且与基于 raw 的视图对不上。
+                let deleted = (|| -> rusqlite::Result<usize> {
+                    conn.execute_batch("BEGIN IMMEDIATE")?;
+                    let deleted = conn.execute("DELETE FROM events WHERE timestamp < ?1", [&cutoff_str]);
+                    let daily = conn.execute("DELETE FROM daily_agg WHERE date < ?1", [&cutoff_date]);
+                    let minute = conn.execute("DELETE FROM agg_minute WHERE date < ?1", [&cutoff_date]);
+                    let app = conn.execute(
+                        "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
+                        [&cutoff_date],
+                    );
+                    let deleted = (deleted?, daily?, minute?, app?);
+                    conn.execute_batch("COMMIT")?;
+                    Ok(deleted.0)
+                })();
+                match deleted {
                     Ok(deleted) => {
                         if deleted > 0 {
                             log::info!(
-                                "清理了 {} 条超过 {} 天的旧事件",
+                                "清理了 {} 条超过 {} 天的旧事件（daily_agg/agg_minute/agg_daily 同步清理）",
                                 deleted,
                                 self.retention_days
                             );
@@ -215,6 +279,8 @@ impl Database {
                         deleted
                     }
                     Err(e) => {
+                        // 回滚部分删除，避免原始/聚合清理到一半的不一致状态
+                        let _ = conn.execute_batch("ROLLBACK");
                         log::error!("清理旧事件失败: {e}");
                         0
                     }
