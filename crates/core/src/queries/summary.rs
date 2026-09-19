@@ -351,10 +351,19 @@ pub fn keys_clicks_today(conn: &Connection, today: &str, tomorrow: &str) -> (i64
 }
 
 pub fn count_active_min_since(conn: &Connection, since_id: i64) -> i64 {
+    // 口径统一（见 daily_agg 的活跃分钟定义）：只认 keys+clicks>0 的本地分钟，
+    // 剔除 move-only 分钟（纯移动不能伪造活跃），且按 datetime(timestamp, off)
+    // 换本地钟面后再取分钟桶——此前无条件数 UTC 原始分钟，与全库口径相左。
+    let off = super::local_offset_modifier();
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(DISTINCT substr(timestamp,1,16)) FROM events WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click','input_agg') AND id > ?1",
-            params![since_id],
+            &format!(
+                "SELECT COUNT(DISTINCT CASE WHEN {KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR} > 0 \
+                 THEN replace(substr(datetime(timestamp, ?2), 1, 16), ' ', 'T') END) \
+                 FROM events WHERE event_type IN ('keyboard','mouse') \
+                   AND event_action IN ('press','click','input_agg') AND id > ?1"
+            ),
+            params![since_id, off],
             get_count_i64,
         ),
         "count_active_min_since",

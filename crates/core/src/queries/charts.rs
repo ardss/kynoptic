@@ -340,8 +340,11 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
+    // 分钟桶与 agg 路径同构：本地钟面 "YYYY-MM-DDTHH:MM"（datetime 输出为空格
+    // 分隔，replace 成 "T"）。此前回退路径直接 substr UTC 原串，异常卡上时区错位。
+    let off = super::local_offset_modifier();
     let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT substr(timestamp, 1, 16) AS minute, \
+        "SELECT replace(substr(datetime(timestamp, ?3), 1, 16), ' ', 'T') AS minute, \
                 SUM({KEYS_ROW_EXPR}) AS keys, \
                 SUM({CLICKS_ROW_EXPR}) AS clicks, \
                 SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches \
@@ -353,7 +356,7 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
     )) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map(params![start, end], |r| {
+    let Ok(rows) = stmt.query_map(params![start, end, off], |r| {
         Ok(MinuteStat {
             minute: r.get::<_, String>(0)?,
             keys: r.get::<_, Option<i64>>(1)?.unwrap_or(0),

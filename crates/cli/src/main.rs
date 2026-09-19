@@ -247,8 +247,18 @@ fn cmd_export(args: &[String]) -> Result<()> {
     // panic（out of bounds）。钳到 20 万天（≈547 年，早于任何可能的数据，
     // 也在 DateTime 表示范围内）= 等效全量导出；days<1 已在解析处拒绝。
     let days = days.min(200_000);
-    let cutoff =
-        (Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000))).to_rfc3339();
+    // 与面板「最近 N 天」对齐（交叉审查 P2）：dashboard 按本地日历日切天
+    // （queries::local_day_range），导出此前用 Utc::now() 的滚动 24h 瞬间，
+    // 两边窗口对不上。现取 (今日 - N) 本地日的**起点**作 cutoff，
+    // 使导出结果可与 dashboard 的天窗口对账。
+    let cutoff_date = queries::date_offset_str(-days);
+    let cutoff = match queries::local_day_range(&cutoff_date) {
+        Some((start, _)) => start,
+        None => {
+            // 本地日期换算失败时的兜底：退回滚动 UTC 瞬间（旧行为）
+            (Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000))).to_rfc3339()
+        }
+    };
     let conn = open_db(&db_path)?;
     // 流式导出（审查 P2：不再把全表载入内存）
     use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
