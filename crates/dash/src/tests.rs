@@ -1017,7 +1017,7 @@ fn overview_counts_mixed_minutes_for_both_presence_and_automation() {
     assert_eq!(v["automation_minutes"], json!(2), "{v}");
     assert_eq!(v["mixed_minutes"], json!(1), "{v}");
     assert!(v["unattended_fg_minutes"].is_number());
-    assert!(v["metrics_note"].as_str().unwrap().contains("混合分钟"));
+    assert!(v["metrics_note"].as_str().unwrap().contains("自动化脚本"));
 }
 
 // === insights：节律卡（首末输入 + 单事件日标注） ===

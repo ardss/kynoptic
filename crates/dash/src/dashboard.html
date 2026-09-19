@@ -196,7 +196,7 @@
     <div class="label"><span class="l en">automation today</span><span class="l zh">今日自动化</span></div>
     <div class="value" style="font-size:34px; color:var(--dim);" id="c-automation">–</div>
     <div style="font-size:12px; color:var(--dim);">
-      <span class="l en">minutes injected by automation tools; mixed minutes (human + automation) count for both</span><span class="l zh">自动化工具注入的分钟；与人同时在场的混合分钟双方都计</span>
+      <span class="l en">operations produced by automation tools or scripts</span><span class="l zh">自动化脚本或工具产生的操作</span>
       · <span id="c-automation-delta"></span>
     </div>
   </div>
@@ -774,15 +774,15 @@ async function loadTimeline() {
   };
   /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
   const TL_COLORS = { human: "#5BA8FF", auto: "#E0A24A", away: "#1a2230" };
-  const MIXED_NOTE = zh ? " · 混合分钟（人+自动化）双方都计" : " · mixed minutes (human + automation) count for both";
+  const MIXED_NOTE = zh ? " · 这一小时人和自动化脚本都有操作" : " · mixed minutes (human + automation) count for both";
   el.innerHTML = '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
     + '<span style="color:' + TL_COLORS.human + '">■</span> ' + L.human + '　'
     + '<span style="color:' + TL_COLORS.auto + '">■</span> ' + L.auto + '　'
     + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
     + '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
     + (zh
-      ? "口径：在场=人分钟（键/点击/滚轮，剔除自动化注入）；自动化=纯自动化分钟；混合分钟双方都计；无人=前台有窗口但人不在场。各行单位为分钟。"
-      : "Definition: presence = human minutes (keys/clicks/scroll, injected input excluded); automation = pure automation minutes; mixed minutes count for both; unattended = a foreground window with no human presence. Each row is in minutes.")
+      ? "在场 = 有键鼠或滚轮操作；自动化 = 自动化脚本的操作；无人 = 屏幕上有窗口但两者都没有。"
+      : "Presence = keyboard/mouse/scroll activity; automation = actions by automation tools; unattended = a window in the foreground with neither.")
     + '</div>'
     + tl.buckets.map(b => {
     // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节。

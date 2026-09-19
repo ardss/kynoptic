@@ -659,7 +659,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "mixed_minutes": mixed_minutes,
         "presence_yesterday": yday.presence_minutes,
         "automation_yesterday": yday.automation_minutes,
-        "metrics_note": "口径：在场=人分钟（键/点击/滚轮，剔除自动化注入的输入）；自动化=纯自动化分钟；混合分钟同时计入两者；无人=前台有窗口但人不在场也不自动化。",
+        "metrics_note": "在场按你的真实键鼠和滚轮操作统计，自动化脚本的操作不计入在场，单独计为自动化。",
         "unattended_fg_minutes": unattended_fg_minutes,
         "unattended_fg_method": "保守近似：前台应用时长 −（在场 + 自动化 − 混合分钟），负值记 0",
         "has_full_day": has_full_day,
