@@ -3,7 +3,7 @@
 use crate::types::*;
 use crossbeam_channel::Sender;
 use serde_json::json;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -27,9 +27,22 @@ struct KBDLLHOOKSTRUCT {
 static KB_TX: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static KB_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static KB_HOOK: AtomicU32 = AtomicU32::new(0);
+/// 最近一次键盘事件的 epoch 毫秒（Wave20 P0：摘钩检测用——LL hook 被
+/// 系统超时摘除时静默死亡，这里提供"还在产事件吗"的信号）
+static KB_LAST_EVENT_MS: AtomicU64 = AtomicU64::new(0);
+/// hook 线程自定义消息：重装 hook（摘钩自愈）
+const WM_APP_REHOOK: u32 = 0x8105;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
+        KB_LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
         // minute 粒度（opt-in）：纯原子计数，跳过修饰键采样与事件构造
         if crate::input_agg::minute_mode() {
             if matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -116,7 +129,7 @@ impl EventHook for KeyboardHook {
                 let my_tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
                 KB_THREAD_ID.store(my_tid, Ordering::Release);
 
-                let hook =
+                let mut hook =
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), std::ptr::null_mut(), 0);
                 if hook.is_null() {
                     log::error!("键盘 Hook 安装失败");
@@ -131,8 +144,78 @@ impl EventHook for KeyboardHook {
                 KB_HOOK.store(hook as u32, Ordering::Release);
                 log::info!("keyboard_hook 已启动 (事件驱动)");
 
+                // Wave20 P0 摘钩自愈：监视线程发现"光标在动但本 hook 长时间
+                // 无事件"（LL hook 被系统 LowLevelHooksTimeout 静默摘除的
+                // 特征）时投递 WM_APP_REHOOK，在本线程（消息循环所在线程）
+                // 重装。误报无害（先摘后装，不产生双 hook）。
+                {
+                    std::thread::Builder::new()
+                        .name("keyboard_hook_watch".into())
+                        .spawn(move || {
+                            #[repr(C)]
+                            #[allow(clippy::upper_case_acronyms)]
+                            struct POINT {
+                                x: i32,
+                                y: i32,
+                            }
+                            extern "system" {
+                                fn GetCursorPos(pt: *mut POINT) -> i32;
+                            }
+                            let mut prev = POINT { x: 0, y: 0 };
+                            let _ = GetCursorPos(&mut prev);
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(10));
+                                if KB_THREAD_ID.load(Ordering::Acquire) != my_tid {
+                                    return; // 本代 hook 已停止
+                                }
+                                let mut cur = POINT { x: 0, y: 0 };
+                                if GetCursorPos(&mut cur) == 0 {
+                                    continue;
+                                }
+                                let moved = cur.x != prev.x || cur.y != prev.y;
+                                prev = cur;
+                                let stale = now_ms()
+                                    .saturating_sub(KB_LAST_EVENT_MS.load(Ordering::Relaxed))
+                                    > 30_000;
+                                if moved && stale {
+                                    log::warn!("keyboard_hook 疑似被系统摘除，尝试重装");
+                                    PostThreadMessageW(my_tid, WM_APP_REHOOK, 0, 0);
+                                }
+                            }
+                        })
+                        .ok();
+                }
+
                 let mut msg: MSG = std::mem::zeroed();
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
+                loop {
+                    let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                    if r <= 0 {
+                        if r == -1 {
+                            // GetMessageW 出错返回 -1，旧写法 !=0 会带着错误
+                            // 状态空转烧 CPU（Wave20 P1）
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        }
+                        break; // WM_QUIT
+                    }
+                    if msg.message == WM_APP_REHOOK {
+                        UnhookWindowsHookEx(hook);
+                        let h = SetWindowsHookExW(
+                            WH_KEYBOARD_LL,
+                            Some(keyboard_proc),
+                            std::ptr::null_mut(),
+                            0,
+                        );
+                        if !h.is_null() {
+                            hook = h;
+                            KB_HOOK.store(h as u32, Ordering::Release);
+                            KB_LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
+                            log::info!("keyboard_hook 已重装");
+                        } else {
+                            log::error!("keyboard_hook 重装失败");
+                        }
+                        continue;
+                    }
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

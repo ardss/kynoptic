@@ -47,6 +47,8 @@ static MOUSE_TX: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static MOUSE_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static MOUSE_HOOK: AtomicU32 = AtomicU32::new(0);
 static LAST_MOVE_TIME: AtomicU64 = AtomicU64::new(0);
+/// hook 线程自定义消息：重装 hook（摘钩自愈，Wave20 P0，同 keyboard_hook）
+const WM_APP_REHOOK: u32 = 0x8106;
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
@@ -166,7 +168,7 @@ impl EventHook for MouseHook {
                 let my_tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
                 MOUSE_THREAD_ID.store(my_tid, Ordering::Release);
 
-                let hook =
+                let mut hook =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), std::ptr::null_mut(), 0);
                 if hook.is_null() {
                     log::error!("鼠标 Hook 安装失败");
@@ -181,8 +183,75 @@ impl EventHook for MouseHook {
                 MOUSE_HOOK.store(hook as u32, Ordering::Release);
                 log::info!("mouse_hook 已启动 (事件驱动, 移动节流 500ms)");
 
+                // Wave20 P0 摘钩自愈（同 keyboard_hook）：光标在动但 hook
+                // 长时间无事件 → 投递重装消息。移动节流 ≤500ms，30s 无事件
+                // 且光标在动基本可断定被系统摘钩。
+                {
+                    std::thread::Builder::new()
+                        .name("mouse_hook_watch".into())
+                        .spawn(move || {
+                            extern "system" {
+                                fn GetCursorPos(pt: *mut POINT) -> i32;
+                            }
+                            let mut prev = POINT { x: 0, y: 0 };
+                            if GetCursorPos(&mut prev) == 0 {
+                                prev = POINT { x: -1, y: -1 };
+                            }
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(10));
+                                if MOUSE_THREAD_ID.load(Ordering::Acquire) != my_tid {
+                                    return;
+                                }
+                                let mut cur = POINT { x: 0, y: 0 };
+                                if GetCursorPos(&mut cur) == 0 {
+                                    continue;
+                                }
+                                let moved = cur.x != prev.x || cur.y != prev.y;
+                                prev = cur;
+                                let stale = LAST_MOVE_TIME.load(Ordering::Relaxed) != 0 && {
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    now_ms.saturating_sub(LAST_MOVE_TIME.load(Ordering::Relaxed))
+                                        > 30_000
+                                };
+                                if moved && stale {
+                                    log::warn!("mouse_hook 疑似被系统摘除，尝试重装");
+                                    PostThreadMessageW(my_tid, WM_APP_REHOOK, 0, 0);
+                                }
+                            }
+                        })
+                        .ok();
+                }
+
                 let mut msg: MSG = std::mem::zeroed();
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
+                loop {
+                    let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                    if r <= 0 {
+                        if r == -1 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        }
+                        break;
+                    }
+                    if msg.message == WM_APP_REHOOK {
+                        UnhookWindowsHookEx(hook);
+                        let h = SetWindowsHookExW(
+                            WH_MOUSE_LL,
+                            Some(mouse_proc),
+                            std::ptr::null_mut(),
+                            0,
+                        );
+                        if !h.is_null() {
+                            hook = h;
+                            MOUSE_HOOK.store(h as u32, Ordering::Release);
+                            log::info!("mouse_hook 已重装");
+                        } else {
+                            log::error!("mouse_hook 重装失败");
+                        }
+                        continue;
+                    }
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

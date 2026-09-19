@@ -1530,8 +1530,7 @@ pub fn api_report_at(
                 .ok()
                 .map(|t| {
                     let ds = day_start.with_timezone(&chrono::Local).naive_local();
-                    let m = ((t - ds).num_minutes().max(0) as usize).min(1439);
-                    m
+                    ((t - ds).num_minutes().max(0) as usize).min(1439)
                 })
         })
         .collect();

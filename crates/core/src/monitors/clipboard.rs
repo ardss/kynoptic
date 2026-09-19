@@ -90,10 +90,13 @@ fn read_clipboard_hash() -> Option<(String, [u8; 16], usize)> {
             return Some(("empty".into(), [0u8; 16], 0));
         }
 
-        // 计算长度
+        // 计算长度（Wave20 P2：以 GlobalSize 为上界——异常应用写入未 NUL
+        // 终止的数据时纯信任剪贴板会越界读）
+        let global_bytes = GlobalSize(handle);
+        let max_u16 = (global_bytes / 2).max(1);
         let mut len = 0usize;
         let mut p = ptr as *const u16;
-        while *p != 0 {
+        while len < max_u16 && *p != 0 {
             len += 1;
             p = p.add(1);
         }
@@ -114,6 +117,7 @@ extern "system" {
     fn GetClipboardData(format: u32) -> *mut std::ffi::c_void;
     fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+    fn GlobalSize(hMem: *mut std::ffi::c_void) -> usize;
 }
 
 /// 简单哈希用于去重（不需要密码学安全）

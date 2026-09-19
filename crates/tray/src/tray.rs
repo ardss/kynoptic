@@ -281,7 +281,7 @@ impl TrayCtx {
                 }
             }
             MenuId::About => {
-                let url: Vec<u16> = String::from("https://github.com/ardss/kynoptic ")
+                let url: Vec<u16> = String::from("https://github.com/ardss/kynoptic\0")
                     .encode_utf16()
                     .collect();
                 open_with_shell(&url);

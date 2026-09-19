@@ -33,13 +33,29 @@ impl TrayIcons {
     /// 启动时绘制全部三态。任一绘制失败返回 None(调用方降级处理)。
     pub fn create() -> Option<Self> {
         let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-        Some(Self {
-            handles: [
-                draw(IconShape::Running, size)?,
-                draw(IconShape::Paused, size)?,
-                draw(IconShape::Error, size)?,
-            ],
-        })
+        // Wave20 P2：逐个 draw 失败时先销毁已成功的 HICON（原 `?` 提前
+        // 返回会让 Self 不构造、Drop 不跑，已建图标泄漏）
+        #[allow(clippy::upper_case_acronyms)]
+        type HICON = windows_sys::Win32::UI::WindowsAndMessaging::HICON;
+        let mut handles: [HICON; 3] = std::array::from_fn(|_| std::ptr::null_mut());
+        for (slot, shape) in
+            handles
+                .iter_mut()
+                .zip([IconShape::Running, IconShape::Paused, IconShape::Error])
+        {
+            match draw(shape, size) {
+                Some(h) => *slot = h,
+                None => {
+                    for h in handles.iter_mut() {
+                        if !h.is_null() {
+                            unsafe { DestroyIcon(*h) };
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(Self { handles })
     }
 
     pub fn for_state(
