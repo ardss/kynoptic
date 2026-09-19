@@ -1,6 +1,6 @@
 [package]
 name = "kynoptic-tray"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 description = "托盘壳:单进程内采集器 + 本地 dashboard 服务 + 系统托盘图标(纯 Win32,无 web 框架)"
 

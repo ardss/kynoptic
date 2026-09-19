@@ -51,6 +51,8 @@ jobs:
           Copy-Item target/release/kynoptic.exe dist/kynoptic.exe
           Copy-Item target/release/kynoptic-watchdog.exe dist/kynoptic-watchdog.exe
           Copy-Item target/release/kynoptic-tray.exe dist/kynoptic-tray.exe
+          Copy-Item target/release/kynoptic-aggrepair.exe dist/kynoptic-aggrepair.exe
+          Copy-Item target/release/kynoptic-ctl.exe dist/kynoptic-ctl.exe
           Copy-Item README.md dist/
           Copy-Item LICENSE dist/ -ErrorAction SilentlyContinue
           # SKILL.md 随 release 分发（自更新会拉取并刷新到 exe 目录，见 update.rs）
@@ -71,11 +73,12 @@ jobs:
           [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", $sums)
       - name: Write release notes
         run: |
-          $ver = "${{ github.ref_name }}"
+          $tag = $env:GITHUB_REF_NAME
+          $ver = $tag.TrimStart("v")
           $notes = @"
           ## Kynoptic $ver - Windows activity tracker, 100% local
 
-          **Download and run [Kynoptic-Setup-$ver.exe](https://github.com/ardss/kynoptic/releases/download/$ver/Kynoptic-Setup-$ver.exe)** - that is the only file most users need.
+          **Download and run [Kynoptic-Setup-$ver.exe](https://github.com/ardss/kynoptic/releases/download/$tag/Kynoptic-Setup-$ver.exe)** - that is the only file most users need.
 
           - SmartScreen will warn (unsigned build): click **More info -> Run anyway**, or verify ``SHA256SUMS.txt`` / build from source.
           - Data stays on your machine: raw events are append-only, never uploaded, never auto-deleted.

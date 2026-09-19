@@ -1,8 +1,11 @@
 import json, subprocess, time, os, sys
 
-EXE = r"K:\kynoptic\target\release\kynoptic.exe"
+EXE = os.environ.get("KYNOPTIC_EXE", os.path.join("target", "release", "kynoptic.exe"))
 env = dict(os.environ)
-env["KYNOPTIC_DB"] = r"C:\Users\13397\AppData\Local\Programs\Kynoptic\data\kynoptic.db"
+env["KYNOPTIC_DB"] = os.environ.get(
+    "KYNOPTIC_DB",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Kynoptic", "data", "kynoptic.db"),
+)
 
 p = subprocess.Popen([EXE, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=subprocess.PIPE, env=env, text=True, encoding="utf-8")

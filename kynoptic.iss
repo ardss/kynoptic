@@ -1,5 +1,5 @@
 ﻿; Kynoptic 安装器脚本（Inno Setup 6）
-; CI: iscc kynoptic.iss /DAppVersion=0.1.0
+; CI: iscc kynoptic.iss /DAppVersion=0.2.1
 
 #ifndef AppVersion
 #define AppVersion "0.2.0"
@@ -47,6 +47,8 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Source: "dist\kynoptic-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\kynoptic.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\kynoptic-watchdog.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\kynoptic-aggrepair.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\kynoptic-ctl.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\README.md"; DestDir: "{app}"; Flags: ignoreversion
 ; SKILL.md 随安装包分发（AI 客户端 skill，见 [Run] 段 skill install）
 Source: "crates\cli\src\assets\skill.md"; DestDir: "{app}"; DestName: "SKILL.md"; Flags: ignoreversion
