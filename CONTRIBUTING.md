@@ -62,6 +62,10 @@ Release checklist (execute verbatim, in order):
    SHA256SUMS.txt downloadable.
 7. Deploy the same commit's build locally and smoke-test
    (`GET /api/status` returns 200).
+8. Sync the website: the landing page (`index.html`, served by GitHub
+   Pages from the repo root) must show the released version in its
+   badge and point the primary CTA at the release — done in the same
+   release cycle via its own PR.
 
 ## 4. Ground rules (checked in every review)
 

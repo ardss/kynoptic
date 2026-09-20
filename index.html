@@ -153,11 +153,11 @@
 <!-- HERO -->
 <header class="hero">
   <div class="wrap">
-    <div class="badge">● <span class="l en">Open source · Windows 10/11 · v0.1 in development</span><span class="l zh">开源 · Windows 10/11 · v0.1 开发中</span></div>
+    <div class="badge">● <span class="l en">Open source · Windows 10/11 · v0.2.2 released</span><span class="l zh">开源 · Windows 10/11 · v0.2.2 已发布</span></div>
     <h1><span class="l en">What did you do on this computer <span class="quiet">yesterday afternoon?</span></span><span class="l zh">昨天下午你在电脑上干了什么？<span class="quiet">这句话现在可以直接问 AI。</span></span></h1>
     <p class="sub"><span class="l en">Kynoptic records which apps you use and what your machine was doing into one local file that Claude, Cursor, or any MCP AI can search. So next time you can't remember where you saw or did something — just ask.</span><span class="l zh">Kynoptic 在后台记下你用过哪些软件、机器当时在干什么，存成一个 AI 能查的本地文件。下次想不起某个东西在哪看过、哪天做过，直接问就行。</span></p>
     <div class="ctas">
-      <a class="btn btn-primary" href="#waitlist"><span class="l en">Get launch updates</span><span class="l zh">上线时通知我</span></a>
+      <a class="btn btn-primary" href="https://github.com/ardss/kynoptic/releases/latest"><span class="l en">Download for Windows</span><span class="l zh">下载 Windows 版</span></a>
       <a class="btn btn-ghost" href="https://github.com/ardss/kynoptic"><span class="l en">Star on GitHub</span><span class="l zh">去 GitHub 点个 Star</span></a>
     </div>
     <div class="demo">
@@ -328,13 +328,13 @@
 <section class="endcta" id="waitlist" style="padding-top:0">
   <div class="wrap">
     <div class="wl">
-      <h2><span class="l en">v0.1 is almost ready.</span><span class="l zh">v0.1 就快好了。</span></h2>
-      <p><span class="l en">Leave your email and we'll tell you the day the installer is out. No spam, no newsletter — one launch email, that's it.</span><span class="l zh">留个邮箱，安装包发布当天告诉你。不发垃圾邮件、不发订阅——就一封上线通知。</span></p>
+      <h2><span class="l en">v0.2.2 is out — download it now.</span><span class="l zh">v0.2.2 已发布，直接下载。</span></h2>
+      <p><span class="l en">Grab the installer from <a href="https://github.com/ardss/kynoptic/releases/latest">GitHub Releases</a> — signed checksums included. Prefer email? Leave your address and we'll ping you when macOS / Linux land.</span><span class="l zh">去 <a href="https://github.com/ardss/kynoptic/releases/latest">GitHub Releases</a> 拿安装包，附带校验和。也可以留个邮箱，macOS / Linux 版发布时通知你。</span></p>
       <form id="wlform" onsubmit="return submitWL(event)">
         <input type="email" id="wlemail" required placeholder="you@example.com">
-        <button class="btn btn-primary" type="submit"><span class="l en">Notify me</span><span class="l zh">上线通知我</span></button>
+        <button class="btn btn-primary" type="submit"><span class="l en">Notify me</span><span class="l zh">发布时通知我</span></button>
       </form>
-      <p class="ok" id="wlok"><span class="l en">Got it — see you at launch.</span><span class="l zh">收到，上线时见。</span></p>
+      <p class="ok" id="wlok"><span class="l en">Got it — we'll email you when macOS / Linux are ready.</span><span class="l zh">收到，macOS / Linux 版发布时发邮件通知你。</span></p>
       <p class="note"><span class="l en">Prefer to watch the code? Star the repo instead — releases are announced there too.</span><span class="l zh">更想盯代码？直接 Star 仓库，Release 也会同步发在那里。</span></p>
     </div>
   </div>
@@ -346,7 +346,7 @@
     <div class="links">
       <a href="https://github.com/ardss/kynoptic">GitHub</a>
       <a href="https://github.com/ardss/kynoptic/blob/main/PRIVACY.md"><span class="l en">Privacy</span><span class="l zh">隐私</span></a>
-      <a href="https://github.com/ardss/kynoptic/blob/main/ROADMAP.md"><span class="l en">Roadmap</span><span class="l zh">路线图</span></a>
+      <a href="https://github.com/ardss/kynoptic/releases"><span class="l en">Releases</span><span class="l zh">版本发布</span></a>
     </div>
     <div><span class="l en">MIT License · © 2026 Kynoptic contributors</span><span class="l zh">MIT 协议 · © 2026 Kynoptic 贡献者</span></div>
   </div>
@@ -380,7 +380,7 @@ function submitWL(e){
   var done = function(){ ok.style.display = 'block'; document.getElementById('wlform').style.display = 'none'; };
   fetch('https://formsubmit.co/ajax/' + WL_EMAIL, {
     method: 'POST', headers: {'Accept':'application/json','Content-Type':'application/json'},
-    body: JSON.stringify({email: email, _subject: '[Kynoptic waitlist] new signup'})
+    body: JSON.stringify({email: email, _subject: '[Kynoptic waitlist] macOS/Linux notify'})
   }).then(done).catch(function(){
     location.href = 'mailto:' + WL_EMAIL + '?subject=' + encodeURIComponent('[Kynoptic waitlist] ' + email);
     done();
