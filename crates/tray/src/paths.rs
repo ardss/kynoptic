@@ -20,7 +20,7 @@ pub const HEARTBEAT_FILE: &str = "kynoptic-heartbeat";
 /// 旗标路径覆盖环境变量(测试/多实例调试用)
 pub const EXIT_FLAG_ENV: &str = "KYNOPTIC_EXIT_FLAG";
 
-/// 单实例互斥体名（多用户/多会话隔离收口后 = `Global\KynopticTrayMutex\<SID>`）。
+/// 单实例互斥体名（多用户/多会话隔离收口后 = `Global\KynopticTrayMutex-<SID>`）。
 ///
 /// **契约（Wave29 挂账收口）**：tray / CLI collect / watchdog 探活三处一律经
 /// `kynoptic_core::singleton::singleton_mutex_name()` 取名，禁止写死字面值——
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn single_instance_mutex_name_is_the_shared_contract() {
         // Wave29 挂账收口：名字改由 core 单一事实源派生
-        //（Global\KynopticTrayMutex\<SID>），三处（tray/collect/watchdog）
+        //（Global\KynopticTrayMutex-<SID>），三处（tray/collect/watchdog）
         // 都调 kynoptic_core::singleton::singleton_mutex_name()，不再锁字面值；
         // 这里只锁定"派生名与助手一致 + 回退旧名保留"。
         assert_eq!(

@@ -3309,7 +3309,7 @@ mod tests {
     fn single_instance_mutex_name_matches_tray_contract() {
         // Wave29 挂账收口：名字不再锁字面值，改锁"三处同源"——collect 与
         // watchdog 都经 kynoptic_core::singleton::singleton_mutex_name()
-        // 派生（Global\KynopticTrayMutex\<SID>），旧名仅作回退。
+        // 派生（Global\KynopticTrayMutex-<SID>，单层名字），旧名仅作回退。
         assert_eq!(
             kynoptic_core::singleton::singleton_mutex_name(),
             kynoptic_core::singleton::singleton_mutex_name()
@@ -3321,9 +3321,11 @@ mod tests {
         let name = kynoptic_core::singleton::singleton_mutex_name();
         if kynoptic_core::singleton::current_user_sid().is_some() {
             assert!(
-                name.starts_with(r"Global\KynopticTrayMutex\S-1-"),
+                name.starts_with(r"Global\KynopticTrayMutex-S-1-"),
                 "got {name:?}"
             );
+            // 单层名字契约：真实 CreateMutexW 对 Global\A\B 报 PATH_NOT_FOUND
+            assert_eq!(name.matches('\\').count(), 1, "got {name:?}");
         } else {
             assert_eq!(name, SINGLE_INSTANCE_MUTEX_NAME, "SID 不可用须回退旧名");
         }

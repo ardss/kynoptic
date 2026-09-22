@@ -1,11 +1,14 @@
 //! 单实例互斥体名（多用户/多会话隔离收口，Wave29 遗留挂账）。
 //!
 //! 设计：安装为 per-user（%LOCALAPPDATA%\Programs），数据已按用户隔离；
-//! 互斥体从 `Local\KynopticTrayMutex` 升级为 `Global\KynopticTrayMutex\<SID>`：
+//! 互斥体从 `Local\KynopticTrayMutex` 升级为 `Global\KynopticTrayMutex-<SID>`：
 //! - `Global\` 前缀跨会话可见——同一用户在两个会话（如快速用户切换/SSH 进程
 //!   内拉起）里启动也会互斥；
 //! - 后缀当前用户 SID（TokenUser 查询）——不同用户互不干扰，各自有独立的
 //!   单实例与 watchdog 探活。
+//! - **名字必须单层**：内核命名对象不支持路径嵌套（`Global\A\B` 实测
+//!   ERROR_PATH_NOT_FOUND，本机 2026-09-23 部署翻车根因），所以用 `-` 连接
+//!   而非 `\`。改动名字结构前必须先在真实 CreateMutexW 上验证。
 //!
 //! **契约**：tray（crates/tray/src/main.rs）、CLI collect（crates/cli/src/main.rs
 //! 的 acquire_single_instance）与 watchdog（OpenMutexW 探活）三处都必须经
@@ -18,11 +21,12 @@
 /// 旧名（SID 获取失败时的回退；保留旧语义 = 当前会话内互斥）
 pub const LEGACY_MUTEX_NAME: &str = r"Local\KynopticTrayMutex";
 
-/// 单实例互斥体名：`Global\KynopticTrayMutex\<当前用户 SID>`。
+/// 单实例互斥体名：`Global\KynopticTrayMutex-<当前用户 SID>`（单层名字，
+/// 见模块注释的 PATH_NOT_FOUND 教训）。
 /// SID 不可用时回退旧名并 log::warn（降级留痕）。
 pub fn singleton_mutex_name() -> String {
     match current_user_sid() {
-        Some(sid) => format!("Global\\KynopticTrayMutex\\{sid}"),
+        Some(sid) => format!("Global\\KynopticTrayMutex-{sid}"),
         None => {
             log::warn!("无法获取当前用户 SID，单实例互斥体回退为会话级旧名 {LEGACY_MUTEX_NAME:?}");
             LEGACY_MUTEX_NAME.to_string()
@@ -159,15 +163,14 @@ mod tests {
     fn singleton_mutex_name_is_global_and_per_user() {
         let name = singleton_mutex_name();
         if current_user_sid().is_some() {
+            let name = singleton_mutex_name();
             assert!(
-                name.starts_with(r"Global\KynopticTrayMutex\S-1-"),
+                name.starts_with(r"Global\KynopticTrayMutex-S-1-"),
                 "got {name:?}"
             );
-            assert_eq!(
-                name.rsplit('\\').next(),
-                current_user_sid().as_deref(),
-                "后缀必须是当前用户 SID"
-            );
+            // 单层名字契约：除 Global 前缀外不允许再出现路径分隔符
+            // （Global\A\B 在真实 CreateMutexW 上是 PATH_NOT_FOUND）
+            assert_eq!(name.matches('\\').count(), 1, "got {name:?}");
         } else {
             // 回退路径：保留旧名（此分支通常不触发，仅在令牌不可读的
             // 沙箱里生效）
