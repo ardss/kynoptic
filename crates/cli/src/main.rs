@@ -721,30 +721,88 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
     }
     // --date 是窗口的最后一天（默认今天）；--days N 往前多看 N-1 天
     let end = parse_date(&date)?;
-    let conn = open_db(&resolve_db())?;
+    let db_path = resolve_db();
+    let conn = open_db(&db_path)?;
     let end_d = chrono::NaiveDate::parse_from_str(&end, "%Y-%m-%d")
         .map_err(|e| Error::InvalidData(format!("日期格式错: {e}")))?;
-    for off in (0..days).rev() {
-        let d = (end_d - chrono::Duration::days(i64::from(off)))
-            .format("%Y-%m-%d")
-            .to_string();
-        print_analyze_day(&conn, &d)?;
+    let dates: Vec<String> = (0..days)
+        .rev()
+        .map(|off| {
+            (end_d - chrono::Duration::days(i64::from(off)))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .collect();
+    if dates.len() == 1 {
+        print_analyze_day(&conn, &dates[0])?;
+        return Ok(());
+    }
+    // 多日模式：逐日循环会随天数线性放大扫描成本（--days 7 实测 46.7s）。
+    // 各天之间互不依赖，改为按天并行（每线程独立连接，busy_timeout=5000 兜底
+    // 并发初始化；首个连接已在主线程完成迁移，后续各线程 open_db 不再竞争迁移写）。
+    // 输出按日期顺序汇总打印；错误契约与旧逐日串行版一致：某天失败（含
+    // open_db 失败）即以原错误变体（如 Error::Db）中止，失败日之后的输出
+    // 不再打印——计算可并行，但汇总打印按日期序遇到首个错误即停。
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(dates.len());
+    let chunk = dates.len().div_ceil(workers);
+    let db_path = &db_path; // 各线程共享路径引用，避免 move
+                            // 各组并行计算，join 留在 scope 内；组序即日期序
+    let joined = std::thread::scope(|scope| {
+        let hs: Vec<_> = dates
+            .chunks(chunk)
+            .map(|group| {
+                scope.spawn(move || -> Result<Vec<String>> {
+                    // 每线程独立连接；连接/单日失败按原错误变体向上传播（不吞、
+                    // 不字符串化），首个失败即中止本组后续天的计算
+                    let conn = open_db(db_path)?;
+                    let mut out = Vec::with_capacity(group.len());
+                    for d in group {
+                        out.push(analyze_day_text(&conn, d)?);
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| {
+                h.join()
+                    .map_err(|_| Error::InvalidData("分析线程 panic".into()))
+            })
+            .collect::<Vec<Result<Result<Vec<String>>>>>()
+    });
+    for r in joined {
+        for text in r?.into_iter().flatten() {
+            print!("{text}");
+        }
     }
     Ok(())
 }
 
 /// analyze 的单日输出（多日模式逐日调用）。
 fn print_analyze_day(conn: &Connection, date: &str) -> Result<()> {
+    print!("{}", analyze_day_text(conn, date)?);
+    Ok(())
+}
+
+/// analyze 单日文本（与旧 println! 逐行输出逐字节一致），供并行汇总后打印。
+fn analyze_day_text(conn: &Connection, date: &str) -> Result<String> {
     let analysis = analyzer::analyze_day(conn, date)?;
     let anomalies = anomaly::detect_all(conn, date).unwrap_or_default();
-    println!("=== Analyze {} ===", date);
-    println!("keys:           {}", analysis.total_keys);
-    println!("clicks:         {}", analysis.total_clicks);
-    println!("active minutes: {}", analysis.active_minutes);
-    println!("apm:            {:.1}", analysis.apm_avg);
-    println!("focus segments: {}", analysis.focus_segments.len());
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let w = &mut out;
+    writeln!(w, "=== Analyze {} ===", date)?;
+    writeln!(w, "keys:           {}", analysis.total_keys)?;
+    writeln!(w, "clicks:         {}", analysis.total_clicks)?;
+    writeln!(w, "active minutes: {}", analysis.active_minutes)?;
+    writeln!(w, "apm:            {:.1}", analysis.apm_avg)?;
+    writeln!(w, "focus segments: {}", analysis.focus_segments.len())?;
     for s in &analysis.focus_segments {
-        println!(
+        writeln!(
+            w,
             "  {} → {}  {}min  keys={} clicks={} app={:?}",
             &s.start[11..16],
             &s.end[11..16],
@@ -752,19 +810,26 @@ fn print_analyze_day(conn: &Connection, date: &str) -> Result<()> {
             s.key_count,
             s.click_count,
             s.app_name.as_deref().map(strip_c0)
-        );
+        )?;
     }
-    println!(
+    writeln!(
+        w,
         "fragmentation:  {:.3} (longest {} min, {} breaks)",
         analysis.fragmentation.fragmentation_index,
         analysis.fragmentation.longest_streak_min,
         analysis.fragmentation.total_breaks
-    );
-    println!("anomalies:      {}", anomalies.len());
+    )?;
+    writeln!(w, "anomalies:      {}", anomalies.len())?;
     for a in &anomalies {
-        println!("  [{}] {} - {}", a.severity, a.kind, strip_c0(&a.message));
+        writeln!(
+            w,
+            "  [{}] {} - {}",
+            a.severity,
+            a.kind,
+            strip_c0(&a.message)
+        )?;
     }
-    Ok(())
+    Ok(out)
 }
 
 // === ghost ===
@@ -1276,9 +1341,10 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     use std::sync::atomic::Ordering;
 
     // P1 单实例保护（实测：collect 与 tray 并发 = 同库双写、事件口径翻倍、
-    // 双全局钩子）：与托盘同名 CreateMutexW（契约见 crates/tray/src/paths.rs
-    // 的 SINGLE_INSTANCE_MUTEX_NAME），已有实例立即报错退出。
-    acquire_single_instance(SINGLE_INSTANCE_MUTEX_NAME)?;
+    // 双全局钩子）：与托盘同名 CreateMutexW（Wave29 挂账收口后名字由
+    // kynoptic_core::singleton 单一事实源派生，含当前用户 SID），已有实例
+    // 立即报错退出。
+    acquire_single_instance(&kynoptic_core::singleton::singleton_mutex_name())?;
 
     let mut db_path = resolve_db().to_string_lossy().to_string();
     let mut all = false;
@@ -1352,12 +1418,12 @@ fn cmd_collect(args: &[String]) -> Result<()> {
 
 // === collect 单实例互斥体 ===
 
-/// 单实例互斥体名（P1：与托盘同名，防 collect 与 tray 双写同一库）。
-/// 契约见 crates/tray/src/paths.rs 的 SINGLE_INSTANCE_MUTEX_NAME——tray 是
-/// bin crate 无法被 cli 依赖，两边各持一份同名常量并各自用测试锁定字面值，
-/// 改名必须两边同步。
+/// 单实例互斥体旧名（Wave29 挂账收口后仅作回退/测试锚点保留；生产路径
+/// 一律走 kynoptic_core::singleton::singleton_mutex_name()——名字收敛为
+/// core 单一事实源，杜绝三处字面值漂移）。
 #[cfg(windows)]
-const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\KynopticTrayMutex";
+#[allow(dead_code)]
+const SINGLE_INSTANCE_MUTEX_NAME: &str = kynoptic_core::singleton::LEGACY_MUTEX_NAME;
 
 /// 尝试持有单实例命名互斥体（可测：name 注入）。互斥体句柄故意持有到进程
 /// 退出（RAII 释放会让保护在函数返回后失效）。已有实例 → Err。
@@ -1365,22 +1431,34 @@ const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\KynopticTrayMutex";
 fn acquire_single_instance(name: &str) -> Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    let wname: Vec<u16> = name.encode_utf16().chain([0]).collect();
-    unsafe {
-        let h = CreateMutexW(std::ptr::null(), 0, wname.as_ptr());
-        if h.is_null() {
-            return Err(Error::InvalidData(format!(
-                "单实例互斥体创建失败 (GetLastError={}), 拒绝启动以防并发写库",
-                GetLastError()
-            )));
+    fn hold(n: &str) -> Result<()> {
+        let wname: Vec<u16> = n.encode_utf16().chain([0]).collect();
+        unsafe {
+            let h = CreateMutexW(std::ptr::null(), 0, wname.as_ptr());
+            if h.is_null() {
+                return Err(Error::InvalidData(format!(
+                    "单实例互斥体创建失败 (GetLastError={}), 拒绝启动以防并发写库",
+                    GetLastError()
+                )));
+            }
+            // 只在句柄非空时才读 last error（创建成功不重置 last error,残留
+            // ERROR_ALREADY_EXISTS 会误判）
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(h);
+                return Err(Error::InvalidData(
+                    "已有 kynoptic 实例在运行(托盘或另一 collect): 两个采集器并发写同一数据库会导致事件翻倍, 拒绝启动".to_string(),
+                ));
+            }
         }
-        // 只在句柄非空时才读 last error（创建成功不重置 last error,残留
-        // ERROR_ALREADY_EXISTS 会误判）
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            CloseHandle(h);
-            return Err(Error::InvalidData(
-                "已有 kynoptic 实例在运行(托盘或另一 collect): 两个采集器并发写同一数据库会导致事件翻倍, 拒绝启动".to_string(),
-            ));
+        Ok(())
+    }
+    hold(name)?;
+    // 升级过渡桥：同时持有旧名互斥体，旧版 collect/tray（只探旧名）也能
+    // 发现本实例；旧版实例尚在本会话运行时这里会报已存在，同样拒绝启动。
+    // 只对生产新名（Global\ 前缀）生效——测试/注入的任意名字不做桥接。
+    if name.starts_with("Global\\") {
+        if let Some(legacy) = kynoptic_core::singleton::legacy_bridge_mutex_name(name) {
+            hold(legacy)?;
         }
     }
     Ok(())
@@ -2101,10 +2179,18 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
         use windows_sys::Win32::System::Threading::OpenMutexW;
         const SYNCHRONIZE: u32 = 0x0010_0000;
         use std::os::windows::process::CommandExt;
-        let name: Vec<u16> = r"Local\KynopticTrayMutex"
+        // Wave29 挂账收口：探活名字与 tray/collect 同源（core 单一事实源，
+        // 含当前用户 SID；跨会话同用户也互斥）
+        let name: Vec<u16> = kynoptic_core::singleton::singleton_mutex_name()
             .encode_utf16()
             .chain([0])
             .collect();
+        // 升级过渡桥：同时探旧名——watchdog 换新后仍要能为尚未升级的旧版
+        // tray 探活（旧 tray 只持旧名，新 watchdog 只探新名会误判死亡并重复拉起）
+        let legacy_name: Option<Vec<u16>> = kynoptic_core::singleton::legacy_bridge_mutex_name(
+            &kynoptic_core::singleton::singleton_mutex_name(),
+        )
+        .map(|n| n.encode_utf16().chain([0]).collect());
         let exit_flag = exit_flag_path();
         let mut state = load_watchdog_state();
         // 审查 P2：并发 watchdog 互斥锁。拿不到锁 = 已有实例活跃,静默退出
@@ -2123,6 +2209,14 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 if !h.is_null() {
                     windows_sys::Win32::Foundation::CloseHandle(h);
                     true
+                } else if let Some(lname) = &legacy_name {
+                    let hl = OpenMutexW(SYNCHRONIZE, 0, lname.as_ptr());
+                    if !hl.is_null() {
+                        windows_sys::Win32::Foundation::CloseHandle(hl);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -3213,9 +3307,26 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn single_instance_mutex_name_matches_tray_contract() {
-        // 与 crates/tray/src/paths.rs 的 SINGLE_INSTANCE_MUTEX_NAME 契约:
-        // 同名字面值,任一侧改名必须两边同步（见常量注释）。
-        assert_eq!(SINGLE_INSTANCE_MUTEX_NAME, r"Local\KynopticTrayMutex");
+        // Wave29 挂账收口：名字不再锁字面值，改锁"三处同源"——collect 与
+        // watchdog 都经 kynoptic_core::singleton::singleton_mutex_name()
+        // 派生（Global\KynopticTrayMutex\<SID>），旧名仅作回退。
+        assert_eq!(
+            kynoptic_core::singleton::singleton_mutex_name(),
+            kynoptic_core::singleton::singleton_mutex_name()
+        );
+        assert_eq!(
+            SINGLE_INSTANCE_MUTEX_NAME,
+            kynoptic_core::singleton::LEGACY_MUTEX_NAME
+        );
+        let name = kynoptic_core::singleton::singleton_mutex_name();
+        if kynoptic_core::singleton::current_user_sid().is_some() {
+            assert!(
+                name.starts_with(r"Global\KynopticTrayMutex\S-1-"),
+                "got {name:?}"
+            );
+        } else {
+            assert_eq!(name, SINGLE_INSTANCE_MUTEX_NAME, "SID 不可用须回退旧名");
+        }
     }
 
     #[cfg(windows)]
