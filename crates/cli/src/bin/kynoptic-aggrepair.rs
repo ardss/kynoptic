@@ -134,13 +134,23 @@ fn read_minute_keys(conn: &Connection, from: &str, to: &str) -> BTreeMap<(String
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, f64>(3)?,
+                // 脏行容错：sum_value 为 NULL → Ok(None)；错型 → Err 由外层跳过
+                r.get::<_, Option<f64>>(3).unwrap_or(None),
             ))
         })
         .expect("查询 agg_minute 失败");
     for row in rows {
-        let (d, h, m, s) = row.expect("读取 agg_minute 行失败");
-        map.insert((d, h, m), s);
+        // 本工具专门处理脏库：行级错误（任一列类型不符）不得裸 panic，
+        // 跳过并告警留痕
+        match row {
+            Ok((d, h, m, Some(s))) => {
+                map.insert((d, h, m), s);
+            }
+            Ok((d, h, m, None)) => {
+                eprintln!("警告: 跳过 sum_value 为 NULL 的脏 agg_minute 行: {d} {h:02}:{m:02}")
+            }
+            Err(e) => eprintln!("警告: 跳过无法解析的脏 agg_minute 行: {e}"),
+        }
     }
     map
 }
@@ -397,7 +407,11 @@ fn main() {
             })
             .expect("快照 agg_minute 失败");
         for row in rows {
-            min_rows.push(row.expect("快照 agg_minute 行失败"));
+            // 同 read_minute_keys：脏行（NULL/错型）跳过并告警，不裸 panic
+            match row {
+                Ok(r) => min_rows.push(r),
+                Err(e) => eprintln!("警告: 跳过无法解析的快照 agg_minute 行: {e}"),
+            }
         }
     }
     let mut day_rows = Vec::new();
@@ -421,7 +435,11 @@ fn main() {
             })
             .expect("快照 agg_daily 失败");
         for row in rows {
-            day_rows.push(row.expect("快照 agg_daily 行失败"));
+            // 同上：脏行跳过并告警，不裸 panic
+            match row {
+                Ok(r) => day_rows.push(r),
+                Err(e) => eprintln!("警告: 跳过无法解析的快照 agg_daily 行: {e}"),
+            }
         }
     }
     println!(
