@@ -85,10 +85,15 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
                 modifiers.push("win");
             }
 
+            // 审查 MEDIUM：LLKHF_INJECTED（0x10）归一化落为 event_data 的
+            // "injected" 布尔——presence 的 raw 分支按它把注入输入排除出
+            // 人在场（宏/连点器/SendInput 脚本不得伪造在场）。
+            let injected = kb.flags & 0x10 != 0;
             let event = Event::new(action, EventType::Keyboard).data(json!({
                 "vk_code": kb.vk_code,
                 "scan_code": kb.scan_code,
                 "flags": kb.flags,
+                "injected": injected,
                 "modifiers": modifiers,
             }));
             crate::collector::send_event(&tx, event);
@@ -163,6 +168,12 @@ impl EventHook for KeyboardHook {
                             }
                             let mut prev = POINT { x: 0, y: 0 };
                             let _ = GetCursorPos(&mut prev);
+                            // 约束（误报二次确认）：纯鼠标浏览（阅读场景）下键盘
+                            // 本来就 30s+ 无事件，单拍 stale 就 Unhook→重装会在
+                            // 无 hook 窗口期静默丢真实按键。要求连续两拍（约
+                            // 20-30s）都 stale 才重装；真正被系统摘钩时下一拍
+                            // 依旧 stale，最多延迟一拍自愈。
+                            let mut stale_beats: u32 = 0;
                             loop {
                                 std::thread::sleep(std::time::Duration::from_secs(10));
                                 if KB_THREAD_ID.load(Ordering::Acquire) != my_tid {
@@ -178,7 +189,14 @@ impl EventHook for KeyboardHook {
                                     .saturating_sub(KB_LAST_EVENT_MS.load(Ordering::Relaxed))
                                     > 30_000;
                                 if moved && stale {
-                                    log::warn!("keyboard_hook 疑似被系统摘除，尝试重装");
+                                    stale_beats += 1;
+                                } else {
+                                    stale_beats = 0;
+                                }
+                                if stale_beats >= 2 {
+                                    // 重置计数：本次重装后从零重新累计确认
+                                    stale_beats = 0;
+                                    log::warn!("keyboard_hook 连续两拍无事件且光标在动，疑似被系统摘除，尝试重装");
                                     PostThreadMessageW(my_tid, WM_APP_REHOOK, 0, 0);
                                 }
                             }
@@ -234,6 +252,12 @@ impl EventHook for KeyboardHook {
     }
 
     fn stop(&self) {
+        // 已接受的已知损耗（复核 low）：stop 为 Post WM_QUIT + take KB_TX 的
+        // 异步退出，且不 join hook 线程；热重载 stop→start 之间存在毫秒级
+        // 窗口（raw 模式丢键；minute 模式旧线程晚退钩的计数落入新会话并被
+        // 抑制语义整体丢弃——见 input_agg 的 rollover 测试）。消除需把 hook
+        // 线程 handle 化并在新实例启动前等待旧线程确认退钩，属过度工程，
+        // 本轮不改；此处注释固化该口径。
         let tid = KB_THREAD_ID.load(Ordering::Acquire);
         if tid != 0 {
             unsafe {

@@ -87,16 +87,69 @@ pub fn apply_pragmas_readonly(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// 读取当前 schema 版本（metadata.schema_version，0 表示全新库）。
+/// 读取当前 schema 版本（0 表示全新库）。
+///
+/// 审查 MEDIUM：schema_version 只存 metadata 文本、解析失败静默归零会触发
+/// 全量重放（0002 无条件 RENAME / 0007 裸 ALTER 不幂等，重放即撞名硬失败）。
+/// 现在权威版本同步写入 `PRAGMA user_version`（整数、库文件内、外部工具可见）：
+/// 优先读 user_version；为 0（老库尚未写入）时回退 metadata 并把解析失败
+/// 显式告警（不再静默）。
 fn current_version(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'schema_version'",
-        [],
-        |r| r.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|s| s.parse().ok())
-    .unwrap_or(0)
+    let uv: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if uv > 0 {
+        return uv;
+    }
+    match conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        Some(v) => v,
+        None => {
+            // metadata 有值但解析失败（格式漂移/损坏）：告警后按 0 处理，
+            // 由 run_migrations 的守卫决定是否安全重放
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(raw) = raw {
+                log::warn!("metadata.schema_version 值异常（{raw:?}），按 0 处理");
+            }
+            0
+        }
+    }
+}
+
+/// 把权威版本同步写入 PRAGMA user_version（写失败不阻塞——metadata 仍是
+/// 可用回退源，只是外部工具短暂看不到准确版本）。
+fn sync_user_version(conn: &Connection, version: i64) {
+    let _ = conn.execute_batch(&format!("PRAGMA user_version = {version};"));
+}
+
+/// 审查 HIGH：0007 是唯一非 IF NOT EXISTS 迁移（裸 ALTER ADD COLUMN）。
+/// 非事务老二进制可能"加列成功但没写 schema_version"（断电），重启重放
+/// 即 duplicate column 且无自愈路径。列已存在时跳过 ALTER、只补记版本号。
+fn agg_minute_has_max_event_rowid(conn: &Connection) -> bool {
+    let mut stmt = match conn.prepare("PRAGMA table_info(agg_minute)") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1));
+    match rows {
+        Ok(it) => it
+            .filter_map(|r| r.ok())
+            .any(|name| name == "max_event_rowid"),
+        Err(_) => false,
+    }
 }
 
 /// 执行全部未应用的编号迁移。每个迁移在独立事务内执行：
@@ -106,14 +159,36 @@ fn current_version(conn: &Connection) -> i64 {
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     heal_half_applied_0002(conn)?;
     let mut applied = current_version(conn);
+    // 审查 MEDIUM：未来版本库守卫——schema_version 高于本二进制已知迁移数
+    // 说明库被更新版本的程序迁移过，旧代码静默零操作后会按旧列集向新库
+    // 写入。拒绝打开（硬失败）而不是带病运行。
+    if applied > MIGRATIONS.len() as i64 {
+        let msg = format!(
+            "数据库 schema 版本 (v{applied}) 高于本程序支持的版本 (v{})，拒绝以旧代码打开未来版本库",
+            MIGRATIONS.len()
+        );
+        log::error!("{msg}");
+        return Err(rusqlite::Error::InvalidParameterName(msg));
+    }
     for (idx, (name, sql)) in MIGRATIONS.iter().enumerate() {
         let version = (idx + 1) as i64;
         if applied >= version {
             continue;
         }
+        // 0007 半应用自愈（审查 HIGH）：max_event_rowid 列已存在（非事务
+        // 老二进制加列成功但未写版本）时跳过 ALTER，只补记版本号。
+        let sql_effective: String =
+            if *name == "0007_agg_minute_max_rowid" && agg_minute_has_max_event_rowid(conn) {
+                log::warn!(
+                "0007 自愈：agg_minute.max_event_rowid 已存在（半应用），跳过 ALTER 只补记版本号"
+            );
+                format!("-- {name}: 列已存在，跳过（半应用自愈）")
+            } else {
+                (*sql).to_string()
+            };
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         let outcome = conn
-            .execute_batch(sql)
+            .execute_batch(&sql_effective)
             .and_then(|_| {
                 conn.execute(
                     "INSERT INTO metadata (key, value) VALUES ('schema_version', ?1)
@@ -130,6 +205,9 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         log::info!("已应用迁移 {name} (v{version})");
         applied = version;
     }
+    // 权威版本同步到 PRAGMA user_version（审查 MEDIUM：单靠 metadata 文本
+    // 脆弱，user_version 整数存于库文件、外部工具可见）
+    sync_user_version(conn, applied);
     Ok(())
 }
 
@@ -139,14 +217,28 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 /// 处置：pet_signals 若为空表（同次迁移的 CREATE IF NOT EXISTS 壳）则删壳
 /// 让 RENAME 重放成功；若壳里有行则不动、报错指引用户（永不删数据）。
 fn heal_half_applied_0002(conn: &Connection) -> rusqlite::Result<()> {
-    let has: bool = conn
+    // 审查 HIGH：命中条件改为**逐表判断**——旧条件"两张名字计数恰好 == 2"
+    // 救不了 0002 中途断电最常见的三表残局（legacy_pet_signals + pet_memory
+    // + pet_state 并存时改名已成功、pet_signals 壳已不在，COUNT=1≠2 → 判
+    // skip → 重放 RENAME 撞名硬失败）。现在：legacy_pet_signals 存在且
+    // pet_signals 也存在时才需要处置（空壳删掉让 RENAME 重放成功）。
+    let legacy_exists: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'              AND name IN ('pet_signals','legacy_pet_signals')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='legacy_pet_signals')",
             [],
             |r| r.get::<_, i64>(0),
         )
-        .map(|n| n == 2)?;
-    if !has {
+        .map(|n| n != 0)?;
+    let shell_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='pet_signals')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n != 0)?;
+    if !(legacy_exists && shell_exists) {
         return Ok(());
     }
     let rows: i64 = conn.query_row(
@@ -158,11 +250,18 @@ fn heal_half_applied_0002(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("DROP TABLE IF EXISTS pet_signals;")?;
         log::info!("0002 自愈：移除空壳 pet_signals（legacy 归档已在位）");
     } else {
-        return Err(rusqlite::Error::InvalidColumnType(
-            0,
-            "pet_signals".into(),
-            rusqlite::types::Type::Null,
-        ));
+        // 审查 LOW：错误文本必须可行动——此前返回 InvalidColumnType(0,
+        // "pet_signals", Null)，与真实原因（归档壳非空、需人工处置）无关。
+        let msg = format!(
+            "0002 自愈中止：pet_signals 归档壳含 {rows} 行数据，不能自动删除；\
+             请人工确认并导出/迁移该表后删除 pet_signals，再重试打开数据库"
+        );
+        log::error!("{msg}");
+        // ToSqlConversionFailure 的 Display 原样输出内层错误文本（无前缀包装），
+        // 运维/用户看到的即是上面的可行动处置指引
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::other(msg),
+        )));
     }
     Ok(())
 }

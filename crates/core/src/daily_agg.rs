@@ -21,7 +21,7 @@ pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
         // 解析失败时回退到宽松前缀匹配（保留容错）
         (date.to_string(), format!("{date}\u{7f}"))
     });
-    let off = queries::local_offset_modifier();
+    let off = queries::LOCAL_MODIFIER_AT_EVENT;
 
     let (keys, clicks, active_min): (i64, i64, i64) = conn.query_row(
         &format!(
@@ -83,7 +83,7 @@ pub fn recompute_recent_days(conn: &Connection, days: i64) -> Result<usize> {
 
 /// 重新计算所有有事件的日期（按**本地**日期 DISTINCT）。
 pub fn recompute_all(conn: &Connection) -> Result<usize> {
-    let off = queries::local_offset_modifier();
+    let off = queries::LOCAL_MODIFIER_AT_EVENT;
     let dates: Vec<String> = conn
         .prepare("SELECT DISTINCT substr(datetime(timestamp, ?1), 1, 10) FROM events ORDER BY 1")?
         .query_map(params![off], |r| r.get::<_, String>(0))?

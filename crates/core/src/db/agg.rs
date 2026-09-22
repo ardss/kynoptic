@@ -230,7 +230,7 @@ impl super::Database {
 ///
 /// 兼容两种事件形态：raw（press/click/switch 逐行）与 input_agg（计数 JSON）。
 pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
-    let off = crate::queries::local_offset_modifier();
+    let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
     conn.execute("DELETE FROM agg_minute", [])?;
     conn.execute("DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%'", [])?;
 
@@ -306,7 +306,7 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
 /// 来自事务化之前的历史遗留 kill，且日常使用中不会再看；需要修复历史数据时
 /// 显式调用 `rebuild_agg`（或删掉 agg_minute 触发懒回填）即可全量重建。
 pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
-    let off = crate::queries::local_offset_modifier();
+    let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
     // 只核对最近 7 天（见上方取舍说明）；cutoff 用 UTC RFC3339 与 timestamp 列同构比较。
     let cutoff = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
     let sql = format!(
@@ -457,7 +457,7 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
         return Ok(());
     };
     let (dstart, dend) = local_day_bounds(date).unwrap_or((start.clone(), end.clone()));
-    let off = crate::queries::local_offset_modifier();
+    let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let r = (|| -> crate::Result<()> {
         conn.execute(

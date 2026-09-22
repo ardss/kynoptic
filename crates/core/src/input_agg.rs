@@ -71,6 +71,20 @@ fn note_event_epoch_now() {
         .unwrap_or(0);
     LAST_EVENT_EPOCH_MIN.store(secs / 60, Ordering::Relaxed);
 }
+
+/// 本会话已折叠为终值（final=true）并落库的最大 UTC 纪元分钟（时钟回拨防护，
+/// 审查 HIGH）。from_epoch_min 只钳 future 分钟、对过去无单调性防护：回拨
+/// 60-119 秒落回刚折叠完的那一分钟时，后到输入会折出同键 (timestamp,etype)
+/// 的行，UPSERT 整行覆盖把那分钟的真实终值改掉（历史被改写）。终值落库点
+/// （drain rollover）记下分钟，之后的折叠若目标分钟 <= 已终值分钟则丢弃。
+/// 只做会话内防护（reset 清零——重启场景由重启抑制 + $.final 判定负责）。
+static LAST_FINALIZED_MIN: AtomicU64 = AtomicU64::new(0);
+
+/// 目标分钟是否仍允许折叠落库（true = 未被更晚的终值覆盖过）。
+fn fold_allowed(key: &MinuteKey) -> bool {
+    let m = key.start_local.with_timezone(&Utc).timestamp() / 60;
+    (m as u64) > LAST_FINALIZED_MIN.load(Ordering::Relaxed)
+}
 static CLICKS: AtomicU64 = AtomicU64::new(0);
 /// per-key 频次（vk code 0..255 各一个原子计数）。只存"每个键按了多少次"，
 /// 不存内容、顺序、时间戳——与计数红线同口径（WhatPulse 式键盘热力图数据源）。
@@ -86,6 +100,9 @@ static BUTTON: [AtomicU64; 5] = {
     [Z; 5]
 };
 static SCROLL_TICKS: AtomicU64 = AtomicU64::new(0);
+/// 注入滚轮刻度（审查 MEDIUM：滚轮连点器/自动化滚动不得伪造在场——
+/// SCROLL_TICKS 的注入子集，presence 的 human 项扣减、auto 项计入）
+static INJECTED_SCROLL_TICKS: AtomicU64 = AtomicU64::new(0);
 /// 注入输入（自动化/合成）单独计数，绝不混入人的活动（三指标模型）
 static INJECTED_KEYS: AtomicU64 = AtomicU64::new(0);
 static INJECTED_CLICKS: AtomicU64 = AtomicU64::new(0);
@@ -163,11 +180,15 @@ pub fn record_click_button(button: usize, injected: bool) {
     }
 }
 
-/// 滚轮（ticks = |delta|/120 整数刻度数）。
-pub fn record_scroll(ticks: u64) {
+/// 滚轮（ticks = |delta|/120 整数刻度数）。injected = LLMHF_INJECTED——
+/// 注入滚轮单独计数，presence 不计入人在场（审查 MEDIUM：滚轮连点器）。
+pub fn record_scroll(ticks: u64, injected: bool) {
     SCROLL_TICKS.fetch_add(ticks, Ordering::Relaxed);
     SAMPLES.fetch_add(1, Ordering::Relaxed);
     note_event_epoch_now();
+    if injected {
+        INJECTED_SCROLL_TICKS.fetch_add(ticks, Ordering::Relaxed);
+    }
 }
 
 /// 鼠标移动（每事件记录：不做节流——原子计数无洪泛风险，且距离统计更准确）。
@@ -202,6 +223,8 @@ struct MinuteCounters {
     /// 注入输入（合成/自动化）子集计数，<= keys/clicks（三指标模型）
     injected_keys: u64,
     injected_clicks: u64,
+    /// 注入滚轮刻度，<= scroll_ticks（同上）
+    injected_scroll_ticks: u64,
 }
 
 impl MinuteCounters {
@@ -219,6 +242,7 @@ impl MinuteCounters {
         self.clicks += o.clicks;
         self.injected_keys += o.injected_keys;
         self.injected_clicks += o.injected_clicks;
+        self.injected_scroll_ticks += o.injected_scroll_ticks;
         self.scroll_ticks += o.scroll_ticks;
         self.moves += o.moves;
         self.move_dist_px += o.move_dist_px;
@@ -300,6 +324,7 @@ fn drain_atomics() -> MinuteCounters {
         samples: SAMPLES.swap(0, Ordering::Relaxed),
         injected_keys: INJECTED_KEYS.swap(0, Ordering::Relaxed),
         injected_clicks: INJECTED_CLICKS.swap(0, Ordering::Relaxed),
+        injected_scroll_ticks: INJECTED_SCROLL_TICKS.swap(0, Ordering::Relaxed),
         vk,
         buttons: [
             BUTTON[0].swap(0, Ordering::Relaxed),
@@ -362,6 +387,10 @@ fn events_for(key: MinuteKey, c: &MinuteCounters, final_row: bool) -> Vec<Event>
         if c.injected_clicks > 0 {
             md["injected_clicks"] = serde_json::json!(c.injected_clicks);
         }
+        if c.injected_scroll_ticks > 0 {
+            // 注入滚轮单列（presence human 项扣减，审查 MEDIUM）
+            md["injected_scroll_ticks"] = serde_json::json!(c.injected_scroll_ticks);
+        }
         out.push(
             Event::new(EventAction::InputAgg, EventType::Mouse)
                 .data(md)
@@ -419,17 +448,29 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
                 }
                 // 被抑制分钟攒的计数**直接丢弃**——它们是重启后
                 // 的小值，写出去会把库里上一会话的大终值覆盖回小值
-                if !suppressing {
+                // 审查 HIGH：时钟回拨防护——目标分钟已被本会话更晚的终值
+                // 覆盖过（回拨落回已折叠分钟）时不得再回写（UPSERT 会把
+                // 已发生的历史计数改掉），直接丢弃。
+                if !suppressing && fold_allowed(&key) {
                     out = events_for(key, &acc, true);
                 }
+                // 无论是否被抑制/是否空桶，rollover 后该分钟在本会话内不再回写
+                let m = key.start_local.with_timezone(&Utc).timestamp() / 60;
+                LAST_FINALIZED_MIN.fetch_max(m as u64, Ordering::Relaxed);
                 *sup = None;
                 if evt_key == cur {
                     *g = Some((cur, drained));
                 } else if merged_into_fold {
                     *g = Some((cur, MinuteCounters::default()));
-                } else {
+                } else if fold_allowed(&evt_key) {
                     // 迟到事件属于更早的未建桶分钟：为该分钟开桶
                     *g = Some((evt_key, drained));
+                } else {
+                    // 迟到事件的目标分钟已被本会话更晚的终值覆盖（时钟回拨
+                    // 防护，见 fold_allowed）：往该分钟开桶必被丢弃。计数是
+                    // 本会话的新鲜输入，改记到当前分钟——历史行不被改写，
+                    // 计数也不丢
+                    *g = Some((cur, drained));
                 }
             }
             None => {
@@ -443,37 +484,107 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
 /// 关停兜底：把当前**未满**分钟的部分计数立即折叠成事件（不留到下一分钟；
 /// 行带 `$.final: false`，重启时可识别为部分快照）。
 pub fn flush_partial(now_local: DateTime<Local>) -> Vec<Event> {
-    // 与 drain 同序：先 drain 计数再取事件时间（见 drain 内注释）
-    let drained = drain_atomics();
-    let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
-    let cur = MinuteKey::of(now_local);
-    // 统一锁获取顺序：先 PENDING 再 SUPPRESS（与 drain 一致，审查 P2：
-    // 两函数顺序相反构成潜在死锁对）。
-    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
-    // 抑制分钟内：残留计数直接丢弃（小值覆盖大终值的口子，二轮审查 P1）
-    if matches!(sup.as_ref(), Some(k) if *k == cur) {
-        *sup = None;
-        return Vec::new();
+    PendingFlush::take(now_local).0
+}
+
+/// 可回滚的关停部分分钟 flush（审查 HIGH：flush_partial 是消费性的——
+/// g.take() + swap(0)。聚合线程关停 flush 撞满通道被丢后，shutdown 的
+/// "直写最后一份 partial"兜底读到的是已被消费掉的空状态，"最后一分钟不丢"
+/// 恰在 writer 停滞+通道满的目标场景下失效。take() 与入队解耦：入队失败时
+/// 调 restore() 把消费掉的计数与 pending 桶整体还回，shutdown 兜底仍拿得到）。
+pub struct PendingFlush {
+    counters: MinuteCounters,
+    last_evt: u64,
+    pending: Option<(MinuteKey, MinuteCounters)>,
+}
+
+impl PendingFlush {
+    /// 消费当前状态并折叠为关停部分行（final=false）。
+    pub fn take(now_local: DateTime<Local>) -> (Vec<Event>, PendingFlush) {
+        // 与 drain 同序：先 drain 计数再取事件时间（见 drain 内注释）
+        let counters = drain_atomics();
+        let last_evt = LAST_EVENT_EPOCH_MIN.swap(0, Ordering::Relaxed);
+        let cur = MinuteKey::of(now_local);
+        // 统一锁获取顺序：先 PENDING 再 SUPPRESS（与 drain 一致，审查 P2：
+        // 两函数顺序相反构成潜在死锁对）。
+        let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
+        // 快照 pending（restore 用）：无论下方走哪个分支，还原时整体放回
+        let pending_snapshot = g.clone();
+        // 抑制分钟内：残留计数直接丢弃（小值覆盖大终值的口子，二轮审查 P1）
+        if matches!(sup.as_ref(), Some(k) if *k == cur) {
+            *sup = None;
+            return (
+                Vec::new(),
+                PendingFlush {
+                    counters,
+                    last_evt,
+                    pending: pending_snapshot,
+                },
+            );
+        }
+        let (key, mut acc) = match g.take() {
+            Some((k, a)) => (k, a),
+            // 无 pending 桶时按**最后一次活动的分钟**（钳到当前）落桶，避免
+            // 关停路径把最后几秒的计数归错分钟（事件时间分桶，审查）
+            None => MinuteKey::from_epoch_min(last_evt as i64, &cur)
+                .map(|k| (k, MinuteCounters::default()))
+                .unwrap_or((cur, MinuteCounters::default())),
+        };
+        // 极端兜底：pending 桶与当前分钟不一致（聚合线程刚 rollover 但事件
+        // 尚未落库），以 pending 桶为准输出，避免把计数归错分钟。
+        acc.add(&counters);
+        // 回归审查 P2：抑制判定也要覆盖 pending 桶分钟——聚合线程停滞跨分钟后
+        // 关停时，pending key 等于被抑制的分钟（< cur），上面的 cur 判定拦不住，
+        // 会把重启会话的小值当 final:false 写出去覆盖上一会话的大终值。
+        let events = if matches!(sup.as_ref(), Some(k) if *k == key) {
+            Vec::new()
+        } else if !fold_allowed(&key) {
+            // 审查 HIGH：时钟回拨防护——该分钟已被本会话更晚的终值落库，
+            // 部分行回写同样会覆盖真实计数，丢弃
+            Vec::new()
+        } else {
+            events_for(key, &acc, false)
+        };
+        (
+            events,
+            PendingFlush {
+                counters,
+                last_evt,
+                pending: pending_snapshot,
+            },
+        )
     }
-    let (key, mut acc) = match g.take() {
-        Some((k, a)) => (k, a),
-        // 无 pending 桶时按**最后一次活动的分钟**（钳到当前）落桶，避免
-        // 关停路径把最后几秒的计数归错分钟（事件时间分桶，审查）
-        None => MinuteKey::from_epoch_min(last_evt as i64, &cur)
-            .map(|k| (k, MinuteCounters::default()))
-            .unwrap_or((cur, MinuteCounters::default())),
-    };
-    // 极端兜底：pending 桶与当前分钟不一致（聚合线程刚 rollover 但事件
-    // 尚未落库），以 pending 桶为准输出，避免把计数归错分钟。
-    acc.add(&drained);
-    // 回归审查 P2：抑制判定也要覆盖 pending 桶分钟——聚合线程停滞跨分钟后
-    // 关停时，pending key 等于被抑制的分钟（< cur），上面的 cur 判定拦不住，
-    // 会把重启会话的小值当 final:false 写出去覆盖上一会话的大终值。
-    if matches!(sup.as_ref(), Some(k) if *k == key) {
-        return Vec::new();
+
+    /// 入队失败：把消费掉的原子计数、pending 桶与事件时间分钟原样还回。
+    ///
+    /// 关停时 hooks 已停（collector.shutdown 先 stop 再 join 聚合线程），
+    /// 此处 store/fetch_add 无并发写者。若部分事件已入队、部分撞 Full，还原
+    /// 后 shutdown 兜底会再写一次同键 UPSERT（同 (timestamp,event_type) 整行
+    /// 覆盖、值相同），幂等收敛，不产生重复计数。
+    pub fn restore(self) {
+        use Ordering::Relaxed;
+        KEYS.fetch_add(self.counters.keys, Relaxed);
+        KEY_SAMPLES.fetch_add(self.counters.keys_samples, Relaxed);
+        CLICKS.fetch_add(self.counters.clicks, Relaxed);
+        SCROLL_TICKS.fetch_add(self.counters.scroll_ticks, Relaxed);
+        MOVES.fetch_add(self.counters.moves, Relaxed);
+        MOVE_DIST_PX.fetch_add(self.counters.move_dist_px, Relaxed);
+        SAMPLES.fetch_add(self.counters.samples, Relaxed);
+        INJECTED_KEYS.fetch_add(self.counters.injected_keys, Relaxed);
+        INJECTED_CLICKS.fetch_add(self.counters.injected_clicks, Relaxed);
+        INJECTED_SCROLL_TICKS.fetch_add(self.counters.injected_scroll_ticks, Relaxed);
+        for (i, v) in self.counters.buttons.iter().enumerate() {
+            BUTTON[i].fetch_add(*v, Relaxed);
+        }
+        for (vk, n) in &self.counters.vk {
+            VK[*vk as usize].fetch_add(*n, Relaxed);
+        }
+        LAST_EVENT_EPOCH_MIN.store(self.last_evt, Relaxed);
+        // pending 桶整体还原（take 消费前的快照）
+        let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        *g = self.pending;
     }
-    events_for(key, &acc, false)
 }
 
 /// 重置全部聚合状态（采集器启动/重启时调用，避免跨会话串数）。
@@ -491,9 +602,13 @@ pub fn reset() {
     }
     INJECTED_KEYS.store(0, Ordering::Relaxed);
     INJECTED_CLICKS.store(0, Ordering::Relaxed);
+    INJECTED_SCROLL_TICKS.store(0, Ordering::Relaxed);
     KEY_SAMPLES.store(0, Ordering::Relaxed);
     PREV_POS.store(0, Ordering::Relaxed);
     LAST_EVENT_EPOCH_MIN.store(0, Ordering::Relaxed);
+    // 会话内时钟回拨防护一并复位（reset = 新采集会话开始；跨会话的重启
+    // 小快照覆盖问题由重启抑制 + $.final 判定负责，见模块文档）
+    LAST_FINALIZED_MIN.store(0, Ordering::Relaxed);
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     *g = None;
 }
@@ -580,7 +695,7 @@ mod tests {
         record_key();
         record_key();
         record_move(0, 0); // 鼠标样本：不得计入 keyboard 行 samples
-        record_scroll(1);
+        record_scroll(1, false);
         let evts = drain(local_min(2026, 6, 15, 10, 30)); // 建桶
         assert!(evts.is_empty());
         let evts = flush_partial(local_min(2026, 6, 15, 10, 30));
@@ -671,7 +786,7 @@ mod tests {
         record_move(0, 0);
         record_move(3, 4); // 距离 5
         record_move(3, 4); // 距离 0（不动）
-        record_scroll(2);
+        record_scroll(2, false);
         let evts = drain(local_min(2026, 6, 15, 10, 30)); // 建桶
         assert!(evts.is_empty());
         let evts = flush_partial(local_min(2026, 6, 15, 10, 30)); // 同分钟 partial

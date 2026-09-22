@@ -41,10 +41,26 @@ fn all_failed(rowids: &[i64], expected: usize) -> bool {
     rowids.len() == expected && rowids.iter().all(|&r| r == 0)
 }
 
+/// 时间戳规范化（审查 HIGH：格式漂移防护）：统一改写为 UTC `+00:00` 形的
+/// RFC3339。events.timestamp 的全部范围谓词是字符串比较，一旦带非 +00:00
+/// 后缀（采集器 bug 或外部导入写成 '+08:00'/'Z'），字典序不再等于时间序，
+/// 事件会被静默计入错误的"今日"或直接丢弃。可解析的时间戳就地归一化；
+/// 不可解析的保持原样（不阻塞落库，由读侧既有容错兜底）。
+fn normalize_timestamp(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        // to_rfc3339 输出固定 +00:00 后缀，字典序 == 时间序
+        Ok(t) => t.with_timezone(&chrono::Utc).to_rfc3339(),
+        Err(_) => ts.to_string(),
+    }
+}
+
 /// 单条事件落库（input_agg 行走 UPSERT，其余 INSERT）。返回该行的 events
 /// rowid（input_agg 聚合行无稳定新 rowid，返回 0，与旧 insert_events 语义一致）。
 fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
     let data_str = e.event_data.as_ref().map(|v| v.to_string());
+    // 审查 HIGH：写库统一规范化时间戳（见 normalize_timestamp），
+    // 保证字符串范围谓词（timestamp >= ?1 AND < ?2）语义正确
+    let ts = normalize_timestamp(&e.timestamp);
     // input_agg 聚合行走 UPSERT（同分钟同类型覆盖），其余照旧 INSERT
     let is_agg = e.event_action == crate::types::EventAction::InputAgg;
     // prepare_cached 复用 prepared statement 计划，避免每行重新 prepare/finalize
@@ -54,7 +70,7 @@ fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
         INSERT_SQL
     })?;
     stmt.execute(params![
-        e.timestamp,
+        ts,
         e.event_type.as_str(),
         e.event_action.as_str(),
         data_str,

@@ -3,6 +3,12 @@
 //! raw 粒度（默认）：点击/滚轮/释放全部发送，移动每 500ms 采样一次。
 //! minute 粒度（opt-in，见 collector::CollectorSettings）：回调退化为
 //! 纯原子计数（input_agg::record_*），不做节流（原子操作无洪泛风险）。
+//!
+//! 记录口径（复核 low，本轮不改代码）：按 Win32 文档化语义，WH_MOUSE_LL
+//! 不接收 WM_POINTER/触屏手势路径的输入——触屏/触控笔用户的双指滚动不产生
+//! WM_MOUSEWHEEL，故整类滚动行为不在记录口径内，presence 的"滚轮=主动
+//! 阅读"启发对触屏用户会偏低。补齐需另装 WM_POINTER 处理路径，非本轮
+//! 最小改动范围；此注释固化该口径。
 
 use crate::types::*;
 use crossbeam_channel::Sender;
@@ -72,7 +78,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
                 }
                 WM_MOUSEWHEEL => {
                     let delta = (ms.mouse_data >> 16) as i16 as i32;
-                    crate::input_agg::record_scroll((delta.unsigned_abs() / 120) as u64);
+                    // LLMHF_INJECTED（0x1）：注入滚轮单独累计（审查 MEDIUM：
+                    // 滚轮连点器/自动化滚动不得计入人在场）
+                    let injected = ms.flags & 0x1 != 0;
+                    crate::input_agg::record_scroll((delta.unsigned_abs() / 120) as u64, injected);
                 }
                 // 释放类事件只计样本，不影响点击计数口径
                 _ => {}
@@ -118,8 +127,12 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
                     } else {
                         EventAction::Release
                     };
+                    // 审查 MEDIUM：LLMHF_INJECTED（0x1）归一化落为 "injected"
+                    // 布尔——presence 的 raw 分支据此把注入点击排除出人在场
+                    let injected = ms.flags & 0x1 != 0;
                     let event = Event::new(action, EventType::Mouse).data(json!({
                         "button": button, "x": ms.pt.x, "y": ms.pt.y, "pressed": pressed,
+                        "injected": injected,
                     }));
                     crate::collector::send_event(&tx, event);
                 }
@@ -127,9 +140,12 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
                     let delta = (ms.mouse_data >> 16) as i16 as i32;
                     let direction = if delta > 0 { "up" } else { "down" };
                     let steps = delta.unsigned_abs() / 120;
+                    // 审查 MEDIUM：注入滚轮同样归一化落 "injected" 布尔
+                    let injected = ms.flags & 0x1 != 0;
                     let event = Event::new(EventAction::Scroll, EventType::Mouse).data(json!({
                         "x": ms.pt.x, "y": ms.pt.y,
                         "direction": direction, "steps": steps, "dy": delta,
+                        "injected": injected,
                     }));
                     crate::collector::send_event(&tx, event);
                 }

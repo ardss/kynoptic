@@ -91,10 +91,9 @@ pub fn resolve_db_path() -> PathBuf {
     cwd.join("data").join(filename)
 }
 
-/// 确保主 DB 路径上有一份完整数据。
-///
-/// 开发期可能因 cwd 不同产生两份 DB（cargo run 写根 data/，tauri dev 写 src-tauri/data/）。
-/// 本函数在目标路径不存在但某处存在旧库时，把旧库复制过来（取行数最多的那份），
+/// 确保主 DB 路径可读性诊断：对目标路径开只读连接跑 `PRAGMA quick_check`，
+/// 把结果转成人类可读的诊断文本（完整 / 损坏 / 打不开）。供打开失败时的
+/// 错误信息组装使用；本函数只读不写、不做任何复制或合并。
 pub fn diagnose_open_failure(path: &std::path::Path) -> String {
     match Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
@@ -209,6 +208,10 @@ pub struct Database {
     /// 的"取该 session 最后事件时间/事件数"全部退化为 start_time/0，sessions
     /// 表事实失效。writer 在落库前从此原子量补盖 session_id。
     current_session: std::sync::atomic::AtomicI64,
+    /// 停机旗标（审查 MEDIUM）：采集器 shutdown 置位后，maintenance() 跳过
+    /// checkpoint/VACUUM 等持写互斥体的重活——否则 shutdown 对 Maintenance
+    /// 线程的 join 会被大库 VACUUM 阻塞数分钟（心跳停滞被 watchdog 误杀）。
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 /// RAII：回填线程退出时（无论成功/失败/panic）置完成信号。
@@ -252,7 +255,10 @@ impl Database {
             log::info!("检测到 agg 缓存缺失，转入后台分块回填（不阻塞启动）");
             let bg_path = path.to_string();
             let done_flag = backfill_done.clone();
-            let _ = thread::Builder::new()
+            // 审查 LOW：spawn 失败被 let _ 静默吞掉——BackfillDoneGuard 在闭包内
+            // 构造，spawn 失败则永远不置位（wait_for_backfill 吃满超时）。Err 分支
+            // 显式记日志并手动置位完成信号。
+            if let Err(e) = thread::Builder::new()
                 .name("agg-backfill".into())
                 .spawn(move || {
                     let _guard = BackfillDoneGuard(&done_flag);
@@ -268,12 +274,20 @@ impl Database {
                         }
                         Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
                     }
-                });
+                })
+            {
+                log::error!("agg 后台回填线程 spawn 失败，完成信号直接置位: {e}");
+                if let Ok(mut d) = backfill_done.0.lock() {
+                    *d = true;
+                }
+                backfill_done.1.notify_all();
+            }
         } else if agg::read_cursor_incomplete(&writer) {
             // 上次分块回填中断（agg 已有部分行）：补齐剩余块
             let bg_path = path.to_string();
             let done_flag = backfill_done.clone();
-            let _ = thread::Builder::new()
+            // 审查 LOW：同上——spawn 失败必须记日志并置位完成信号
+            if let Err(e) = thread::Builder::new()
                 .name("agg-backfill".into())
                 .spawn(move || {
                     let _guard = BackfillDoneGuard(&done_flag);
@@ -287,7 +301,14 @@ impl Database {
                         }
                         Err(e) => log::warn!("agg 后台回填连接创建失败: {e}"),
                     }
-                });
+                })
+            {
+                log::error!("agg 后台回填补齐线程 spawn 失败，完成信号直接置位: {e}");
+                if let Ok(mut d) = backfill_done.0.lock() {
+                    *d = true;
+                }
+                backfill_done.1.notify_all();
+            }
         } else {
             // 欠聚合核对（P1，廉价：timestamp 下界 7 天 + 索引区间，见
             // agg::under_agg_dates 的取舍说明）：events 里应有聚合贡献的
@@ -309,21 +330,30 @@ impl Database {
                 );
                 let bg_path = path.to_string();
                 let done_flag = backfill_done.clone();
-                let _ = thread::Builder::new()
-                    .name("agg-lag-heal".into())
-                    .spawn(move || {
-                        let _guard = BackfillDoneGuard(&done_flag);
-                        match Connection::open(&bg_path) {
-                            Ok(c) => {
-                                let _ = apply_pragmas(&c);
-                                match agg::heal_under_agg(&c) {
-                                    Ok(n) => log::info!("欠聚合自愈完成（{} 个日期）", n),
-                                    Err(e) => log::warn!("欠聚合自愈失败: {e}"),
+                // 审查 LOW：同上——spawn 失败必须记日志并置位完成信号
+                if let Err(e) =
+                    thread::Builder::new()
+                        .name("agg-lag-heal".into())
+                        .spawn(move || {
+                            let _guard = BackfillDoneGuard(&done_flag);
+                            match Connection::open(&bg_path) {
+                                Ok(c) => {
+                                    let _ = apply_pragmas(&c);
+                                    match agg::heal_under_agg(&c) {
+                                        Ok(n) => log::info!("欠聚合自愈完成（{} 个日期）", n),
+                                        Err(e) => log::warn!("欠聚合自愈失败: {e}"),
+                                    }
                                 }
+                                Err(e) => log::warn!("欠聚合自愈连接创建失败: {e}"),
                             }
-                            Err(e) => log::warn!("欠聚合自愈连接创建失败: {e}"),
-                        }
-                    });
+                        })
+                {
+                    log::error!("欠聚合自愈线程 spawn 失败，完成信号直接置位: {e}");
+                    if let Ok(mut d) = backfill_done.0.lock() {
+                        *d = true;
+                    }
+                    backfill_done.1.notify_all();
+                }
             }
         }
 
@@ -342,7 +372,19 @@ impl Database {
             reader_degraded: AtomicU64::new(0),
             backfill_done,
             current_session: std::sync::atomic::AtomicI64::new(0),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 标记停机：maintenance() 此后跳过 checkpoint/VACUUM 等重活
+    /// （采集器 shutdown/Drop 调用，见字段文档）。
+    pub fn mark_stopping(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 借出读连接。
@@ -468,6 +510,14 @@ impl Database {
 
     /// 完整的维护操作：清理 + 欠聚合核对自愈 + WAL 检查点 + VACUUM 压缩
     pub fn maintenance(&self) {
+        // 审查 MEDIUM：停机旗标置位即整体跳过——checkpoint/VACUUM 持写互斥体
+        // 数分钟会让 shutdown 的 maintenance join 挂死（与"join 有界"注释矛盾，
+        // 且心跳停滞 1800s 后被 watchdog 误杀）。维护是周期性的，跳过一次
+        // 无损，下一周期（或下次会话）照常执行。
+        if self.is_stopping() {
+            log::info!("停机中：跳过本次数据库维护（不阻塞关停）");
+            return;
+        }
         self.cleanup_old_events();
         self.cleanup_old_sessions();
         self.refresh_daily_agg();
@@ -480,6 +530,12 @@ impl Database {
         let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
             return;
         };
+        // 拿到写锁后再查一次停机旗标：上面的前置检查与拿锁之间维护可能已被
+        // shutdown 追上——重活（checkpoint/VACUUM）必须在关停路径上让位。
+        if self.is_stopping() {
+            log::info!("停机中：跳过 WAL 检查点与 VACUUM（不阻塞关停）");
+            return;
+        }
         log::info!("正在执行 WAL 检查点...");
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         // Wave19 性能审查：retention=0 下库是 append-only，空闲页极少，

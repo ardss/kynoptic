@@ -48,8 +48,10 @@ pub fn top_apps_today(
     limit: i64,
 ) -> Vec<(String, i64)> {
     let mut out = Vec::new();
+    // 审查 MEDIUM：空白名过滤——只挡空串会让纯空白 app_name（'   '）原样进
+    // Top 应用榜（前端渲染为无名列）。TRIM 归一化 + NULLIF 空白归 (unknown)。
     let Ok(mut stmt) = conn.prepare(
-        "SELECT COALESCE(NULLIF(app_name, ''), '(unknown)'), COUNT(*) as cnt FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND app_name IS NOT NULL AND app_name != '' GROUP BY app_name ORDER BY cnt DESC LIMIT ?3"
+        "SELECT COALESCE(NULLIF(TRIM(app_name), ''), '(unknown)'), COUNT(*) as cnt FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND app_name IS NOT NULL AND TRIM(app_name) != '' GROUP BY app_name ORDER BY cnt DESC LIMIT ?3"
     ) else {
         return out;
     };
@@ -105,7 +107,8 @@ pub fn tab_change_count_today(conn: &Connection, today: &str, tomorrow: &str) ->
 pub fn hourly_counts_today(conn: &Connection, today: &str, tomorrow: &str) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     // 桶按本地小时取：datetime(timestamp, modifier) 把 UTC 时刻换成本地时刻后取 HH。
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     let sql =
         "SELECT CAST(substr(datetime(timestamp, ?1), 12, 2) AS INTEGER) as hour, COUNT(*) as cnt \
          FROM events WHERE timestamp >= ?2 AND timestamp < ?3 GROUP BY hour ORDER BY hour";
@@ -127,7 +130,8 @@ pub fn hourly_counts_today(conn: &Connection, today: &str, tomorrow: &str) -> Ve
 /// 桶按**本地分钟**取（同 [`hourly_counts_today`]），否则分钟分布整体错位时区偏移量。
 pub fn minute_counts_today(conn: &Connection, today: &str, tomorrow: &str) -> Vec<(String, i64)> {
     let mut out = Vec::new();
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     let sql = "SELECT substr(datetime(timestamp, ?1), 12, 5) as minute, COUNT(*) as cnt \
          FROM events WHERE timestamp >= ?2 AND timestamp < ?3 GROUP BY minute ORDER BY minute";
     let Ok(mut stmt) = conn.prepare(sql) else {
@@ -149,13 +153,17 @@ pub fn minute_counts_today(conn: &Connection, today: &str, tomorrow: &str) -> Ve
 /// WHERE 走 timestamp 范围索引，GROUP BY 用 datetime(timestamp, modifier) 投影。
 pub fn daily_counts_since(conn: &Connection, since: &str) -> Vec<(String, i64)> {
     let mut out = Vec::new();
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
+    // 审查 MEDIUM：上界排除 timestamp > 当前 UTC 的未来行——时钟拨快期间
+    // 写入的脏数据不得画出未来柱（与 dash 侧 reject_future_date 同口径）。
+    let now = chrono::Utc::now().to_rfc3339();
     let sql = "SELECT substr(datetime(timestamp, ?1), 1, 10) as date, COUNT(*) as cnt \
-         FROM events WHERE timestamp >= ?2 GROUP BY date";
+         FROM events WHERE timestamp >= ?2 AND timestamp < ?3 GROUP BY date";
     let Ok(mut stmt) = conn.prepare(sql) else {
         return out;
     };
-    if let Ok(rows) = stmt.query_map(params![&off, since], |r| {
+    if let Ok(rows) = stmt.query_map(params![&off, since, &now], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) {
         for row in rows.flatten() {
@@ -342,7 +350,8 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
     };
     // 分钟桶与 agg 路径同构：本地钟面 "YYYY-MM-DDTHH:MM"（datetime 输出为空格
     // 分隔，replace 成 "T"）。此前回退路径直接 substr UTC 原串，异常卡上时区错位。
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT replace(substr(datetime(timestamp, ?3), 1, 16), ' ', 'T') AS minute, \
                 SUM({KEYS_ROW_EXPR}) AS keys, \
@@ -412,7 +421,8 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
     // KEYS_ROW_EXPR + CLICKS_ROW_EXPR > 0 判定（keys/clicks 才算活跃分钟）。
     // 分钟串同样与 agg 路径同构：本地钟面 "YYYY-MM-DDTHH:MM"（datetime 输出
     // 为空格分隔，replace 成 "T"；此前回退路径返回 UTC 原串，异常卡上时区错位）。
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT DISTINCT replace(substr(datetime(timestamp, ?3), 1, 16), ' ', 'T') AS minute \
          FROM events \
@@ -495,25 +505,36 @@ pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
     }
 }
 
-/// 在 `[start, start:59]` 分钟区间内取最频繁的 (app_name, window_title)。
+/// 在 `[start, end)` 分钟区间内取最频繁的 (app_name, window_title)。
 ///
 /// 供 [`crate::analyzer`] 为专注段补全 app/window 标签。`end` 是 "YYYY-MM-DDTHH:MM"
-/// 形式，本函数自动补 `:59` 以覆盖该分钟内的全部秒。
+/// 形式，本函数把它换算成**半开**的下一分钟上界。
+///
+/// 审查 MEDIUM：旧实现补 `':59'` 与真实 timestamp 的 `.nnnnnn+00:00` 后缀做
+/// 字典序比较恒为假，该分钟第 59 秒内的事件永远不参与标注；建议的
+/// `datetime(end,'+60 seconds')` 也无效（datetime 输出空格分隔，与 'T' 分隔
+/// 的 timestamp 比较同样恒为假）。改为在 Rust 侧 +1 分钟、用 strftime 同构的
+/// 'T' 分隔格式做 `timestamp < 上界`（解析失败兜底补 ':59.999999' 后缀）。
 pub fn top_app_window_in_range(
     conn: &Connection,
     start: &str,
     end: &str,
 ) -> Option<(String, String)> {
+    let upper = chrono::NaiveDateTime::parse_from_str(&format!("{end}:00"), "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .and_then(|t| t.checked_add_signed(chrono::Duration::minutes(1)))
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|| format!("{end}:59.999999"));
     conn.query_row(
         "SELECT app_name, window_title \
          FROM events \
-         WHERE timestamp >= ?1 AND timestamp <= ?2 \
+         WHERE timestamp >= ?1 AND timestamp < ?2 \
            AND event_type IN ('window', 'keyboard', 'mouse') \
            AND COALESCE(app_name, '') <> '' \
          GROUP BY app_name, window_title \
          ORDER BY COUNT(*) DESC \
          LIMIT 1",
-        params![start, &format!("{}:59", end)],
+        params![start, &upper],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     )
     .ok()
@@ -547,14 +568,15 @@ pub fn late_night_key_count(conn: &Connection, date: &str, hour_start: i64, hour
             )
             .unwrap_or(0);
     }
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     match super::local_day_range(date) {
         Some((start, end)) => {
-            late_night_key_count_in_range(conn, &start, &end, hour_start, hour_end, &off)
+            late_night_key_count_in_range(conn, &start, &end, hour_start, hour_end, off)
         }
         None => {
             let end = format!("{date}\u{7f}");
-            late_night_key_count_in_range(conn, date, &end, hour_start, hour_end, &off)
+            late_night_key_count_in_range(conn, date, &end, hour_start, hour_end, off)
         }
     }
 }
@@ -638,8 +660,9 @@ pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
-    let off = super::local_offset_modifier();
-    top_burst_minutes_in_range(conn, &start, &end, min_count, &off)
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
+    top_burst_minutes_in_range(conn, &start, &end, min_count, off)
 }
 
 /// [`top_burst_minutes`] 的机器无关核心：显式接收 UTC `[start, end)` 边界与
@@ -759,14 +782,17 @@ pub fn app_history_totals(conn: &Connection, app: &str, before_date: &str) -> (i
             )
             .unwrap_or((0, 0));
     }
-    // 时区修正（审查 P1）：before_date 是本地日期，timestamp 是 UTC 字符串，
-    // 直接 substr 前缀比较会把本地当天 00:00–offset 段的事件错算成"更早日期"
-    // （UTC+8 下 skew 整个凌晨）。与其它回退路径同样用 local_offset_modifier。
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
+    // 审查 HIGH：历史基线必须与"今日"侧及 agg 路径同口径——过滤
+    // keyboard/mouse/window。不过滤时历史里只有 clipboard/系统事件的 app 会
+    // 把日均基线抬高，真实突增被静默漏报，且 hist_days>0 会吞掉"新应用首次
+    // 出现"分支，与 agg_daily 缓存路径结论分叉。
     conn.query_row(
         "SELECT COUNT(*), COUNT(DISTINCT substr(datetime(timestamp, ?3), 1, 10)) \
          FROM events \
-         WHERE app_name = ?1 AND substr(datetime(timestamp, ?3), 1, 10) < ?2",
+         WHERE app_name = ?1 AND substr(datetime(timestamp, ?3), 1, 10) < ?2 \
+           AND event_type IN ('keyboard','mouse','window')",
         params![app, before_date, off],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     )
