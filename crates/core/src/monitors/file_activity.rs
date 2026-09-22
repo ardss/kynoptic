@@ -16,6 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::IO::CancelIoEx;
+
+/// HANDLE 的 Send 包装（裸指针默认非 Send）：登记表跨线程共享句柄数值，
+/// 仅用于 monitor Drop 侧对仍在监视的句柄调 CancelIoEx，绝不解引用。
+#[derive(Clone, Copy)]
+struct WatchHandle(HANDLE);
+unsafe impl Send for WatchHandle {}
 
 /// 变化聚合去抖窗口
 const DEBOUNCE: Duration = Duration::from_secs(2);
@@ -52,6 +59,9 @@ pub struct RawSender {
     dropped: Arc<std::sync::atomic::AtomicU64>,
     /// 监视器消亡旗标（Drop 时置位；watcher 自检退出防泄漏）
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// 各 watch 线程当前打开的目录句柄登记表（热重载 Drop 时按表
+    /// CancelIoEx 解阻塞，见 FileActivityMonitor::drop）
+    handles: Arc<Mutex<Vec<WatchHandle>>>,
 }
 
 impl RawSender {
@@ -95,12 +105,15 @@ pub struct FileActivityMonitor {
     state: Mutex<State>,
     /// watcher 共享的消亡旗标：monitor Drop（采集器重启/线程退出）置位
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// watcher 当前打开的目录句柄登记表（与 RawSender.handles 同一份）
+    live_handles: Arc<Mutex<Vec<WatchHandle>>>,
 }
 
 impl Default for FileActivityMonitor {
     fn default() -> Self {
         Self {
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_handles: Arc::new(Mutex::new(Vec::new())),
             state: Mutex::new(State {
                 started: false,
                 rx: None,
@@ -118,6 +131,16 @@ impl Default for FileActivityMonitor {
 impl Drop for FileActivityMonitor {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // 热重载线程泄漏修复（审查 P2）：旧 watch 线程阻塞在同步
+        // ReadDirectoryChangesW（LPOVERLAPPED=None）里，只置 stop 旗标它们
+        // 要等被监视目录下一次变化才会醒来，采集器每次热重载就泄漏
+        // 3 线程 + 3 目录句柄。对每个在监视句柄调 CancelIoEx(NULL)，被阻塞
+        // 的调用立即以 ERROR_OPERATION_ABORTED 返回，线程外层循环看到
+        // stop 旗标后自行退出并关闭句柄。
+        let snapshot: Vec<WatchHandle> = self.live_handles.lock().unwrap().clone();
+        for h in snapshot {
+            unsafe { CancelIoEx(h.0, std::ptr::null_mut()) };
+        }
     }
 }
 
@@ -147,6 +170,7 @@ impl Monitor for FileActivityMonitor {
                         tx: raw_tx.clone(),
                         dropped: Arc::clone(&st.dropped_raw),
                         stop: Arc::clone(&self.stop),
+                        handles: Arc::clone(&self.live_handles),
                     },
                 );
             }
@@ -285,10 +309,12 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
+        register_handle(&tx.handles, handle);
 
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
             if tx.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                deregister_handle(&tx.handles, handle);
                 unsafe { CloseHandle(handle) };
                 return;
             }
@@ -351,10 +377,21 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
             }
         }
 
+        deregister_handle(&tx.handles, handle);
         unsafe {
             CloseHandle(handle);
         }
     }
+}
+
+/// 把 watch 句柄登记进共享表（monitor Drop 时按表 CancelIoEx 解阻塞）。
+fn register_handle(handles: &Mutex<Vec<WatchHandle>>, h: HANDLE) {
+    handles.lock().unwrap().push(WatchHandle(h));
+}
+
+/// 句柄关闭前从共享表移除，避免 Drop 对已关闭句柄调 CancelIoEx。
+fn deregister_handle(handles: &Mutex<Vec<WatchHandle>>, h: HANDLE) {
+    handles.lock().unwrap().retain(|x| x.0 != h);
 }
 
 fn open_watch_handle(path: &str) -> HANDLE {
@@ -488,6 +525,7 @@ mod tests {
                 tx,
                 dropped: Arc::clone(&dropped),
                 stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                handles: Arc::new(Mutex::new(Vec::new())),
             },
             rx,
             dropped,

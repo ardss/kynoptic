@@ -250,7 +250,7 @@
   <div class="wrap">
     <div class="kicker"><span class="l en">For context</span><span class="l zh">背景</span></div>
     <h2><span class="l en">Three roads to "AI knows your computer"</span><span class="l zh">"让 AI 了解你的电脑"的三条路线</span></h2>
-    <p class="sub"><span class="l en">If you've seen screen-recording memory tools before: those rebuild what your screen showed. Kynoptic takes a different trade-off — structured events only, at a fraction of the cost and privacy surface. (Detailed numbers live in the repo's RESEARCH.md.)</span><span class="l zh">如果你见过录屏类记忆工具：它们重建的是"你的屏幕看过什么"。Kynoptic 走了另一条路——只存结构化事件，成本和隐私面都小一个数量级。（详细数据见仓库 RESEARCH.md）</span></p>
+    <p class="sub"><span class="l en">If you've seen screen-recording memory tools before: those rebuild what your screen showed. Kynoptic takes a different trade-off — structured events only, at a fraction of the cost and privacy surface. (Details in the repo's README and BENCHMARKS.md.)</span><span class="l zh">如果你见过录屏类记忆工具：它们重建的是"你的屏幕看过什么"。Kynoptic 走了另一条路——只存结构化事件，成本和隐私面都小一个数量级。（详细数据见仓库的 README 和 BENCHMARKS.md）</span></p>
     <div class="tbl-wrap">
       <table>
         <thead>
@@ -303,7 +303,7 @@
     </details>
     <details>
       <summary><span class="l en">Does it record my screen or my passwords?</span><span class="l zh">会录屏或记录我的密码吗？</span></summary>
-      <p><span class="l en">No screens, ever. Password fields are filtered at the hook level — typing in one produces no data at all, not even a count. A strict mode can additionally drop window titles.</span><span class="l zh">永不录屏。密码框在钩子层就被过滤——在密码框里打字不产生任何数据，连计数都没有。还提供严格模式，连窗口标题都不存。</span></p>
+      <p><span class="l en">No screens, ever. Kynoptic stores counts and metadata (which app, how many keys), not what you typed — key content is never recorded, only per-key frequency counts. If that's still more than you want, per-key frequency counting can be turned off in settings.</span><span class="l zh">永不录屏。Kynoptic 存的是计数和元数据（哪个应用、按了多少键），不是你输入的内容——从不记录按键内容，只有每个按键的频次计数。如果你连这个也不想要，可以在设置里关闭每键频次采集。</span></p>
     </details>
     <details>
       <summary><span class="l en">How much resource does it use?</span><span class="l zh">资源占用多大？</span></summary>
@@ -319,7 +319,7 @@
     </details>
     <details>
       <summary><span class="l en">Windows only? What's the license?</span><span class="l zh">只有 Windows 吗？开源协议是什么？</span></summary>
-      <p><span class="l en">Windows first — it's where the demand is, and plain Win32 APIs make the monitors truly lightweight. macOS and Linux are on the roadmap. MIT licensed, fully auditable.</span><span class="l zh">先做 Windows——需求在这里，而且原生 Win32 API 能做到真正的轻量。macOS 和 Linux 在路线图上。MIT 协议，完全可审计。</span></p>
+      <p><span class="l en">Windows first — it's where the demand is, and plain Win32 APIs make the monitors truly lightweight. macOS and Linux are on the roadmap. Apache-2.0 licensed, fully auditable.</span><span class="l zh">先做 Windows——需求在这里，而且原生 Win32 API 能做到真正的轻量。macOS 和 Linux 在路线图上。Apache-2.0 协议，完全可审计。</span></p>
     </details>
   </div>
 </section>
@@ -329,7 +329,7 @@
   <div class="wrap">
     <div class="wl">
       <h2><span class="l en">v0.2.2 is out — download it now.</span><span class="l zh">v0.2.2 已发布，直接下载。</span></h2>
-      <p><span class="l en">Grab the installer from <a href="https://github.com/ardss/kynoptic/releases/latest">GitHub Releases</a> — signed checksums included. Prefer email? Leave your address and we'll ping you when macOS / Linux land.</span><span class="l zh">去 <a href="https://github.com/ardss/kynoptic/releases/latest">GitHub Releases</a> 拿安装包，附带校验和。也可以留个邮箱，macOS / Linux 版发布时通知你。</span></p>
+      <p><span class="l en">Grab the installer from <a href="https://github.com/ardss/kynoptic/releases/latest">GitHub Releases</a> — SHA256 checksums included. Prefer email? Leave your address and we'll ping you when macOS / Linux land.</span><span class="l zh">去 <a href="https://github.com/ardss/kynoptic/releases/latest">GitHub Releases</a> 拿安装包，附带校验和。也可以留个邮箱，macOS / Linux 版发布时通知你。</span></p>
       <form id="wlform" onsubmit="return submitWL(event)">
         <input type="email" id="wlemail" required placeholder="you@example.com">
         <button class="btn btn-primary" type="submit"><span class="l en">Notify me</span><span class="l zh">发布时通知我</span></button>
@@ -345,10 +345,10 @@
     <div class="logo">Kynoptic<span>_</span></div>
     <div class="links">
       <a href="https://github.com/ardss/kynoptic">GitHub</a>
-      <a href="https://github.com/ardss/kynoptic/blob/main/PRIVACY.md"><span class="l en">Privacy</span><span class="l zh">隐私</span></a>
+      <a href="https://github.com/ardss/kynoptic/blob/main/README.md#privacy"><span class="l en">Privacy</span><span class="l zh">隐私</span></a>
       <a href="https://github.com/ardss/kynoptic/releases"><span class="l en">Releases</span><span class="l zh">版本发布</span></a>
     </div>
-    <div><span class="l en">MIT License · © 2026 Kynoptic contributors</span><span class="l zh">MIT 协议 · © 2026 Kynoptic 贡献者</span></div>
+    <div><span class="l en">Apache-2.0 License · © 2026 Kynoptic contributors</span><span class="l zh">Apache-2.0 协议 · © 2026 Kynoptic 贡献者</span></div>
   </div>
 </footer>
 

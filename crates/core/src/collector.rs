@@ -55,18 +55,46 @@ pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
 /// 返回更新后的连续写失败周期数。
 /// Wave22 P1：写失败升级为 error 时同步留档到 data 目录（磁盘满场景下
 /// tray.log 同样写不进；恢复后第一份错误可留痕）。
+/// 看门狗写失败留档（有界日志纪律，对齐 crates/tray/src/filelog.rs 的做法）：
+/// 日志类文件必须有界——单文件 1MB 上限，超限轮转一次成 collector-error.log.old
+/// （覆盖式，总占用 ≤ 2MB）。此前追加写无上限：磁盘写满类永久故障下看门狗每
+/// 60s 留档一次，反而加速吃满磁盘。轮转失败退化为截断（宁可丢旧错误留痕，
+/// 不能让日志文件无限膨胀）。
 fn archive_write_failure(msg: &str) {
     use std::io::Write;
+    const MAX_BYTES: u64 = 1024 * 1024;
     let Some(dir) = crate::db::resolve_db_path()
         .parent()
         .map(|p| p.to_path_buf())
     else {
         return;
     };
+    let path = dir.join("collector-error.log");
+    // 先查大小再写：超限先轮转，保证本轮错误记录落在新文件里
+    if std::fs::metadata(&path)
+        .map(|m| m.len() >= MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let old = dir.join("collector-error.log.old");
+        let _ = std::fs::remove_file(&old);
+        // 打开中的句柄/杀毒扫描短暂持有文件会令 rename 失败：短重试几次，
+        // 仍失败则截断（同 filelog.rs 的降级策略）
+        let mut done = false;
+        for _ in 0..5 {
+            if std::fs::rename(&path, &old).is_ok() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !done {
+            let _ = std::fs::File::create(&path);
+        }
+    }
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("collector-error.log"))
+        .open(&path)
     else {
         return;
     };
@@ -196,16 +224,36 @@ fn write_batch(db: &Database, batch: &mut [Event], total_written: &AtomicUsize) 
     // 聚合增量维护与 events 落库在同一事务内完成（审查 P1：两个独立事务之间
     // kill 会留下"events 有 agg 无"的欠聚合且永不自愈）；rowids 与 batch 一一
     // 对应（失败行为 0），事务化后由 insert 层内部直接用于 agg 维护。
-    let _rowids = db.insert_events_with_agg(batch);
-    total_written.fetch_add(batch.len(), Ordering::Relaxed);
-    // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
-    LAST_FLUSH_EPOCH.store(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        Ordering::Relaxed,
-    );
+    let rowids = db.insert_events_with_agg(batch);
+    // 审查 HIGH：不能无视插入结果——整批失败（磁盘满/杀毒锁库）时若照旧推进
+    // LAST_FLUSH_EPOCH 并累加 total_written，心跳保持"健康"而数据静默丢失，
+    // 看门狗的停滞检测与写入统计双双失效。落库契约（db/events.rs）：rowids 与
+    // batch 一一对应，失败行为 0；input_agg 行走 UPSERT 本就合法返回 rowid 0
+    // （见 events.rs 对 execute_event 返回语义的注释），故"纯 input_agg 批 +
+    // 全零 rowid"视为成功。真正的整批失败计入 WRITE_FAILURES（由 insert 层
+    // 已计一次），此处不推进心跳时钟、不计 total_written。
+    let landed = rowids.len() == batch.len()
+        && (rowids.iter().any(|&r| r != 0)
+            || batch
+                .iter()
+                .all(|e| e.event_action == crate::types::EventAction::InputAgg));
+    if landed {
+        total_written.fetch_add(batch.len(), Ordering::Relaxed);
+        // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
+        LAST_FLUSH_EPOCH.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    } else {
+        WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        log::error!(
+            "整批落库失败，{} 条事件未计入写入统计，心跳时钟不推进",
+            batch.len()
+        );
+    }
 }
 
 fn writer_loop(
@@ -415,6 +463,12 @@ pub struct Collector {
     /// writer，顺序保证终值必被落库（审查 P1：此前句柄即弃，flush 撞上
     /// writer 已退出的通道被静默丢弃）。
     agg_handle: Option<thread::JoinHandle<()>>,
+    /// 定期维护线程句柄（审查 LOW）：shutdown 时置位停机旗标后 join——否则
+    /// 热重载后旧 Maintenance 线程可能与新采集器的维护线程并发跑
+    /// db.maintenance()。用 Option + take() 保证 shutdown 与 Drop 不双重 join。
+    maintenance_handle: Option<thread::JoinHandle<()>>,
+    /// 丢弃/写失败看门狗线程句柄（同上，shutdown 时 join）。
+    watchdog_handle: Option<thread::JoinHandle<()>>,
     pub hooks: Vec<Box<dyn EventHook>>,
     /// 设置副本：shutdown 时决定是否 flush 未满分钟的部分输入计数。
     settings: CollectorSettings,
@@ -461,6 +515,16 @@ impl Collector {
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
+        }
+        // 审查 LOW：writer 退出后 join 维护与看门狗线程。两个循环的睡眠都做
+        // 了 1 秒切片并在切片间检查停机旗标（见 spawn 处），故 join 有界
+        // （最多 ~1s），热重载后不会出现新旧维护线程并发 db.maintenance()。
+        // take() 防止 Drop 路径双重 join。
+        if let Some(h) = self.maintenance_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.watchdog_handle.take() {
+            let _ = h.join();
         }
         // 终值直写兜底（与 Drop 同款，审查 P1）：聚合线程的关停终值 flush 走
         // 通道，若通道已满（writer 停滞场景）会被 try_send 丢弃且无人补偿。
@@ -534,6 +598,14 @@ impl Drop for Collector {
                     if !events.is_empty() {
                         write_batch(&self.db, &mut events, &self.total_written);
                     }
+                }
+                // Drop 兜底路径同样 join 维护/看门狗线程（审查 LOW）；take()
+                // 与 shutdown 互斥，不会双重 join。
+                if let Some(h) = self.maintenance_handle.take() {
+                    let _ = h.join();
+                }
+                if let Some(h) = self.watchdog_handle.take() {
+                    let _ = h.join();
                 }
             }
             let total = self.total_written.load(Ordering::Relaxed) as i64;
@@ -638,13 +710,15 @@ pub fn start_collection_custom(
     // （用宏而非闭包：闭包按引用捕获会把 db 借用拖到函数尾，与收尾的
     // Collector { db, .. } 移动冲突。）
     macro_rules! spawn_fail_collector {
-        ($writer:expr, $agg:expr, $hooks:expr) => {{
+        ($writer:expr, $agg:expr, $maint:expr, $watch:expr, $hooks:expr) => {{
             Collector {
                 db: db.clone(),
                 session_id,
                 total_written: total_written.clone(),
                 writer_handle: $writer,
                 agg_handle: $agg,
+                maintenance_handle: $maint,
+                watchdog_handle: $watch,
                 hooks: $hooks,
                 settings,
                 shutdown: shutdown.clone(),
@@ -671,7 +745,7 @@ pub fn start_collection_custom(
         }) {
         Ok(h) => h,
         Err(e) => {
-            spawn_fail_collector!(None, None, Vec::new());
+            spawn_fail_collector!(None, None, None, None, Vec::new());
             panic!("Writer 启动失败: {e}");
         }
     };
@@ -691,7 +765,7 @@ pub fn start_collection_custom(
             Err(e) => {
                 // 停机旗标让已启动的 monitor 在下一轮检查点（<=1s）退出，
                 // writer_stop 让 writer 排空尾批退出，再关闭 session
-                spawn_fail_collector!(Some(writer_handle), None, Vec::new());
+                spawn_fail_collector!(Some(writer_handle), None, None, None, Vec::new());
                 panic!("Monitor 线程启动失败: {e}");
             }
         }
@@ -752,7 +826,7 @@ pub fn start_collection_custom(
                 }) {
                 Ok(h) => h,
                 Err(e) => {
-                    spawn_fail_collector!(Some(writer_handle), None, Vec::new());
+                    spawn_fail_collector!(Some(writer_handle), None, None, None, Vec::new());
                     panic!("InputAgg 聚合线程启动失败: {e}");
                 }
             },
@@ -792,26 +866,35 @@ pub fn start_collection_custom(
             // 每 DAILY_AGG_REFRESH_SECS（600s = 10 分钟）刷新一次 daily_agg
             // 派生缓存（图表与实时卡片不能互相矛盾）；
             // 每 MAINTENANCE_INTERVAL_SECS 做一次全量维护（清理/回填等重活）。
+            // 睡眠做 1 秒切片并在切片间检查停机旗标（审查 LOW）：shutdown 会
+            // join 本线程，整段 sleep 会让 join 挂满一个周期（最长 10 分钟）。
             let mut ticks: u64 = 0;
+            let interval = Duration::from_secs(constants::DAILY_AGG_REFRESH_SECS);
+            let mut next_tick = std::time::Instant::now() + interval;
             loop {
-                thread::sleep(Duration::from_secs(constants::DAILY_AGG_REFRESH_SECS));
                 if sd_maint.load(Ordering::Acquire) {
                     return;
                 }
-                ticks += 1;
-                if ticks.is_multiple_of(
-                    constants::MAINTENANCE_INTERVAL_SECS / constants::DAILY_AGG_REFRESH_SECS,
-                ) {
-                    log::info!("执行定期数据库维护...");
-                    db_clone.maintenance();
-                } else {
-                    db_clone.refresh_daily_agg();
+                let now = std::time::Instant::now();
+                if now >= next_tick {
+                    next_tick = now + interval;
+                    ticks += 1;
+                    if ticks.is_multiple_of(
+                        constants::MAINTENANCE_INTERVAL_SECS / constants::DAILY_AGG_REFRESH_SECS,
+                    ) {
+                        log::info!("执行定期数据库维护...");
+                        db_clone.maintenance();
+                    } else {
+                        db_clone.refresh_daily_agg();
+                    }
                 }
+                let remaining = next_tick.saturating_duration_since(std::time::Instant::now());
+                thread::sleep(remaining.min(Duration::from_secs(1)));
             }
         });
     if let Err(e) = maint_handle {
         // hooks/agg/writer 均已启动：全量兜底清理后再 panic（审查 P1）
-        spawn_fail_collector!(Some(writer_handle), agg_handle, hooks);
+        spawn_fail_collector!(Some(writer_handle), agg_handle, None, None, hooks);
         panic!("维护线程启动失败: {e}");
     }
 
@@ -823,14 +906,23 @@ pub fn start_collection_custom(
     let watch_handle = thread::Builder::new()
         .name("DropWatchdog".into())
         .spawn(move || loop {
-            thread::sleep(Duration::from_secs(60));
-            if sd_watch.load(Ordering::Acquire) {
-                return;
+            // 睡眠 1 秒切片：shutdown join 本线程时最多 ~1 秒退出（审查 LOW）
+            for _ in 0..60 {
+                if sd_watch.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_secs(1));
             }
             log_dropped_events_watchdog();
         });
     if let Err(e) = watch_handle {
-        spawn_fail_collector!(Some(writer_handle), agg_handle, hooks);
+        spawn_fail_collector!(
+            Some(writer_handle),
+            agg_handle,
+            maint_handle.ok(),
+            None,
+            hooks
+        );
         panic!("丢弃看门狗线程启动失败: {e}");
     }
 
@@ -840,6 +932,8 @@ pub fn start_collection_custom(
         total_written,
         writer_handle: Some(writer_handle),
         agg_handle,
+        maintenance_handle: maint_handle.ok(),
+        watchdog_handle: watch_handle.ok(),
         hooks,
         settings,
         shutdown,

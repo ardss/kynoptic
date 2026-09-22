@@ -17,10 +17,22 @@ pub use kynoptic_dash::settings::{
 pub fn load(db_path: &Path) -> AppSettings {
     match kynoptic_dash::settings::try_load(db_path) {
         Some(s) => s,
-        None => AppSettings {
-            autostart: crate::autostart::is_enabled().unwrap_or(false),
-            ..AppSettings::default()
-        },
+        None => {
+            // 文件存在但解析失败 = settings.json 已损坏。dash 侧 load 会改名
+            // 留档 settings.json.corrupt.bak 并重建；cli 侧不复制那份逻辑，
+            // 仅回退默认值——但至少把分叉 eprintln 出来，避免静默吞配置。
+            let path = kynoptic_dash::settings::settings_path(db_path);
+            if path.exists() {
+                eprintln!(
+                    "警告: 损坏的 settings.json，已回退默认值 — 参考托盘路径会留档 settings.json.corrupt.bak（{}）",
+                    path.with_extension("json.corrupt.bak").display()
+                );
+            }
+            AppSettings {
+                autostart: crate::autostart::is_enabled().unwrap_or(false),
+                ..AppSettings::default()
+            }
+        }
     }
 }
 

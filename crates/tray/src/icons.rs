@@ -27,6 +27,9 @@ use crate::state::TrayState;
 /// 三态图标句柄([Running, Paused, Error])。
 pub struct TrayIcons {
     handles: [windows_sys::Win32::UI::WindowsAndMessaging::HICON; 3],
+    /// 绘制时的小图标边长（SM_CXSMICON）：运行时 DPI 变化后据此判断是否
+    /// 需要重绘（见 tray.rs wndproc 的 WM_SETTINGCHANGE/WM_DPICHANGED 分支）
+    size: i32,
 }
 
 impl TrayIcons {
@@ -55,7 +58,7 @@ impl TrayIcons {
                 }
             }
         }
-        Some(Self { handles })
+        Some(Self { handles, size })
     }
 
     pub fn for_state(
@@ -63,6 +66,11 @@ impl TrayIcons {
         state: TrayState,
     ) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
         self.handles[state as usize]
+    }
+
+    /// 绘制时使用的边长（运行时 DPI 变化检测用）。
+    pub fn size(&self) -> i32 {
+        self.size
     }
 }
 

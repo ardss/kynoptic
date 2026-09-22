@@ -139,8 +139,14 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
                 UPSERT_MINUTE,
                 params![date, hour, minute, "window_switches", 1, 1, rowid],
             )?;
+            // 审查 MEDIUM：app_name 为 Some("") 的 switch 行不得写 'app:' 桶——
+            // rebuild_all / backfill_chunk 的 agg_daily 重算都过滤 app_name != ''，
+            // 该行会被下次重建/自愈删除，增量与重建语义分叉（违反模块头的
+            // 等价性契约）。空名一律跳过，与重建口径对齐。
             if let Some(app) = e.app_name.as_deref() {
-                conn.execute(UPSERT_DAILY_APP, params![date, app, 1])?;
+                if !app.is_empty() {
+                    conn.execute(UPSERT_DAILY_APP, params![date, app, 1])?;
+                }
             }
         }
         _ => {}

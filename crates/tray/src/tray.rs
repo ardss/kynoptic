@@ -386,6 +386,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // 最多一个 flush 周期的事件（审查 P1）。发 Quit 走与菜单退出同一
         // 条优雅关停链（排空通道+join writer+关 session），系统留给我们
         // 的宽限窗口足够 writer 排空。
+        // DPI/系统设置变化（审查 LOW）：小图标按启动时的 SM_CXSMICON 绘制，
+        // 运行时改 DPI（显示器热插拔/缩放调整）会留下一枚陈旧尺寸的图标。
+        // 尺寸确实变了才重绘三态并 NIM_MODIFY 换新（WM_SETTINGCHANGE 对
+        // 时区等无关设置也会广播，不能无脑重建）。
+        0x001A | 0x02A0 => {
+            // 0x001A = WM_SETTINGCHANGE, 0x02A0 = WM_DPICHANGED
+            let new_size = win::GetSystemMetrics(win::SM_CXSMICON).max(16);
+            if let Some(c) = ctx.as_mut() {
+                if c.icons.size() != new_size {
+                    if let Some(fresh) = TrayIcons::create() {
+                        c.icons = fresh; // 旧图标经 Drop 销毁
+                        c.modify_icon(hwnd);
+                    }
+                }
+            }
+            0
+        }
         WM_QUERYENDSESSION => {
             let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if ctx_ptr != 0 {

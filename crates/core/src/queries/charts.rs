@@ -713,11 +713,15 @@ pub fn top_apps_by_event_types(conn: &Connection, date: &str, limit: i64) -> Vec
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
+    // 审查 HIGH：input_agg 行经 .app("", "") 落库时 app_name 为空串（非 NULL），
+    // 只过滤 IS NOT NULL 会让空名幽灵行成为 top-1，与上方 agg 缓存路径
+    // （rebuild/backfill 均过滤 app_name != ''）结果分叉——与 top_apps_today
+    // 同款补上非空串过滤。
     let Ok(mut stmt) = conn.prepare(
         "SELECT IFNULL(app_name, '(unknown)') AS app, COUNT(*) AS n \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
-           AND app_name IS NOT NULL \
+           AND app_name IS NOT NULL AND app_name != '' \
            AND event_type IN ('keyboard', 'mouse', 'window') \
          GROUP BY app \
          ORDER BY n DESC \

@@ -76,7 +76,8 @@ Download [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)
 from the latest release, run it, and launch Kynoptic from the Start menu.
 Collection starts automatically. Open the dashboard from the tray icon
 menu ("open dashboard"); it binds to `http://127.0.0.1:8422` by default
-(if 8422 is taken, it falls back to 18422/28422 segments and the actual
+(if 8422 is taken, it falls back to 8423–8432, then the 18422/28422
+segments, and the actual
 port is recorded in `data\dashboard-port.txt`).
 
 **Option 2 — Build from source:**
