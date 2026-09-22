@@ -634,7 +634,11 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
         for pair in rows.windows(2) {
             if let (Some(a), Some(b)) = (parse(&pair[0].0), parse(&pair[1].0)) {
-                let secs = (b - a).num_seconds(); // 不封顶：连续 N 小时就是 N 小时（审查 DeepSeek）
+                // 不封顶：连续 N 小时就是 N 小时（审查 DeepSeek）；但必须有下界
+                // 0：SQL 端按 timestamp 字符串排序，时间戳时区偏移漂移时字符串
+                // 序可能与瞬时序相反，(b-a) 为负——无 max(0) 时前台应用会出现
+                // 负分钟数（复核实测 -60，unattended 指标随之更异常）。
+                let secs = (b - a).num_seconds().max(0);
                 // 采集停摆（暂停/看门狗杀/关机）产生的窗口间隔不能记成前台
                 // 时长（全库审查 P1：8 小时关机会变成某应用 8 小时驻留），
                 // 超 2h 的间隔两侧都不归属。
@@ -986,13 +990,17 @@ pub fn api_input_at(
         std::collections::BTreeMap::new();
     let today_prefix = today.format("%Y-%m-%d").to_string();
     let mut hourly_today: [u64; 24] = [0; 24];
-    let minute_rows = rows.len();
+    // 回退判定不能只看行数：一条 event_data 为 NULL/非法 JSON 的脏行会使
+    // minute_rows>0 而永远不触发 raw 回退（复现：100 条 raw press + 1 条
+    // NULL 脏行 → granularity=minute、keys_total=0）。改数"可解析的行"。
+    let mut minute_rows = 0usize;
 
     for (bucket, etype, data) in rows {
         let v: Value = match data.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
             Some(v) => v,
             None => continue,
         };
+        minute_rows += 1;
         let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
         let day: String = bucket.chars().take(10).collect();
         let e = series.entry(day).or_default();
@@ -2403,10 +2411,17 @@ fn handle_client(
     db_path: &Path,
     port: u16,
 ) -> std::io::Result<()> {
+    // 整请求 deadline（slowloris 防线）：每次 read 有 5s 超时不够——慢客户端
+    // 每 4s 滴 1 字节可永不完成，64 个此类连接即可占满并发名额令正常请求 503
+    // （复核实测）。从首字节起 30s 未读完请求即静默断开。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     // 读请求行 + 头部（字节层解析；上限 8 KiB，超限 431，审查 P2）。
     let mut buf = [0u8; 4096];
     let mut raw = Vec::new();
     let header_end = loop {
+        if std::time::Instant::now() > deadline {
+            return Ok(()); // 超时断开（不回 408，避免给慢客户端再写响应的机会）
+        }
         let n = stream.read(&mut buf)?;
         if n == 0 {
             break raw.len();
@@ -2475,6 +2490,10 @@ fn handle_client(
         );
     }
     while raw.len() < header_end + content_length {
+        // 同一整请求 deadline 覆盖 body 读取（慢滴客户端同样无法占住名额）
+        if std::time::Instant::now() > deadline {
+            return Ok(());
+        }
         let n = stream.read(&mut buf)?;
         if n == 0 {
             break;
