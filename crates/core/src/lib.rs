@@ -16,6 +16,7 @@ pub mod probe;
 pub mod queries;
 pub mod raw_input_devices;
 pub mod registry;
+pub mod singleton;
 pub mod time;
 pub mod types;
 

@@ -215,6 +215,9 @@ impl Monitor for FileActivityMonitor {
             }
             if c.action == "overflow" {
                 details.push(json!({ "action": "overflow", "root": c.root }));
+            } else if c.action == "unavailable" {
+                // 根目录打不开的留痕条目：path = 实际解析出的目录路径
+                details.push(json!({ "action": "unavailable", "root": c.root, "path": c.seg }));
             } else {
                 details.push(json!({ "action": c.action, "root": c.root, "path": c.seg }));
             }
@@ -264,20 +267,73 @@ fn watch_roots() -> Vec<(&'static str, String)> {
     ]
 }
 
+// 已知文件夹解析（OneDrive「已知文件夹移动」修复）：旧实现用 %USERPROFILE%
+// 拼死英文目录名，KFM 重定向后监控的是不存在的本地目录，功能整体静默失效。
+// 现按 HKCU\...\Explorer\User Shell Folders 取真实路径（RegGetValueW 配
+// RRF_RT_REG_SZ 会对 REG_EXPAND_SZ 自动做环境变量展开，覆盖 %OneDrive% 等
+// 重定向变量），注册表缺失时退回 %USERPROFILE% 拼接。
+
+/// User Shell Folders 里三个目录的注册表值名
+const DESKTOP_VALUE: &str = "Desktop";
+const DOCUMENTS_VALUE: &str = "Personal";
+/// Downloads 的已知文件夹 GUID（注册表值名就是该 GUID 字符串）
+const DOWNLOADS_VALUE: &str = "{374DE290-123F-4565-9164-39C4925E467B}";
+
 fn get_desktop_path() -> String {
-    user_profile_dir("Desktop")
+    known_folder(DESKTOP_VALUE, "Desktop")
 }
 fn get_documents_path() -> String {
-    user_profile_dir("Documents")
+    known_folder(DOCUMENTS_VALUE, "Documents")
 }
 fn get_downloads_path() -> String {
-    user_profile_dir("Downloads")
+    known_folder(DOWNLOADS_VALUE, "Downloads")
 }
+
+/// 兜底：%USERPROFILE%\<sub>（注册表不可读时的保守回退）
 fn user_profile_dir(sub: &str) -> String {
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
         format!("{}\\{}", userprofile, sub)
     } else {
         String::new()
+    }
+}
+
+/// 读一个已知文件夹的真实路径：注册表值优先，缺失/失败回退 %USERPROFILE% 拼接。
+fn known_folder(value_name: &str, fallback_sub: &str) -> String {
+    user_shell_folder(value_name).unwrap_or_else(|| user_profile_dir(fallback_sub))
+}
+
+/// HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders
+/// 下读字符串值。RRF_RT_REG_SZ：REG_EXPAND_SZ 被自动展开并按 REG_SZ 返回。
+fn user_shell_folder(value_name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders";
+    let sub_wide: Vec<u16> = SUBKEY.encode_utf16().chain([0]).collect();
+    let val_wide: Vec<u16> = value_name.encode_utf16().chain([0]).collect();
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    let mut kind: u32 = 0;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub_wide.as_ptr(),
+            val_wide.as_ptr(),
+            RRF_RT_REG_SZ,
+            &mut kind,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+    if ok != 0 {
+        return None;
+    }
+    let len = (size as usize / 2).saturating_sub(1); // 去掉结尾 NUL
+    let s = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -296,6 +352,8 @@ pub fn spawn_watcher(path: &str, root_name: &str, tx: RawSender) {
 }
 
 fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
+    // 目录打不开的留痕旗标：进入失败态只发一次 unavailable，重开成功后复位
+    let unavailable_sent = std::sync::atomic::AtomicBool::new(false);
     loop {
         // 回归审查 P2：watcher 生命周期绑定所属 monitor——monitor Drop 置位
         // stop，旧线程自检退出，不再对着死通道空转泄漏（采集器设置热重载
@@ -305,10 +363,21 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
         }
         let handle = open_watch_handle(path);
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            // 目录可能暂不可用（OneDrive 未就绪等），稍后重试
+            // 目录可能暂不可用（OneDrive 未就绪等），稍后重试。
+            // 根因留痕：连续打不开时发一条 unavailable 原始变化（只在进入
+            // 失败态的第一次发，成功后复位）——此前是静默 0 计数，监控器
+            // 整体失效无任何痕迹。
+            if !unavailable_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tx.send(RawChange {
+                    action: "unavailable",
+                    root: root_name.to_string(),
+                    seg: path.to_string(),
+                });
+            }
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
+        unavailable_sent.store(false, std::sync::atomic::Ordering::Relaxed);
         register_handle(&tx.handles, handle);
 
         let mut buffer = vec![0u8; BUFFER_SIZE];
@@ -530,6 +599,49 @@ mod tests {
             rx,
             dropped,
         )
+    }
+
+    #[test]
+    fn known_folder_falls_back_to_userprofile() {
+        // 注册表值名缺失时回退 %USERPROFILE%\<sub>，绝不返回不存在目录名之外
+        // 的空串/panic
+        let d = known_folder("{00000000-0000-0000-0000-000000000000}", "Desktop");
+        assert!(
+            d.ends_with("Desktop") || d.is_empty(),
+            "fallback must be USERPROFILE\\Desktop, got {d:?}"
+        );
+        // 真实值名（有 KFM 重定向时指向 OneDrive 路径，否则本地路径）：
+        // 只断言非空且可解析，不断言具体盘符
+        assert!(!get_desktop_path().is_empty());
+        assert!(!get_documents_path().is_empty());
+        assert!(!get_downloads_path().is_empty());
+    }
+
+    #[test]
+    fn unavailable_action_survives_collect_pipeline() {
+        // root 打不开时的留痕变化必须能走完去抖/聚合管线并以 unavailable
+        // 条目出现在事件里（丢失可见）
+        let monitor = FileActivityMonitor::default();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        {
+            let mut st = monitor.state.lock().unwrap();
+            st.started = true;
+            let (_t, r) = crossbeam_channel::unbounded();
+            st.rx = Some(r);
+            st.push_pending((
+                Instant::now() - Duration::from_secs(3),
+                RawChange {
+                    action: "unavailable",
+                    root: "desktop".into(),
+                    seg: r"F:\OneDrive\Desktop".into(),
+                },
+            ));
+        }
+        monitor.collect(&tx);
+        let ev = rx.try_recv().expect("unavailable must emit event");
+        let data = ev.event_data.unwrap();
+        assert_eq!(data["changes"][0]["action"], "unavailable");
+        assert_eq!(data["changes"][0]["root"], "desktop");
     }
 
     #[test]

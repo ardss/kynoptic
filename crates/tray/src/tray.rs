@@ -40,6 +40,10 @@ const SW_SHOWNORMAL: i32 = 1;
 const SW_HIDE: i32 = 0;
 const WM_CONTEXTMENU: u32 = 0x0205;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
+/// TaskbarCreated 广播消息 id（RegisterWindowMessageW 注册后写入；0=未注册）。
+/// explorer 崩溃重启后系统广播此消息，托盘必须重发 NIM_ADD 重建图标，
+/// 否则图标永久消失而进程继续采集——活着又不可控（审查 P1）。
+static WM_TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 发给采集器属主线程的命令(main.rs 定义线程,这里只约定协议)。
 #[derive(Debug, Clone)]
@@ -60,6 +64,9 @@ struct TrayCtx {
     cmd_tx: Sender<CollectorCmd>,
     state: TrayState,
     args: Args,
+    /// 当前图标的 NIM_ADD 数据副本（explorer 重启收到 TaskbarCreated 后
+    /// 原样重发 NIM_ADD 重建图标）
+    nid: NOTIFYICONDATAW,
 }
 
 /// 自动更新检查结果文件（data\update-available.txt，内容=新版本号）。
@@ -121,7 +128,14 @@ impl TrayCtx {
             // 双语（装机审查：托盘是英文系统之外用户唯一常驻可见面）
             TrayState::Running => "Kynoptic: collecting / 采集中 · 右键菜单",
             TrayState::Paused => "Kynoptic: paused / 已暂停",
-            TrayState::Error => "Kynoptic: error / 异常",
+            // Error 态区分来源：采集器故障 vs dashboard 故障（审查 P1）
+            TrayState::Error => {
+                if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                    "Kynoptic: collector error / 采集异常"
+                } else {
+                    "Kynoptic: dashboard error / 面板异常"
+                }
+            }
         }
     }
 
@@ -267,15 +281,35 @@ impl TrayCtx {
                                 "--- update requested {} ---",
                                 chrono::Local::now().to_rfc3339()
                             );
-                            let errlog = open().unwrap_or_else(|| {
-                                std::fs::File::create(db_dir.join("update.log")).unwrap()
-                            });
-                            let _ = std::process::Command::new(dir.join("kynoptic.exe"))
-                                .arg("update")
-                                .stdout(log)
-                                .stderr(errlog)
-                                .creation_flags(DETACHED_PROCESS)
-                                .spawn();
+                            // 审查修复：errlog 兜底 File::create 的 unwrap 在
+                            // 磁盘满/ACL 拒绝时会 panic 托盘进程——降级为
+                            // stderr 丢弃，更新照跑。
+                            let errlog = open()
+                                .or_else(|| std::fs::File::create(db_dir.join("update.log")).ok());
+                            let spawn_res = match errlog {
+                                Some(f) => std::process::Command::new(dir.join("kynoptic.exe"))
+                                    .arg("update")
+                                    .stdout(log)
+                                    .stderr(f)
+                                    .creation_flags(DETACHED_PROCESS)
+                                    .spawn(),
+                                None => std::process::Command::new(dir.join("kynoptic.exe"))
+                                    .arg("update")
+                                    .stdout(log)
+                                    .stderr(std::process::Stdio::null())
+                                    .creation_flags(DETACHED_PROCESS)
+                                    .spawn(),
+                            };
+                            if let Err(e) = spawn_res {
+                                log::error!("一键更新子进程启动失败: {e}");
+                            }
+                        } else {
+                            // 审查修复：update.log 打不开（磁盘满/ACL）此前
+                            // 静默不启动更新且无任何反馈
+                            log::error!(
+                                "update.log 无法打开（{:?}），一键更新未启动",
+                                db_dir.join("update.log")
+                            );
                         }
                     }
                 }
@@ -359,13 +393,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         0x0113 => {
-            // WM_TIMER：同步 dashboard 健康旗标到 Error/Running 图标
-            //（dash 线程不能直接碰 UI；托盘三态此前是死代码，定性审查接线）
-            let failed = crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed);
-            let want = match failed {
-                1 => Some(TrayState::Error),
-                2 => Some(TrayState::Running),
-                _ => None,
+            // WM_TIMER：同步健康旗标到 Error/Running 图标（dash 线程与采集
+            // 器属主线程都不能直接碰 UI）。采集器故障（COLLECTOR_FAILED，
+            // DB 损坏/被锁/磁盘满/启用集为空）优先级最高——数据静默归零
+            // 是最严重的用户可见后果，此前没有任何静态量接入 UI。
+            let want = if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                Some(TrayState::Error)
+            } else {
+                match crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                    1 => Some(TrayState::Error),
+                    2 => Some(TrayState::Running),
+                    _ => None,
+                }
             };
             if let Some(w) = want {
                 if let Some(c) = ctx.as_mut() {
@@ -424,6 +463,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             PostQuitMessage(0);
             0
         }
+        _ if msg != 0 && msg == WM_TASKBAR_CREATED.load(std::sync::atomic::Ordering::Relaxed) => {
+            // explorer 重启广播：用保存的 NIM_ADD 数据重建托盘图标。
+            // 图标本就存在时重发 NIM_ADD 幂等无害。
+            if let Some(ctx) = ctx_ptr.as_mut() {
+                Shell_NotifyIconW(NIM_ADD, &ctx.nid);
+            }
+            0
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -448,9 +495,15 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
             lpszClassName: class_name.as_ptr(),
         };
         if RegisterClassW(&wc) == 0 {
+            log::error!("RegisterClassW 失败，托盘退出（watchdog 将拉起）");
             eprintln!("kynoptic-tray: RegisterClassW failed");
             return false;
         }
+
+        // 注册 TaskbarCreated 广播（explorer 重启后重建图标的前提）
+        let tbc: Vec<u16> = "TaskbarCreated\0".encode_utf16().collect();
+        let tbc_id = win::RegisterWindowMessageW(tbc.as_ptr());
+        WM_TASKBAR_CREATED.store(tbc_id, std::sync::atomic::Ordering::Release);
 
         // 不可见顶层窗口(零尺寸、不显示)
         let title: Vec<u16> = "Kynoptic tray\0".encode_utf16().collect();
@@ -469,6 +522,7 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
             std::ptr::null_mut(),
         );
         if hwnd.is_null() {
+            log::error!("CreateWindowExW 失败，托盘退出（watchdog 将拉起）");
             eprintln!("kynoptic-tray: CreateWindowExW failed");
             return false;
         }
@@ -477,6 +531,7 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
         SetTimer(hwnd, 1, 2000, None);
 
         let Some(icons) = TrayIcons::create() else {
+            log::error!("托盘图标绘制失败，托盘退出（watchdog 将拉起）");
             eprintln!("kynoptic-tray: icon drawing failed");
             // 约束:早退路径须回收已建窗口与定时器,句柄生命周期不依赖进程退出兜底
             KillTimer(hwnd, 1);
@@ -500,6 +555,11 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         if !added {
+            // 基础设施故障：留痕 + 返回 false（main 据此不写用户退出旗标，
+            // watchdog 限速拉起），不再无痕消失
+            log::error!(
+                "Shell_NotifyIconW(NIM_ADD) 10×500ms 重试耗尽，托盘退出（watchdog 将拉起）"
+            );
             eprintln!("kynoptic-tray: Shell_NotifyIconW(NIM_ADD) failed");
             // 约束:放弃路径同样回收窗口与定时器
             KillTimer(hwnd, 1);
@@ -513,6 +573,7 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
             cmd_tx,
             state: TrayState::Running,
             args,
+            nid,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize);
 

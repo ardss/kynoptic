@@ -33,6 +33,12 @@ pub enum Error {
     #[error("序列化错误: {0}")]
     Serde(#[from] serde_json::Error),
 
+    /// 格式化错误：消费方（cli）在返回 `crate::Result` 的函数里用
+    /// `writeln!` 拼 String——写入 String 的 fmt::Error 实际不可能发生，
+    /// 补此 `From` 纯为让 `?` 通过（无运行时行为变化）。
+    #[error("格式化错误: {0}")]
+    Fmt(#[from] std::fmt::Error),
+
     /// IO 错误（文件读写等）
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
@@ -53,5 +59,40 @@ impl serde::Serialize for Error {
         S: serde::Serializer,
     {
         serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl Error {
+    /// 统一双语渲染（审查 MEDIUM）：中文一句话 + 换行 + 英文对照。
+    ///
+    /// 「打开数据库失败」此前在三个入口措辞/结构/去向互不一致（MCP 英文优先
+    /// 双语 isError、dash 中文 HTTP 400、CLI 裸 Display + exit 1）。MCP/CLI/
+    /// dash 三面应共用本函数渲染给用户，保证同一根因在协议面措辞唯一；
+    /// `Display`（`to_string`）保留为内部日志与 Serialize 的中文短形态。
+    pub fn bilingual(&self) -> String {
+        let en = match self {
+            Error::Db(e) => format!("database error: {e}"),
+            Error::PoolExhausted => "read connection pool exhausted".to_string(),
+            Error::Migration(d) => format!("schema migration failed: {d}"),
+            Error::InvalidData(d) => format!("invalid data: {d}"),
+            Error::Serde(e) => format!("serialization error: {e}"),
+            Error::Fmt(e) => format!("format error: {e}"),
+            Error::Io(e) => format!("io error: {e}"),
+        };
+        format!("{}\n{}", self, en)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 统一双语渲染：中文行在前、英文行在后，均含根因。
+    #[test]
+    fn bilingual_contains_both_languages() {
+        let e = Error::InvalidData("bad ts".into());
+        let s = e.bilingual();
+        assert!(s.contains("数据错误: bad ts"), "中文行缺失: {s}");
+        assert!(s.contains("invalid data: bad ts"), "英文行缺失: {s}");
     }
 }

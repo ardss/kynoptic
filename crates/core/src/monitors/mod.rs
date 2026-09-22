@@ -80,3 +80,15 @@ pub fn quiet_command(program: &str) -> std::process::Command {
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
 }
+
+/// monitor 级降级事件计数（审查：鼠标 Hook 安装失败、powershell 被杀软
+/// 拦截等依赖性故障此前只留一句日志甚至完全静默，与"没这传感器"无法
+/// 区分）。任何监控器进入降级态都调 [`note_degraded`]：计数 +1 并写
+/// error 日志，供上层（诊断/面板）聚合展示。只增不减，单调计数器语义。
+pub static MONITOR_DEGRADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 登记一次监控器降级：写 error 日志 + 计数 +1。
+pub fn note_degraded(what: &str) {
+    log::error!("监控器降级: {what}");
+    MONITOR_DEGRADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}

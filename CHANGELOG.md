@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dashboard: `/api/overview` no longer waits on the `nvidia-smi`
+  subprocess — GPU utilization now refreshes on a background thread
+  (stale-while-revalidate, 30s TTL, single-flight), so request threads
+  return the last known value immediately instead of blocking up to 3s+.
+- Dashboard: read endpoints (`/api/trends`, `/api/apps`, `/api/daily_top`,
+  `/api/heatmap`) map database-level failures to `400` with the root cause
+  instead of degrading to `200` with silently empty payloads (which was
+  indistinguishable from a legitimate empty result).
+- Dashboard: the report page's `data_since` now uses the local calendar
+  date (`datetime(timestamp,'localtime')`), consistent with the
+  "a day = local day" convention everywhere else; in UTC+8 the calendar no
+  longer opens one extra blank day.
+- Dashboard settings: hand-edited `settings.json` with more than 100
+  categories or a pattern longer than 200 characters is clamped on load
+  (with a warning) instead of amplifying match cost; category rules
+  precompile their lowercase tokens once at load so per-segment matching no
+  longer re-lowercases the pattern for every rule.
+  **Migration note:** category-rule matching is now genuinely
+  case-insensitive. Previously a pattern token containing uppercase
+  letters (e.g. "GitHub", "VSCode") never matched — the haystack was
+  lowercased but the token was not — so such rules were silently dead.
+  After upgrading, existing rules with uppercase tokens may start
+  matching, and report/category results can differ from previous runs.
+  Lowercase your patterns if you need the old (dead-token) behavior.
+- Dashboard page: light-color-scheme palette and `forced-colors` support;
+  the heatmap SVG colors are read from CSS variables at render time instead
+  of hardcoded dark hex values, so canvas/SVG pixels follow the system
+  theme and keep contrast in Windows high-contrast mode.
+
+### Changed
+
+- Dashboard: the HTTP service keeps a small pool (3) of read-only
+  connections instead of one shared mutex-guarded connection, so a slow
+  endpoint no longer serializes every other card request behind it.
+- Dashboard: `/api/input` aggregates keys/clicks/button/scroll/move
+  scalars and per-key frequency in SQL (`SUM`/`json_each`) instead of
+  pulling every `input_agg` row into memory and serde-parsing each one;
+  results are unchanged, cost no longer grows with the window's row count.
+- Dashboard: `/api/timeline` results are cached for 60s in the long-running
+  server (keyed by hours/bridge/db path) to avoid re-running the
+  expensive multi-day aggregation on every panel poll; pure
+  `api_timeline_at` used by tests is unaffected.
+- Single-instance: while upgrading from the session-scoped
+  `Local\KynopticTrayMutex` to the per-user `Global\KynopticTrayMutex\<SID>`
+  name, new builds also acquire and probe the legacy `Local\` name
+  (bridge mutex), so an old tray/collect still running during the upgrade
+  window is detected by new binaries and vice versa — the no-double-writer
+  guarantee no longer lapses across version mixes.
+- Dashboard: new `GET /api/diagnostics` enumerates the known log/archive
+  files (collector-error/dashboard-error/watchdog/tray/update/
+  dashboard-port) across the data and exe directories with existence,
+  size, mtime and a sanitized 20-line tail (no paths exposed); the
+  settings page consumes it in a collapsible "diagnostics" block.
+
+### Fixed
+
 - Dashboard: report page "today" goal card now recomputes the local date
   per render, so a page left open across midnight no longer applies the
   server's today presence to yesterday's report.

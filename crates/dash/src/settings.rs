@@ -14,13 +14,10 @@ use kynoptic_core::registry;
 /// dashboard 默认端口。
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8422;
 
-/// 窗口分类规则（正则，匹配 app_name 或 window_title，大小写不敏感）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CategoryRule {
-    pub name: String,
-    /// 不区分大小写的子串/正则模式（简化：按空格拆 token，任一 token 命中即归类）
-    pub pattern: String,
-}
+/// 分类规则的加载钳制上限（挂账 Wave31：规则匹配 CPU 放大收口——手改
+/// settings.json 塞进超量/超长 pattern 时，匹配成本随行数×规则数线性放大）。
+pub const MAX_CATEGORIES: usize = 100;
+pub const MAX_PATTERN_CHARS: usize = 200;
 
 /// 内置默认分类（可被 settings.json 覆盖）。匹配顺序即优先级，未命中 → 其他。
 pub fn default_categories() -> Vec<CategoryRule> {
@@ -34,17 +31,67 @@ pub fn default_categories() -> Vec<CategoryRule> {
     ]
 }
 
+/// 窗口分类规则（正则，匹配 app_name 或 window_title，大小写不敏感）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryRule {
+    pub name: String,
+    /// 不区分大小写的子串/正则模式（简化：按空格拆 token，任一 token 命中即归类）
+    pub pattern: String,
+    /// pattern 预编译（小写 token 化一次，加载时生成；序列化跳过）。
+    /// 匹配热路径（每 dwell 段 × 每规则）不再重复 split/to_lowercase。
+    #[serde(skip)]
+    pub lc_tokens: Vec<String>,
+}
+
 impl CategoryRule {
-    pub(crate) fn rule(name: &str, pattern: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            pattern: pattern.to_string(),
-        }
+    /// 由 name + pattern 构造并预编译（外部构造请走这里，保证 lc_tokens 同步）。
+    pub fn new(name: impl Into<String>, pattern: impl Into<String>) -> Self {
+        let mut r = Self {
+            name: name.into(),
+            pattern: pattern.into(),
+            lc_tokens: Vec::new(),
+        };
+        r.recompile();
+        r
     }
+
+    /// pattern 变更后重建预编译 token（反序列化 skip 字段后也须调用）。
+    pub fn recompile(&mut self) {
+        self.lc_tokens = self
+            .pattern
+            .to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+    }
+
+    pub(crate) fn rule(name: &str, pattern: &str) -> Self {
+        Self::new(name, pattern)
+    }
+
     /// app/title 是否命中该规则（token 子串匹配，大小写不敏感）。
     pub fn matches(&self, app: &str, title: &str) -> bool {
+        // 每段只小写一次（与规则数无关），token 命中判定走预编译表
         let hay = format!("{} {}", app, title).to_lowercase();
-        self.pattern.split_whitespace().any(|tok| hay.contains(tok))
+        self.matches_lc(&hay)
+    }
+
+    /// [`matches`] 的小写预 映射版：调用方（如 report 的 classify 循环）对
+    /// 同一段落逐一试规则时，可先 lowercase 一次再复用。
+    pub fn matches_lc(&self, hay_lower: &str) -> bool {
+        self.lc_tokens.iter().any(|tok| hay_lower.contains(tok))
+    }
+}
+
+/// 加载后的钳制：categories 条数 ≤100、单条 pattern ≤200 字符（字符级截断），
+/// 超限截断 + warn。POST 通道本就拒绝毒值，这里只兜手改文件的底。
+fn clamp_categories(categories: &mut [CategoryRule]) {
+    for r in categories.iter_mut() {
+        if r.pattern.chars().count() > MAX_PATTERN_CHARS {
+            log::warn!("categories[].pattern 超过 {MAX_PATTERN_CHARS} 字符，已截断");
+            r.pattern = r.pattern.chars().take(MAX_PATTERN_CHARS).collect();
+            r.recompile();
+        }
     }
 }
 
@@ -140,21 +187,77 @@ pub fn try_load(db_path: &Path) -> Option<AppSettings> {
     // 整份设置被静默判损坏回落默认。剥掉 UTF-8 BOM 再解析（仅此一处容错；
     // UTF-16 等其他编码仍按损坏处理，与 .corrupt.bak 兜底语义一致）。
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    serde_json::from_str::<AppSettings>(raw).ok()
+    let mut s: AppSettings = serde_json::from_str(raw).ok()?;
+    // 预编译 + 钳制（反序列化 skip 字段为空，必须重建；挂账 Wave31）
+    let truncate_at = s.categories.len().min(MAX_CATEGORIES);
+    if s.categories.len() > MAX_CATEGORIES {
+        log::warn!("categories 条数超过 {MAX_CATEGORIES}，已截断");
+        s.categories.truncate(MAX_CATEGORIES);
+    }
+    clamp_categories(&mut s.categories[..truncate_at]);
+    for r in &mut s.categories {
+        r.recompile();
+    }
+    Some(s)
+}
+
+/// 设置缓存：GET 侧热路径（每请求曾全量读盘 + serde 解析；坏文件场景还
+/// 每次触发 rename 留档副作用）。以 (path, mtime, len) 失效——tray 等外部
+/// 进程写文件后 mtime 变化即自动失效，无需跨进程信号。
+struct SettingsCache {
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    len: u64,
+    settings: AppSettings,
+}
+static SETTINGS_CACHE: std::sync::Mutex<Option<SettingsCache>> = std::sync::Mutex::new(None);
+
+fn stat_of(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
 }
 
 /// 读取设置；文件不存在/损坏时返回缺省（autostart 先探测现有注册表
 /// Run 项，与 `kynoptic-ctl autostart status` 同一事实源）。
+/// 带进程内缓存：stat 未变化直接返回克隆，绝不重复读盘/解析。
 pub fn load(db_path: &Path) -> AppSettings {
+    let path = settings_path(db_path);
+    let st = stat_of(&path);
+    if let Ok(g) = SETTINGS_CACHE.lock() {
+        if let Some(c) = g.as_ref() {
+            if c.path == path && st == Some((c.mtime, c.len)) {
+                return c.settings.clone();
+            }
+        }
+    }
+    let s = load_uncached(db_path, &path);
+    // 文件存在的可缓存形态才落缓存（缺省路径含注册表探测，同样缓存：
+    // 文件缺失时 stat 为 None，文件一旦出现 stat 变化即失效）。
+    if let Ok(mut g) = SETTINGS_CACHE.lock() {
+        if let Some((mtime, len)) = st {
+            *g = Some(SettingsCache {
+                path,
+                mtime,
+                len,
+                settings: s.clone(),
+            });
+        } else if g.as_ref().map(|c| c.path.as_path()) == Some(path.as_path()) {
+            *g = None; // 文件被删：丢弃旧缓存
+        }
+    }
+    s
+}
+
+fn load_uncached(db_path: &Path, path: &Path) -> AppSettings {
     match try_load(db_path) {
         Some(s) => s,
         None => {
             // 文件存在但损坏：改名留档（审查 P1：坏文件若留原地，下次保存
-            // 会用默认值静默覆盖用户配置；数据不删铁律，只改名）。
-            let path = settings_path(db_path);
+            // 会用默认值静默覆盖用户配置；数据不删铁律，只改名）。缓存化后
+            // 同一 stat 只触发一次 rename，不再每请求重复留档。
             if path.exists() {
                 let bak = path.with_extension("json.corrupt.bak");
-                let _ = std::fs::rename(&path, &bak);
+                let _ = std::fs::rename(path, &bak);
                 log::warn!(
                     "settings.json 损坏，已留档为 {}，本次回退默认值",
                     bak.display()
@@ -189,7 +292,14 @@ pub fn save(db_path: &Path, settings: &AppSettings) -> std::io::Result<()> {
     let tmp = path.with_file_name(uniq);
     let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, &path)?;
+    // 写成功即失效缓存（下次 load 重新 stat 读盘）
+    if let Ok(mut g) = SETTINGS_CACHE.lock() {
+        if g.as_ref().map(|c| c.path.as_path()) == Some(path.as_path()) {
+            *g = None;
+        }
+    }
+    Ok(())
 }
 
 /// 校验 id 集合：全部必须在 MONITOR_REGISTRY 中。返回第一个非法 id。

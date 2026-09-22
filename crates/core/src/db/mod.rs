@@ -562,11 +562,6 @@ impl Database {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
-    /// 刷新 daily_agg（异常检测的历史基线）——重算最近 2 天（今天 + 昨天）。
-    ///
-    /// 此前 daily_agg 只在 `ctl recompute` 手动刷新,采集器运行期间基线会滞后。
-    /// 维护线程每天调用一次即可让 anomaly 的历史均值 APM 保持新鲜。
-    /// 走写连接（daily_agg 是写操作），失败仅 log,不影响后续维护步骤。
     /// 等待后台聚合回填完成（最多 `timeout`）。供测试与需要在回填结束后
     /// 读取聚合缓存的调用方使用；超时返回 false。
     pub fn wait_for_backfill(&self, timeout: std::time::Duration) -> bool {
@@ -584,12 +579,53 @@ impl Database {
         }
     }
 
+    /// 刷新 daily_agg（异常检测的历史基线）——重算最近 2 天（今天 + 昨天）。
+    ///
+    /// 此前 daily_agg 只在 `ctl recompute` 手动刷新,采集器运行期间基线会滞后。
+    /// 维护线程每天调用一次即可让 anomaly 的历史均值 APM 保持新鲜。
+    /// 失败仅 log,不影响后续维护步骤。
+    ///
+    /// perf 审查（LOW）修复：单日重扫描成本随当日行数线性（合成基准 50 万行
+    /// 达 13-18s），旧实现在写连接 Mutex 内完成全部扫描——占锁期间写批次停摆，
+    /// 且不检查停机旗标、启动首刷还在 tray 启动路径上。现拆为
+    /// [`crate::daily_agg::compute_day`]（读连接，锁外）+
+    /// [`crate::daily_agg::upsert_day`]（写连接，锁内仅 UPSERT），并在停机
+    /// 旗标置位时整体跳过（与 maintenance 一致，不阻塞关停）。
     pub(crate) fn refresh_daily_agg(&self) {
+        if self.is_stopping() {
+            log::info!("停机中：跳过 daily_agg 刷新");
+            return;
+        }
+        // 读侧计算：borrow 读连接池，不碰写锁
+        let today = chrono::Local::now();
+        let dates: Vec<String> = (0..2)
+            .map(|i| {
+                (today - chrono::Duration::days(i))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+        let mut computed: Vec<(String, crate::daily_agg::DayStats)> = Vec::new();
+        {
+            let reader = self.reader();
+            for date in &dates {
+                match crate::daily_agg::compute_day(&reader, date) {
+                    Ok(s) => computed.push((date.clone(), s)),
+                    Err(e) => log::warn!("daily_agg 读侧计算失败（{date}）: {e}"),
+                }
+            }
+        }
+        if computed.is_empty() {
+            return;
+        }
+        // 写侧落库：锁内只做两条廉价 UPSERT
         self.with_writer(
-            |conn| match crate::daily_agg::recompute_recent_days(conn, 2) {
-                Ok(n) if n > 0 => log::info!("daily_agg 已刷新（{} 天有变化）", n),
-                Ok(_) => {}
-                Err(e) => log::warn!("daily_agg 刷新失败: {e}"),
+            |conn| {
+                for (date, s) in &computed {
+                    if let Err(e) = crate::daily_agg::upsert_day(conn, date, s) {
+                        log::warn!("daily_agg 刷新失败（{date}）: {e}");
+                    }
+                }
             },
             || log::warn!("daily_agg 刷新跳过：写连接不可用"),
         );
