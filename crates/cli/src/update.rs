@@ -364,8 +364,8 @@ fn replace_with_backup(dest: &std::path::Path, new_file: &std::path::Path) -> (b
 }
 
 /// 新 exe 启动失败时从 `.bak` 还原（审查 P0-2）
-fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)]) {
-    eprintln!("新 kynoptic.exe 启动验证失败，回滚到旧版本...");
+fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)], reason: &str) {
+    eprintln!("{reason}，回滚到旧版本...");
     for (dest, bak) in backups {
         let _ = std::fs::remove_file(dest);
         if bak.exists() {
@@ -389,7 +389,19 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)]) {
 pub fn is_stable_release(version: &str) -> bool {
     // semver 预发布约定：tag 含 '-' 即非稳定（v0.2.0-1 这类带后缀 tag 同样
     // 被拒——文档化的有意决定，测试直接调用本函数防同义反复）
-    !version.contains('-')
+    if version.contains('-') {
+        return false;
+    }
+    // 修复（审查 low）：仅靠 '-' 过滤会放过 v0.2.1x / v0.3.0beta 这类无连字符
+    // 的非法 tag——version_cmp 对非数字尾缀组件解析为 None，比较结果不可靠
+    //（v0.2.1x 恰为最新时会被误判 already up to date / 被提示更新到非法 tag）。
+    // 要求 tag 严格匹配 ^v?\d+(\.\d+){0,2}$ 才参与比较与 release 选择。
+    let v = version.strip_prefix('v').unwrap_or(version);
+    let parts: Vec<&str> = v.split('.').collect();
+    (1..=3).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub fn cmd_check_only() -> crate::Result<()> {
@@ -571,9 +583,22 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         }
     }
 
+    // 修复（审查 medium）：任一三件套未替换即整体失败。旧实现只 push 警告，
+    // 但 rename 失败（如杀软/备份软件以无共享模式持有句柄）时后续
+    // verify_launch 验证的是未被替换的旧 kynoptic.exe（--version 必通过），
+    // 最终仍打印 updated to，造成三件套版本漂移。此处校验三件套全部替换，
+    // 任一未换则回滚已换文件并按失败退出，要求用户关闭占用进程后重跑。
+    if backups.len() != BIN_NAMES.len() {
+        rollback(&backups, "部分文件被占用未能替换");
+        return Err(crate::Error::InvalidData(
+            "部分文件被占用未能替换（可能被杀软/备份软件锁定），已回滚到旧版本；请关闭所有 kynoptic 进程后重跑 update"
+                .to_string(),
+        ));
+    }
+
     // 5. 新主 exe 启动验证，失败整体回滚（审查 P0-2）
     if !verify_launch(&dir.join("kynoptic.exe")) {
-        rollback(&backups);
+        rollback(&backups, "新 kynoptic.exe 启动验证失败");
         return Err(crate::Error::InvalidData(
             "新版本启动失败，已回滚到旧版本".to_string(),
         ));
@@ -694,5 +719,11 @@ mod tests {
         assert!(!is_stable_release("0.3.0-rc.1"), "预发布必须被过滤");
         assert!(!is_stable_release("0.2.0-1"), "带后缀的 tag 被过滤（有意）");
         assert!(!is_stable_release("0.2.0-beta"), "beta 必须被过滤");
+        // 修复（审查 low）：无连字符但带非数字尾缀的非法 tag 同样必须被拒
+        assert!(!is_stable_release("v0.2.1x"), "非数字尾缀 tag 必须被过滤");
+        assert!(!is_stable_release("0.3.0beta"), "非数字尾缀 tag 必须被过滤");
+        assert!(!is_stable_release("0.2.1.1.1"), "超过三段必须被过滤");
+        assert!(!is_stable_release("0..1"), "空组件必须被过滤");
+        assert!(is_stable_release("v0.2.1"), "带 v 前缀的合法 tag 放行");
     }
 }
