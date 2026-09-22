@@ -41,7 +41,7 @@ kynoptic update --check            # 只查不装：stdout "UPDATE <ver>" 或 "U
 ```
 
 HTTP API（GET 全部只读）：
-`/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶；hours 有效上限 48，请求更大值会被静默取 48 而非 400）、
+`/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶；hours 有效范围 1–744（31 天），超出范围的取值会被收拢到该区间）、
 `/api/insights`（6 张叙事卡）、`/api/report`、`/api/heatmap`、`/api/anomalies`（含 message_en）、
 `/api/settings`、`/api/status`、`/api/summary`、`/api/input`、
 `/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours`（黄金时段）、

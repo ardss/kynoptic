@@ -182,6 +182,7 @@ pub fn api_timeline_at(
              FROM events \
              WHERE timestamp >= ?2 AND timestamp < ?3 \
                AND event_type IN ('keyboard','mouse','window') \
+               AND event_action != 'input_agg' \
              GROUP BY hour_bucket, app",
         )
         .map_err(|e| e.to_string())?;
