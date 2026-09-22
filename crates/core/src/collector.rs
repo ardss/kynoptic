@@ -38,15 +38,16 @@ pub fn last_flush_epoch() -> u64 {
     LAST_FLUSH_EPOCH.load(Ordering::Relaxed)
 }
 
-pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) {
+pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) -> bool {
     match tx.try_send(event) {
-        Ok(()) => {}
+        Ok(()) => true,
         // 只计"真满"：Disconnected 表示采集器已关停（writer 已退出），
         // 属关停尾部的一次性发送，计入丢弃只会污染后续会话的观测。
         Err(crossbeam_channel::TrySendError::Full(_)) => {
             DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+            false
         }
-        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -499,6 +500,10 @@ impl Collector {
 
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        // 审查 MEDIUM：通知 db 层停机——maintenance() 据此跳过 checkpoint/VACUUM
+        // 等持写互斥体的重活，避免 shutdown 对 Maintenance 线程的 join 被
+        // 大库 VACUUM 阻塞数分钟（心跳停滞 1800s 后被 watchdog 误杀）。
+        self.db.mark_stopping();
 
         for h in &self.hooks {
             h.stop();
@@ -517,9 +522,12 @@ impl Collector {
             let _ = handle.join();
         }
         // 审查 LOW：writer 退出后 join 维护与看门狗线程。两个循环的睡眠都做
-        // 了 1 秒切片并在切片间检查停机旗标（见 spawn 处），故 join 有界
-        // （最多 ~1s），热重载后不会出现新旧维护线程并发 db.maintenance()。
-        // take() 防止 Drop 路径双重 join。
+        // 了 1 秒切片并在切片间检查停机旗标（见 spawn 处），故空闲时的 join
+        // 有界（最多 ~1s）；但若 Maintenance 已在执行 db.maintenance()，其
+        // checkpoint/VACUUM 曾会持写互斥体阻塞 join 数分钟——已通过
+        // shutdown 开头的 db.mark_stopping() 让 maintenance() 跳过重活
+        // （见 db/mod.rs），join 不再被 VACUUM 拖长。take() 防止 Drop 路径
+        // 双重 join。
         if let Some(h) = self.maintenance_handle.take() {
             let _ = h.join();
         }
@@ -569,6 +577,8 @@ impl Drop for Collector {
             );
             // 注意：此分支只运行一次（shutdown 会 take writer_handle）
             self.shutdown.store(true, Ordering::Release);
+            // 同 shutdown：停机时让 maintenance() 跳过 VACUUM/checkpoint 重活
+            self.db.mark_stopping();
             for h in &self.hooks {
                 h.stop();
             }
@@ -671,7 +681,17 @@ pub fn start_collection_custom(
     // 本实例独立的停机旗标（见 Collector.shutdown 字段文档）。
     let shutdown = Arc::new(AtomicBool::new(false));
     DROPPED_EVENTS.store(0, Ordering::Relaxed);
-    WRITE_FAILURES.store(0, Ordering::Relaxed);
+    // 审查 LOW：热重载不能无条件清零上一实例遗留的写失败——旧实例 shutdown
+    // 尾排空的写失败发生在旧 watchdog 已 join 之后，无条件 store(0) 会让它
+    // 永久无告警。改 swap 取复位前余数并立即告警（留档口径同看门狗）。
+    let prev_write_failures = WRITE_FAILURES.swap(0, Ordering::Relaxed);
+    if prev_write_failures > 0 {
+        let msg = format!(
+            "上一采集实例遗留 {prev_write_failures} 次写失败未被看门狗消费（热重载复位前发现）"
+        );
+        log::error!("{msg}");
+        archive_write_failure(&msg);
+    }
     CONSECUTIVE_WRITE_FAILURE_PERIODS.store(0, Ordering::Relaxed);
     // 回归审查 P1：flush epoch 是进程级全局，重启采集器时不清会带着上一
     // 会话的时间戳——心跳线程立即误判 stalled（raw 粒度安静机器上首笔
@@ -804,8 +824,21 @@ pub fn start_collection_custom(
                                 // 关停兜底（审查 P1：必须在这里入队而不是 shutdown 直写——
                                 // 本线程是最后一个生产者，入队晚于队列里残留的秒级小快照，
                                 // writer 按序落库即天然消除"小快照后写覆盖最终行"竞态）
-                                for e in input_agg::flush_partial(chrono::Local::now()) {
-                                    send_event(&tx_agg, e);
+                                // 审查 HIGH：flush_partial 是消费性的——撞满通道被丢后
+                                // shutdown 的直写兜底会拿到空状态（最后一分钟归零）。
+                                // 改用可回滚的 PendingFlush：入队失败即整体还回状态，
+                                // shutdown 兜底 flush_partial 仍拿得到最后一分钟计数。
+                                let (evts, snap) =
+                                    input_agg::PendingFlush::take(chrono::Local::now());
+                                let mut all_queued = true;
+                                for e in evts {
+                                    if !send_event(&tx_agg, e) {
+                                        all_queued = false;
+                                    }
+                                }
+                                if !all_queued {
+                                    log::warn!("关停终值 flush 撞满通道，状态已还原，交由 shutdown 直写兜底");
+                                    snap.restore();
                                 }
                                 return true;
                             }

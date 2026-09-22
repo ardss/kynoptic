@@ -1,8 +1,8 @@
 [workspace.package]
 version = "0.2.2"
+rust-version = "1.85"
 
 [workspace]
-rust-version = "1.85"
 resolver = "2"
 members = [
     "crates/core",

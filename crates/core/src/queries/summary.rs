@@ -125,7 +125,8 @@ pub fn active_minutes_today(conn: &Connection, today: &str, tomorrow: &str) -> i
     // 口径统一（交叉审查 P1）：只认 keys/clicks 分钟（KEYS/CLICKS_ROW_EXPR > 0），
     // 剔除 move-only 分钟——与 active_minutes_by_date / day_totals /
     // daily_agg.recompute_day 同一口径，脚本级鼠标抖动无法刷活跃分钟。
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     count_or_log(
         conn.query_row(
             &format!(
@@ -145,11 +146,17 @@ pub fn active_minutes_today(conn: &Connection, today: &str, tomorrow: &str) -> i
 
 /// 有数据的天数（DISTINCT **本地**日期）。用于 summary 面板。
 pub fn distinct_active_days(conn: &Connection) -> i64 {
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
+    // 审查 MEDIUM：排除 timestamp > 当前 UTC 的未来行——时钟拨快期间写入的
+    // 脏数据不得被当成未来日期计入有效天数（与 dash 侧 reject_future_date
+    // 校验同口径，读侧双保险）。
+    let now = chrono::Utc::now().to_rfc3339();
     count_or_log(
         conn.query_row(
-            "SELECT COUNT(DISTINCT substr(datetime(timestamp, ?1), 1, 10)) FROM events",
-            params![&off],
+            "SELECT COUNT(DISTINCT substr(datetime(timestamp, ?1), 1, 10)) FROM events \
+             WHERE timestamp < ?2",
+            params![&off, &now],
             get_count_i64,
         ),
         "distinct_active_days",
@@ -193,7 +200,8 @@ pub fn count_all_clicks(conn: &Connection) -> i64 {
 }
 
 pub fn count_all_active_minutes(conn: &Connection) -> i64 {
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     // 审查 P1：minute 模式（input_agg 计数行）下没有 press/click 事件行，
     // 全时活跃分钟此前恒为 0。统一用行级 CASE 表达式（raw 计数行 +
     // input_agg 计数行两种形态）判活跃，本地分钟去重口径不变。
@@ -354,7 +362,8 @@ pub fn count_active_min_since(conn: &Connection, since_id: i64) -> i64 {
     // 口径统一（见 daily_agg 的活跃分钟定义）：只认 keys+clicks>0 的本地分钟，
     // 剔除 move-only 分钟（纯移动不能伪造活跃），且按 datetime(timestamp, off)
     // 换本地钟面后再取分钟桶——此前无条件数 UTC 原始分钟，与全库口径相左。
-    let off = super::local_offset_modifier();
+    // 事件时刻本地化（审查 HIGH：DST 修复，见 queries::LOCAL_MODIFIER_AT_EVENT）
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
     count_or_log(
         conn.query_row(
             &format!(

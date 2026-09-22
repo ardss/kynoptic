@@ -584,6 +584,13 @@ fn main() {
                                 COLLECTOR_RUNNING
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
                                 // 保持 None:下一轮再试
+                                // 约束：Err 分支必须把 collector 置 None。上面
+                                // Resume/Start 前已对旧实例 shutdown()（505-507），
+                                // 若这里仍留着 Some(已关停实例)，60s 重试条件
+                                // collector.is_none()（487）永不成立——采集器静默
+                                // 死亡且无法自愈；后续 Start/Pause 还会对同一实例
+                                // 二次 shutdown()。take 掉即恢复重试条件。
+                                let _ = collector.take();
                             }
                         }
                     }

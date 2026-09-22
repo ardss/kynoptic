@@ -32,24 +32,19 @@ mod summary;
 
 // ─── 共享 helper（子模块通过 super:: 引用） ──────────────────────────────────
 
-/// 返回本地时区相对 UTC 的偏移秒数（东半球为正，如 UTC+8 返回 28800）。
-pub(crate) fn local_offset_seconds() -> i64 {
-    Local::now().offset().local_minus_utc() as i64
-}
+// 审查 HIGH（DST 修复）遗留说明：旧的 local_offset_seconds /
+// local_offset_modifier（取"当前时刻"的固定偏移）已被
+// [`LOCAL_MODIFIER_AT_EVENT`]（SQLite 'localtime'，按事件时刻取历史时区
+// 规则）取代并删除——固定偏移会让跨 DST 的历史日小时桶整体错位 1 小时。
 
-/// 返回 SQLite `datetime()` 用的本地偏移修饰符字符串，如 `"+28800 seconds"` / `"-18000 seconds"`。
+/// 聚合/投影用的"事件时刻本地化"修饰符（审查 HIGH：DST 修复）。
 ///
-/// 供按小时/分钟/日期聚合的 SQL：`datetime(timestamp, ?modifier)` 先把 UTC 存储的
-/// timestamp 换成本地时刻，再 `substr` 取桶——否则"小时分布"图会整体错位（如 UTC+8 下
-/// 本地下午 14:00 的活动被画到 UTC 06:00 那一柱）。
-pub(crate) fn local_offset_modifier() -> String {
-    let secs = local_offset_seconds();
-    format!(
-        "{}{} seconds",
-        if secs >= 0 { "+" } else { "-" },
-        secs.abs()
-    )
-}
+/// `localtime` 让 SQLite 按每行事件所属时刻套用操作系统的历史时区规则
+/// （与活写路径 `agg::apply_event` 的 chrono Local 换算同口径）；而
+/// [`local_offset_modifier`] 固定用**当前时刻**的偏移，跨 DST 的历史日会在
+/// 小时桶上整体错位 1 小时并可跨日溢出。仅用于 SELECT/GROUP BY 投影，
+/// WHERE 仍走可下推索引的 timestamp 裸区间。
+pub(crate) const LOCAL_MODIFIER_AT_EVENT: &str = "localtime";
 
 /// 计数类查询的默认值（失败时）。
 /// 真正的 SQL 异常会 log warn；`QueryReturnedNoRows` 静默（视为无数据）。
@@ -152,16 +147,19 @@ pub fn today_range() -> (String, String) {
 //   event_data JSON（$.keys / $.clicks）里。
 // 两种形态可在同一库中共存（中途切换粒度），故所有按键/点击计数查询统一走
 // 这两个行级 CASE 表达式（外层 SUM），禁止再写只认 raw 形态的 COUNT(*)。
+// 审查 MEDIUM：json_extract 结果一律 MAX(..., 0) 钳非负——一条负值脏数据
+// （{"keys":-5}）会把"今日按键"算成负数原样展示，且使该分钟在
+// keys+clicks>0 判活下被误判为不活跃。
 pub(crate) const KEYS_ROW_EXPR: &str = "(CASE \
          WHEN event_type='keyboard' AND event_action='press' THEN 1 \
          WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
-           THEN COALESCE(json_extract(event_data, '$.keys'), 0) \
+           THEN MAX(COALESCE(json_extract(event_data, '$.keys'), 0), 0) \
          ELSE 0 END)";
 
 pub(crate) const CLICKS_ROW_EXPR: &str = "(CASE \
          WHEN event_type='mouse' AND event_action='click' THEN 1 \
          WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
-           THEN COALESCE(json_extract(event_data, '$.clicks'), 0) \
+           THEN MAX(COALESCE(json_extract(event_data, '$.clicks'), 0), 0) \
          ELSE 0 END)";
 
 /// 一分钟内的活动统计——供 [`crate::analyzer`] 专注段 / APM 序列消费。
