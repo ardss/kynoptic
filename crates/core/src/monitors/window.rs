@@ -63,8 +63,13 @@ impl Monitor for WindowMonitor {
         "window"
     }
 
+    // 约束（采样口径）：本监控是轮询式而非事件驱动（无
+    // SetWinEventHook/EVENT_SYSTEM_FOREGROUND），寿命短于一个采样周期的
+    // 前台切换（通知弹窗、广告抢焦等）可能整段漏记；恰好跨过采样点的
+    // 会被记录一次。曾为 1s，现降到 200ms 缩小漏记窗口——彻底消除需改用
+    // WinEventProc 事件钩子并重接 monitor 调度框架，非本轮最小改动范围。
     fn interval(&self) -> Duration {
-        Duration::from_secs(1)
+        Duration::from_millis(200)
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
