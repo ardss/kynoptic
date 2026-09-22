@@ -20,14 +20,21 @@ pub const HEARTBEAT_FILE: &str = "kynoptic-heartbeat";
 /// 旗标路径覆盖环境变量(测试/多实例调试用)
 pub const EXIT_FLAG_ENV: &str = "KYNOPTIC_EXIT_FLAG";
 
-/// 单实例互斥体名（Local\ 前缀 = 当前登录会话内唯一）。
+/// 单实例互斥体名（多用户/多会话隔离收口后 = `Global\KynopticTrayMutex\<SID>`）。
 ///
-/// **与 `kynoptic collect` 的契约**：crates/cli/src/main.rs 的 cmd_collect 用
-/// 同名 CreateMutexW 做单实例保护——两个写者（tray 采集器 / CLI collect）绝
-/// 不能并发写同一 SQLite 库（实测双写导致事件翻倍 + 双全局钩子）。tray 是
-/// bin crate 无法被 cli 依赖，两边各持一份同名常量，各自用测试锁定字面值，
-/// 改名必须两边同步。
-pub const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\KynopticTrayMutex";
+/// **契约（Wave29 挂账收口）**：tray / CLI collect / watchdog 探活三处一律经
+/// `kynoptic_core::singleton::singleton_mutex_name()` 取名，禁止写死字面值——
+/// 历史上三处各持同名常量靠测试锁字面值防漂移，现收敛为 core 单一事实源。
+/// SID 获取失败时助手回退旧名 `Local\KynopticTrayMutex` 并留痕。
+///
+/// 兼容名常量仅供回退断言使用。
+#[allow(dead_code)]
+pub const SINGLE_INSTANCE_MUTEX_NAME: &str = kynoptic_core::singleton::LEGACY_MUTEX_NAME;
+
+/// 当前进程应使用的单实例互斥体名（含用户 SID）。
+pub fn single_instance_mutex_name() -> String {
+    kynoptic_core::singleton::singleton_mutex_name()
+}
 
 /// 给定 exe 路径,推出旗标文件位置(纯函数,单测覆盖)。
 pub fn exit_flag_for_exe(exe: &Path) -> Option<PathBuf> {
@@ -66,9 +73,18 @@ mod tests {
 
     #[test]
     fn single_instance_mutex_name_is_the_shared_contract() {
-        // 与 crates/cli/src/main.rs 的 SINGLE_INSTANCE_MUTEX_NAME 契约:
-        // 同名字面值,任一侧改名必须两边同步(见常量注释)。
-        assert_eq!(SINGLE_INSTANCE_MUTEX_NAME, r"Local\KynopticTrayMutex");
+        // Wave29 挂账收口：名字改由 core 单一事实源派生
+        //（Global\KynopticTrayMutex\<SID>），三处（tray/collect/watchdog）
+        // 都调 kynoptic_core::singleton::singleton_mutex_name()，不再锁字面值；
+        // 这里只锁定"派生名与助手一致 + 回退旧名保留"。
+        assert_eq!(
+            single_instance_mutex_name(),
+            kynoptic_core::singleton::singleton_mutex_name()
+        );
+        assert_eq!(
+            SINGLE_INSTANCE_MUTEX_NAME,
+            kynoptic_core::singleton::LEGACY_MUTEX_NAME
+        );
     }
 
     #[test]

@@ -45,6 +45,11 @@ static COLLECTOR_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// dashboard 服务健康旗标（0=未定,1=失败,2=正常）。dash 线程写，托盘 UI
 /// 定时读——Error 态图标此前是死代码，现在真正接线（定性审查）。
 static DASH_FAILED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 采集器故障旗标（审查 P1）：启动失败（DB 损坏/被锁/磁盘满/启用集为空）置
+/// true，成功启动清零。托盘 UI 定时读它切 Error 图标——此前采集器故障没有
+/// 任何静态量接入 UI，图标保持绿色"采集中"，数据静默归零。
+pub static COLLECTOR_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 采集停滞阈值（审查 P1）：采集器在跑且"醒着的时间"内 flush 停滞超过该秒数,
 /// 心跳打 stalled:true。30s 写一轮心跳、正常批次间隔远小于此。
@@ -134,7 +139,7 @@ fn main() {
     {
         use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
         use windows_sys::Win32::System::Threading::CreateMutexW;
-        let name: Vec<u16> = format!("{}\0", paths::SINGLE_INSTANCE_MUTEX_NAME)
+        let name: Vec<u16> = format!("{}\0", paths::single_instance_mutex_name())
             .encode_utf16()
             .collect();
         unsafe {
@@ -160,8 +165,27 @@ fn main() {
                 std::process::exit(1);
             }
             if GetLastError() == ERROR_ALREADY_EXISTS {
+                // 留痕（审查：自启动场景无 console，eprintln 会被丢弃；
+                // filelog 已初始化，warn 落 tray.log 供用户自助定位）
+                log::warn!("已有实例在运行(互斥体已存在)，本实例退出");
                 eprintln!("kynoptic-tray: 已有实例在运行,退出");
                 return;
+            }
+            // 升级过渡桥：同时持有旧名互斥体——旧版 tray/collect 只持/只探
+            // 旧名，不持旧名则升级窗口里新旧实例互不可见（单实例保护失效）。
+            // 旧版实例尚在本会话运行时此处报已存在，同样退出。
+            if let Some(legacy) = kynoptic_core::singleton::legacy_bridge_mutex_name(
+                &paths::single_instance_mutex_name(),
+            ) {
+                let lname: Vec<u16> = format!("{legacy}\0").encode_utf16().collect();
+                let lh = CreateMutexW(std::ptr::null(), 0, lname.as_ptr());
+                if lh.is_null() {
+                    log::warn!("过渡桥互斥体创建失败(GetLastError={})", GetLastError());
+                } else if GetLastError() == ERROR_ALREADY_EXISTS {
+                    log::warn!("已有旧版实例在运行(过渡桥互斥体已存在)，本实例退出");
+                    eprintln!("kynoptic-tray: 已有实例在运行,退出");
+                    return;
+                }
             }
         }
     }
@@ -206,6 +230,9 @@ fn main() {
     let dash_port_requested = parsed.port;
     // 实际绑定端口回传主线程（托盘菜单 Open Dashboard 用同一端口,不打开死链）
     let (port_tx, port_rx) = mpsc::channel::<Option<u16>>();
+    // spawn 失败降级（审查 P1：.expect 会 panic 全进程且发生在收尾之前，
+    // exit 旗标写不出去，watchdog 持续拉起形成崩溃-重启循环）——dashboard
+    // 失败可降级：记日志、置失败旗标，托盘与采集器继续活着。
     let _dash_handle = thread::Builder::new()
         .name("Dashboard".into())
         .spawn(move || {
@@ -281,8 +308,11 @@ fn main() {
                 }
             }
             let _ = port_tx.send(None);
-        })
-        .expect("dashboard 线程启动失败");
+        });
+    if let Err(e) = &_dash_handle {
+        log::error!("dashboard 线程启动失败（面板不可用，采集不受影响）: {e}");
+        DASH_FAILED.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // 等实际端口（探测 bind 就绪即回传,常见路径毫秒级;库文件缺失的冷启动
     // 路径最多等 2s,超时则菜单退回请求端口——与旧行为一致,不阻塞托盘出现）。
@@ -321,7 +351,7 @@ fn main() {
     // stalled 布尔位,旧字段全部保留,新旧两代可共存。
     {
         let hb = paths::resolve_heartbeat();
-        thread::Builder::new()
+        let hb_handle = thread::Builder::new()
             .name("Heartbeat".into())
             .spawn(move || {
                 let mut prev_flush: u64 = 0;
@@ -355,8 +385,13 @@ fn main() {
                     let _ = std::fs::write(&hb, content);
                     thread::sleep(std::time::Duration::from_secs(30));
                 }
-            })
-            .expect("心跳线程启动失败");
+            });
+        // spawn 失败降级（审查 P1）：心跳缺失会让 watchdog 退化为纯互斥体
+        // 探活，不能因此 panic 全进程（panic 发生在 exit 旗标写出之前，
+        // 会形成崩溃-重启循环）
+        if let Err(e) = &hb_handle {
+            log::error!("心跳线程启动失败（watchdog 退化为互斥体探活）: {e}");
+        }
     }
 
     // 自动更新检查（用户设计要求：更新发现必须自动，不能指望用户敲命令）：
@@ -369,7 +404,7 @@ fn main() {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| p.to_path_buf()));
-        thread::Builder::new()
+        let upd_handle = thread::Builder::new()
             .name("UpdateCheck".into())
             .spawn(move || {
                 // Some(v)=有新版；None=明确无更新或查询失败。二者都清提示文件；
@@ -461,8 +496,11 @@ fn main() {
                     }
                     thread::sleep(std::time::Duration::from_secs(24 * 3600));
                 }
-            })
-            .expect("更新检查线程启动失败");
+            });
+        // spawn 失败降级（审查 P1）：更新检查是可降级服务，不允许 panic 托盘
+        if let Err(e) = &upd_handle {
+            log::error!("更新检查线程启动失败（自动更新发现不可用）: {e}");
+        }
     }
 
     // 采集器属主线程:Collector 只在本线程构造/持有/关停(所有权不跨线程)
@@ -476,6 +514,9 @@ fn main() {
             // Pause 状态记忆（审查 P2：设置保存触发的 Start 不能解除用户的
             // 暂停——只有托盘菜单的 Resume 才解除）
             let mut paused = false;
+            // 启用集为空的失败态：阻止 60s 超时空转重试（留档有界，只在
+            // 设置再次变更时重新评估）
+            let mut empty_set = false;
             // 审查 P0：启动失败后不能只等下一条命令才重试——改为 60s 超时
             // 醒来一次，采集器缺位且未暂停时自动重试（库被占/磁盘满恢复后
             // 自愈，无需用户干预）。超时重试走 Resume 语义：collector 为 None
@@ -484,7 +525,7 @@ fn main() {
                 let cmd = match cmd_rx.recv_timeout(std::time::Duration::from_secs(60)) {
                     Ok(c) => c,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if collector.is_none() && !paused {
+                        if collector.is_none() && !paused && !empty_set {
                             CollectorCmd::Resume
                         } else {
                             continue;
@@ -538,6 +579,33 @@ fn main() {
                             ..kynoptic_core::collector::CollectorSettings::default()
                         };
                         let db_str = owner_db.to_string_lossy().into_owned();
+                        // 审查 P1：registry 过滤后空集 = 启动失败，不得照常
+                        // 启动 0 监控器空采（图标绿色、writer 永不落库、
+                        // 30 分钟后 stalled 被看门狗 kill 复活成循环）。视为
+                        // 启动失败留档 + 置 COLLECTOR_FAILED，且不进入 60s
+                        // 空转重试（避免无限刷留档文件）；仅当设置再次变更
+                        // （新的 Start 命令）时才重新评估。
+                        if enabled.is_empty() {
+                            let raw = kynoptic_dash::settings::load(&owner_db)
+                                .enabled_monitors
+                                .join(", ");
+                            let msg = format!(
+                                "[{}] 采集器启动失败: 启用监控器集合为空（settings 原始列表: [{}]；全部被 registry 过滤掉，可能是版本降级/设置损坏）\n（修正后保存设置即可恢复）\n",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                raw
+                            );
+                            let err_path = owner_db
+                                .parent()
+                                .unwrap_or(&owner_db)
+                                .join("collector-error.log");
+                            let _ = std::fs::write(&err_path, &msg);
+                            log::error!("启用监控器集合为空，拒绝空采；已写入 {}", err_path.display());
+                            COLLECTOR_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                            COLLECTOR_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                            empty_set = true;
+                            continue;
+                        }
+                        empty_set = false;
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             kynoptic_core::collector::start_collection_custom(&enabled, cs, &db_str)
                         })) {
@@ -546,6 +614,8 @@ fn main() {
                                 collector = Some(c);
                                 // 审查 P1：成功启动 = 心跳 stalled 判定的前提成立
                                 COLLECTOR_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
+                                // 成功清零故障旗标（托盘 UI 从 Error 回 Running）
+                                COLLECTOR_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
                                 // 恢复成功：清除持久化错误留档
                                 let _ = std::fs::remove_file(
                                     owner_db
@@ -558,7 +628,7 @@ fn main() {
                                 // 审查 P0：启动失败此前只在 stdout 喊一嗓子（托盘
                                 // 无 console 等于没人看见），托盘照常活着、数据
                                 // 静默归零——正是"库损坏=无声空采"的用户可见形态。
-                                // 改为：持久化留档 + 每次刷新都重试。
+                                // 改为：持久化留档 + 置 COLLECTOR_FAILED + 每次刷新都重试。
                                 let msg = kynoptic_core::db::diagnose_open_failure(
                                     std::path::Path::new(&db_str),
                                 );
@@ -576,10 +646,12 @@ fn main() {
                                         msg
                                     ),
                                 );
+                                log::error!("采集器启动失败: {msg}（已写 collector-error.log，60s 后重试）");
                                 eprintln!(
                                     "采集器启动失败: {msg}，已写入 {}，60s 后重试",
                                     err_path.display()
                                 );
+                                COLLECTOR_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                                 // 审查 P1：未在跑就不得让心跳判定 stalled 依据成立
                                 COLLECTOR_RUNNING
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -613,8 +685,14 @@ fn main() {
                     }
                 }
             }
-        })
-        .expect("采集器属主线程启动失败");
+        });
+    // spawn 失败降级（审查 P1）：属主线程死 = 采集永久停止，panic 又会让
+    // exit 旗标写不出去触发看门狗崩溃-重启循环；改为留痕 + Error 图标，
+    // 进程继续活着让用户可见异常。
+    if let Err(e) = &owner {
+        log::error!("采集器属主线程启动失败（采集不可用）: {e}");
+        COLLECTOR_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // 设置变更监听：dashboard 保存设置 -> SETTINGS_EPOCH +1 -> 自动重启采集器，
     // 并把 autostart 同步到注册表 Run 项（保存即生效，无需手动重启进程）。
@@ -639,7 +717,7 @@ fn main() {
     let mut debounce = Debounce::new();
     // autostart 上次已同步值（P2：仅值实际变化才写注册表 Run 键）
     let mut last_applied_autostart: Option<bool> = None;
-    thread::Builder::new()
+    let sw_handle = thread::Builder::new()
         .name("SettingsWatch".into())
         .spawn(move || loop {
             thread::sleep(std::time::Duration::from_millis(250));
@@ -662,8 +740,11 @@ fn main() {
                 log::info!("设置已变更（防抖合并后生效），自动重启采集器");
                 let _ = watch_tx.send(CollectorCmd::Start);
             }
-        })
-        .expect("设置监听线程启动失败");
+        });
+    // spawn 失败降级（审查 P1）：设置热重载失效只留痕，不许 panic 托盘
+    if let Err(e) = &sw_handle {
+        log::error!("设置监听线程启动失败（设置变更需手动重启托盘生效）: {e}");
+    }
 
     // P1：settings.json 丢失不能静默。旧路径下文件消失（误删/重装残留清理）
     // 时 load() 无声回退 14 监控器缺省，用户"全开配置"凭空丢失且毫无痕迹。
@@ -709,24 +790,35 @@ fn main() {
     // 初始启动采集
     let _ = cmd_tx.send(CollectorCmd::Start);
 
-    // 托盘消息循环(阻塞直到 Quit;内部 NIM_ADD 失败会返回 false)
-    if !tray::run(parsed, cmd_tx.clone()) {
+    // 托盘消息循环(阻塞直到 Quit;内部初始化失败会返回 false)
+    let tray_ok = tray::run(parsed, cmd_tx.clone());
+    if !tray_ok {
         let _ = cmd_tx.send(CollectorCmd::Quit);
     }
 
     // 优雅收尾:等属主线程完成置旗标 + join writer。
     // dashboard 服务线程不 join(listener 无关闭语义),随进程退出而终止。
-    let _ = owner.join();
+    if let Ok(h) = owner {
+        let _ = h.join();
+    }
 
     // 优雅退出写旗标:watchdog 据此区分"用户主动退出"(不拉起)与"被杀/崩溃"(拉起)。
     // 被杀路径走不到这里,旗标不存在,watchdog 会重新拉起托盘。
-    // 写失败重试（审查 P2：旗标写丢会让 watchdog 把用户明确退出的托盘
-    // 每分钟复活一次）；最终仍失败至少在心跳文件旁留痕。
-    for _ in 0..3 {
-        if std::fs::write(&exit_flag, chrono::Utc::now().to_rfc3339()).is_ok() {
-            break;
+    // 审查 P1：托盘 UI 初始化失败（RegisterClassW/CreateWindowExW/图标绘制/
+    // NIM_ADD 耗尽）属基础设施故障，不得复用"用户主动退出"语义——否则
+    // watchdog 永不拉起，采集随每次开机时序复现永久停止。此路径不写旗标：
+    // watchdog 会按其坏托盘退避状态机（观察窗+连续失败退避）限速拉起。
+    if tray_ok {
+        // 写失败重试（审查 P2：旗标写丢会让 watchdog 把用户明确退出的托盘
+        // 每分钟复活一次）；最终仍失败至少在心跳文件旁留痕。
+        for _ in 0..3 {
+            if std::fs::write(&exit_flag, chrono::Utc::now().to_rfc3339()).is_ok() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(300));
         }
-        thread::sleep(std::time::Duration::from_millis(300));
+    } else {
+        log::error!("托盘 UI 初始化失败，退出且不写用户退出旗标（watchdog 将限速拉起）");
     }
 }
 
@@ -806,14 +898,31 @@ fn apply_autostart(enable: bool) {
     // Wave20 P0：autostart 双写源统一——看门狗计划任务随开关一起
     // ENABLE/DISABLE，否则设置页关了 autostart 后计划任务仍每分钟把
     // 被杀的托盘复活（"关了还弹回来"）。
+    // 审查修复：schtasks 退出码此前被 `let _` 吞掉——任务被组策略禁用/
+    // 删除时开关静默失效且零日志。失败必须留痕（log 落 tray.log）。
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let flag = if enable { "/ENABLE" } else { "/DISABLE" };
-        let _ = std::process::Command::new("schtasks")
+        match std::process::Command::new("schtasks")
             .args(["/Change", "/TN", "Kynoptic Watchdog", flag])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log::warn!(
+                    "schtasks /Change {} Kynoptic Watchdog 失败(退出码 {:?}) {}。看门狗计划任务的启停可能未生效（任务被禁用/删除/组策略拦截）",
+                    flag,
+                    out.status.code(),
+                    stderr.trim()
+                );
+            }
+            Err(e) => {
+                log::warn!("schtasks 执行失败: {e}。看门狗计划任务的启停可能未生效");
+            }
+        }
     }
 }
 

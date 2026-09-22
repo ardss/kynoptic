@@ -187,7 +187,10 @@ impl EventHook for MouseHook {
                 let mut hook =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), std::ptr::null_mut(), 0);
                 if hook.is_null() {
-                    log::error!("鼠标 Hook 安装失败");
+                    // 降级留痕：带 GetLastError（杀软/安全策略拦截时用户无从
+                    // 区分"没这传感器"与"被拦截"）+ 计入 MONITOR_DEGRADED
+                    let err = windows_sys::Win32::Foundation::GetLastError();
+                    super::note_degraded(&format!("鼠标 Hook 安装失败 (GetLastError={err})"));
                     let _ = MOUSE_THREAD_ID.compare_exchange(
                         my_tid,
                         0,
@@ -264,7 +267,11 @@ impl EventHook for MouseHook {
                             MOUSE_HOOK.store(h as u32, Ordering::Release);
                             log::info!("mouse_hook 已重装");
                         } else {
-                            log::error!("mouse_hook 重装失败");
+                            // 降级留痕：带错误码 + 计入 MONITOR_DEGRADED
+                            let err = windows_sys::Win32::Foundation::GetLastError();
+                            super::note_degraded(&format!(
+                                "mouse_hook 重装失败 (GetLastError={err})"
+                            ));
                         }
                         continue;
                     }
