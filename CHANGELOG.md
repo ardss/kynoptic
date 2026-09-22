@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Dashboard: report page "today" goal card now recomputes the local date
+  per render, so a page left open across midnight no longer applies the
+  server's today presence to yesterday's report.
+- Dashboard: `/api/timeline` DST caveat (`local_offset_note`) is now
+  rendered as a small note when the hour-window crosses a local offset
+  change (or the server offset differs from the browser's).
+- Dashboard: keyboard heatmap uses five distinct color steps (the bottom
+  two quantiles previously shared one color); zero-activity days no longer
+  draw a 2px phantom bar in the trend chart; `fmtBytes` supports TB;
+  per-app colors are derived from a stable name hash so the apps grid and
+  daily-top charts agree; monitors KPI falls back to `0 / 0` on missing
+  fields; unparsable `last_event_ts` no longer claims "collector down".
+- Security: POST /api/settings additionally requires a per-session random
+  token injected into the served page (the previous three CSRF checks were
+  all client-controlled headers); settings-audit.log refuses to follow
+  symlink/reparse-point targets on open.
+
+### Changed
+
+- Docs: README/README.zh-CN clarify the 8422→8432→18422/28422 port
+  fallback applies to the tray entry only (the CLI dashboard exits on a
+  taken port); APP.md updated to the v0.2.x state (six MCP tools incl.
+  `get_top_apps`, `--metric`/`--join` still not implemented).
+
 ## [0.2.2] - 2026-09-19
 
 ### Fixed
