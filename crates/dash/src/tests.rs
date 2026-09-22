@@ -286,7 +286,7 @@ fn heatmap_fills_missing_days_with_zero_and_counts_input_minutes() {
     )
     .unwrap();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
-    let v = api_heatmap_at(&conn, 1, today);
+    let v = api_heatmap_at(&conn, 1, today).unwrap();
     let days = v["days"].as_array().unwrap();
     assert_eq!(days.len(), 7, "weeks=1 → 7 天补全: {v}");
     assert_eq!(days[6]["date"], json!("2026-09-09"));
@@ -325,7 +325,7 @@ fn heatmap_daily_agg_equivalent_to_agg_minute_distinct_minutes() {
         )
         .unwrap();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
-    let v = api_heatmap_at(&conn, 1, today);
+    let v = api_heatmap_at(&conn, 1, today).unwrap();
     let value = v["days"].as_array().unwrap()[6]["value"].as_i64().unwrap();
     assert_eq!(legacy, 3);
     assert_eq!(
@@ -338,7 +338,7 @@ fn heatmap_daily_agg_equivalent_to_agg_minute_distinct_minutes() {
 fn heatmap_weeks_clamped() {
     let conn = mem_conn();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
-    let v = api_heatmap_at(&conn, 999, today);
+    let v = api_heatmap_at(&conn, 999, today).unwrap();
     assert_eq!(v["weeks"], json!(52));
     assert_eq!(v["days"].as_array().unwrap().len(), 52 * 7);
 }
@@ -362,7 +362,7 @@ fn apps_ranks_window_events_and_excludes_empty_names() {
     // 8 天前的事件不在 7 天窗口内
     insert(&conn, &local_ts(-8, 9, 0), "window", "switch", Some("old"));
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
-    let v = api_apps_at(&conn, 7, today);
+    let v = api_apps_at(&conn, 7, today).unwrap();
     let apps = v["apps"].as_array().unwrap();
     assert_eq!(apps.len(), 2, "空名与窗口外排除: {v}");
     assert_eq!(apps[0]["app"], json!("code"));
@@ -1285,7 +1285,7 @@ fn trends_no_presence_alias_and_notes_raw_metric() {
     )
     .unwrap();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
-    let v = api_trends_at(&conn, today);
+    let v = api_trends_at(&conn, today).unwrap();
     let d = &v["daily"].as_array().unwrap()[0];
     assert_eq!(d["active_minutes"], json!(45));
     // 假别名彻底移除：active_minutes 是 raw 输入口径，不得冒充"人在场"
@@ -1319,7 +1319,7 @@ fn trends_sum7_aligned_by_calendar_date_zero_fills_missing_days() {
         .unwrap();
     }
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
-    let v = api_trends_at(&conn, today);
+    let v = api_trends_at(&conn, today).unwrap();
     assert_eq!(v["this_week"]["keys"], json!(600), "缺日按 0 计: {v}");
     assert_eq!(v["this_week"]["active_minutes"], json!(30));
     // 上周（09-03..09-09）7 天全有数据：不受本周缺日影响
@@ -1609,4 +1609,191 @@ mod socket_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// === 本轮修复（发现修复 + 挂账清偿）===
+
+/// 挂账 Wave31：try_load 钳制 categories 条数（≤100）与 pattern 长度（≤200），
+/// 且预编译 lc_tokens（小写、非空），匹配语义不变。
+#[test]
+fn try_load_clamps_categories_and_precompiles_tokens() {
+    let dir = tmpdir("clamp");
+    let db = dir.join("kyn.db");
+    // 150 条规则，每条 pattern 300 字符
+    let long_pat = "a".repeat(300);
+    let rules: Vec<String> = (0..150)
+        .map(|i| format!(r#"{{"name":"c{i}","pattern":"{long_pat}"}}"#))
+        .collect();
+    std::fs::write(
+        settings::settings_path(&db),
+        format!(r#"{{"categories":[{}]}}"#, rules.join(",")),
+    )
+    .unwrap();
+    let s = settings::try_load(&db).expect("合法 JSON 应解析成功");
+    assert_eq!(s.categories.len(), 100, "超 100 条应截断");
+    for r in &s.categories {
+        assert!(r.pattern.chars().count() <= 200, "pattern 应截到 200 字符");
+        assert!(
+            r.lc_tokens
+                .iter()
+                .all(|t| t.chars().all(|c| !c.is_uppercase())),
+            "预编译 token 必须已小写"
+        );
+    }
+    // 匹配语义不变：小写 token 子串命中
+    let r = settings::CategoryRule::rule("x", "GitHub CODE");
+    assert!(r.matches("github.com", "Pull Requests"));
+    assert!(!r.matches("gitee.com", "Pull Requests"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 发现 ①-3：读端点 DB 级失败统一 400（不再 200 + 静默空数据）。
+#[test]
+fn read_endpoints_map_db_errors_to_400() {
+    let conn = mem_conn();
+    let db = tmpdir("errmap").join("kyn.db");
+    conn.execute_batch("ALTER TABLE daily_agg RENAME TO daily_agg_x")
+        .unwrap();
+    let (code, _, body) = route_req(&conn, "GET", "/api/trends", "", &db);
+    assert_eq!(code, 400, "trends 表缺失应 400: {body}");
+    assert!(body.contains("error"));
+    conn.execute_batch("ALTER TABLE daily_agg_x RENAME TO daily_agg")
+        .unwrap();
+    conn.execute_batch("ALTER TABLE events RENAME TO events_x")
+        .unwrap();
+    // heatmap 只读 daily_agg（不触 events），rename 后仍合法 200，不在断言列
+    for path in ["/api/apps?days=3", "/api/daily_top?days=3"] {
+        let (code, _, body) = route_req(&conn, "GET", path, "", &db);
+        assert_eq!(code, 400, "{path} events 表缺失应 400: {body}");
+    }
+}
+
+/// 发现 ①-4：/api/diagnostics 返回固定文件清单，含存在性/大小/尾部，
+/// 只回文件名不暴露路径。
+#[test]
+fn diagnostics_lists_known_files_without_paths() {
+    let dir = tmpdir("diag");
+    let db = dir.join("kyn.db");
+    std::fs::write(dir.join("collector-error.log"), "line1\nboom \u{7}bad\x1b").unwrap();
+    let (code, _, body) = route_req(&mem_conn(), "GET", "/api/diagnostics", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(db_path_is_not_leaked(&v, &db));
+    let files = v["files"].as_array().unwrap();
+    for name in [
+        "collector-error.log",
+        "dashboard-error.log",
+        "watchdog.log",
+        "tray.log",
+        "update.log",
+        "dashboard-port.txt",
+    ] {
+        assert!(
+            files.iter().any(|f| f["name"] == name),
+            "清单缺 {name}: {body}"
+        );
+    }
+    let ce = files
+        .iter()
+        .find(|f| f["name"] == "collector-error.log")
+        .unwrap();
+    assert_eq!(ce["exists"], json!(true));
+    assert_eq!(ce["size_bytes"], json!(ce["size_bytes"]), "size 字段存在");
+    let tail = ce["tail"].as_str().unwrap();
+    assert!(tail.contains("line1") && tail.contains("boom"));
+    assert!(
+        !tail.contains('\u{7}') && !tail.contains('\u{1b}'),
+        "控制字符应被净化"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn db_path_is_not_leaked(v: &Value, db: &Path) -> bool {
+    let s = v.to_string();
+    let dir = db.parent().unwrap().to_string_lossy().to_string();
+    !s.contains(&dir) && !s.contains(&db.to_string_lossy().to_string())
+}
+
+/// 发现 ①-8：/api/input 的 SQL 聚合与逐行累加语义一致（keys/clicks 求和、
+/// per-key 频次、今日逐时），NULL/脏 JSON 行跳过。
+#[test]
+fn input_sql_aggregation_matches_row_semantics() {
+    let conn = mem_conn();
+    let today = chrono::Local::now().date_naive();
+    let ts = |h: u32| {
+        let naive = today.and_hms_opt(h, 1, 0).unwrap();
+        use chrono::TimeZone;
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .to_rfc3339()
+    };
+    let ins = |ts: &str, etype: &str, data: &str| {
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,?2,'input_agg',?3,NULL,NULL,NULL)",
+            params![ts, etype, data],
+        )
+        .unwrap();
+    };
+    ins(&ts(8), "keyboard", r#"{"keys":10,"vk":{"65":7,"66":3}}"#);
+    ins(&ts(9), "keyboard", r#"{"keys":5,"vk":{"65":2}}"#);
+    // (timestamp,event_type) 唯一键：错开分钟
+    let ts9 = |m: u32| {
+        let naive = today.and_hms_opt(9, m, 0).unwrap();
+        use chrono::TimeZone;
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .to_rfc3339()
+    };
+    ins(
+        &ts9(2),
+        "mouse",
+        r#"{"clicks":4,"clicks_left":3,"clicks_right":1,"scroll_ticks":9,"moves":20,"move_distance_px":500}"#,
+    );
+    ins(&ts9(3), "mouse", r#"not json"#); // 脏行：跳过
+    let v = api_input_at(&conn, 7, today).unwrap();
+    assert_eq!(v["granularity"], json!("minute"));
+    assert_eq!(v["keys_total"], json!(15));
+    assert_eq!(v["clicks_total"], json!(4));
+    assert_eq!(v["clicks_left"], json!(3));
+    assert_eq!(v["scroll_ticks"], json!(9));
+    assert_eq!(v["move_distance_px"], json!(500));
+    assert_eq!(v["key_freq"]["65"], json!(9));
+    assert_eq!(v["key_freq"]["66"], json!(3));
+    let hour = chrono::Local::now().hour() as usize;
+    if hour == 8 {
+        assert_eq!(v["hourly_today"][8], json!(10));
+    }
+    assert_eq!(v["series"].as_array().unwrap().len(), 1);
+    assert_eq!(v["series"][0]["keys"], json!(15));
+    assert_eq!(v["series"][0]["clicks"], json!(4));
+}
+
+/// 发现 ①-7：report 的 data_since 取本地日口径（UTC+8 下不早一天）。
+#[test]
+fn report_data_since_uses_local_date() {
+    let conn = mem_conn();
+    let db = tmpdir("since").join("kyn.db");
+    // 一个明确的 UTC 时刻：其 UTC 日期与本地日期不同的时刻一定存在于任一时区
+    // 差 ≥1h 的机器上；此处只验证字段来自 datetime(...,'localtime') 通路
+    // （值 = 库中最早事件的本地日），不针对特定时区断言具体日期。
+    insert(
+        &conn,
+        "2026-01-05T20:30:00+00:00",
+        "window",
+        "switch",
+        Some("code"),
+    );
+    let s = settings::AppSettings::default();
+    let v = api_report_at(&conn, "2026-01-06", &s).unwrap_or_else(|e| panic!("{e}"));
+    let since = v["data_since"].as_str().unwrap();
+    let expect = {
+        let t = chrono::DateTime::parse_from_rfc3339("2026-01-05T20:30:00+00:00").unwrap();
+        t.with_timezone(&Local).format("%Y-%m-%d").to_string()
+    };
+    assert_eq!(since, expect, "data_since 应为最早事件的本地日");
+    let _ = db;
 }

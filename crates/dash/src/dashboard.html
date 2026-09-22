@@ -17,6 +17,9 @@
     --ok: #3FB68B; --warn: #F5B454; --bad: #FF6B6B;
     /* 时间线三态与降色 */
     --human: #5BA8FF; --auto: #E0A24A; --down: #E06C75;
+    /* 热力图五档色阶（JS 绘制 SVG 时经 getComputedStyle 读取，见 hmLevels()；
+       亮色/高对比媒体查询整体换色，画布不再硬编码深色像素） */
+    --hm-0: #0B0F16; --hm-1: #1e3a5f; --hm-2: #2d5f94; --hm-3: #3b82c4; --hm-4: #5BA8FF;
     --surface-btn: #2A3442;
     --amber: #F5B454; /* 兼容旧引用 */
     --radius: 10px; --radius-s: 6px;
@@ -28,6 +31,29 @@
   /* 双语：html[lang] 切换 .l.en / .l.zh */
   html[lang="en"] .l.zh, html[lang="zh"] .l.en { display: none; }
   html { color-scheme: dark; }
+  /* 亮色主题（发现 ①-10）：系统亮色下跟随，避免面板纯黑底与系统断裂。
+     只覆盖颜色变量，版式/字号全部继承暗色定义。 */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F4F6FA; --panel: #FFFFFF; --panel-2: #EDF1F7;
+      --border: #D4DCE6; --border-soft: #E3E9F1;
+      --fg: #1C2530; --dim: #5B6B7E; --faint: #7E8DA0;
+      --brand: #2F7FE0; --accent-ink: #FFFFFF;
+      --ok: #1E8F66; --warn: #B27717; --bad: #C94F58;
+      --human: #2F7FE0; --auto: #B27717; --down: #C94F58;
+      --surface-btn: #E4EAF2; --amber: #B27717;
+      --hm-0: #E9EDF3; --hm-1: #BBD4EE; --hm-2: #85B4E8; --hm-3: #5296DF; --hm-4: #2F7FE0;
+    }
+    html { color-scheme: light; }
+  }
+  /* Windows 高对比（forced-colors）：UA 会替换 CSS 底色但不碰 canvas/SVG
+     内绘制的像素——色阶改用系统色变量，保证档位区分度与可读性。 */
+  @media (forced-colors: active) {
+    :root {
+      --hm-0: Canvas; --hm-1: GrayText; --hm-2: GrayText;
+      --hm-3: Highlight; --hm-4: Highlight;
+    }
+  }
   body {
     margin: 0 auto; background: var(--bg); color: var(--fg);
     font-family: var(--font-ui); font-size: 14px; line-height: 1.55;
@@ -44,6 +70,13 @@
   h1::before { content: ""; display: none; }
   .muted { color: var(--dim); }
   .note { font-size: 12px; color: var(--dim); }
+  /* 诊断信息（设置页折叠块）的日志尾部 */
+  .diag-tail {
+    font-family: var(--font-data); font-size: 11px; color: var(--dim);
+    background: var(--panel-2); border: 1px solid var(--border-soft);
+    border-radius: var(--radius-s); padding: 8px; margin: 4px 0 0;
+    overflow: auto; max-height: 220px; white-space: pre-wrap; word-break: break-all;
+  }
   header { margin-bottom: 18px; position: relative; padding-bottom: 14px;
            border-bottom: 1px solid var(--border-soft); }
   header::after { /* 签名元素：状态光带 */
@@ -468,6 +501,14 @@
     <span id="settings-msg" aria-live="polite"></span>
   </div>
 </section>
+<section>
+  <h3><span class="l en">diagnostics</span><span class="l zh">诊断信息</span></h3>
+  <div class="note"><span class="l en">log files kept next to the app and the database — the dashboard reads their tails so support issues don't require digging through folders. Paths are never shown.</span><span class="l zh">采集器 / 面板 / 看门狗等留档日志（程序目录与数据目录）。面板代读尾部内容，便于排查问题；只显示文件名，不暴露路径。</span></div>
+  <details id="diag-details" style="margin-top:8px">
+    <summary style="cursor:pointer;color:var(--dim)"><span class="l en">show diagnostic files</span><span class="l zh">查看诊断文件</span></summary>
+    <div id="diag-body" class="note" style="margin-top:8px"><span class="l en">loading…</span><span class="l zh">加载中…</span></div>
+  </details>
+</section>
 </div>
 
 <div class="muted" style="font-size:12px;margin:6px 0 14px">
@@ -483,8 +524,15 @@
 
 <script>
 "use strict";
-/* 热力图五档色阶：深底色 → 顶档 #5BA8FF（HM_LEVELS 末位，即"更多"端） */
-const HM_LEVELS = ["#0B0F16", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
+/* 热力图五档色阶：深底色 → 顶档 #5BA8FF（"更多"端）。
+   发现 ①-10：色值不再硬编码——改读 :root 的 --hm-N 变量（亮色/高对比
+   媒体查询整体换色，SVG 绘制像素跟随系统主题）；变量缺失时回退暗色组。 */
+const HM_LEVELS_FALLBACK = ["#0B0F16", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
+function hmLevels() {
+  const cs = getComputedStyle(document.documentElement);
+  return [0, 1, 2, 3, 4].map(i =>
+    (cs.getPropertyValue("--hm-" + i) || "").trim() || HM_LEVELS_FALLBACK[i]);
+}
 /* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS） */
 const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
@@ -894,6 +942,7 @@ async function loadHeatmap() {
   const cell = 14, gap = 3;
   const cols = Math.ceil(days.length / 7);
   const W = 40 + cols * (cell + gap) + 8, H = 7 * (cell + gap) + 16;
+  const HM_LEVELS = hmLevels(); // 每次渲染现读 CSS 变量（主题切换后同步）
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
   // Wave20 P1：列是"今天回溯"对齐的，首行星期 = 第一格的星期，按真实
   // 日期推（原固定 Mon/Wed/Fri/Sun 在非周一开头的窗口里全列错位）。
@@ -904,7 +953,7 @@ async function loadHeatmap() {
                         : ["S", "M", "T", "W", "T", "F", "S"];
   for (let r = 0; r < 7; r++) {
     const dow = (firstDow + r) % 7;
-    svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="#93A1B3" font-size="10" text-anchor="end">' + dowNames[dow] + "</text>";
+    svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="var(--faint)" font-size="10" text-anchor="end">' + dowNames[dow] + "</text>";
   }
   days.forEach((d, i) => {
     const col = Math.floor(i / 7), row = i % 7;
@@ -913,7 +962,7 @@ async function loadHeatmap() {
     const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
-      (level === 0 ? "#232B38" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
+      (level === 0 ? "var(--border)" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
   });
   svg += "</svg>";
   // 近空热力图：非空格极少时提示"数据积累中"，与全 0 空态区分开
@@ -1560,6 +1609,29 @@ async function loadSettings() {
   document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
   settingsMsg("", true);
 }
+/* 诊断信息（发现 ①-4）：首次展开时拉 /api/diagnostics，展示各留档日志的
+   存在性/大小/尾部内容；只显示文件名与目录类别（data/exe），不暴露路径。 */
+let DIAG_LOADED = false;
+async function loadDiagnostics() {
+  const el = document.getElementById("diag-body");
+  try {
+    const d = await jget("/api/diagnostics");
+    el.innerHTML = d.files.map(f => {
+      const meta = f.exists
+        ? (f.size_bytes + " B" + (f.modified ? " · " + f.modified : ""))
+        : (document.documentElement.lang === "zh" ? "不存在" : "not present");
+      const tail = f.tail ? '<pre class="diag-tail">' + esc(f.tail) + "</pre>" : "";
+      return '<div style="margin-top:8px"><b>' + esc(f.name) + '</b> <span class="muted">[' +
+        esc(f.dir) + "] " + esc(meta) + "</span>" + tail + "</div>";
+    }).join("");
+    DIAG_LOADED = true;
+  } catch (e) {
+    el.textContent = document.documentElement.lang === "zh" ? "加载失败：" + e.message : "failed: " + e.message;
+  }
+}
+document.getElementById("diag-details").addEventListener("toggle", function () {
+  if (this.open && !DIAG_LOADED) loadDiagnostics().catch(() => {});
+});
 // 监控器预设（定性审查：40 复选框墙需要快捷入口）。仅改界面勾选，保存才生效。
 const PRESETS = {
   essential: null, // default_enabled 集，运行时取 LAST_SETTINGS
