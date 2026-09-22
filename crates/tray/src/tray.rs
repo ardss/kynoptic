@@ -19,10 +19,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging as win;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, GWLP_USERDATA, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW,
+    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
+    TrackPopupMenu, TranslateMessage, GWLP_USERDATA, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
+    WM_APP, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW,
     WS_OVERLAPPED,
 };
 
@@ -478,6 +478,9 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
 
         let Some(icons) = TrayIcons::create() else {
             eprintln!("kynoptic-tray: icon drawing failed");
+            // 约束:早退路径须回收已建窗口与定时器,句柄生命周期不依赖进程退出兜底
+            KillTimer(hwnd, 1);
+            DestroyWindow(hwnd);
             return false;
         };
 
@@ -487,8 +490,20 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = icons.for_state(TrayState::Running);
         set_tip(&mut nid, "Kynoptic: collecting");
-        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+        // explorer 可能晚于本进程就绪,NIM_ADD 短重试覆盖开机时序(500ms × 10)
+        let mut added = false;
+        for _ in 0..10 {
+            if Shell_NotifyIconW(NIM_ADD, &nid) != 0 {
+                added = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if !added {
             eprintln!("kynoptic-tray: Shell_NotifyIconW(NIM_ADD) failed");
+            // 约束:放弃路径同样回收窗口与定时器
+            KillTimer(hwnd, 1);
+            DestroyWindow(hwnd);
             return false;
         }
 

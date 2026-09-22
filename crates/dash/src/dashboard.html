@@ -531,6 +531,10 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+// 每会话 CSRF 令牌：占位符由服务端在返回首页时替换（lib.rs serve 生成，
+// 不落盘不外发）。POST 必带 X-Kynoptic-Token——原三重防线全是客户端可控头，
+// 只拦浏览器，拦不住同机进程伪造两个头。
+const KYN_CSRF_TOKEN = "__KYN_CSRF_TOKEN__";
 async function jget(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(url + " → HTTP " + r.status);
@@ -538,7 +542,8 @@ async function jget(url) {
 }
 function fmtBytes(n) {
   if (!n) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
+  // 追加 TB：>1TB 的库不再显示千位 GB 数字
+  const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0, v = n;
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + units[i];
@@ -607,7 +612,11 @@ async function loadStatus() {
   const zh = document.documentElement.lang === "zh";
   const age = (Date.now() - d.getTime()) / 1000;
   let stateTxt;
-  if (age < 600) stateTxt = zh ? "采集中" : "collecting";
+  if (isNaN(d.getTime())) {
+    // 时刻解析失败时与 shown 的回退口径对齐：不再误断言"采集器未运行"
+    stateTxt = zh ? "事件时刻无法解析" : "event time unparsable";
+  }
+  else if (age < 600) stateTxt = zh ? "采集中" : "collecting";
   else if (age < 86400) stateTxt = zh ? "停滞（最后事件 " + Math.round(age/60) + " 分钟前）" : "stale (last event " + Math.round(age/60) + " min ago)";
   else stateTxt = zh ? "无事件（采集器可能未运行）" : "no events (collector may be down)";
   el.textContent = "[" + stateTxt + "] " + s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + dbStatusText(s);
@@ -739,7 +748,8 @@ async function loadOverview() {
   }
   document.getElementById("c-uptime").textContent = fmtUptime(o.uptime_seconds);
   document.getElementById("c-today-events").textContent = (o.today_events || 0).toLocaleString();
-  document.getElementById("c-monitors").textContent = o.monitors_enabled + " / " + o.monitors_total;
+  // ?? 0 兜底：与同函数其余数值字段一致，旧后端缺字段不显示 "undefined"
+  document.getElementById("c-monitors").textContent = (o.monitors_enabled ?? 0) + " / " + (o.monitors_total ?? 0);
   document.getElementById("c-dbsize").textContent = fmtBytes((o.db_size_bytes || 0) + (o.db_wal_bytes || 0));
   // 口径说明小字（overview.metrics_note）：字段缺失（旧后端）时静默留空
   const on = document.getElementById("overview-note");
@@ -785,7 +795,20 @@ async function loadTimeline() {
   /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
   const TL_COLORS = { human: "var(--human)", auto: "var(--auto)", away: "#1a2230" };
   const MIXED_NOTE = zh ? " · 这一小时人和自动化脚本都有操作" : " · mixed minutes (human + automation) count for both";
-  el.innerHTML = '<div class="note" style="margin-bottom:6px">'
+  // DST 标注：后端 local_offset_note 随响应返回并承诺"供前端标注"（lib.rs）。
+  // 窗口内本机偏移发生过变化（跨夏令时），或服务器偏移与本机当前偏移不一致
+  // 时，在时间线顶部渲染小字说明（与图例小字同款），历史小时桶 ±1h 不再无声。
+  let dstNote = "";
+  if (tl.local_offset_note) {
+    const localOff = -new Date().getTimezoneOffset() * 60;
+    let shifted = typeof tl.local_offset_seconds === "number" && tl.local_offset_seconds !== localOff;
+    if (!shifted && tl.buckets.length >= 2) {
+      const offAt = h => -new Date(h + ":00").getTimezoneOffset() * 60;
+      shifted = offAt(tl.buckets[0].hour) !== offAt(tl.buckets[tl.buckets.length - 1].hour);
+    }
+    if (shifted) dstNote = '<div class="note" style="margin-bottom:6px;color:var(--dim)">' + esc(tl.local_offset_note) + "</div>";
+  }
+  el.innerHTML = dstNote + '<div class="note" style="margin-bottom:6px">'
     + '<span style="color:' + TL_COLORS.human + '">■</span> ' + L.human + '　'
     + '<span style="color:' + TL_COLORS.auto + '">■</span> ' + L.auto + '　'
     + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
@@ -950,7 +973,8 @@ const KB_ROWS = [].concat(
 );
 function kbColor(v, max) {
   if (!v) return "#0B0F16";
-  const steps = ["#1e3a5f", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
+  // 五个互异色（原前两项同色，1%~39% 档位信息丢失）
+  const steps = ["#16324f", "#1e3a5f", "#2d5f94", "#3b82c4", "#5BA8FF"];
   return steps[Math.min(4, Math.floor(v / max * 5))];
 }
 function renderKeyboard(freq) {
@@ -1095,7 +1119,9 @@ async function loadReport() {
   // 口径统一：目标卡用"在场分钟"（与总览环同一字段 presence_minutes），
   // 仅当日（今天）能取到；历史日期退回 trends 的 raw active_minutes 并注明差异。
   let presenceMin = null, rawNote = "";
-  if (!dateVal || dateVal === TODAY_STR) {
+  // 跨午夜修复：TODAY_STR 是脚本加载时定格的，页面跨天后会把服务端"今天"
+  // 的 presence_minutes 套到昨天的报告上——这里必须与 todayStr() 现算一致。
+  if (!dateVal || dateVal === todayStr()) {
     try {
       const ov = await jget("/api/overview");
       if (seq !== REPORT_SEQ) return;
@@ -1140,7 +1166,7 @@ async function loadReport() {
     tr.daily.forEach(function (x, i) {
       const bh = (x.active_minutes || 0) / tmax * innerH;
       svg += '<rect x="' + (padL + i * bw + 2) + '" y="' + (padT + innerH - bh) +
-        '" width="' + (bw - 4) + '" height="' + Math.max(bh, 2) + '" rx="2" fill="#3FB68B"><title>' +
+        '" width="' + (bw - 4) + '" height="' + Math.max(bh, (x.active_minutes || 0) > 0 ? 2 : 0) + '" rx="2" fill="#3FB68B"><title>' +
         esc(x.date) + " — " + fmtMin(x.active_minutes || 0) + '</title></rect>';
       if (i % 7 === 0) svg += '<text x="' + (padL + i * bw + bw / 2) + '" y="' + (H - 6) +
         '" fill="#93A1B3" font-size="10" text-anchor="middle">' + esc(x.date.slice(5)) + "</text>";
@@ -1171,9 +1197,15 @@ async function loadApps() {
   const hmax = Math.max(1, ...ht);
   const bw = innerW / 24;
   const colorOf = {};
-  // (other) 固定灰，不占主色（Wave20 P2：原按数组序上色让 other 拿主色、
-  // Top 应用错位）
-  grid.forEach((g, i) => { colorOf[g.app] = g.app === "(other)" ? "#6B7683" : APP_COLORS[i % APP_COLORS.length]; });
+  // 单一色源：按应用名稳定哈希取色（(other) 固定灰，不占主色）。原按数组序
+  // 上色让同一应用在 grid 图与 daily_top 两图颜色互换——两图必须同色同源。
+  const appColor = name => {
+    if (name === "(other)") return "#6B7683";
+    let h = 0;
+    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return APP_COLORS[h % APP_COLORS.length];
+  };
+  grid.forEach(g => { colorOf[g.app] = appColor(g.app); });
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="hourly stacked app usage / 逐时应用堆叠柱状图">';
   for (let g = 0; g <= 4; g++) {
     const y = padT + innerH - innerH * g / 4;
@@ -1189,8 +1221,9 @@ async function loadApps() {
       if (!v) continue;
       const bh = v / hmax * innerH;
       yCur -= bh;
+      // 与趋势图同口径：零值不画柱（此处 v>0 已被 continue 保证，写法保持一致）
       svg += '<rect x="' + (padL + hr * bw + 2) + '" y="' + yCur + '" width="' + (bw - 4) +
-        '" height="' + Math.max(bh, 2) + '" rx="1.5" fill="' + (colorOf[g.app] || "#888") +
+        '" height="' + Math.max(bh, v > 0 ? 2 : 0) + '" rx="1.5" fill="' + (colorOf[g.app] || "#888") +
         '"><title>' + hr + ":00 — " + esc(g.app) + " (" + v.toLocaleString() + ')</title></rect>';
     }
     if (hr % 3 === 0) {
@@ -1210,7 +1243,7 @@ async function loadApps() {
     ? rows.map(r => '<div class="mon-row"><span class="muted" style="width:84px">' + esc(r.date) + "</span>" +
       (r.top || []).map((t, i) =>
         '<span class="app-track" style="flex:1"><span class="app-bar" style="width:' +
-        (t.count / cmax * 100).toFixed(2) + "%;background:" + (t.app === "(other)" ? "#6B7683" : APP_COLORS[i]) + '"></span></span>' +
+        (t.count / cmax * 100).toFixed(2) + "%;background:" + appColor(t.app) + '"></span></span>' +
         '<span style="width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
         esc(t.app) + '">' + esc(prettyApp(t.app)) + ' <span class="muted">(' + t.count.toLocaleString() + ")</span></span>").join("") +
       "</div>").join("")
@@ -1581,7 +1614,7 @@ async function saveSettings() {
     };
     const r = await fetch("/api/settings", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Kynoptic": "1" },
+      headers: { "Content-Type": "application/json", "X-Kynoptic": "1", "X-Kynoptic-Token": KYN_CSRF_TOKEN },
       body: JSON.stringify(body)
     });
     if (!r.ok) {

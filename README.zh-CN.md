@@ -47,9 +47,11 @@ Windows 上的本地优先活动感知层。Kynoptic 记录你使用了哪些应
 从最新 Release 下载
 [Kynoptic-Setup.exe](https://github.com/ardss/kynoptic/releases/latest)，
 运行安装，从开始菜单启动 Kynoptic。采集自动开始，仪表盘在浏览器
-`http://127.0.0.1:8422` 打开（若 8422 段被占用，面板按
+`http://127.0.0.1:8422` 打开（8422 被占用时按
 8422-8432 → 18422-18432 → 28422-28432 三段依次回退，
-实际端口写入 `data\dashboard-port.txt`）。
+实际端口写入 `data\dashboard-port.txt`——**该回退仅在托盘入口生效**；
+命令行 `kynoptic dashboard` 端口被占时会直接报错退出，
+需用 `--port` 另指定端口）。
 
 > **SmartScreen 提示：** 构建未做代码签名，首次运行 Windows 会弹出
 > "Windows 已保护你的电脑"。点击 **更多信息 → 仍要运行**（二进制可自行检验——

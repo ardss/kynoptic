@@ -232,6 +232,8 @@ fn draw(shape: IconShape, size: i32) -> Option<windows_sys::Win32::UI::WindowsAn
                 SelectObject(mem, dot);
                 Ellipse(mem, dcx - dr, dcy - dr, dcx + dr, dcy + dr);
                 SelectObject(mem, old_brush);
+                // 约束:主体画刷与 dot 画刷都要销毁,与 Error 分支成对销毁一致,防 GDI 泄漏
+                DeleteObject(brush);
                 DeleteObject(dot);
             }
             IconShape::Error => {

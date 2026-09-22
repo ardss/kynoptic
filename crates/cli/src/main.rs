@@ -200,11 +200,22 @@ fn cmd_stats(args: &[String]) -> Result<()> {
             "{:<12} {:>7} {:>7} {:>7} {:>7}",
             "date", "keys", "clicks", "act_min", "apm"
         );
+        // 与 presence/analyze 同口径：按本地日历日输出满 N 天。daily_agg::recent
+        // 的 LIMIT 查询只返回有聚合行的日，无行日历日（未开机整天等）曾被静默
+        // 跳过，"last N days" 表头下实际少于 N 行。缺行日补零。
+        let mut by_date = std::collections::BTreeMap::new();
         for row in daily_agg::recent(&conn, days) {
-            println!(
-                "{:<12} {:>7} {:>7} {:>7} {:>7.1}",
-                row.0, row.1, row.2, row.3, row.4
-            );
+            by_date.insert(row.0.clone(), row);
+        }
+        for offset in (1 - days)..=0 {
+            let date = queries::date_offset_str(offset);
+            match by_date.get(&date) {
+                Some(row) => println!(
+                    "{:<12} {:>7} {:>7} {:>7} {:>7.1}",
+                    row.0, row.1, row.2, row.3, row.4
+                ),
+                None => println!("{:<12} {:>7} {:>7} {:>7} {:>7.1}", date, 0, 0, 0, 0.0),
+            }
         }
     }
     Ok(())
@@ -255,11 +266,11 @@ fn cmd_export(args: &[String]) -> Result<()> {
     // panic（out of bounds）。钳到 20 万天（≈547 年，早于任何可能的数据，
     // 也在 DateTime 表示范围内）= 等效全量导出；days<1 已在解析处拒绝。
     let days = days.min(200_000);
-    // 与面板「最近 N 天」对齐（交叉审查 P2）：dashboard 按本地日历日切天
-    // （queries::local_day_range），导出此前用 Utc::now() 的滚动 24h 瞬间，
-    // 两边窗口对不上。现取 (今日 - N) 本地日的**起点**作 cutoff，
-    // 使导出结果可与 dashboard 的天窗口对账。
-    let cutoff_date = queries::date_offset_str(-days);
+    // 与面板/其余命令统一口径：导出窗口 = 含今天在内的 N 个本地日。
+    // 旧实现取 (今日 - N) 本地日起点作 cutoff，实际覆盖 N+1 个日历日
+    //（--days 1 连昨日整天一起导出多泄一天敏感明文），与 daily_agg
+    // 「最近 days 天（含今天）」及 query/presence/stats 均不一致。
+    let cutoff_date = queries::date_offset_str(-(days - 1));
     let cutoff = match queries::local_day_range(&cutoff_date) {
         Some((start, _)) => start,
         None => {
@@ -1443,8 +1454,11 @@ fn foreground_minutes(conn: &Connection, start: &str, end: &str) -> i64 {
 /// queries::classify_minutes（与 dash overview/timeline 同一实现，无本地副本）。
 fn cmd_presence(args: &[String]) -> Result<()> {
     let days = parse_presence_args(args)?;
-    let bridge = kynoptic_dash::settings::load(&resolve_db()).presence_bridge_minutes;
-    let conn = open_db(&resolve_db())?;
+    // 路径只解析一次：旧实现连调两次 resolve_db，默认推导分支会把
+    // "using db: <path>" 打两遍，污染 stderr 且削弱人工核对信号。
+    let db_path = resolve_db();
+    let bridge = kynoptic_dash::settings::load(&db_path).presence_bridge_minutes;
+    let conn = open_db(&db_path)?;
     println!("=== Presence last {days} day(s) (bridge <= {bridge} min) ===");
     for offset in (1 - days)..=0 {
         let date = queries::date_offset_str(offset);
@@ -1717,11 +1731,31 @@ fn release_watchdog_lock(path: &Path) {
 }
 
 /// 读状态；文件缺失/损坏一律回退缺省（计数丢失可接受，不能因此拒绝工作）。
+/// 反序列化后做值域钳制：state 文件只经 serde 类型校验，注入
+/// consecutive_failures=u32::MAX 曾使 `+= 1` 回绕清零（熔断被永久绕过）、
+/// 注入 epoch=i64::MIN 曾使裸减法 debug panic / release 回绕恒 Pending。
 fn load_watchdog_state() -> WatchdogState {
-    std::fs::read_to_string(watchdog_state_path())
+    let mut st = std::fs::read_to_string(watchdog_state_path())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str::<WatchdogState>(&s).ok())
+        .unwrap_or_default();
+    // 失败计数钳到远小于 u32::MAX 的上限，saturating_add 永不回绕
+    st.consecutive_failures = st.consecutive_failures.min(1_000_000);
+    // epoch 类字段：非正数或超出当前时钟 1 天以上（时钟不可能合法走到那）
+    // 一律重置为 0（= 无该值），后续判定按缺省语义走。backoff_until 允许
+    // 最多 1 天未来（退避档位封顶 30min，1 天足够宽）。
+    const MAX_EPOCH_SKEW_SECS: i64 = 86_400;
+    let now = Utc::now().timestamp();
+    for e in [
+        &mut st.last_spawn_epoch,
+        &mut st.heartbeat_at_spawn_epoch,
+        &mut st.backoff_until_epoch,
+    ] {
+        if *e <= 0 || *e - now > MAX_EPOCH_SKEW_SECS {
+            *e = 0;
+        }
+    }
+    st
 }
 
 fn save_watchdog_state(st: &WatchdogState) {
@@ -1778,7 +1812,9 @@ fn judge_spawn_outcome(
     if hb_mtime_epoch > hb_at_spawn_epoch {
         return SpawnOutcome::Recovered;
     }
-    if now_epoch - last_spawn_epoch < SPAWN_GRACE_SECS {
+    // saturating 减法：last_spawn_epoch 经值域钳制后仍防状态文件在两次
+    // 读取间被换成极小值——裸减法 debug panic / release 回绕恒 Pending
+    if now_epoch.saturating_sub(last_spawn_epoch) < SPAWN_GRACE_SECS {
         return SpawnOutcome::Pending;
     }
     // 审查 P2 睡眠误判守卫：mtime 未前进且墙钟已过观察窗时,若"拉起时刻的
@@ -1787,8 +1823,8 @@ fn judge_spawn_outcome(
     // 跳过本次判定不记失败。上限 24×（约 36 分钟）兜底:真正秒死的托盘在
     // 无睡眠的长跨度下最终仍会走到 Failed,不会因本守卫永久豁免。
     if hb_at_spawn_epoch > 0
-        && now_epoch - hb_at_spawn_epoch > SPAWN_GRACE_SECS * 4
-        && now_epoch - hb_at_spawn_epoch <= SPAWN_GRACE_SECS * 24
+        && now_epoch.saturating_sub(hb_at_spawn_epoch) > SPAWN_GRACE_SECS * 4
+        && now_epoch.saturating_sub(hb_at_spawn_epoch) <= SPAWN_GRACE_SECS * 24
     {
         return SpawnOutcome::SuspendSuspicion;
     }
@@ -1888,7 +1924,8 @@ fn watchdog_tick(
             TickAction::SkipObservation
         }
         SpawnOutcome::Failed => {
-            state.consecutive_failures += 1;
+            // saturating：release 下 u32::MAX+1 曾回绕为 0，熔断与退避被永久绕过
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             state.last_spawn_epoch = 0;
             let delay = backoff_delay_secs(state.consecutive_failures);
             state.backoff_until_epoch = now_epoch + delay;
@@ -2077,6 +2114,8 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             Some(p) => p,
             None => return Ok(()),
         };
+        // 旗标告警去重：常驻模式下 tray-exit.flag 持续存在，只留痕一次
+        let mut flag_warned = false;
         loop {
             let now_epoch = Utc::now().timestamp();
             let running = unsafe {
@@ -2182,7 +2221,15 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         if let Ok(exe) = std::env::current_exe() {
                             if let Some(dir) = exe.parent() {
                                 let tray = dir.join("kynoptic-tray.exe");
-                                if tray.exists() {
+                                // 便携版劫持缓解（低危，最小改动）：拒绝拉起
+                                // 符号链接/junction 形式的托盘 exe。同用户可写
+                                // 目录内 exe 被整体替换属部署形态固有权限问题，
+                                // 完整防御需托盘侧签名/基线哈希校验（域外）。
+                                if is_reparse_point(&tray) {
+                                    watchdog_log(
+                                        "kynoptic-tray.exe 是符号链接/junction，拒绝拉起（防劫持，请排查）",
+                                    );
+                                } else if tray.exists() {
                                     use std::process::{Command, Stdio};
                                     const DETACHED_PROCESS: u32 = 0x0000_0008;
                                     match Command::new(&tray)
@@ -2210,7 +2257,8 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                             let msg = format!("watchdog: 拉起托盘失败: {e}");
                                             eprintln!("{msg}");
                                             watchdog_log(&msg);
-                                            state.consecutive_failures += 1;
+                                            state.consecutive_failures =
+                                                state.consecutive_failures.saturating_add(1);
                                             if state.consecutive_failures >= FAILURE_THRESHOLD {
                                                 let backoff =
                                                     backoff_delay_secs(state.consecutive_failures);
@@ -2235,6 +2283,23 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         }
                     }
                 }
+            } else if !flag_warned {
+                // 静默停摆告警（低危，最小缓解）：tray-exit.flag 是固定名
+                // 文件，任何同用户进程写一个同名文件即可让看门狗永久停止
+                // 拉起（唯一不会被自动复活的停摆路径）。同用户可伪造内容，
+                // 读取侧校验不可行——至少留痕一次供人工判断；旗标唯一合法
+                // 删除点是托盘自身启动，被压制后无人清理。
+                flag_warned = true;
+                let age = std::fs::metadata(&exit_flag)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                watchdog_log(&format!(
+                    "tray-exit.flag 已存在（{}s 前写入），看门狗不拉起托盘；若非本人主动退出托盘，请删除该文件",
+                    age
+                ));
             }
             if once {
                 release_watchdog_lock(&lock_path);

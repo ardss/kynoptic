@@ -2003,9 +2003,25 @@ fn append_settings_audit(db_path: &Path, summary: &str) {
     };
     // 审计失败不影响主流程：设置已保存，日志尽力而为
     let target = dir.join("settings-audit.log");
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    // 符号链接防护（审查：固定名 create+append 可被预置 symlink 把审计行
+    // 追加进用户可写的任意文件）：reparse point 一律拒绝写入，宁可丢这条
+    // 审计行也不污染其他文件。custom_flags 令 Windows 打开链接对象本身，
+    // 追加写入会失败而非穿透。
+    if std::fs::symlink_metadata(&target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        log::warn!("settings-audit.log 是符号链接，拒绝写入（疑似劫持，不影响设置保存）");
+        return;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let result = opts
         .open(&target)
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     if let Err(e) = result {
@@ -2300,6 +2316,33 @@ fn open_read_only(db_path: &Path) -> Result<Connection> {
 
 // ─── HTTP 服务（std::net 手写最小 handler） ─────────────────────────────────
 
+/// 每会话 CSRF 令牌（64 位 splitmix64 混合 4 轮 → 32 hex）。
+/// 熵源：启动时刻纳秒 + PID + 栈地址（ASLR）。std 无 RNG，不引新依赖；
+/// 令牌仅存在于本进程内存、注入首页响应，不落盘不外发——同机进程理论上
+/// 仍可 GET / 读到它，但至少把"两个头一加就过"的静默写抬高一档。
+fn gen_session_token() -> String {
+    fn mix(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let anchor = 0u8; // 仅取地址作熵源
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).wrapping_mul(0x1234_5678_9ABC_DEF1)
+        ^ (&anchor as *const u8 as u64);
+    (0u64..4).fold(String::with_capacity(32), |acc, i| {
+        format!(
+            "{acc}{:08x}",
+            mix(seed ^ i.wrapping_mul(0xD1B5_4A32_D192_ED03))
+        )
+    })
+}
+
 /// 阻塞服务循环。仅绑定 127.0.0.1；每连接一线程内串行处理、响应后立即关闭。
 ///
 /// `readonly=true`（cli 与 tray 均传 true）：DB 只读打开，唯一写路径是
@@ -2328,6 +2371,9 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
     };
     #[allow(unused_variables)]
     let db_owned = db_path.to_path_buf();
+    // 每会话写令牌：POST /api/settings 除三重请求头防线外必须携带本进程
+    // 随机令牌（首页响应注入），令牌在 serve 期间不变。
+    let csrf = gen_session_token();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
         Error::Io(std::io::Error::other(format!(
             "绑定 127.0.0.1:{port} 失败: {e}"
@@ -2358,6 +2404,7 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         // 复用常驻只读连接（Connection 非 Sync，经 Mutex 共享）。
         let shared_inner = shared.clone();
         let db_owned = db_owned.clone();
+        let csrf_inner = csrf.clone();
         let inflight_inner = inflight.clone();
         inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 名额守卫：Drop 时归还。handle_client panic 或提前 return 都不会
@@ -2381,7 +2428,9 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-                if let Err(e) = handle_client(stream, shared_inner.as_ref(), &db_owned, bound) {
+                if let Err(e) =
+                    handle_client(stream, shared_inner.as_ref(), &db_owned, bound, &csrf_inner)
+                {
                     log::warn!("dashboard 连接处理失败: {e}");
                 }
             });
@@ -2410,6 +2459,7 @@ fn handle_client(
     shared: Option<&Arc<std::sync::Mutex<Connection>>>,
     db_path: &Path,
     port: u16,
+    csrf: &str,
 ) -> std::io::Result<()> {
     // 整请求 deadline（slowloris 防线）：每次 read 有 5s 超时不够——慢客户端
     // 每 4s 滴 1 字节可永不完成，64 个此类连接即可占满并发名额令正常请求 503
@@ -2436,8 +2486,8 @@ fn handle_client(
     };
     let head = String::from_utf8_lossy(&raw[..header_end.min(raw.len())]).to_string();
 
-    let (mut host, mut origin, mut fetch_site, mut marker, mut content_length) =
-        (String::new(), None, None, false, 0usize);
+    let (mut host, mut origin, mut fetch_site, mut marker, mut token, mut content_length) =
+        (String::new(), None, None, false, None, 0usize);
     for l in head.lines().skip(1) {
         let Some((k, v)) = l.split_once(':') else {
             continue;
@@ -2448,6 +2498,7 @@ fn handle_client(
             "origin" => origin = Some(v),
             "sec-fetch-site" => fetch_site = Some(v),
             "x-kynoptic" => marker = v == "1",
+            "x-kynoptic-token" => token = Some(v),
             "content-length" => content_length = v.parse().unwrap_or(0),
             _ => {}
         }
@@ -2489,6 +2540,17 @@ fn handle_client(
             "{\"error\":\"payload too large (max 65536 bytes)\"}",
         );
     }
+    // 会话令牌校验（审查 P1 补强：marker/Origin/Sec-Fetch-Site 三防线均为
+    // 客户端可控头，只拦浏览器；同机进程还需读到仅本进程注入页面的令牌）。
+    // 放在 413 之后，保持"超限 body 必回 413"的既有测试口径。
+    if is_post && token.as_deref() != Some(csrf) {
+        return http_simple(
+            &mut stream,
+            403,
+            "application/json",
+            "{\"error\":\"missing or invalid session token\"}",
+        );
+    }
     while raw.len() < header_end + content_length {
         // 同一整请求 deadline 覆盖 body 读取（慢滴客户端同样无法占住名额）
         if std::time::Instant::now() > deadline {
@@ -2519,6 +2581,12 @@ fn handle_client(
         }
     };
     let (status, ctype, body) = route_req(conn, &method, &path, &body, db_path);
+    // 首页注入会话令牌（dashboard.html 占位符），前端 POST 回带
+    let body = if method == "GET" && path.split('?').next() == Some("/") {
+        body.replace("__KYN_CSRF_TOKEN__", csrf)
+    } else {
+        body
+    };
     http_simple(&mut stream, status, ctype, &body)
 }
 
