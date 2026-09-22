@@ -11,11 +11,32 @@ use rusqlite::{params, Connection};
 use crate::queries;
 use crate::Result;
 
-/// 计算某天的 daily_agg 行（如果不存在则插入，已存在则更新）。
-/// 返回 0/1 表示是否有变化。`date` 为本地日期 `YYYY-MM-DD`。
+/// 单日聚合统计（读侧计算结果，写侧只做 UPSERT）。
+#[derive(Debug, Clone, Copy)]
+pub struct DayStats {
+    pub keys: i64,
+    pub clicks: i64,
+    pub active_min: i64,
+}
+
+impl DayStats {
+    pub fn apm(&self) -> f64 {
+        if self.active_min > 0 {
+            (self.keys + self.clicks) as f64 / self.active_min as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// 从 events 读侧计算某天的 daily_agg 统计（纯查询，不写库）。
+/// `date` 为本地日期 `YYYY-MM-DD`。
 ///
-/// 注意：WHERE 用 `timestamp >= ? AND < ?`（本地午夜→UTC 边界，走 idx_events_timestamp）。
-pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
+/// 拆分自原 `recompute_day`（perf 审查 LOW）：计算放在读连接上，
+/// 让调用方无需持有写锁即可完成重扫描（成本随当日行数线性）。
+///
+/// WHERE 用 `timestamp >= ? AND < ?`（本地午夜→UTC 边界，走 idx_events_timestamp）。
+pub fn compute_day(conn: &Connection, date: &str) -> Result<DayStats> {
     // 本地日 → [UTC start, UTC end) 边界，与全链路查询口径一致。
     let (start, end) = queries::local_day_range(date).unwrap_or_else(|| {
         // 解析失败时回退到宽松前缀匹配（保留容错）
@@ -42,13 +63,16 @@ pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
         params![start, end, off],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    Ok(DayStats {
+        keys,
+        clicks,
+        active_min,
+    })
+}
 
-    let apm = if active_min > 0 {
-        (keys + clicks) as f64 / active_min as f64
-    } else {
-        0.0
-    };
-
+/// 把 [`compute_day`] 的结果 UPSERT 进 daily_agg（写侧，锁内廉价步骤）。
+/// 返回 0/1 表示是否有变化。
+pub fn upsert_day(conn: &Connection, date: &str, s: &DayStats) -> Result<bool> {
     let changed = conn.execute(
         "INSERT INTO daily_agg (date, keys, clicks, active_minutes, apm_avg)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -57,9 +81,18 @@ pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
             clicks = excluded.clicks,
             active_minutes = excluded.active_minutes,
             apm_avg = excluded.apm_avg",
-        params![date, keys, clicks, active_min, apm],
+        params![date, s.keys, s.clicks, s.active_min, s.apm()],
     )?;
     Ok(changed > 0)
+}
+
+/// 计算某天的 daily_agg 行（如果不存在则插入，已存在则更新）。
+/// 返回 0/1 表示是否有变化。`date` 为本地日期 `YYYY-MM-DD`。
+///
+/// 注意：WHERE 用 `timestamp >= ? AND < ?`（本地午夜→UTC 边界，走 idx_events_timestamp）。
+pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
+    let stats = compute_day(conn, date)?;
+    upsert_day(conn, date, &stats)
 }
 
 /// 重新计算「最近 days 天」（含今天，按**本地**时区）的 daily_agg 行。

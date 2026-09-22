@@ -19,14 +19,23 @@ impl Database {
         let id = self.with_writer(
             |conn| {
                 let now = chrono::Utc::now().to_rfc3339();
-                conn.execute("INSERT INTO sessions (start_time) VALUES (?1)", [&now])
-                    .ok();
-                conn.last_insert_rowid()
+                // P0 修复：INSERT 失败（磁盘满/只读/触发器中止）时不得读
+                // last_insert_rowid——那会拿到写连接上一次任意表插入的残留
+                // rowid，被当作新 session id 后幽灵清扫（end_time IS NULL）
+                // 永久失明。失败时 log::error 并返回 0（= 无会话），writer
+                // 不补盖 session_id，数据保持 NULL 可追溯。
+                match conn.execute("INSERT INTO sessions (start_time) VALUES (?1)", [&now]) {
+                    Ok(_) => conn.last_insert_rowid(),
+                    Err(e) => {
+                        log::error!("start_session INSERT 失败，本会话不登记 session id: {e}");
+                        0
+                    }
+                }
             },
             || 0,
         );
-        // P0 修复：登记当前会话 id，供 writer 落库时补盖 event.session_id
-        // （此前该列全为 NULL，ghost 清扫/total_events 全部失效）。
+        // 登记当前会话 id（0 = 无会话），供 writer 落库时补盖 event.session_id。
+        // 此前该列全为 NULL，ghost 清扫/total_events 全部失效。
         self.current_session.store(id, Ordering::Relaxed);
         id
     }

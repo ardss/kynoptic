@@ -353,6 +353,13 @@ pub fn heal_under_agg(conn: &Connection) -> crate::Result<usize> {
         for h in 0..24i64 {
             backfill_chunk(conn, date, h)?;
         }
+        // daily_agg 同步补算（缺陷修复）：7 天自愈窗口此前只修 agg_minute，
+        // 跨 ≥2 个午夜唤醒后迟到的旧日事件会让 daily_agg 永久读 0，与
+        // agg_minute 分叉。对齐 recompute_recent_days 的 2 天窗口与这里的
+        // 7 天自愈窗口，命中日期一并重算，两套派生缓存保持一致。
+        if let Err(e) = crate::daily_agg::recompute_day(conn, date) {
+            log::warn!("欠聚合日期 {date} 的 daily_agg 补算失败: {e}");
+        }
         log::info!("欠聚合日期 {date} 已重算自愈");
     }
     Ok(dates.len())

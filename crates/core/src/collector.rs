@@ -209,7 +209,33 @@ fn create_monitors_for(
     crate::registry::create_monitors_for(enabled)
 }
 
-fn write_batch(db: &Database, batch: &mut [Event], total_written: &AtomicUsize) {
+/// 未来时间戳防线（Wave30 挂账，根治读侧修补之外的写入源）：拒绝 timestamp
+/// 晚于当前 UTC 时间 5 分钟以上的事件（时钟漂移/系统时间回拨/外部注入），
+/// 计数进 DROPPED_EVENTS 并留日志——趋势/热力图永远不会再画出未来柱。
+/// 铁律：只拦截新入库，历史数据不清洗；不可解析的时间戳不在写入侧拦截
+/// （交由 db/events.rs 的 normalize_timestamp 与读侧容错处理）。
+fn reject_future_events(batch: &mut Vec<Event>) {
+    let cutoff = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let before = batch.len();
+    batch.retain(
+        |e| match chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
+            Ok(t) => t.with_timezone(&chrono::Utc) <= cutoff,
+            Err(_) => true,
+        },
+    );
+    let dropped = before - batch.len();
+    if dropped > 0 {
+        DROPPED_EVENTS.fetch_add(dropped as u64, Ordering::Relaxed);
+        log::warn!("拒绝 {dropped} 条未来时间戳事件（> UTC now+5min），不入库");
+    }
+}
+
+fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsize) {
+    // 未来时间戳防线：先于 session 补盖与落库执行（见 reject_future_events）
+    reject_future_events(batch);
+    if batch.is_empty() {
+        return;
+    }
     // 审查 P0：Event::new 硬编码 session_id=None 且全链路无人回填，导致
     // events.session_id 全库为 NULL、sessions.total_events/ghost 清扫失效。
     // 落库前用 db 登记的当前会话 id 补盖（None 才盖，尊重显式赋值）。
