@@ -46,14 +46,52 @@ static COLLECTOR_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// 定时读——Error 态图标此前是死代码，现在真正接线（定性审查）。
 static DASH_FAILED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// 采集停滞阈值（审查 P1）：flush 距今超过该秒数且采集器在跑,心跳打
-/// stalled:true。30s 写一轮心跳、正常批次间隔远小于此,300s ≈ 连续 10 个
-/// 心跳周期无落库,足以区分"空闲无输入"与"writer 挂死"。
+/// 采集停滞阈值（审查 P1）：采集器在跑且"醒着的时间"内 flush 停滞超过该秒数,
+/// 心跳打 stalled:true。30s 写一轮心跳、正常批次间隔远小于此。
 const HEARTBEAT_STALLED_SECS: i64 = 1800; // 30min：必须大于最慢的周期性写入者
                                           //（process 监控器 600s 强制心跳 + 30% 抖动 ≈ 780s），否则空闲机器会被误判
                                           // stalled 遭看门狗循环误杀（全库审查 P0：300<600 的余量倒挂）
 
+/// 进程启动时刻的无偏中断时间基线（秒）。QueryUnbiasedInterruptTime 不计
+/// 系统休眠时间，是区分"机器睡过"与"writer 挂死"的唯一可靠时钟——墙钟 gap
+/// 在休眠唤醒后第一拍必然巨大，且旧实现那个 >4h 才豁免的护栏挡不住
+/// 30min-4h 的睡眠（唤醒后 healthy 托盘被 watchdog 误杀的根因）。
+static PROCESS_START_UNBIASED_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// 最近一次观测到 flush 前进时的无偏秒数（心跳线程刷新）。stalled 判据 =
+/// 当前无偏秒 - 该值 > HEARTBEAT_STALLED_SECS；休眠不积累无偏时间，
+/// 所以睡着的机器永远不会因此被打 stalled。
+static LAST_FLUSH_AWAKE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// QueryUnbiasedInterruptTime（100ns 计数,不含休眠时间）。tray 的
+// windows-sys 未启用 Win32_System_SystemInformation feature，按 session.rs
+// 的先例手写 extern 声明，避免为单个函数动依赖表。
+extern "system" {
+    fn QueryUnbiasedInterruptTime(lpUnbiasedTime: *mut u64) -> i32;
+}
+
+/// 进程累计醒着的秒数（无偏中断时间 - 启动基线；休眠期间不增长）。
+fn awake_secs() -> u64 {
+    let mut t: u64 = 0;
+    let ok = unsafe { QueryUnbiasedInterruptTime(&mut t) };
+    if ok == 0 {
+        return 0;
+    }
+    (t / 10_000_000)
+        .saturating_sub(PROCESS_START_UNBIASED_SECS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn main() {
+    // 心跳基线先行：QueryUnbiasedInterruptTime 按进程启动时刻取样
+    let mut unbiased_raw: u64 = 0;
+    unsafe {
+        QueryUnbiasedInterruptTime(&mut unbiased_raw);
+    }
+    PROCESS_START_UNBIASED_SECS.store(
+        unbiased_raw / 10_000_000,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let port_from_args = argv.iter().any(|a| a == "--port");
     let mut parsed = match args::parse(&argv) {
@@ -275,31 +313,48 @@ fn main() {
     // 每次成功落库刷新);采集运行中且 flush 停滞超 HEARTBEAT_STALLED_SECS(1800s)
     // 时打 stalled:true,watchdog 侧 classify_heartbeat 据此判为过期并 kill。
     // 旧版纯时间戳内容仍被 watchdog 兼容解析(向后兼容,滚动升级期两代共存)。
+    //
+    // 休眠误报修复（P1）：stalled 判据从墙钟 gap 改为"无偏秒差"——JSON 里新增
+    // "awake" 字段（进程累计醒着秒数,QueryUnbiasedInterruptTime 不计休眠），
+    // stalled = flush 前进之后醒着超过 1800s 没再前进。机器睡着时无偏时间
+    // 停走,唤醒后第一拍 awake 差值接近 0,绝不会被误报;watchdog 侧只认
+    // stalled 布尔位,旧字段全部保留,新旧两代可共存。
     {
         let hb = paths::resolve_heartbeat();
         thread::Builder::new()
             .name("Heartbeat".into())
-            .spawn(move || loop {
-                let now = chrono::Utc::now();
-                let flush = kynoptic_core::collector::last_flush_epoch();
-                let running = COLLECTOR_RUNNING.load(std::sync::atomic::Ordering::Relaxed);
-                // flush==0 = 本进程尚未落过库(启动初期正常),不误报;真正
-                // 挂死场景是 flush 曾前进后停滞,由 1800s 阈值覆盖。
-                // 审查 P1:gap 按墙钟计算,系统休眠唤醒后第一拍 gap 巨大但采集
-                // 并未挂死,误报 stalled 会被 watchdog kill/重启托盘。gap 超过
-                // 4 小时(14400s)视为"机器睡过,不是停滞"——不报 stalled,
-                // 等下一拍(30s 后)flush 正常前进即自然恢复。
-                let gap = now.timestamp() - flush as i64;
-                let stalled = running && flush > 0 && gap > HEARTBEAT_STALLED_SECS && gap < 14400;
-                let content = format!(
-                    "{{\"pid\":{},\"ts\":\"{}\",\"flush\":{},\"stalled\":{}}}",
-                    std::process::id(),
-                    now.to_rfc3339(),
-                    flush,
-                    stalled
-                );
-                let _ = std::fs::write(&hb, content);
-                thread::sleep(std::time::Duration::from_secs(30));
+            .spawn(move || {
+                let mut prev_flush: u64 = 0;
+                loop {
+                    let now = chrono::Utc::now();
+                    let flush = kynoptic_core::collector::last_flush_epoch();
+                    let running = COLLECTOR_RUNNING.load(std::sync::atomic::Ordering::Relaxed);
+                    let awake = awake_secs();
+                    // flush==0 = 本进程尚未落过库(启动初期正常),不误报;真正
+                    // 挂死场景是 flush 曾前进后停滞,由 1800s 阈值覆盖。
+                    // flush 前进即刷新"最近活跃时刻"的无偏基线。
+                    if flush > 0 && flush != prev_flush {
+                        LAST_FLUSH_AWAKE_SECS.store(awake, std::sync::atomic::Ordering::Relaxed);
+                        prev_flush = flush;
+                    }
+                    // 醒着的时间里 flush 停滞超阈值才报 stalled（休眠不积累醒着
+                    // 时间,唤醒后的巨大墙钟 gap 在此归零,无需任何护栏豁免）
+                    let stalled = running
+                        && flush > 0
+                        && awake.saturating_sub(
+                            LAST_FLUSH_AWAKE_SECS.load(std::sync::atomic::Ordering::Relaxed),
+                        ) > HEARTBEAT_STALLED_SECS as u64;
+                    let content = format!(
+                        "{{\"pid\":{},\"ts\":\"{}\",\"flush\":{},\"awake\":{},\"stalled\":{}}}",
+                        std::process::id(),
+                        now.to_rfc3339(),
+                        flush,
+                        awake,
+                        stalled
+                    );
+                    let _ = std::fs::write(&hb, content);
+                    thread::sleep(std::time::Duration::from_secs(30));
+                }
             })
             .expect("心跳线程启动失败");
     }
