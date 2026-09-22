@@ -166,7 +166,11 @@ fn cmd_stats(args: &[String]) -> Result<()> {
                     return Err(Error::InvalidData("--days 需要 >=1".into()));
                 }
             }
-            _ => {}
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（支持 --date/--days）"
+                )))
+            }
         }
         i += 1;
     }
@@ -238,7 +242,11 @@ fn cmd_export(args: &[String]) -> Result<()> {
             "--redact" => redact = true,
             // 历史兼容：旧 --raw 语义（保留原文）即现在的默认行为，接受但不做事
             "--raw" => {}
-            _ => {}
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（支持 --days/--format/--out/--redact）"
+                )))
+            }
         }
         i += 1;
     }
@@ -862,7 +870,7 @@ fn cmd_now(args: &[String]) -> Result<()> {
 /// 解析 `--from`/`--to` 时间边界。支持：
 /// - `today` / `yesterday`（本地日界）
 /// - `YYYY-MM-DD`（本地日的起点；作为上界时为次日零点，即闭开区间语义）
-/// - RFC3339 / `YYYY-MM-DDTHH:MM`（原样使用，非 RFC3339 时补 `:00+00:00`）
+/// - RFC3339（统一转 UTC 规范形 `+00:00`、秒精度）/ `YYYY-MM-DDTHH:MM`（按本地时区补偏移）
 fn parse_when(s: &str, is_upper_bound: bool) -> Result<String> {
     let shift = if is_upper_bound { 1 } else { 0 };
     match s {
@@ -881,8 +889,14 @@ fn parse_when(s: &str, is_upper_bound: bool) -> Result<String> {
                 // 纯日期：下界取日始，上界取次日零点（[from, to) 闭开区间）
                 return Ok(if is_upper_bound { end } else { start });
             }
-            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-                return Ok(s.to_string());
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+                // timestamp 列全部由 DateTime<Utc>::to_rfc3339() 写入（+00:00 形），
+                // 边界原样透传 +08:00 等显式偏移字面量，RFC3339 **字符串比较**
+                // 的字典序不等于时间序，窗口会静默算错。镜像 mcp state.rs
+                // normalize_bound 的修法：解析后转 UTC 规范形（+00:00、秒精度）。
+                return Ok(t
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
             }
             for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
                 if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
@@ -974,11 +988,12 @@ fn parse_query_args(args: &[String]) -> Result<QueryArgs> {
             }
             "--limit" => {
                 i += 1;
-                q.limit = args
+                // Wave19：非法值报错而非静默回落 50（与 stats --days 同政策）
+                let v: usize = args
                     .get(i)
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(50)
-                    .clamp(1, 1000);
+                    .ok_or_else(|| Error::InvalidData("--limit 需要一个正整数".into()))?;
+                q.limit = v.clamp(1, 1000);
             }
             "--json" => q.json = true,
             other => {
@@ -1197,7 +1212,11 @@ fn cmd_probe(args: &[String]) -> Result<()> {
             }
             "--secs" => {
                 i += 1;
-                secs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(15);
+                // Wave19：非法值报错而非静默回落 15（与 stats --days 同政策）
+                secs = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| Error::InvalidData("--secs 需要一个正整数".into()))?;
             }
             "--all" => all = true,
             other => {
@@ -1267,16 +1286,25 @@ fn cmd_collect(args: &[String]) -> Result<()> {
 
     // 设置面板（dashboard /api/settings）写入的 settings.json 是监控器开关
     // 的唯一事实源：collect 启动时读取；--all 显式覆盖为全集。
+    // Wave20 P1：与 POST /api/settings 同一套校验（dash/src/lib.rs）——未知 id
+    // 与空集都报错退出。手改 settings.json 写入空数组会绕过面板守卫，若不拦
+    // 会静默 0 监控器空采（图标绿色但什么都没记）；要暂停请用托盘 Pause。
     let enabled: std::collections::HashSet<String> = if all {
         kynoptic_core::registry::all_monitor_ids()
             .iter()
             .map(|s| s.to_string())
             .collect()
     } else {
-        crate::settings::load(std::path::Path::new(&db_path))
-            .enabled_monitors
-            .into_iter()
-            .collect()
+        let s = crate::settings::load(std::path::Path::new(&db_path));
+        if let Some(bad) = crate::settings::first_invalid_id(&s.enabled_monitors) {
+            return Err(Error::InvalidData(format!("未知监控器 id: {bad}")));
+        }
+        if s.enabled_monitors.is_empty() {
+            return Err(Error::InvalidData(
+                "enabled_monitors 不能为空（暂停请用托盘菜单）".into(),
+            ));
+        }
+        s.enabled_monitors.into_iter().collect()
     };
     eprintln!(
         "kynoptic collect: {} monitors, db = {db_path}. Ctrl+C to stop.",
@@ -2482,9 +2510,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_when_rfc3339_passthrough_and_naive_datetime() {
+    fn parse_when_rfc3339_normalizes_to_utc_and_naive_datetime() {
+        // RFC3339 边界统一转 UTC 规范形（+00:00、秒精度）再进 SQL：
+        // 原样透传 +08:00 会按字典序比较、窗口静默算错（与 mcp normalize_bound 同修）
         let t = parse_when("2026-09-09T12:30:00+08:00", false).unwrap();
-        assert_eq!(t, "2026-09-09T12:30:00+08:00");
+        assert_eq!(t, "2026-09-09T04:30:00+00:00");
         // 无时区的钟表时间按本地时区解释（审查 P2：按 UTC 补偏移会错 8 小时）
         let naive = parse_when("2026-09-09T12:30", false).unwrap();
         assert!(naive.starts_with("2026-09-09T12:30:00"), "{naive}");
