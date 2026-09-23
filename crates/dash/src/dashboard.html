@@ -19,7 +19,9 @@
     --human: #5BA8FF; --auto: #E0A24A; --down: #E06C75;
     /* 热力图五档色阶（JS 绘制 SVG 时经 getComputedStyle 读取，见 hmLevels()；
        亮色/高对比媒体查询整体换色，画布不再硬编码深色像素） */
-    --hm-0: #0B0F16; --hm-1: #1e3a5f; --hm-2: #2d5f94; --hm-3: #3b82c4; --hm-4: #5BA8FF;
+    /* hm-4 不与 --human 同色（一处一义：热力图是含自动化注入的 raw 输入分钟，
+       时间线蓝才是人在场），顶档改用与三指标无关的青绿色 */
+    --hm-0: #0B0F16; --hm-1: #1e3a5f; --hm-2: #2d5f94; --hm-3: #3b82c4; --hm-4: #3FB6A8;
     --surface-btn: #2A3442;
     --amber: #F5B454; /* 兼容旧引用 */
     --radius: 10px; --radius-s: 6px;
@@ -42,7 +44,7 @@
       --ok: #1E8F66; --warn: #B27717; --bad: #C94F58;
       --human: #2F7FE0; --auto: #B27717; --down: #C94F58;
       --surface-btn: #E4EAF2; --amber: #B27717;
-      --hm-0: #E9EDF3; --hm-1: #BBD4EE; --hm-2: #85B4E8; --hm-3: #5296DF; --hm-4: #2F7FE0;
+      --hm-0: #E9EDF3; --hm-1: #BBD4EE; --hm-2: #85B4E8; --hm-3: #5296DF; --hm-4: #1F8F79;
     }
     html { color-scheme: light; }
   }
@@ -211,7 +213,7 @@
   <div class="muted" id="status-line">loading…</div>
   <div id="update-banner" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#243040;font-size:13px"></div>
   <div class="tabs" role="tablist">
-    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview"><span class="l en">Overview</span><span class="l zh">运行信息</span></button>
+    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview"><span class="l en">Overview</span><span class="l zh">今日概览</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-report"><span class="l en">Report</span><span class="l zh">报告</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps"><span class="l en">Apps</span><span class="l zh">应用</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input"><span class="l en">Input</span><span class="l zh">输入</span></button>
@@ -221,15 +223,15 @@
   </div>
 </header>
 
-<div id="view-overview" role="tabpanel" aria-label="Overview / 运行信息">
+<div id="view-overview" role="tabpanel" aria-label="Overview / 今日概览">
 
 <div class="cards">
   <div class="card">
     <div class="label"><span class="l en">presence today</span><span class="l zh">今日在场</span></div>
     <div class="value xl" id="c-presence">–</div>
     <div class="note">
-      <span class="l en">first</span><span class="l zh">首次活跃</span> <span id="c-first">–</span>
-      · <span class="l en">last</span><span class="l zh">最近活跃</span> <span id="c-last">–</span>
+      <span class="l en">first presence</span><span class="l zh">首次在场</span> <span id="c-first">–</span>
+      · <span class="l en">last presence</span><span class="l zh">最近在场</span> <span id="c-last">–</span>
       · <span id="c-presence-delta"></span>
       · <span id="c-presence-goal"></span>
     </div>
@@ -313,7 +315,7 @@
 
 <section>
   <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-    <span><span class="l en">activity heatmap (keyboard/mouse minutes per day)</span><span class="l zh">活跃度热力图（每日键鼠输入分钟）</span></span>
+    <span><span class="l en">input heatmap (keyboard/mouse minutes per day, incl. automation-injected input)</span><span class="l zh">输入热力图（每日键鼠输入分钟，含自动化注入）</span></span>
     <span id="hm-range" style="display:inline-flex;gap:4px">
       <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
       <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
@@ -470,7 +472,7 @@
   <div class="mon-row" style="display:flex;align-items:center;gap:8px">
     <label for="set-bridge" style="white-space:nowrap"><span class="l en">presence grace minutes (0-15):</span><span class="l zh">在场宽限分钟（0-15）：</span></label>
     <input type="number" id="set-bridge" min="0" max="15" style="width:64px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
-    <span class="muted" style="font-size:11px"><span class="l en">still counts as presence after N consecutive minutes without keyboard/mouse input</span><span class="l zh">连续 N 分钟无键鼠输入仍计为在场</span></span>
+    <span class="muted" style="font-size:11px"><span class="l en">still counts as presence after N consecutive minutes without keyboard/mouse/scroll input</span><span class="l zh">连续 N 分钟无键鼠/滚轮输入仍计为在场</span></span>
   </div>
   <div class="mon-row" style="display:flex;align-items:center;gap:8px">
     <label for="set-goal" style="white-space:nowrap"><span class="l en">daily presence goal (minutes):</span><span class="l zh">每日目标在场分钟数：</span></label>
@@ -513,7 +515,7 @@
 
 <div class="muted" style="font-size:12px;margin:6px 0 14px">
   <span class="l en">auto-refresh every 30s (paused while hidden; full re-render on the overview tab only). per-key/mouse aggregates land within ~10-20s (minute buckets).</span>
-  <span class="l zh">数据每 30 秒自动刷新（后台隐藏时暂停；仅运行信息页全量重渲染）；键鼠聚合约 10-20 秒内可见（按分钟桶追加）。</span>
+  <span class="l zh">数据每 30 秒自动刷新（后台隐藏时暂停；仅总览页全量重渲染）；键鼠聚合约 10-20 秒内可见（按分钟桶追加）。</span>
 </div>
 <footer>
   <span class="l en">All data is local. This page reads your kynoptic.db on this machine only.<br>
@@ -814,11 +816,19 @@ async function loadOverview() {
       el.classList.remove("empty-note");
     }
   }
-  // 对比增量（定性审查：裸数字无上下文像报表）——vs 昨日同口径
+  // 对比增量（定性审查：裸数字无上下文像报表）——vs 昨日同口径。
+  // 今日刚开始防线：昨日是完整自然日，今天刚过几分钟就比必然是大幅"下降"，
+  // 每个凌晨都系统性误导——距零点不足 3 小时不渲染对比。
+  const elapsedToday = (() => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); })();
   const delta = (today, yest, el) => {
     const e = document.getElementById(el);
     if (!e) return;
     if (collecting || typeof yest !== "number" || yest <= 0) { e.textContent = ""; e.style.color = ""; return; }
+    if (elapsedToday < 180) {
+      e.textContent = zh ? "今日刚开始（" + Math.max(1, Math.round(elapsedToday / 60)) + " 小时内，暂不与昨日对比）" : "day just started (no comparison yet)";
+      e.style.color = "";
+      return;
+    }
     const diff = today - yest;
     if (Math.abs(diff) < 1) { e.textContent = zh ? "与昨日持平" : "same as yesterday"; return; }
     const sign = diff > 0 ? "+" : "−";
@@ -852,7 +862,14 @@ async function loadInsights() {
   const zh = document.documentElement.lang === "zh";
   const el = document.getElementById("insights-list");
   if (!d.insights || !d.insights.length) {
-    el.innerHTML = '<div class="card"><div class="value">–</div><div class="label"><span class="l en">Not enough data yet — insights appear after a day of collection</span><span class="l zh">数据还不够——采集满一天后这里会出现洞察</span></div></div>';
+    // 真实门槛（后端 gate 字段）：7 天窗口内输入事件满 50 条才生成洞察；
+    // 旧后端无 gate 字段时退回平实静态文案
+    const n = d.gate && typeof d.gate.events === "number" ? d.gate.events : null;
+    const req = d.gate && d.gate.required ? d.gate.required : 50;
+    const msg = zh
+      ? (n === null ? "输入事件积累到 50 条后，这里会出现洞察" : "输入事件已积累 " + n + "/" + req + " 条，满 " + req + " 条后这里会出现洞察")
+      : (n === null ? "Insights appear here after 50 input events" : n + "/" + req + " input events so far — insights appear at " + req);
+    el.innerHTML = '<div class="card"><div class="value">–</div><div class="label">' + esc(msg) + '</div></div>';
     return;
   }
   el.innerHTML = '<div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Insights are statistical patterns mined from your activity — they describe, not explain.</span><span class="l zh">洞察 = 从活动数据中挖出的统计规律，描述现象，不解释因果。</span></div>'
@@ -881,7 +898,7 @@ async function loadTimeline() {
   const L = {
     human: zh ? "在场" : "presence",
     auto: zh ? "自动化" : "automation",
-    away: zh ? "无人" : "away"
+    away: zh ? "无输入" : "away"
   };
   /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
   const TL_COLORS = { human: "var(--human)", auto: "var(--auto)", away: "#1a2230" };
@@ -913,8 +930,8 @@ async function loadTimeline() {
     + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
     + '<div class="note" style="margin-bottom:6px">'
     + (zh
-      ? "在场 = 有键鼠或滚轮操作；自动化 = 自动化脚本的操作；无人 = 屏幕上有窗口但两者都没有。"
-      : "Presence = keyboard/mouse/scroll activity; automation = actions by automation tools; unattended = a window in the foreground with neither.")
+      ? "在场 = 有键鼠或滚轮操作；自动化 = 自动化脚本的操作；无输入 = 该小时内既没有人在场也没有自动化操作的部分。"
+      : "Presence = keyboard/mouse/scroll activity; automation = actions by automation tools; away = the part of the hour with neither presence nor automation.")
     + '</div>'
     + tl.buckets.map(b => {
     // 三色分层：在场(蓝) / 自动化(橙) / 无人(暗)，应用色带保留为 tooltip 细节。
@@ -1215,10 +1232,14 @@ async function loadReport() {
   if (seq !== REPORT_SEQ) return;
   const tr = await jget("/api/trends");
   if (seq !== REPORT_SEQ) return;
-  const today = (tr.daily || []).slice(-1)[0];
+  // 历史日期修复：旧实现恒取 trends 末行（=今天），查看历史日期时目标卡
+  // 显示的是"今天"的分钟数。现在按所选日期在 daily 数组（自带 date 字段）
+  // 里找对应日行，查不到按 0 计。
+  const dayRow = (tr.daily || []).find(x => x.date === (dateVal || todayStr()));
   const goal = st.daily_goal_minutes || 0;
-  // 口径统一：目标卡用"在场分钟"（与总览环同一字段 presence_minutes），
-  // 仅当日（今天）能取到；历史日期退回 trends 的 raw active_minutes 并注明差异。
+  // 口径：目标卡优先用"在场分钟"（与总览环同一字段 presence_minutes），
+  // 仅今天能取到；历史日期只有 raw 输入口径可用——明确标注"原始输入分钟"，
+  // 不再冒充在场分钟（同一张卡随所选日期静默换身份的问题不再发生）。
   let presenceMin = null, rawNote = "";
   // 跨午夜修复：TODAY_STR 是脚本加载时定格的，页面跨天后会把服务端"今天"
   // 的 presence_minutes 套到昨天的报告上——这里必须与 todayStr() 现算一致。
@@ -1228,7 +1249,7 @@ async function loadReport() {
       if (seq !== REPORT_SEQ) return;
       if (typeof ov.presence_minutes === "number") {
         presenceMin = ov.presence_minutes;
-        const raw = today ? (today.active_minutes || 0) : 0;
+        const raw = dayRow ? (dayRow.active_minutes || 0) : 0;
         if (Math.abs(raw - presenceMin) >= 1) {
           rawNote = " <span class='muted' style='font-size:12px'>(" +
             (document.documentElement.lang === "zh"
@@ -1237,7 +1258,12 @@ async function loadReport() {
       }
     } catch (e) { /* overview 失败时退回 raw，不打断整页渲染 */ }
   }
-  if (presenceMin === null) presenceMin = today ? (today.active_minutes || 0) : 0;
+  if (presenceMin === null) {
+    presenceMin = dayRow ? (dayRow.active_minutes || 0) : 0;
+    rawNote = " <span class='muted' style='font-size:12px'>(" +
+      (document.documentElement.lang === "zh"
+        ? "原始输入分钟，非在场口径" : "raw input minutes, not presence") + ")</span>";
+  }
   document.getElementById("r-goal").innerHTML = goal
     ? fmtMin(presenceMin) + " / " + fmtMin(goal) + rawNote
     : t("goalOff");

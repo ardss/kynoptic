@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Dashboard (insights): the human-side row filter now counts scroll-only
+  input_agg minutes (keys/clicks/scroll_ticks each minus their injected
+  counterpart, aligned with the presence definition), so scroll-only
+  reading time shows up in longest-presence / late-night / golden-hours
+  cards; the empty state now reports the real gate (`gate.events` /
+  `gate.required`) instead of promising "after a day of collection".
+- Dashboard (report): the goal card for a historical date now looks up the
+  selected day in the trends `daily` array instead of always showing the
+  last row (today), and the raw input-minute fallback is explicitly
+  labelled instead of silently posing as presence minutes.
+- Dashboard (`/api/hours`): the hourly values are now input counts
+  (keystrokes + clicks; raw press/click fallback), not total event counts
+  that were dominated by heartbeat/sampling noise; the response and the AI
+  skill doc no longer describe it as "golden hours".
+- Dashboard (wording): timeline legend "无人" renamed to "无输入" (away) to
+  match what the band actually computes; heatmap top color no longer
+  shares the presence-blue value and the daily heatmap is titled "incl.
+  automation-injected input"; the trends note is phrased in plain language;
+  the presence-grace hint mentions scroll; nav label is "今日概览" and the
+  presence card says first/last "在场" (presence).
+- Dashboard (overview): the "vs yesterday" delta is suppressed in the first
+  3 hours after local midnight (yesterday is a full day; early-morning
+  comparisons were systematically misleading).
+- Dashboard (API): `/api/summary` accepts `today` like report/hours/
+  apps_grid; `/api/input` accepts `date=` for the hourly series (previously
+  silently ignored; an empty or invalid `date` now returns 400 instead of
+  falling back to today) and returns `hourly_date`.
+- Core (anomalies): marathon-session detection now reads the same
+  human-presence minute source as the overview "presence" number
+  (`human_minutes_by_date`: excludes automation-injected input, includes
+  scroll ticks) instead of raw keyboard/mouse input minutes; sessions with
+  only injected or scroll-only activity are no longer counted as marathons.
+- Dashboard (report) / MCP: foreground dwell segments are now capped at
+  2 hours per switch (gaps longer than the stall cap — shutdown, sleep,
+  leaving the desk — are no longer attributed to the app). This applies to
+  the report page dwell breakdown and MCP `get_top_apps`; values for a
+  day with one long uninterrupted session are lower than before and now
+  agree with overview/CLI presence.
+- Core (sessions): `idle_seconds` is now backfilled from the
+  `idle_start`/`idle_end` event pairs inside a session on both close paths
+  (startup sweep and ghost-session cleanup); it was always written as 0
+  before.
+- Core (daily_agg): recompute no longer writes an all-zero row for days
+  without any input and clears legacy all-zero rows (the trend chart used
+  to show phantom zero points for those days). To keep consumers aligned,
+  `/api/trends` now zero-fills missing calendar days so `daily` always
+  covers the full 28-day window.
+- CLI (watchdog): stall alerts are now recorded in the events table as
+  `system`/`notification` rows and surfaced as a system notification, so
+  watchdog alerts appear in the timeline/event views like other
+  notifications.
+- Dashboard (API): the `/api/hours` note and the AI skill doc now state
+  that the hourly input counts include automation-injected input (the
+  values themselves are unchanged; only the labeling, matching the daily
+  heatmap).
+
 ## [0.3.0] - 2026-09-23
 
 ### Fixed
