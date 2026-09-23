@@ -56,6 +56,18 @@ impl Database {
             .unwrap_or(0)
     }
 
+    /// 汇总某会话内 idle_start → idle_end 事件对覆盖的空转时长（秒）。
+    ///
+    /// 审查：sessions.idle_seconds 此前在两条结束路径上都被硬编码/遗漏为
+    /// 0.0——优雅关停 end_session 写 0，幽灵清扫根本不写该列；而事件流里
+    /// 的 idle_start/idle_end 对（跨空转/离机时段）从未被折算，导致跨日
+    /// 长会话的空转时长统计失真。这里以事件对为准回填：未闭合的尾部
+    /// idle_start 计到该会话最后一条事件为止。
+    pub fn session_idle_seconds(&self, session_id: i64) -> f64 {
+        let reader = self.reader();
+        compute_idle_seconds(&reader, session_id)
+    }
+
     /// 结束会话。注意：不再在此触发 daily_agg 重算（消除 db → daily_agg 反向依赖）。
     /// 如需刷新当日聚合，调用方应在结束后显式调用 `daily_agg::recompute_day`。
     pub fn end_session(&self, session_id: i64, total_events: i64, idle_seconds: f64) {
@@ -154,9 +166,13 @@ impl Database {
                     .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339()),
             };
 
+            // 折算该会话内 idle_start/idle_end 事件对覆盖的空转时长
+            // （审查：此前清扫路径从不写 idle_seconds，该列全为 0）
+            let idle_secs = compute_idle_seconds(&conn, *sid);
+
             if let Err(e) = conn.execute(
-                "UPDATE sessions SET end_time = ?1, total_events = ?2 WHERE id = ?3 AND end_time IS NULL",
-                params![end_time_str, n_events, sid],
+                "UPDATE sessions SET end_time = ?1, total_events = ?2, idle_seconds = ?3 WHERE id = ?4 AND end_time IS NULL",
+                params![end_time_str, n_events, idle_secs, sid],
             ) {
                 log::warn!("清扫幽灵 session {sid} 失败: {e}");
                 continue;
@@ -169,4 +185,68 @@ impl Database {
         }
         closed
     }
+}
+
+/// 汇总某会话内 idle_start → idle_end 事件对覆盖的空转时长（秒）。
+///
+/// 审查：sessions.idle_seconds 此前在两条结束路径上都被硬编码/遗漏为
+/// 0.0——优雅关停 end_session 写 0，幽灵清扫根本不写该列；而事件流里
+/// 的 idle_start/idle_end 对（跨空转/离机时段）从未被折算，导致跨日
+/// 长会话的空转时长统计失真。这里以事件对为准回填：未闭合的尾部
+/// idle_start 计到该会话最后一条事件为止。接受连接参数，使优雅关停
+/// 与幽灵清扫两条路径共用同一口径。
+fn compute_idle_seconds(conn: &rusqlite::Connection, session_id: i64) -> f64 {
+    let rows: Vec<(String, String)> = match conn
+        .prepare(
+            "SELECT event_action, timestamp FROM events
+             WHERE session_id = ?1 AND event_action IN ('idle_start', 'idle_end')
+             ORDER BY timestamp, id",
+        )
+        .and_then(|mut s| {
+            s.query_map(params![session_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|it| it.filter_map(|x| x.ok()).collect())
+        }) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("读取会话 {session_id} 的空转事件失败: {e}");
+            return 0.0;
+        }
+    };
+    if rows.is_empty() {
+        return 0.0;
+    }
+    // 未闭合 idle_start 的兜底终点：会话最后一条事件的时间
+    let last_event: Option<String> = conn
+        .query_row(
+            "SELECT MAX(timestamp) FROM events WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let parse = |ts: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(Into::into)
+    };
+    let mut total = 0.0f64;
+    let mut open_start: Option<chrono::DateTime<chrono::Utc>> = None;
+    for (action, ts) in &rows {
+        let Some(t) = parse(ts) else { continue };
+        if action == "idle_start" {
+            // 连续两个 idle_start：以新的为准（丢一段无终点的计时，不猜）
+            open_start = Some(t);
+        } else if let Some(s) = open_start.take() {
+            total += (t - s).num_milliseconds().max(0) as f64 / 1000.0;
+        }
+    }
+    // 未闭合的尾部 idle_start：计到会话最后一条事件为止
+    if let Some(s) = open_start {
+        if let Some(end_ts) = last_event.as_deref().and_then(parse) {
+            total += (end_ts - s).num_milliseconds().max(0) as f64 / 1000.0;
+        }
+    }
+    total
 }
