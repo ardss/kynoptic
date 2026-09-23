@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dashboard (web): `loadApps` now guards the second `await`
+  (`/api/daily_top`) with the same sequence check as the first, so a
+  stale response can no longer overwrite the "daily Top 3" table with
+  data from a previously selected date.
+- Dashboard (web): non-numeric input in the settings numeric fields
+  (daily goal / bridge minutes / port) no longer silently saves `0`
+  via `parseInt(...) || 0`; the previous saved value (or the default)
+  is kept and a note is shown. A changed port now also surfaces the
+  "takes effect after tray restart" hint (previously dead i18n copy).
+- Dashboard (web): with per-keystroke (raw) granularity the input page
+  no longer renders the misleading "N unattributed clicks from an old
+  version" banner — raw mode never produces per-button rows, so all
+  clicks were falsely reported as unattributed.
+- Dashboard (web): a last-event timestamp in the future (dirty data /
+  clock skew) no longer reports "collecting" forever; it is shown as a
+  timestamp anomaly instead.
+- Dashboard (web): the 24h timeline no longer draws a full 60-minute
+  "away" span for the in-progress current hour; away is capped at the
+  minutes elapsed since the hour start (computed from the response's
+  `generated_at`, not the client clock).
+- Dashboard (web): `jget` now surfaces the backend `{"error": ...}`
+  reason on non-200 responses (e.g. future-date validation) instead of
+  only "URL → HTTP 400".
+- Dashboard (web): the Top Apps list uses the same display names as the
+  timeline / app grid / daily Top 3 (`.exe` suffix stripped; full name
+  kept in the tooltip).
+
 - Dashboard: `/api/overview` no longer waits on the `nvidia-smi`
   subprocess — GPU utilization now refreshes on a background thread
   (stale-while-revalidate, 30s TTL, single-flight), so request threads
