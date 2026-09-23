@@ -1,10 +1,10 @@
-//! `kynoptic update`：从 GitHub Releases 自更新（便携版三件套）。
+//! `kynoptic update`：从 GitHub Releases 自更新（便携版五件套）。
 //!
 //! 设计依据（v0.1 发行方式 = GitHub Releases 裸二进制）：
 //! - 审查 P0：旧实现走 self_update 的 `{bin}-{version}-{target}.zip` 资产只换
 //!   kynoptic.exe 一个文件，造成 tray/watchdog 版本漂移。现改为手动流程：
-//!   下载 SHA256SUMS.txt + 三个裸 exe + SKILL.md 资产（release 同时上传 zip
-//!   三件套供手动下载），全部通过 SHA-256 校验后才替换；SKILL.md 在 exe 替换
+//!   下载 SHA256SUMS.txt + 五个裸 exe + SKILL.md 资产（release 同时上传 zip
+//!   供手动下载），全部通过 SHA-256 校验后才替换；SKILL.md 在 exe 替换
 //!   成功后刷新到 exe 同目录（文档文件，失败仅告警不回滚）。
 //! - 审查 P0：替换前旧 exe 改名 `.bak` 保留；新 kynoptic.exe 启动失败时
 //!   从 `.bak` 整体还原。校验失败则整体放弃、不动任何旧文件。
@@ -46,19 +46,28 @@ fn io_err(x: std::io::Error) -> crate::Error {
     crate::Error::InvalidData(format!("self-update io: {x}"))
 }
 
-/// 便携版自更新必须整体替换的三件套（与 release.yml 的 update zip 一致）。
+/// 便携版自更新必须整体替换的五件套（与 release.yml 上传的 release assets
+/// 一致——五个裸 exe 均作为独立资产上传，自更新逐个下载校验）。
 /// 注意：[0] 必须是主 exe kynoptic.exe——替换顺序逻辑（先换 [1..] 再换 [0]）
-/// 依赖这一约定，勿改。
-const BIN_NAMES: [&str; 3] = ["kynoptic.exe", "kynoptic-tray.exe", "kynoptic-watchdog.exe"];
-/// 随更新分发的 SKILL.md（release 资产名；成功替换后落到 exe 同目录）。
-/// 校验/下载走 ASSET_NAMES（三件套 + SKILL.md），exe 替换仍只走 BIN_NAMES，
-/// 避免把文档文件塞进 BIN_NAMES[1..]+[0] 的进程解锁/启动验证流程。
-const SKILL_MD_NAME: &str = "SKILL.md";
-/// 完整资产清单（完整性检查与下载用）：三件套 + SKILL.md。
-const ASSET_NAMES: [&str; 4] = [
+/// 依赖这一约定，勿改。ctl/aggrepair 无常驻进程，沿用同一 rename 流程即可。
+const BIN_NAMES: [&str; 5] = [
     "kynoptic.exe",
     "kynoptic-tray.exe",
     "kynoptic-watchdog.exe",
+    "kynoptic-ctl.exe",
+    "kynoptic-aggrepair.exe",
+];
+/// 随更新分发的 SKILL.md（release 资产名；成功替换后落到 exe 同目录）。
+/// 校验/下载走 ASSET_NAMES（五件套 + SKILL.md），exe 替换仍只走 BIN_NAMES，
+/// 避免把文档文件塞进 BIN_NAMES[1..]+[0] 的进程解锁/启动验证流程。
+const SKILL_MD_NAME: &str = "SKILL.md";
+/// 完整资产清单（完整性检查与下载用）：五件套 + SKILL.md。
+const ASSET_NAMES: [&str; 6] = [
+    "kynoptic.exe",
+    "kynoptic-tray.exe",
+    "kynoptic-watchdog.exe",
+    "kynoptic-ctl.exe",
+    "kynoptic-aggrepair.exe",
     SKILL_MD_NAME,
 ];
 const SUMS_NAME: &str = "SHA256SUMS.txt";
@@ -446,11 +455,11 @@ pub fn latest_stable_version() -> Option<Option<String>> {
 }
 
 pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
-    // 自更新按 current_exe 文件名收敛到 kynoptic（watchdog/ctl 没有对应资产，
-    // 且即便有也只换一个文件造成三件套版本漂移。审查 P1）。
+    // 自更新按 current_exe 文件名收敛到 kynoptic：更新会整体替换五件套，
+    // 从副 exe 入口发起会与主入口并发替换同一批文件，故一律收敛到主 exe。
     if update_bin_name() != "kynoptic" {
         return Err(crate::Error::InvalidData(
-            "请改用 kynoptic update 完成自更新（watchdog/ctl 随 kynoptic.exe 一并更新）"
+            "请改用 kynoptic update 完成自更新（tray/watchdog/ctl/aggrepair 五件套随其一并替换）"
                 .to_string(),
         ));
     }
@@ -501,7 +510,7 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         })
         .ok_or_else(|| {
             crate::Error::InvalidData(
-                "GitHub Releases 上找不到完整的更新资产（三件套 + SKILL.md + SHA256SUMS.txt）"
+                "GitHub Releases 上找不到完整的更新资产（五件套 + SKILL.md + SHA256SUMS.txt）"
                     .to_string(),
             )
         })?;
@@ -583,10 +592,10 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         }
     }
 
-    // 修复（审查 medium）：任一三件套未替换即整体失败。旧实现只 push 警告，
+    // 修复（审查 medium）：任一五件套未替换即整体失败。旧实现只 push 警告，
     // 但 rename 失败（如杀软/备份软件以无共享模式持有句柄）时后续
     // verify_launch 验证的是未被替换的旧 kynoptic.exe（--version 必通过），
-    // 最终仍打印 updated to，造成三件套版本漂移。此处校验三件套全部替换，
+    // 最终仍打印 updated to，造成多 exe 版本漂移。此处校验五件套全部替换，
     // 任一未换则回滚已换文件并按失败退出，要求用户关闭占用进程后重跑。
     if backups.len() != BIN_NAMES.len() {
         rollback(&backups, "部分文件被占用未能替换");
