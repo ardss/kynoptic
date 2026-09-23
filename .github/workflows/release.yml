@@ -66,7 +66,9 @@ jobs:
           # 只换主 exe 会造成三件套版本漂移。
           Compress-Archive -Path dist/kynoptic.exe, dist/kynoptic-tray.exe, dist/kynoptic-watchdog.exe `
             -DestinationPath "dist/kynoptic-$ver-x86_64-pc-windows-msvc.zip"
-          # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用；覆盖全部 dist 文件，含三件套与自更新 zip）
+          # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用；覆盖全部 dist 文件，含五件套与自更新 zip）
+          # 注意：自更新（update.rs）下载的是上面 files 清单里的五个裸 exe 资产，
+          # 任何一个缺失都会让 `kynoptic update` 的资产完整性校验失败。
           $hashes = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
             ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
           $sums = ($hashes -join "`n") + "`n"
@@ -96,6 +98,8 @@ jobs:
             dist/kynoptic.exe
             dist/kynoptic-watchdog.exe
             dist/kynoptic-tray.exe
+            dist/kynoptic-ctl.exe
+            dist/kynoptic-aggrepair.exe
             dist/SKILL.md
             dist/Kynoptic-Portable-*.zip
             dist/Kynoptic-Setup-*.exe
