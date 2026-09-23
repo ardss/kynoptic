@@ -207,17 +207,17 @@
 <body>
 <header>
   <h1>kynoptic dashboard</h1>
-  <button class="lang-toggle" id="lang-btn" onclick="toggleLang()">中文</button>
+  <button class="lang-toggle" id="lang-btn">中文</button>
   <div class="muted" id="status-line">loading…</div>
   <div id="update-banner" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#243040;font-size:13px"></div>
   <div class="tabs" role="tablist">
-    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview" onclick="showView('overview')"><span class="l en">Overview</span><span class="l zh">运行信息</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-report" onclick="showView('report')"><span class="l en">Report</span><span class="l zh">报告</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps" onclick="showView('apps')"><span class="l en">Apps</span><span class="l zh">应用</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input" onclick="showView('input')"><span class="l en">Input</span><span class="l zh">输入</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights" onclick="showView('insights')"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" onclick="showView('anomalies')"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge"></span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" onclick="showView('settings')"><span class="l en">Settings</span><span class="l zh">设置</span></button>
+    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview"><span class="l en">Overview</span><span class="l zh">运行信息</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-report"><span class="l en">Report</span><span class="l zh">报告</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps"><span class="l en">Apps</span><span class="l zh">应用</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input"><span class="l en">Input</span><span class="l zh">输入</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge"></span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
 </header>
 
@@ -270,7 +270,7 @@
 
 <section>
   <div style="display:flex; align-items:baseline; justify-content:space-between;">
-    <h2 style="cursor:pointer" onclick="toggleOps()"><button type="button" id="ops-toggle" aria-expanded="false" aria-controls="ops-body" onclick="toggleOps(event)" style="background:none;border:none;padding:0 0 0 10px;border-left:2px solid var(--brand);color:inherit;font:inherit;font-weight:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer;"><span class="l en"><span class="caret">▸</span> collection status</span><span class="l zh"><span class="caret">▸</span> 采集状态</span></button></h2>
+    <h2 id="ops-h2" style="cursor:pointer"><button type="button" id="ops-toggle" aria-expanded="false" aria-controls="ops-body" style="background:none;border:none;padding:0 0 0 10px;border-left:2px solid var(--brand);color:inherit;font:inherit;font-weight:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer;"><span class="l en"><span class="caret">▸</span> collection status</span><span class="l zh"><span class="caret">▸</span> 采集状态</span></button></h2>
   </div>
   <div id="ops-body" style="display:none">
     <div class="cards">
@@ -292,10 +292,10 @@
 <section>
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
-    <input type="date" id="report-date" class="date-input" onchange="syncDayBtns(); loadReport()" onclick="this.showPicker && this.showPicker()">
-    <button class="save day-btn btn-ghost" id="day-btn-0" style="margin-left:8px;background:var(--surface-btn)" onclick="pickDay(0)"><span class="l en">today</span><span class="l zh">今天</span></button>
-    <button class="save day-btn btn-ghost" id="day-btn-1" style="margin-left:8px;background:var(--surface-btn)" onclick="pickDay(1)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
-    <button class="save day-btn btn-ghost" id="day-btn-2" style="margin-left:8px;background:var(--surface-btn)" onclick="pickDay(2)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
+    <input type="date" id="report-date" class="date-input">
+    <button class="save day-btn btn-ghost" id="day-btn-0" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-1" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-2" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
   <div id="report-timeline">loading…</div>
   <div id="report-legend" class="muted" style="margin-top:6px"></div>
@@ -313,7 +313,7 @@
 
 <section>
   <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-    <span><span class="l en">activity heatmap (keyboard/mouse minutes per day)</span><span class="l zh">活跃度热力图（每日键鼠输入分钟，绝对分档）</span></span>
+    <span><span class="l en">activity heatmap (keyboard/mouse minutes per day)</span><span class="l zh">活跃度热力图（每日键鼠输入分钟）</span></span>
     <span id="hm-range" style="display:inline-flex;gap:4px">
       <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
       <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
@@ -348,8 +348,8 @@
 <section>
   <h2><span class="l en">hour by hour — which app you were in (pick a day)</span><span class="l zh">逐时一览 — 这天每个小时你在用什么（可选日期）</span></h2>
   <div style="margin-bottom:8px">
-    <input type="date" id="apps-date" class="date-input" onclick="this.showPicker && this.showPicker()" onchange="loadApps()">
-    <button class="save" style="margin-left:8px" onclick="document.getElementById('apps-date').value=todayStr(); loadApps()"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <input type="date" id="apps-date" class="date-input">
+    <button class="save" id="apps-today" style="margin-left:8px"><span class="l en">today</span><span class="l zh">今天</span></button>
   </div>
   <div id="apps-grid-chart">loading…</div>
   <div id="apps-legend" class="muted" style="margin-top:6px"></div>
@@ -369,7 +369,7 @@
 </div>
 
 <section>
-  <h2><span class="l en">keyboard heatmap — per-key frequency (counts only, no content; rendered on ANSI-104)</span><span class="l zh">键盘热力图 — 按键频次（仅计数无内容；按 ANSI-104 布局渲染，非标准布局位置会偏；含自动化注入输入）</span></h2>
+  <h2><span class="l en">keyboard heatmap — per-key frequency (counts only, no content; rendered on ANSI-104; includes automation-injected input)</span><span class="l zh">键盘热力图 — 按键频次（仅计数无内容；按 ANSI-104 布局渲染，非标准布局位置会偏；含自动化注入输入）</span></h2>
   <div class="kb-wrap"><svg id="kb-heatmap" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 910 234"></svg></div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
@@ -442,9 +442,9 @@
   </div>
   <div class="mon-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span class="muted" style="font-size:11px"><span class="l en">presets:</span><span class="l zh">预设：</span></span>
-    <button type="button" class="save btn-ghost" style="background:var(--surface-btn)" onclick="applyPreset('essential')"><span class="l en">Essential (14)</span><span class="l zh">基础（14）</span></button>
-    <button type="button" class="save btn-ghost" style="background:var(--surface-btn)" onclick="applyPreset('full')"><span class="l en">Full (40)</span><span class="l zh">全开（40）</span></button>
-    <button type="button" class="save btn-ghost" style="background:var(--surface-btn)" onclick="applyPreset('minimal')"><span class="l en">Minimal (4)</span><span class="l zh">最小（4）</span></button>
+    <button type="button" class="save btn-ghost" id="preset-essential" style="background:var(--surface-btn)"><span class="l en">Essential (14)</span><span class="l zh">基础（14）</span></button>
+    <button type="button" class="save btn-ghost" id="preset-full" style="background:var(--surface-btn)"><span class="l en">Full (40)</span><span class="l zh">全开（40）</span></button>
+    <button type="button" class="save btn-ghost" id="preset-minimal" style="background:var(--surface-btn)"><span class="l en">Minimal (4)</span><span class="l zh">最小（4）</span></button>
     <span class="muted" style="font-size:11px"><span class="l en">sets checkboxes — click save to apply</span><span class="l zh">仅勾选，需点保存生效</span></span>
   </div>
   <div class="settings-groups">
@@ -496,8 +496,8 @@
 </section>
 <section>
   <div class="settings-actions">
-    <button class="save btn-ghost" style="background:var(--surface-btn)" onclick="restoreDefaults()"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
-  <button class="save" id="settings-save" onclick="saveSettings()"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
+    <button class="save btn-ghost" id="restore-defaults" style="background:var(--surface-btn)"><span class="l en">restore default monitors</span><span class="l zh">恢复默认监控器</span></button>
+  <button class="save" id="settings-save"><span class="l en">save settings</span><span class="l zh">保存设置</span></button>
     <span id="settings-msg" aria-live="polite"></span>
   </div>
 </section>
@@ -522,7 +522,7 @@
   服务仅绑定 127.0.0.1（只监听本机回环，不暴露到网络，无需鉴权）。只读：面板绝不写入事件数据。许可证：Apache-2.0。</span>
 </footer>
 
-<script>
+<script nonce="__KYN_NONCE__">
 "use strict";
 /* 热力图五档色阶：深底色 → 顶档 #5BA8FF（"更多"端）。
    发现 ①-10：色值不再硬编码——改读 :root 的 --hm-N 变量（亮色/高对比
@@ -1890,6 +1890,39 @@ function markDisconnected() {
   const el = document.getElementById("status-line");
   if (el) { el.textContent = t("disconnected"); el.style.color = "#e06c6c"; }
 }
+/* CSP 收紧（script-src 去 unsafe-inline）：静态 HTML 不再用内联
+   onclick/onchange 属性，统一在此委托绑定。语义与原内联属性逐一对应
+   （showPicker/date 输入用 e.target 本体；ops 按钮 stopPropagation，
+   按钮命中优先于 h2 整行，避免双层触发互相抵消）。 */
+(function () {
+  const on = (id, ev, fn) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener(ev, fn);
+  };
+  const pick = e => { if (e.target.showPicker) e.target.showPicker(); };
+  on("lang-btn", "click", () => toggleLang());
+  [["tab-overview", "overview"], ["tab-report", "report"], ["tab-apps", "apps"],
+   ["tab-input", "input"], ["tab-insights", "insights"], ["tab-anomalies", "anomalies"],
+   ["tab-settings", "settings"]].forEach(([id, v]) => on(id, "click", () => showView(v)));
+  on("ops-toggle", "click", e => toggleOps(e));
+  on("ops-h2", "click", () => toggleOps());
+  on("report-date", "click", pick);
+  on("report-date", "change", () => { syncDayBtns(); loadReport(); });
+  on("day-btn-0", "click", () => pickDay(0));
+  on("day-btn-1", "click", () => pickDay(1));
+  on("day-btn-2", "click", () => pickDay(2));
+  on("apps-date", "click", pick);
+  on("apps-date", "change", () => loadApps());
+  on("apps-today", "click", () => {
+    document.getElementById("apps-date").value = todayStr();
+    loadApps();
+  });
+  on("preset-essential", "click", () => applyPreset("essential"));
+  on("preset-full", "click", () => applyPreset("full"));
+  on("preset-minimal", "click", () => applyPreset("minimal"));
+  on("restore-defaults", "click", () => restoreDefaults());
+  on("settings-save", "click", () => saveSettings());
+})();
 </script>
 </body>
 </html>

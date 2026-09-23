@@ -112,6 +112,12 @@ fn reject_future_date(date: &str) -> std::result::Result<(), String> {
     if !is_date_like {
         return Ok(());
     }
+    // 形如日期但历法非法（2026-13-45、9999-99-99）先做真实解析：旧逻辑只做
+    // 字典序比较，非法日期会被误报"在未来"——掩盖格式错且误导用户以为时钟
+    // 问题。
+    if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return Err(date_err(date, "YYYY-MM-DD"));
+    }
     let today = queries::today_local_str();
     if date > today.as_str() {
         return Err(format!("date {date} 在未来（今天 {today}）"));
@@ -494,6 +500,11 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
 /// db_path 只返回文件名（审查 P2：全路径暴露安装目录/用户名等本机拓扑）；
 /// 另带 db_dir_kind 提示数据目录性质（exe 同目录 / 其他），不暴露具体路径。
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
+    // 构建指纹（ci 修复）：审查/排障先比对运行态与源码版本——曾实际发生
+    // 旧 exe 上探测令牌门全 200 的「源码已修但运行态未修」脱节。CI 构建
+    // 注入 KYNOPTIC_GIT_HASH / KYNOPTIC_BUILD_TIME，本地构建缺省 unknown。
+    let git_hash = option_env!("KYNOPTIC_GIT_HASH").unwrap_or("unknown");
+    let build_time = option_env!("KYNOPTIC_BUILD_TIME").unwrap_or("unknown");
     // 自动更新检查结果（托盘每日检查线程写 data\update-available.txt）：
     // 有新版本时面板状态栏同步提示，与托盘菜单的一键更新项互为入口。
     let update_available = db_path
@@ -520,6 +531,10 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         "bind": "127.0.0.1",
         "read_only": true,
         "update_available": update_available,
+        "build": {
+            "git_hash": git_hash,
+            "built_at": build_time,
+        },
     })
 }
 
@@ -1078,14 +1093,7 @@ pub fn api_input_at(
     let since = queries::local_day_range(&since_date.format("%Y-%m-%d").to_string())
         .map(|(s, _)| s)
         .unwrap_or_default();
-    let off = {
-        let secs = Local::now().offset().local_minus_utc() as i64;
-        format!(
-            "{}{} seconds",
-            if secs >= 0 { "+" } else { "-" },
-            secs.abs()
-        )
-    };
+    let off = queries::LOCAL_MODIFIER_AT_EVENT;
 
     #[derive(Default)]
     struct Totals {
@@ -1843,11 +1851,17 @@ pub fn api_trends_at(
 ) -> std::result::Result<Value, String> {
     let since_date = today - chrono::Duration::days(27);
     let since = since_date.format("%Y-%m-%d").to_string();
-    let mut stmt = conn.prepare(
-        "SELECT date, keys, clicks, active_minutes FROM daily_agg WHERE date >= ?1 ORDER BY date",
-    ).map_err(|e| e.to_string())?;
+    // 上界封顶（与 heatmap 同一 today 口径）：时钟拨快再回拨后 daily_agg
+    // 可能残留"未来日"幻影行，无上界会永久混入 daily 序列。
+    let until = today.format("%Y-%m-%d").to_string();
+    let mut stmt = conn
+        .prepare(
+            "SELECT date, keys, clicks, active_minutes FROM daily_agg \
+         WHERE date >= ?1 AND date <= ?2 ORDER BY date",
+        )
+        .map_err(|e| e.to_string())?;
     let rows: Vec<(String, i64, i64, i64)> = stmt
-        .query_map(params![&since], |r| {
+        .query_map(params![&since, &until], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .map_err(|e| e.to_string())?
@@ -1926,14 +1940,10 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
             "SELECT substr(datetime(timestamp, ?1), 12, 2) AS hh,                     COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') AS app,                     COUNT(*) AS cnt              FROM events              WHERE event_type = 'window' AND timestamp >= ?2 AND timestamp < ?3              GROUP BY hh, app",
         )
         .map_err(|e| e.to_string())?;
-    let off = {
-        let secs = Local::now().offset().local_minus_utc() as i64;
-        format!(
-            "{}{} seconds",
-            if secs >= 0 { "+" } else { "-" },
-            secs.abs()
-        )
-    };
+    // 按事件时刻取历史时区（'localtime'，与 queries::LOCAL_MODIFIER_AT_EVENT
+    // 全站口径一致）：旧写法拼"当前时刻固定偏移"，时区带历史 DST 时
+    // 历史日小时分布会整体错位 1 小时。
+    let off = queries::LOCAL_MODIFIER_AT_EVENT;
     let rows: Vec<(String, String, i64)> = stmt
         .query_map(params![&off, &start, &end], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -2002,14 +2012,8 @@ pub fn api_daily_top_at(
             "SELECT substr(datetime(timestamp, ?1), 1, 10) AS d,                 COALESCE(NULLIF(app_name,''), window_title, '') AS app, COUNT(*) AS cnt          FROM events          WHERE event_type = 'window' AND timestamp >= ?2 AND app <> ''          GROUP BY d, app",
         )
         .map_err(|e| e.to_string())?;
-    let off = {
-        let secs = Local::now().offset().local_minus_utc() as i64;
-        format!(
-            "{}{} seconds",
-            if secs >= 0 { "+" } else { "-" },
-            secs.abs()
-        )
-    };
+    // 同 api_input_at / api_apps_grid_at：改按事件时刻 'localtime' 口径。
+    let off = queries::LOCAL_MODIFIER_AT_EVENT;
     let rows: Vec<(String, String, i64)> = stmt
         .query_map(params![&off, &since], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -2092,7 +2096,9 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
             })
             .collect::<std::result::Result<_, _>>()?;
         if let Some(bad) = settings::first_invalid_id(&ids) {
-            return Err(format!("未知监控器 id: {bad}"));
+            // 回显经净化（与日期族同口径）：id 是攻击者可控文本，原样全文
+            // 回显构成响应放大与日志注入投放面。
+            return Err(format!("未知监控器 id: {}", sanitize_date_echo(&bad)));
         }
         if ids.is_empty() {
             // Wave20 P1：空集 = 绿色"采集中"图标下的无声空采。要暂停请用
@@ -2329,11 +2335,37 @@ pub fn route_req(
             (k == key && !v.is_empty()).then(|| v.to_string())
         })
     };
+    // 日期参数专用：显式空值（`?date=`）≠ 缺省。空串回 400，与
+    // hours/days 等数值参数"非法值不静默放行"的政策一致；仅参数完全
+    // 缺省时才回退今天。
+    let qdate = |key: &str| -> std::result::Result<Option<String>, String> {
+        let mut present = false;
+        let mut val = None;
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                if k == key {
+                    present = true;
+                    if !v.is_empty() {
+                        val = Some(v.to_string());
+                    }
+                }
+            }
+        }
+        if present && val.is_none() {
+            Err(format!("{key} 不应为空（缺省用今天，或给 YYYY-MM-DD）"))
+        } else {
+            Ok(val)
+        }
+    };
 
     match (method, route_path) {
         ("GET", "/") => (200, "text/html; charset=utf-8", DASHBOARD_HTML.to_string()),
         ("GET", "/api/summary") => {
-            let date = qval("date").unwrap_or_else(queries::today_local_str);
+            let date = match qdate("date") {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => queries::today_local_str(),
+                Ok(Some(d)) => d,
+            };
             if let Err(e) = reject_future_date(&date) {
                 return (400, "application/json", err_json(&e));
             }
@@ -2445,7 +2477,11 @@ pub fn route_req(
             }
         }
         ("GET", "/api/hours") => {
-            let date = qval("date").unwrap_or_else(|| "today".to_string());
+            let date = match qdate("date") {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => "today".to_string(),
+                Ok(Some(d)) => d,
+            };
             if let Err(e) = reject_future_date(&date) {
                 return (400, "application/json", err_json(&e));
             }
@@ -2481,7 +2517,11 @@ pub fn route_req(
             )
         }
         ("GET", "/api/report") => {
-            let date = qval("date").unwrap_or_else(|| "today".to_string());
+            let date = match qdate("date") {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => "today".to_string(),
+                Ok(Some(d)) => d,
+            };
             if let Err(e) = reject_future_date(&date) {
                 return (400, "application/json", err_json(&e));
             }
@@ -2496,7 +2536,11 @@ pub fn route_req(
             Err(e) => (400, "application/json", err_json(&e)),
         },
         ("GET", "/api/apps_grid") => {
-            let date = qval("date").unwrap_or_else(|| "today".to_string());
+            let date = match qdate("date") {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => "today".to_string(),
+                Ok(Some(d)) => d,
+            };
             if let Err(e) = reject_future_date(&date) {
                 return (400, "application/json", err_json(&e));
             }
@@ -2738,10 +2782,20 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
 
 fn loopback_host_ok(host: &str, port: u16) -> bool {
     let h = host.trim();
+    // 尾点剥离覆盖两种浏览器形态：整串尾点（"127.0.0.1:8422."）与
+    // host 部分尾点（"localhost.:8420"）——先剥整串，再分离端口后对
+    // host 部分再剥一次。
     let h = h.strip_suffix('.').unwrap_or(h);
-    matches!(h, "127.0.0.1" | "localhost")
-        || h == format!("127.0.0.1:{port}")
-        || h == format!("localhost:{port}")
+    let (hp, port_part) = match h.rsplit_once(':') {
+        Some((hp, p)) if p.chars().all(|c| c.is_ascii_digit()) => (hp, Some(p)),
+        _ => (h, None),
+    };
+    let hp = hp.strip_suffix('.').unwrap_or(hp); // "localhost.:8420"
+    match (hp, port_part) {
+        ("127.0.0.1" | "localhost", None) => true,
+        ("127.0.0.1" | "localhost", Some(p)) => p == port.to_string(),
+        _ => false,
+    }
 }
 
 // ─── 可选访问令牌（Wave31 挂账，opt-in） ────────────────────────────────────
@@ -2903,7 +2957,7 @@ fn handle_client(
                     &mut stream,
                     401,
                     "application/json",
-                    "{\"error\":\"unauthorized: missing or invalid access token\"}",
+                    "{\"error\":\"unauthorized: missing or invalid access token (do not bookmark/share /api/*?token=... URLs - the token stays in browser history; open the dashboard page instead, which strips the token from the URL)\"}",
                 );
             }
         }
@@ -2960,21 +3014,32 @@ fn handle_client(
         }
     };
     let (status, ctype, body) = route_req(conn, &method, &path, &body, db_path);
-    // 首页注入会话令牌（dashboard.html 占位符），前端 POST 回带
-    let body = if method == "GET" && path.split('?').next() == Some("/") {
-        body.replace("__KYN_CSRF_TOKEN__", csrf)
-    } else {
-        body
-    };
+    // 首页注入会话令牌（dashboard.html 占位符），前端 POST 回带；
+    // 同路径注入 CSP nonce 并走带 nonce 的响应头（script-src 去 unsafe-inline）。
+    if method == "GET" && path.split('?').next() == Some("/") {
+        let nonce = fresh_nonce();
+        let body = body
+            .replace("__KYN_CSRF_TOKEN__", csrf)
+            .replace("__KYN_NONCE__", &nonce);
+        return http_simple_index(&mut stream, &body, &nonce);
+    }
     http_simple(&mut stream, status, ctype, &body)
 }
 
-/// 统一安全响应头（审查 P1：所有响应必带）。CSP 按 dashboard.html 现状收窄：
-/// 单文件内联 script/style（'unsafe-inline'），favicon 为 data: URI，无外链资源。
-const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\n\
+/// 统一安全响应头（审查 P1：所有响应必带）。`script_src` 由调用方给出：
+/// 普通响应无脚本用 `'self'`；首页内联脚本用每请求随机 nonce（见
+/// `http_simple_index`）。Referrer-Policy 兜底：避免 `?token=` 直链被
+/// 浏览器历史/云同步带离设备后经 Referer 再泄漏。favicon 为 data: URI，
+/// 无外链资源。
+fn security_headers(script_src: &str) -> String {
+    format!(
+        "X-Content-Type-Options: nosniff\r\n\
 X-Frame-Options: DENY\r\n\
 Cache-Control: no-store\r\n\
-Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:\r\n";
+Referrer-Policy: no-referrer\r\n\
+Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src {script_src}; img-src 'self' data:\r\n"
+    )
+}
 
 fn http_simple(
     stream: &mut TcpStream,
@@ -2994,9 +3059,37 @@ fn http_simple(
         503 => "Service Unavailable",
         _ => "Error",
     };
+    let headers = security_headers("'self'");
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// 每请求随机 nonce（128-bit 十六进制）：std 的 RandomState 种子来自操作
+/// 系统熵，两个独立实例拼够 128 位；再混入纳秒时钟防同进程种子意外重复。
+fn fresh_nonce() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h1 = RandomState::new().build_hasher();
+    let h2 = RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    h1.write_u64(nanos);
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+/// 首页专用响应：CSP 的 script-src 带 nonce，与页面 `<script nonce>` 注入
+/// 的占位符配套（脚本内联现状不变，但 'unsafe-inline' 不再放行）。
+fn http_simple_index(stream: &mut TcpStream, body: &str, nonce: &str) -> std::io::Result<()> {
+    let script_src = format!("'self' 'nonce-{nonce}'");
+    let headers = security_headers(&script_src);
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
