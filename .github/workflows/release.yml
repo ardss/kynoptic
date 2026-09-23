@@ -85,6 +85,10 @@ jobs:
             ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
           $sums = ($hashes -join "`n") + "`n"
           [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", $sums)
+      # ci 修复：dist 版本一致性防线——dist 里的 exe 与安装包版本必须等于
+      # Cargo.toml 版本，否则终止发版（拦住「源码已发 0.3.0、产物还是 0.2.x」）
+      - name: Verify dist version matches Cargo.toml
+        run: node scripts/check-dist-version.mjs dist
       - name: Write release notes
         run: |
           $tag = $env:GITHUB_REF_NAME
