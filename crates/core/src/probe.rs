@@ -422,6 +422,32 @@ impl Inducers {
         if id == "file_activity" {
             // 在 Downloads 建一个临时文件，制造目录文件数 delta
             if let Some(dl) = dirs_download() {
+                // 审查 33-F9：先清扫历史残留——进程被硬杀（watchdog taskkill /
+                // 崩溃）时 Drop 不运行，kynoptic-probe-*.tmp 会永久留在用户可见
+                // 的 Downloads。过滤是按前缀 + `.tmp` 后缀匹配本探针命名约定，
+                // 不按 pid 区分；为免误删并发探针（托盘/CLI 同时触发）刚写入、
+                // 正在测量中的文件，只清 mtime 超过 60s 的文件——正在跑的测量
+                // 文件必然是几秒内新建的，被硬杀的残留则随下一次清扫过期回收。
+                if let Ok(rd) = std::fs::read_dir(&dl) {
+                    let now = std::time::SystemTime::now();
+                    for e in rd.flatten() {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        if !(name.starts_with("kynoptic-probe-") && name.ends_with(".tmp")) {
+                            continue;
+                        }
+                        let stale = e
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|m| now.duration_since(m).ok())
+                            .map(|age| age.as_secs() >= 60)
+                            .unwrap_or(false);
+                        if stale {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
                 let f = dl.join(format!("kynoptic-probe-{}.tmp", std::process::id()));
                 if std::fs::write(&f, b"kynoptic probe").is_ok() {
                     out.temp_file = Some(f);

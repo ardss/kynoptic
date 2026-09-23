@@ -157,7 +157,6 @@ fn agg_minute_has_max_event_rowid(conn: &Connection) -> bool {
 /// 旧版吞错会让库带病运行——schema_version 卡住导致下次启动重跑迁移
 /// 再失败，或唯一索引缺失使 input_agg UPSERT 全链路静默归零）。
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
-    heal_half_applied_0002(conn)?;
     let mut applied = current_version(conn);
     // 审查 MEDIUM：未来版本库守卫——schema_version 高于本二进制已知迁移数
     // 说明库被更新版本的程序迁移过，旧代码静默零操作后会按旧列集向新库
@@ -177,18 +176,34 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         }
         // 0007 半应用自愈（审查 HIGH）：max_event_rowid 列已存在（非事务
         // 老二进制加列成功但未写版本）时跳过 ALTER，只补记版本号。
-        let sql_effective: String =
-            if *name == "0007_agg_minute_max_rowid" && agg_minute_has_max_event_rowid(conn) {
-                log::warn!(
+        // 0002 半应用自愈（审查 33-F2，重构）：pet 段从 SQL 剥离，改在 Rust
+        // 侧按 sqlite_master 逐表条件执行（见 apply_0002_pet_tables）——SQL
+        // 侧「缺则建空壳 + 无条件 RENAME」在 legacy_pet_signals 已在场的任何
+        // 半应用残局下重放必撞名硬失败，库永久打不开。
+        let is_0002 = *name == "0002_bucket_model";
+        let sql_effective: String = if is_0002 {
+            match sql.find("-- pet 遗留表改名保留") {
+                Some(i) => format!("-- {name}: pet 段改由 Rust 侧条件执行\n{}", &sql[..i]),
+                None => (*sql).to_string(),
+            }
+        } else if *name == "0007_agg_minute_max_rowid" && agg_minute_has_max_event_rowid(conn) {
+            log::warn!(
                 "0007 自愈：agg_minute.max_event_rowid 已存在（半应用），跳过 ALTER 只补记版本号"
             );
-                format!("-- {name}: 列已存在，跳过（半应用自愈）")
-            } else {
-                (*sql).to_string()
-            };
+            format!("-- {name}: 列已存在，跳过（半应用自愈）")
+        } else {
+            (*sql).to_string()
+        };
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         let outcome = conn
             .execute_batch(&sql_effective)
+            .and_then(|_| {
+                if is_0002 {
+                    apply_0002_pet_tables(conn)
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|_| {
                 conn.execute(
                     "INSERT INTO metadata (key, value) VALUES ('schema_version', ?1)
@@ -211,57 +226,64 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Wave22 P1：修复被 2026-09-09 之前的非事务版二进制"半应用"过 0002 的
-/// 库——legacy_pet_signals 已建（改名成功）而 schema_version 卡在 2 以下，
-/// 重跑 0002 的无条件 RENAME 会撞名硬失败且永远无法自愈。
-/// 处置：pet_signals 若为空表（同次迁移的 CREATE IF NOT EXISTS 壳）则删壳
-/// 让 RENAME 重放成功；若壳里有行则不动、报错指引用户（永不删数据）。
-fn heal_half_applied_0002(conn: &Connection) -> rusqlite::Result<()> {
-    // 审查 HIGH：命中条件改为**逐表判断**——旧条件"两张名字计数恰好 == 2"
-    // 救不了 0002 中途断电最常见的三表残局（legacy_pet_signals + pet_memory
-    // + pet_state 并存时改名已成功、pet_signals 壳已不在，COUNT=1≠2 → 判
-    // skip → 重放 RENAME 撞名硬失败）。现在：legacy_pet_signals 存在且
-    // pet_signals 也存在时才需要处置（空壳删掉让 RENAME 重放成功）。
-    let legacy_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='legacy_pet_signals')",
-            [],
+/// 0002 的 pet 遗留段：Rust 侧按 sqlite_master **逐表条件执行**（审查 33-F2
+/// 重构，取代旧 heal_half_applied_0002 + SQL「缺则建空壳 + 无条件 RENAME」）。
+///
+/// 旧实现的重放死路（第 33 轮审查实测 S3a/S3b 两种残局均复现）：只要
+/// legacy_pet_signals 已存在（改名成功而版本号未写，即半应用），重放 0002
+/// 的 `ALTER TABLE pet_signals RENAME TO legacy_pet_signals` 必撞名硬失败，
+/// 且每次 Database::open 都重跑同一路径——库永久打不开；heal 删空壳处置
+/// 对象也错了（冲突是 legacy 目标名已占用，不是壳）。
+///
+/// 逐表语义：
+/// - 目标 legacy_* 已在 → 跳过（该表已改名归档）；若同名源 pet_* 还在且
+///   **有数据**（异常残局：归档与现表并存）→ 报错指引用户，永不删数据；
+/// - 源 pet_* 存在 → RENAME 归档（含残局中漏改的 pet_memory/pet_state）；
+/// - 两者皆无（全新库）→ 建空壳再改名，保留「新库留下空 legacy_* 归档表」
+///   的既有语义。
+fn apply_0002_pet_tables(conn: &Connection) -> rusqlite::Result<()> {
+    const PET_TABLES: [(&str, &str); 3] = [
+        ("pet_signals", "legacy_pet_signals"),
+        ("pet_memory", "legacy_pet_memory"),
+        ("pet_state", "legacy_pet_state"),
+    ];
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            params![name],
             |r| r.get::<_, i64>(0),
         )
-        .map(|n| n != 0)?;
-    let shell_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='pet_signals')",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n != 0)?;
-    if !(legacy_exists && shell_exists) {
-        return Ok(());
-    }
-    let rows: i64 = conn.query_row(
-        "SELECT COALESCE((SELECT COUNT(*) FROM pet_signals), 0)",
-        [],
-        |r| r.get(0),
-    )?;
-    if rows == 0 {
-        conn.execute_batch("DROP TABLE IF EXISTS pet_signals;")?;
-        log::info!("0002 自愈：移除空壳 pet_signals（legacy 归档已在位）");
-    } else {
-        // 审查 LOW：错误文本必须可行动——此前返回 InvalidColumnType(0,
-        // "pet_signals", Null)，与真实原因（归档壳非空、需人工处置）无关。
-        let msg = format!(
-            "0002 自愈中止：pet_signals 归档壳含 {rows} 行数据，不能自动删除；\
-             请人工确认并导出/迁移该表后删除 pet_signals，再重试打开数据库"
-        );
-        log::error!("{msg}");
-        // ToSqlConversionFailure 的 Display 原样输出内层错误文本（无前缀包装），
-        // 运维/用户看到的即是上面的可行动处置指引
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::other(msg),
-        )));
+        .map(|n| n != 0)
+    };
+    for (src, dst) in PET_TABLES {
+        if table_exists(dst)? {
+            if table_exists(src)? {
+                let rows: i64 =
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {src}"), [], |r| r.get(0))?;
+                if rows > 0 {
+                    let msg = format!(
+                        "0002 自愈中止：{src} 含 {rows} 行数据且 {dst} 归档已在位\
+                         （异常残局），不能自动处置；请人工确认并合并/导出后重试"
+                    );
+                    log::error!("{msg}");
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other(msg),
+                    )));
+                }
+                // 空壳（半应用重放时 CREATE IF NOT EXISTS 留下）且归档已在位：
+                // 删壳无损（零行数据），避免 pet_* 现表残留
+                conn.execute_batch(&format!("DROP TABLE {src};"))?;
+            }
+            continue;
+        }
+        if table_exists(src)? {
+            conn.execute_batch(&format!("ALTER TABLE {src} RENAME TO {dst};"))?;
+        } else {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {src} (id INTEGER PRIMARY KEY);
+                 ALTER TABLE {src} RENAME TO {dst};"
+            ))?;
+        }
     }
     Ok(())
 }
@@ -334,6 +356,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// 审查 33-F2 回归：0002 半应用残局（legacy 已在 + metadata<2）必须能
+    /// 自愈打开。S3a：三表残局（legacy + pet_memory + pet_state、壳不在）；
+    /// S3b：legacy + 空壳。旧实现的「缺则建壳 + 无条件 RENAME」两种形态都
+    /// 撞名硬失败且每次 open 重跑、库永久打不开。
+    #[test]
+    fn migration_0002_half_applied_heals_legacy_conflicts() {
+        for (label, setup) in [
+            (
+                "S3a 三表残局",
+                "CREATE TABLE legacy_pet_signals (id INTEGER PRIMARY KEY);
+                 CREATE TABLE pet_memory (id INTEGER PRIMARY KEY);
+                 CREATE TABLE pet_state (id INTEGER PRIMARY KEY);",
+            ),
+            (
+                "S3b legacy+空壳",
+                "CREATE TABLE legacy_pet_signals (id INTEGER PRIMARY KEY);
+                 CREATE TABLE pet_signals (id INTEGER PRIMARY KEY);",
+            ),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(setup).unwrap();
+            conn.execute_batch("INSERT INTO metadata (key, value) VALUES ('schema_version', '1');")
+                .unwrap();
+            run_migrations(&conn).unwrap_or_else(|e| panic!("{label}: 迁移失败: {e}"));
+            assert_eq!(
+                current_version(&conn),
+                constants::CURRENT_SCHEMA_VERSION,
+                "{label}: 版本必须推进到位"
+            );
+            // 残局源表已归档、无 pet_* 现表残留（legacy_* 归档保留）
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND (name = 'pet_signals' OR name = 'pet_memory' OR name = 'pet_state')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{label}: pet 现表应已全部改名归档");
+            // 二次 open 幂等（旧实现卡 v1 死循环的路径）
+            run_migrations(&conn).unwrap();
+        }
     }
 
     /// 0010 部分索引命中验证（perf P0：api_input / overview 硬件卡的

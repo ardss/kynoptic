@@ -27,7 +27,14 @@
 //! - `/api/diagnostics`              诊断留档文件清单（存在性/mtime/大小/尾部
 //!   20 行，内容净化、不暴露路径；设置页折叠块消费）
 //!
-//! 无鉴权：仅绑定回环地址，不暴露到网络（页脚已声明）。
+//! 无鉴权（默认）：仅绑定回环地址，不暴露到网络（页脚已声明）。
+//!
+//! **可选访问令牌（Wave31 挂账）**：默认完全无 token，本地数据面照常可用
+//! （本地数据完整铁律：禁默认加锁）。仅当用户显式在 data 目录创建
+//! `dashboard-token.txt`（非空内容即令牌）后，所有 `/api/*` 请求必须携带
+//! `?token=`、`X-Kynoptic-Access-Token` 头或 `Authorization: Bearer <token>`
+//! 之一且匹配，否则 401；`/`（静态页）不受限。令牌在 serve 启动时读取一次，
+//! 修改后需重启 dashboard（托盘菜单重启或重开 `kynoptic-ctl dashboard`）。
 
 pub mod settings;
 
@@ -2655,6 +2662,12 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         )))
     })?;
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    // 可选访问令牌（Wave31 挂账）：默认 None（无 token，行为不变）；用户
+    // 显式创建 data\dashboard-token.txt 后所有 /api/* 要求携带匹配令牌。
+    let access_token = load_access_token(db_path);
+    if access_token.is_some() {
+        log::info!("dashboard: 访问令牌已启用（/api/* 需携带 token，见 dashboard-token.txt）");
+    }
     log::info!(
         "dashboard: http://127.0.0.1:{bound}  (db: {}, read-only)",
         db_path.display()
@@ -2680,6 +2693,7 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         let pool_inner = pool.clone();
         let db_owned = db_owned.clone();
         let csrf_inner = csrf.clone();
+        let access_inner = access_token.clone();
         let inflight_inner = inflight.clone();
         inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 名额守卫：Drop 时归还。handle_client panic 或提前 return 都不会
@@ -2703,9 +2717,14 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-                if let Err(e) =
-                    handle_client(stream, pool_inner.as_deref(), &db_owned, bound, &csrf_inner)
-                {
+                if let Err(e) = handle_client(
+                    stream,
+                    pool_inner.as_deref(),
+                    &db_owned,
+                    bound,
+                    &csrf_inner,
+                    access_inner.as_deref(),
+                ) {
                     log::warn!("dashboard 连接处理失败: {e}");
                 }
             });
@@ -2725,6 +2744,55 @@ fn loopback_host_ok(host: &str, port: u16) -> bool {
         || h == format!("localhost:{port}")
 }
 
+// ─── 可选访问令牌（Wave31 挂账，opt-in） ────────────────────────────────────
+
+/// 读取可选访问令牌：data 目录下 `dashboard-token.txt` 存在且内容非空即启用。
+/// 文件不存在/为空 → None → 鉴权分支永不进入，行为与无令牌版本逐字节一致。
+/// 启动时读一次（改后需重启），避免每请求磁盘 IO。
+pub fn load_access_token(db_path: &Path) -> Option<String> {
+    let p = db_path.parent()?.join("dashboard-token.txt");
+    std::fs::read_to_string(p)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 近似恒时比较：长度不同直接否，等长时逐字节异或累积，避免令牌前缀
+/// 逐字符命中带来的时序侧信道（本地威胁模型下属纵深防御，成本可忽略）。
+fn token_eq(a: &str, b: &str) -> bool {
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    if x.len() != y.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..x.len() {
+        diff |= x[i] ^ y[i];
+    }
+    diff == 0
+}
+
+/// 提取请求方出示的访问令牌：query `?token=` 优先，其次
+/// `X-Kynoptic-Access-Token` 头，最后 `Authorization: Bearer <token>`。
+fn presented_access_token(
+    path: &str,
+    access_header: Option<&str>,
+    auth_header: Option<&str>,
+) -> Option<String> {
+    if let Some((_, q)) = path.split_once('?') {
+        for pair in q.split('&') {
+            if let Some(v) = pair.strip_prefix("token=") {
+                return Some(v.to_string());
+            }
+        }
+    }
+    if let Some(v) = access_header {
+        return Some(v.trim().to_string());
+    }
+    auth_header
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+}
+
 /// 读请求行 → 校验 → route → 写响应。任何失败都静默断开（无日志面需求）。
 ///
 /// `pool`：serve 预开的只读连接池（轮询分发，busy_timeout 2s）。池不可用
@@ -2735,6 +2803,7 @@ fn handle_client(
     db_path: &Path,
     port: u16,
     csrf: &str,
+    access: Option<&str>,
 ) -> std::io::Result<()> {
     // 整请求 deadline（slowloris 防线）：每次 read 有 5s 超时不够——慢客户端
     // 每 4s 滴 1 字节可永不完成，64 个此类连接即可占满并发名额令正常请求 503
@@ -2763,6 +2832,7 @@ fn handle_client(
 
     let (mut host, mut origin, mut fetch_site, mut marker, mut token, mut content_length) =
         (String::new(), None, None, false, None, 0usize);
+    let (mut access_hdr, mut auth_hdr): (Option<String>, Option<String>) = (None, None);
     for l in head.lines().skip(1) {
         let Some((k, v)) = l.split_once(':') else {
             continue;
@@ -2774,6 +2844,8 @@ fn handle_client(
             "sec-fetch-site" => fetch_site = Some(v),
             "x-kynoptic" => marker = v == "1",
             "x-kynoptic-token" => token = Some(v),
+            "x-kynoptic-access-token" => access_hdr = Some(v),
+            "authorization" => auth_hdr = Some(v),
             "content-length" => content_length = v.parse().unwrap_or(0),
             _ => {}
         }
@@ -2803,6 +2875,37 @@ fn handle_client(
                 "application/json",
                 "{\"error\":\"cross-origin write blocked\"}",
             );
+        }
+    }
+    // 可选访问令牌（Wave31 挂账）：仅当 serve 启动时读到非空
+    // dashboard-token.txt 才生效；access 为 None 时本分支永不进入，
+    // 既有行为（含响应字节）逐字节不变。/api/* 全部要求携带令牌，
+    // 401 由前端/调用方自行提示；静态页 `/` 不受限（浏览器仍要能打开）。
+    if let Some(expected) = access {
+        let early_path = head
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/");
+        let is_api = early_path
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .starts_with("/api");
+        if is_api {
+            let ok = presented_access_token(early_path, access_hdr.as_deref(), auth_hdr.as_deref())
+                .map(|p| token_eq(&p, expected))
+                .unwrap_or(false);
+            if !ok {
+                return http_simple(
+                    &mut stream,
+                    401,
+                    "application/json",
+                    "{\"error\":\"unauthorized: missing or invalid access token\"}",
+                );
+            }
         }
     }
     // fuzz 加固：超限 body 直接 413，不再静默截断解析（旧路径截断到 64KB 后
@@ -2882,6 +2985,7 @@ fn http_simple(
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -2923,6 +3027,156 @@ mod insights_cache_test {
         // bridge 变了则不命中旧缓存（重算，计数不变）
         let _ = api_insights(&conn, 4);
         assert_eq!(insights_cache_hits(), before + 1);
+    }
+}
+
+#[cfg(test)]
+mod access_token_test {
+    use super::*;
+
+    /// data\dashboard-token.txt 存在且非空才启用；空白内容等同未启用。
+    #[test]
+    fn load_access_token_opt_in_only() {
+        let dir = std::env::temp_dir().join(format!("kyn-dash-tok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("kynoptic.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+
+        // 无文件：None（默认无 token，行为不变）
+        assert!(load_access_token(&db).is_none());
+        // 空文件/纯空白：None
+        std::fs::write(dir.join("dashboard-token.txt"), "  \n").unwrap();
+        assert!(load_access_token(&db).is_none());
+        // 非空：Some 且已 trim
+        std::fs::write(dir.join("dashboard-token.txt"), " s3cret \n").unwrap();
+        assert_eq!(load_access_token(&db).as_deref(), Some("s3cret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_eq_is_exact() {
+        assert!(token_eq("abc", "abc"));
+        assert!(!token_eq("abc", "abd"));
+        assert!(!token_eq("abc", "abcd"));
+        assert!(!token_eq("", "a"));
+        assert!(token_eq("", ""));
+    }
+
+    #[test]
+    fn presented_token_from_query_header_or_bearer() {
+        assert_eq!(
+            presented_access_token("/api/status?token=t1", None, None).as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            presented_access_token("/api/status", Some("t2"), None).as_deref(),
+            Some("t2")
+        );
+        assert_eq!(
+            presented_access_token("/api/status", None, Some("Bearer t3")).as_deref(),
+            Some("t3")
+        );
+        // query 优先；无任何出示 → None
+        assert_eq!(
+            presented_access_token("/api/status?token=q", Some("h"), Some("Bearer b")).as_deref(),
+            Some("q")
+        );
+        assert!(presented_access_token("/api/status", None, None).is_none());
+    }
+
+    /// 用真实 TCP socketpair 直调 handle_client 的最小驱动。
+    fn roundtrip(db: &Path, access: Option<&str>, request: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let access_owned = access.map(String::from);
+        let db_owned = db.to_path_buf();
+        let h = std::thread::spawn(move || {
+            let _ = handle_client(
+                stream,
+                None,
+                &db_owned,
+                port,
+                "csrf",
+                access_owned.as_deref(),
+            );
+        });
+        use std::io::Write as _;
+        client.write_all(request.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = std::io::Read::read_to_string(&mut client, &mut resp);
+        h.join().unwrap();
+        resp
+    }
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kyn-dash-tok-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("kynoptic.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+        let _ = kynoptic_core::db::run_migrations(&conn);
+        db
+    }
+
+    #[test]
+    fn api_without_token_enabled_behaves_unchanged() {
+        // 未启用令牌：/api/status 照常 200（默认行为逐字节一致的口径核验）
+        let db = temp_db("none");
+        let resp = roundtrip(
+            &db,
+            None,
+            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+    }
+
+    #[test]
+    fn api_with_token_enabled_rejects_missing_and_accepts_matching() {
+        let db = temp_db("on");
+        let req =
+            |extra: &str| format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}\r\n");
+        // 未带令牌 → 401
+        let resp = roundtrip(&db, Some("s3cret"), &req(""));
+        assert!(resp.starts_with("HTTP/1.1 401"), "got: {resp}");
+        assert!(resp.contains("unauthorized"));
+        // 错误令牌 → 401
+        let resp = roundtrip(
+            &db,
+            Some("s3cret"),
+            &req("X-Kynoptic-Access-Token: wrong\r\n"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 401"));
+        // query / 头 / Bearer 三种携带方式均放行
+        let resp = roundtrip(
+            &db,
+            Some("s3cret"),
+            "GET /api/status?token=s3cret HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "query: {resp}");
+        let resp = roundtrip(
+            &db,
+            Some("s3cret"),
+            &req("X-Kynoptic-Access-Token: s3cret\r\n"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "header: {resp}");
+        let resp = roundtrip(
+            &db,
+            Some("s3cret"),
+            &req("Authorization: Bearer s3cret\r\n"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "bearer: {resp}");
+        // 静态页不受限：无令牌仍 200
+        let resp = roundtrip(
+            &db,
+            Some("s3cret"),
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "root: {resp}");
     }
 }
 

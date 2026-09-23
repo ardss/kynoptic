@@ -12,7 +12,12 @@ use crate::input_agg;
 use crate::monitors;
 use crate::types::{Event, EventHook, Monitor};
 
-static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// 通道满载丢弃计数（审查 33-F4：与未来时间戳拒绝拆分——两者此前共用一个
+/// 计数器，看门狗对两者都打「通道已满」，无法区分丢数原因）。
+static CHANNEL_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// 未来时间戳拒绝计数（reject_future_events 专用，口径独立告警）。
+static FUTURE_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 /// 数据库写失败累计（P0）：磁盘写满/写失败时旧实现只在 db 层 log（"降级逐条
 /// → 跳过"后无任何观测），而 DropWatchdog 只看 DROPPED_EVENTS（通道满载），
@@ -44,7 +49,7 @@ pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) ->
         // 只计"真满"：Disconnected 表示采集器已关停（writer 已退出），
         // 属关停尾部的一次性发送，计入丢弃只会污染后续会话的观测。
         Err(crossbeam_channel::TrySendError::Full(_)) => {
-            DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+            CHANNEL_DROPPED.fetch_add(1, Ordering::Relaxed);
             false
         }
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
@@ -102,9 +107,21 @@ fn archive_write_failure(msg: &str) {
     let _ = writeln!(f, "[{}] {}", chrono::Utc::now().to_rfc3339(), msg);
 }
 
-fn watchdog_tick(dropped: u64, write_failures: u64, consecutive_wf: &mut u64) -> u64 {
-    if dropped > 0 {
-        log::warn!("通道已满，过去 60 秒丢弃了 {} 个事件", dropped);
+fn watchdog_tick(
+    chan_dropped: u64,
+    future_rejected: u64,
+    write_failures: u64,
+    consecutive_wf: &mut u64,
+) -> u64 {
+    // 审查 33-F4：两类丢弃分别告警，不再统一打成「通道已满」
+    if chan_dropped > 0 {
+        log::warn!("通道已满，过去 60 秒丢弃了 {} 个事件", chan_dropped);
+    }
+    if future_rejected > 0 {
+        log::warn!(
+            "过去 60 秒拒绝了 {} 条未来时间戳事件（> UTC now+5min），不入库",
+            future_rejected
+        );
     }
     if write_failures > 0 {
         *consecutive_wf += 1;
@@ -124,12 +141,18 @@ fn watchdog_tick(dropped: u64, write_failures: u64, consecutive_wf: &mut u64) ->
     *consecutive_wf
 }
 
-/// 丢弃/写失败计数的唯一消费方：看门狗线程每 60 秒 swap 一次（两个计数器）。
+/// 丢弃/写失败计数的唯一消费方：看门狗线程每 60 秒 swap 一次（三个计数器）。
 fn log_dropped_events_watchdog() {
-    let dropped = DROPPED_EVENTS.swap(0, Ordering::Relaxed);
+    let chan_dropped = CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
+    let future_rejected = FUTURE_REJECTED.swap(0, Ordering::Relaxed);
     let write_failures = WRITE_FAILURES.swap(0, Ordering::Relaxed);
     let mut consecutive = CONSECUTIVE_WRITE_FAILURE_PERIODS.load(Ordering::Relaxed);
-    watchdog_tick(dropped, write_failures, &mut consecutive);
+    watchdog_tick(
+        chan_dropped,
+        future_rejected,
+        write_failures,
+        &mut consecutive,
+    );
     CONSECUTIVE_WRITE_FAILURE_PERIODS.store(consecutive, Ordering::Relaxed);
 }
 
@@ -225,7 +248,7 @@ fn reject_future_events(batch: &mut Vec<Event>) {
     );
     let dropped = before - batch.len();
     if dropped > 0 {
-        DROPPED_EVENTS.fetch_add(dropped as u64, Ordering::Relaxed);
+        FUTURE_REJECTED.fetch_add(dropped as u64, Ordering::Relaxed);
         log::warn!("拒绝 {dropped} 条未来时间戳事件（> UTC now+5min），不入库");
     }
 }
@@ -496,6 +519,16 @@ pub struct Collector {
     maintenance_handle: Option<thread::JoinHandle<()>>,
     /// 丢弃/写失败看门狗线程句柄（同上，shutdown 时 join）。
     watchdog_handle: Option<thread::JoinHandle<()>>,
+    /// 监控线程句柄（审查 33-F7：此前 spawn 后句柄即弃，shutdown 排空 rx_tail
+    /// 与 end_session 完成后，尚未查到停机旗标的监控线程仍可做最后一次
+    /// send_event——事件进无人消费的通道随 Collector 销毁静默丢失且不可观测
+    /// （send_event 的 Disconnected 分支不计数）。shutdown 在排空兜底之前
+    /// 全部 join（run_monitor 的睡眠是 1 秒切片，join 有界）。
+    monitor_handles: Vec<thread::JoinHandle<()>>,
+    /// 已收尾旗标（审查 33-F3）：shutdown() 置位，Drop 据此判「是否需要兜底
+    /// 收尾」。此前以 writer_handle 存在性作判据——wait() 先 take 掉句柄后
+    /// 仅 join 不收尾，随后 Drop 误判「已收尾」留下 open 幽灵 session。
+    finished: bool,
     pub hooks: Vec<Box<dyn EventHook>>,
     /// 设置副本：shutdown 时决定是否 flush 未满分钟的部分输入计数。
     settings: CollectorSettings,
@@ -517,14 +550,19 @@ impl Collector {
         self.shutdown.clone()
     }
 
-    /// 阻塞直到 writer 线程退出（通常在 shutdown 置位后）。
+    /// 阻塞直到 writer 线程退出。审查 33-F3：此前只 join writer、不置
+    /// writer_stop 不收尾——writer 的退出条件（writer_stop/通道断开）都不
+    /// 一定满足，join 可能永久阻塞，即便返回也会让随后的 Drop 误判「已收尾」
+    /// 留下幽灵 session。现委托给完整 shutdown()（幂等：Drop 据 finished
+    /// 旗标跳过重复收尾）。
     pub fn wait(&mut self) {
-        if let Some(h) = self.writer_handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown();
     }
 
     pub fn shutdown(&mut self) {
+        if self.finished {
+            return;
+        }
         self.shutdown.store(true, Ordering::Release);
         // 审查 MEDIUM：通知 db 层停机——maintenance() 据此跳过 checkpoint/VACUUM
         // 等持写互斥体的重活，避免 shutdown 对 Maintenance 线程的 join 被
@@ -533,6 +571,13 @@ impl Collector {
 
         for h in &self.hooks {
             h.stop();
+        }
+
+        // 审查 33-F7：先 join 全部监控线程（旗标已置位，睡眠 1 秒切片 → join
+        // 有界），再进聚合/writer 的关停链——保证排空 rx_tail 兜底时所有
+        // 生产者都已退出，最后一次 send_event 不会落入无人消费的通道。
+        for h in self.monitor_handles.drain(..) {
+            let _ = h.join();
         }
 
         // minute 粒度的"最后一分钟不丢"由聚合线程负责：先 join 它（终值
@@ -579,74 +624,45 @@ impl Collector {
             }
         }
         if self.settings.input_granularity == InputGranularity::Minute {
-            let mut events = input_agg::flush_partial(chrono::Local::now());
-            if !events.is_empty() {
-                write_batch(&self.db, &mut events, &self.total_written);
+            // 审查 33-F1 第二道防线：当前分钟行已是上一会话的完整终值
+            // （$.final=true）时，直写 partial 会把大终值整行覆盖回本次重启
+            // 会话的几键小值——跳过（正常路径下 PendingFlush::take 已保留
+            // 抑制语义，此处兜底抑制失效场景，如同分钟内热重载后抑制被消费）。
+            if !current_minute_row_is_final(&self.db) {
+                let mut events = input_agg::flush_partial(chrono::Local::now());
+                if !events.is_empty() {
+                    write_batch(&self.db, &mut events, &self.total_written);
+                }
             }
         }
 
-        let total = self.total_written.load(Ordering::Relaxed) as i64;
+        // 审查 33-F6：total_events 统一为 COUNT(*) 口径（与 ghost 清扫
+        // sessions.rs 的 COUNT(*) 一致）。此前优雅关停写 total_written——把
+        // 每秒一次的 input_agg UPSERT 逐次累加，同一会话因结束方式不同可差
+        // 约 60 倍。total_written 仅保留给写入吞吐观测（CLI collected 输出）。
+        let total = self.db.session_event_count(self.session_id);
         self.db.end_session(self.session_id, total, 0.0);
 
+        self.finished = true;
         log::info!("采集器已停止");
     }
 }
 
 /// Drop 兜底：如果 shutdown 之前没被显式调用（例如应用崩溃、强杀、panic），
 /// 在析构时仍尝试关闭当前 session，避免幽灵 session 累积。
+/// 审查 33-F3：守据改为 finished 旗标（shutdown/wait 都会走完整收尾），
+/// 不再以 writer_handle 存在性判「已收尾」——wait() take 句柄后 Drop 会
+/// 误判并跳过 end_session，留下 open 幽灵 session。
 impl Drop for Collector {
     fn drop(&mut self) {
-        if self.writer_handle.is_some() {
-            log::warn!(
-                "Collector 被 drop 但未调用 shutdown() — 触发兜底关闭 session {}",
-                self.session_id
-            );
-            // 注意：此分支只运行一次（shutdown 会 take writer_handle）
-            self.shutdown.store(true, Ordering::Release);
-            // 同 shutdown：停机时让 maintenance() 跳过 VACUUM/checkpoint 重活
-            self.db.mark_stopping();
-            for h in &self.hooks {
-                h.stop();
-            }
-            // 先 join 聚合线程（它的终值 flush 已入队），再 join writer
-            if let Some(h) = self.agg_handle.take() {
-                let _ = h.join();
-            }
-            self.writer_stop
-                .store(true, std::sync::atomic::Ordering::Release);
-            if let Some(handle) = self.writer_handle.take() {
-                // 再 join writer：通道里残留的秒级小快照全部落库后，
-                // 直写部分分钟终值必然后发生，不会被旧快照覆盖
-                let _ = handle.join();
-                // Drop 路径同样排空 writer 退出后迟到的通道残留（审查 P2）
-                if let Some(rx) = self.rx_tail.take() {
-                    let mut tail: Vec<Event> = Vec::new();
-                    while let Ok(ev) = rx.try_recv() {
-                        tail.push(ev);
-                    }
-                    if !tail.is_empty() {
-                        log::info!("writer 退出后排空通道残留 {} 条", tail.len());
-                        write_batch(&self.db, &mut tail, &self.total_written);
-                    }
-                }
-                if self.settings.input_granularity == InputGranularity::Minute {
-                    let mut events = input_agg::flush_partial(chrono::Local::now());
-                    if !events.is_empty() {
-                        write_batch(&self.db, &mut events, &self.total_written);
-                    }
-                }
-                // Drop 兜底路径同样 join 维护/看门狗线程（审查 LOW）；take()
-                // 与 shutdown 互斥，不会双重 join。
-                if let Some(h) = self.maintenance_handle.take() {
-                    let _ = h.join();
-                }
-                if let Some(h) = self.watchdog_handle.take() {
-                    let _ = h.join();
-                }
-            }
-            let total = self.total_written.load(Ordering::Relaxed) as i64;
-            self.db.end_session(self.session_id, total, 0.0);
+        if self.finished {
+            return;
         }
+        log::warn!(
+            "Collector 被 drop 但未调用 shutdown() — 触发兜底关闭 session {}",
+            self.session_id
+        );
+        self.shutdown();
     }
 }
 
@@ -706,7 +722,18 @@ pub fn start_collection_custom(
 
     // 本实例独立的停机旗标（见 Collector.shutdown 字段文档）。
     let shutdown = Arc::new(AtomicBool::new(false));
-    DROPPED_EVENTS.store(0, Ordering::Relaxed);
+    // 审查 33-F4：丢弃计数改 swap 取复位前余数（与下方 WRITE_FAILURES 同款）——
+    // 热重载时上一实例关停尾部的丢弃发生在旧 watchdog 已 join 之后，无条件
+    // store(0) 会静默抹零。非零即 log::error 并留档。
+    let prev_chan = CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
+    let prev_future = FUTURE_REJECTED.swap(0, Ordering::Relaxed);
+    if prev_chan > 0 || prev_future > 0 {
+        let msg = format!(
+            "上一采集实例遗留 {prev_chan} 条通道满载丢弃、{prev_future} 条未来时间戳拒绝未被看门狗消费（热重载复位前发现）"
+        );
+        log::error!("{msg}");
+        archive_write_failure(&msg);
+    }
     // 审查 LOW：热重载不能无条件清零上一实例遗留的写失败——旧实例 shutdown
     // 尾排空的写失败发生在旧 watchdog 已 join 之后，无条件 store(0) 会让它
     // 永久无告警。改 swap 取复位前余数并立即告警（留档口径同看门狗）。
@@ -756,7 +783,7 @@ pub fn start_collection_custom(
     // （用宏而非闭包：闭包按引用捕获会把 db 借用拖到函数尾，与收尾的
     // Collector { db, .. } 移动冲突。）
     macro_rules! spawn_fail_collector {
-        ($writer:expr, $agg:expr, $maint:expr, $watch:expr, $hooks:expr) => {{
+        ($writer:expr, $agg:expr, $maint:expr, $watch:expr, $monitors:expr, $hooks:expr) => {{
             Collector {
                 db: db.clone(),
                 session_id,
@@ -765,6 +792,8 @@ pub fn start_collection_custom(
                 agg_handle: $agg,
                 maintenance_handle: $maint,
                 watchdog_handle: $watch,
+                monitor_handles: $monitors,
+                finished: false,
                 hooks: $hooks,
                 settings,
                 shutdown: shutdown.clone(),
@@ -791,7 +820,7 @@ pub fn start_collection_custom(
         }) {
         Ok(h) => h,
         Err(e) => {
-            spawn_fail_collector!(None, None, None, None, Vec::new());
+            spawn_fail_collector!(None, None, None, None, Vec::new(), Vec::new());
             panic!("Writer 启动失败: {e}");
         }
     };
@@ -800,6 +829,8 @@ pub fn start_collection_custom(
     let monitor_count = monitors.len();
     log::info!("正在启动 {} 个 Monitor...", monitor_count);
 
+    // 审查 33-F7：保留监控线程句柄，shutdown 收尾时全部 join
+    let mut monitor_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     for m in monitors {
         let tx = tx.clone();
         let sd = shutdown.clone();
@@ -807,11 +838,18 @@ pub fn start_collection_custom(
             .name(m.name().into())
             .spawn(move || run_monitor(m, tx, sd))
         {
-            Ok(_handle) => {}
+            Ok(handle) => monitor_handles.push(handle),
             Err(e) => {
                 // 停机旗标让已启动的 monitor 在下一轮检查点（<=1s）退出，
                 // writer_stop 让 writer 排空尾批退出，再关闭 session
-                spawn_fail_collector!(Some(writer_handle), None, None, None, Vec::new());
+                spawn_fail_collector!(
+                    Some(writer_handle),
+                    None,
+                    None,
+                    None,
+                    monitor_handles,
+                    Vec::new()
+                );
                 panic!("Monitor 线程启动失败: {e}");
             }
         }
@@ -885,7 +923,14 @@ pub fn start_collection_custom(
                 }) {
                 Ok(h) => h,
                 Err(e) => {
-                    spawn_fail_collector!(Some(writer_handle), None, None, None, Vec::new());
+                    spawn_fail_collector!(
+                        Some(writer_handle),
+                        None,
+                        None,
+                        None,
+                        monitor_handles,
+                        Vec::new()
+                    );
                     panic!("InputAgg 聚合线程启动失败: {e}");
                 }
             },
@@ -953,7 +998,14 @@ pub fn start_collection_custom(
         });
     if let Err(e) = maint_handle {
         // hooks/agg/writer 均已启动：全量兜底清理后再 panic（审查 P1）
-        spawn_fail_collector!(Some(writer_handle), agg_handle, None, None, hooks);
+        spawn_fail_collector!(
+            Some(writer_handle),
+            agg_handle,
+            None,
+            None,
+            monitor_handles,
+            hooks
+        );
         panic!("维护线程启动失败: {e}");
     }
 
@@ -980,6 +1032,7 @@ pub fn start_collection_custom(
             agg_handle,
             maint_handle.ok(),
             None,
+            monitor_handles,
             hooks
         );
         panic!("丢弃看门狗线程启动失败: {e}");
@@ -993,6 +1046,8 @@ pub fn start_collection_custom(
         agg_handle,
         maintenance_handle: maint_handle.ok(),
         watchdog_handle: watch_handle.ok(),
+        monitor_handles,
+        finished: false,
         hooks,
         settings,
         shutdown,
@@ -1036,16 +1091,16 @@ mod tests {
     fn watchdog_escalates_after_three_consecutive_write_failure_periods() {
         let mut consecutive = 0u64;
         // 无失败：不推进
-        assert_eq!(watchdog_tick(0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 0, 0, &mut consecutive), 0);
         // 连续三个周期有写失败：1 → 2 → 3（第 3 周期起 error）
-        assert_eq!(watchdog_tick(0, 5, &mut consecutive), 1);
-        assert_eq!(watchdog_tick(0, 1, &mut consecutive), 2);
-        assert_eq!(watchdog_tick(0, 1, &mut consecutive), 3);
-        assert_eq!(watchdog_tick(0, 2, &mut consecutive), 4);
+        assert_eq!(watchdog_tick(0, 0, 5, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 2);
+        assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 3);
+        assert_eq!(watchdog_tick(0, 0, 2, &mut consecutive), 4);
         // 一个干净周期即清零
-        assert_eq!(watchdog_tick(7, 0, &mut consecutive), 0);
-        // 通道丢弃独立于写失败计数推进
-        assert_eq!(watchdog_tick(9, 0, &mut consecutive), 0);
-        assert_eq!(watchdog_tick(0, 1, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(7, 0, 0, &mut consecutive), 0);
+        // 通道丢弃/未来时间戳拒绝独立于写失败计数推进（33-F4 拆分口径）
+        assert_eq!(watchdog_tick(9, 3, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 1);
     }
 }

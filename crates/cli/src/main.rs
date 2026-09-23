@@ -1402,15 +1402,22 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     };
     let mut c = collector::start_collection_custom(&enabled, csettings, &db_path);
 
-    // Ctrl+C → 优雅关停，保证缓冲事件 flush、session 正常关闭
-    let shutdown = c.shutdown_flag().clone();
+    // Ctrl+C → 优雅关停，保证缓冲事件 flush、session 正常关闭。
+    // 修复（挂死）：handler 不能只置停机旗标——旗标本身既不断开事件通道、
+    // 也不置位 writer_stop（两者只在 Collector::shutdown() 内发生），旧实现
+    // 随后的 wait() 在旗标路径下永久挂死。改为 handler 仅通过 channel 唤醒
+    // owner 线程，由 owner 线程走完整 shutdown()（stop hooks→join 聚合→
+    // 置 writer_stop→join writer）。
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     ctrlc::set_handler(move || {
-        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        // 二次 Ctrl+C 时 send 失败可忽略（owner 线程已被首次信号唤醒）
+        let _ = stop_tx.send(());
     })
     .map_err(|e| Error::InvalidData(format!("ctrl-c handler: {e}")))?;
 
-    // 阻塞等待 writer 退出（shutdown 后 join 返回）
-    c.wait();
+    // 阻塞等待 Ctrl+C 信号，再由本线程完整关停（内部 join writer）
+    let _ = stop_rx.recv();
+    c.shutdown();
     let n = c.total_written.load(Ordering::Relaxed);
     println!("collected {n} events into {db_path}");
     Ok(())

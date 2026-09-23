@@ -1,8 +1,10 @@
 ﻿; Kynoptic 安装器脚本（Inno Setup 6）
-; CI: iscc kynoptic.iss /DAppVersion=0.2.1
+; CI: iscc kynoptic.iss /DAppVersion=0.2.2
+; 缺省值必须与 Cargo.toml/CHANGELOG 的当前版本一致（版本漂移审查：忘传
+; /DAppVersion 时曾打包出 0.2.0 安装包而二进制是 0.2.2 的自相矛盾产物）。
 
 #ifndef AppVersion
-#define AppVersion "0.2.0"
+#define AppVersion "0.2.2"
 #endif
 
 #define AppName "Kynoptic"
@@ -86,6 +88,14 @@ Filename: "schtasks"; Parameters: "/Create /F /SC MINUTE /MO 1 /TN ""Kynoptic Wa
 [Code]
 // ============================ 通用辅助 ============================
 
+var
+  // 安装中断补偿（失败/取消恢复路径）：安装是否已走到 ssPostInstall、
+  // PrepareToInstall 时看门狗任务是否存在（存在才需要在失败后恢复 ENABLE）、
+  // 升级前用户是否已显式关闭自启动（Run 值缺失 + 任务存在）。
+  G_PostInstallDone: Boolean;
+  G_TaskExisted: Boolean;
+  G_AutostartWasDisabled: Boolean;
+
 // 静默执行外部命令（SW_HIDE 不弹窗），返回是否成功且退出码为 0
 function RunHidden(const Exe, Params: String): Boolean;
 var
@@ -94,6 +104,15 @@ begin
   Result := Exec(Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
   if Result then
     Result := (CmdResult = 0);
+end;
+
+// 看门狗计划任务是否已存在（升级识别）
+function WatchdogTaskExists(): Boolean;
+var
+  CmdResult: Integer;
+begin
+  Result := Exec('schtasks', '/Query /TN "Kynoptic Watchdog"', '',
+    SW_HIDE, ewWaitUntilTerminated, CmdResult) and (CmdResult = 0);
 end;
 
 // 静默强杀进程树（审查 P1-5：DISABLE 计划任务防不住已在跑的 watchdog）
@@ -111,6 +130,12 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  // 失败/取消补偿基线：记录 DISABLE 前的任务存在性与用户自启动选择
+  G_PostInstallDone := False;
+  G_TaskExisted := WatchdogTaskExists();
+  G_AutostartWasDisabled := G_TaskExisted and (not RegValueExists(
+    HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run',
+    'Kynoptic'));
   if not RunHidden('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE') then
     Log('Watchdog task DISABLE skipped/failed');
   KillProcessSilently('kynoptic-watchdog.exe');
@@ -120,9 +145,21 @@ begin
   KillProcessSilently('kynoptic-tray.exe');
 end;
 
+// 重建指向本次安装目录的看门狗任务并转 DISABLE、清 Run 值
+//（未勾选 autostart / 静默升级尊重此前显式关闭，共用此路径）
+procedure RebuildTaskDisabled();
+begin
+  RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "Kynoptic Watchdog" /TR "' + Chr(39) +
+  ExpandConstant('{app}') + '\kynoptic-watchdog.exe' + Chr(39) + ' watchdog --once"');
+  RunHidden('schtasks', '/Change /TN "Kynoptic Watchdog" /DISABLE');
+  RegDeleteValue(HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Run', 'Kynoptic');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then begin
+    G_PostInstallDone := True;
     // 审查 P1-4：双写，避免升级场景半开半关。
     // 计划任务已无条件 /Create（静默安装不勾任务也会建——此前静默升级会
     // 静默丢看门狗）。未勾选 autostart：任务转 DISABLE（防无人值守拉起），
@@ -130,11 +167,31 @@ begin
     if not WizardIsTaskSelected('autostart') then begin
       // Wave17：先 /F 重建指向本次安装目录（旧任务可能指向旧 {app} 的死
       // 路径），再 DISABLE——[Run] 已按勾选门控，DISABLE 不再被覆盖。
-      RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "Kynoptic Watchdog" /TR "' + Chr(39) +
-      ExpandConstant('{app}') + '\kynoptic-watchdog.exe' + Chr(39) + ' watchdog --once"');
-      RegDeleteValue(HKEY_CURRENT_USER,
-        'Software\Microsoft\Windows\CurrentVersion\Run', 'Kynoptic');
+      RebuildTaskDisabled();
+    end else if WizardSilent and G_AutostartWasDisabled then begin
+      // 自启动审查：UsePreviousTasks=no 曾让每次覆盖升级把用户显式关闭的
+      // 自启动静默改回开启。交互升级以勾选框为用户的显式选择不动；静默
+      // 升级（无人复核勾选框）尊重升级前的关闭态。
+      RebuildTaskDisabled();
     end;
+  end;
+end;
+
+// 安装失败/取消补偿：DeinitializeSetup 在向导以任何方式结束时都会被调用
+//（包括文件复制失败与用户取消）。若从未走到 ssPostInstall，说明本次升级
+// 未完成——恢复 DISABLE 掉的看门狗任务并拉回托盘，不留"任务停在 DISABLE、
+// 托盘被杀、看门狗失效"的孤儿态。
+procedure DeinitializeSetup();
+var
+  CmdResult: Integer;
+begin
+  if not G_PostInstallDone then begin
+    if G_TaskExisted then
+      RunHidden('schtasks', '/Change /TN "Kynoptic Watchdog" /ENABLE');
+    // 旧托盘仍在 {app}（复制未完成的残留也以存在性为准），拉回后台运行
+    if FileExists(ExpandConstant('{app}\kynoptic-tray.exe')) then
+      Exec(ExpandConstant('{app}\kynoptic-tray.exe'), '--minimized', '',
+        SW_HIDE, ewNoWait, CmdResult);
   end;
 end;
 
@@ -145,7 +202,7 @@ var
 
 procedure CurUninstallStepChanged(CurStep: TUninstallStep);
 var
-  AppDir, DataDir: String;
+  AppDir, DataDir, HomeSkillDir: String;
   I: Integer;
   Leftovers: array[0..13] of String;
 begin
@@ -200,6 +257,19 @@ begin
   if CurStep = usPostUninstall then begin
     AppDir := ExpandConstant('{app}');
     DataDir := AppDir + '\data';
+    // skill install 对称清理（卸载审查）：skill install 曾向三个 AI 客户端
+    // home 目录写入 skills/kynoptic/SKILL.md，卸载后残留死技能（指引指向
+    // 已不存在的 %LOCALAPPDATA%\Programs\Kynoptic）。整树删除。
+    for I := 0 to 2 do begin
+      if I = 0 then
+        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.zcode\skills\kynoptic'
+      else if I = 1 then
+        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.claude\skills\kynoptic'
+      else
+        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.cursor\skills\kynoptic';
+      if DirExists(HomeSkillDir) then
+        DelTree(HomeSkillDir, True, True, True);
+    end;
     if DeleteDataOnUninstall then begin
       DelTree(DataDir, True, True, True);
     end else if DirExists(DataDir) then begin

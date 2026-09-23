@@ -291,12 +291,17 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
 }
 
 /// 欠聚合廉价核对（P1 自愈门槛，两条聚合查询）：返回本地日期列表——该日
-/// events 中"应有聚合贡献"的原始行（press/click/switch）最大 id 大于该日
-/// agg_minute 已记录的 MAX(max_event_rowid)（含该日完全没有聚合行的情况）。
+/// events 中"应有聚合贡献"的原始行（press/click/switch/input_agg）最大 id
+/// 大于该日 agg_minute 已记录的 MAX(max_event_rowid)（含该日完全没有聚合行
+/// 的情况）。
 ///
-/// 只对比原始贡献行（不含 input_agg/move 等快照行）：快照行在增量维护中
-/// rowid 记 0，且重算路径写入桶内 MAX(id) 覆盖全部 keyboard/mouse/window 行，
-/// 因此重算后该指标必然收敛（不产生持续误报）。
+/// 审查 33-F5：核对口径加入 input_agg 行。默认 Minute 粒度下输入只以
+/// event_action='input_agg' 落库，旧口径（仅 press/click/switch）对
+/// input_agg-only 日永远检不出欠聚合——不回填也不重算；若该日还残留部分
+/// 旧聚合行，has_minute_for_date=true 会让图表走缓存读路径直接漏算。
+/// 收敛性：重算路径写入桶内 MAX(id)（含 input_agg 行）；input_agg 行是
+/// UPSERT（同分钟同类型不改 id），只有新分钟才产生更大 id——新分钟会再次
+/// 触发当日核对并由下次自愈收敛，不会产生历史日的持续误报。
 ///
 /// **启动延迟（交叉审查 P3）**：本函数在 `Database::open` 主线程同步调用。
 /// 无下界时是 events 全表 GROUP BY 扫描（362 万行库上秒级启动回归）。这里加
@@ -314,7 +319,7 @@ pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
            SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d, MAX(id) AS maxid
            FROM events
            WHERE event_type IN ('keyboard','mouse','window')
-             AND event_action IN ('press','click','switch')
+             AND event_action IN ('press','click','switch','input_agg')
              AND timestamp >= '{cutoff}'
            GROUP BY d
          ) e
@@ -636,15 +641,52 @@ fn count_agg_minute(conn: &Connection) -> usize {
     .unwrap_or(0) as usize
 }
 
-/// 某本地日期是否有 agg_minute 缓存行。表不存在 / 查询失败一律返回 false
-/// （调用方回退 events 现算——保证聚合缺失时行为退化为原始慢路径而非错误）。
+/// 某本地日期是否有**覆盖完整**的 agg_minute 缓存行。表不存在 / 查询失败一律
+/// 返回 false（调用方回退 events 现算——保证聚合缺失时行为退化为原始慢路径
+/// 而非错误）。
+///
+/// 审查 33-F5：缓存命中加廉价完整性校验——该日「会产生聚合行的 input_agg
+/// 分钟数」（keys/clicks/moves/move_distance_px 任一 > 0 的分钟；纯 scroll
+/// 分钟不产聚合行，排除在外）超过该日**去重后的 agg_minute 分钟数**即视为
+/// 残缺（部分旧聚合行残留的中间态），回退 events 现算，不再漏算缺失分钟。
+/// 两边都必须按「分钟」去重计数：agg_minute 主键是 (date, hour, minute,
+/// bucket_id)，同一分钟最多可产 4 行（input_keys/clicks/moves/
+/// window_switches），若拿行数跟分钟数比，上午完整聚合的行数放大（至多
+/// 4×分钟数）可以盖过全天 input_agg 分钟数，把「下午缺失」误判成覆盖完整。
+/// 去重后完整状态下每个这样的分钟至少对应一个 agg_minute 分钟，不会误报。
 pub fn has_minute_for_date(conn: &Connection, date: &str) -> bool {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agg_minute WHERE date = ?1)",
-        params![date],
-        |r| r.get(0),
-    )
-    .unwrap_or(false)
+    let bounds = crate::queries::local_day_range(date);
+    let sql = match &bounds {
+        Some((_start, _end)) => format!(
+            "SELECT EXISTS(SELECT 1 FROM agg_minute WHERE date = ?1)
+             AND NOT (
+               (SELECT COUNT(DISTINCT substr(datetime(timestamp, '{off}'), 1, 16))
+                FROM events
+                WHERE event_action = 'input_agg'
+                  AND timestamp >= ?2 AND timestamp < ?3
+                  AND json_valid(event_data)
+                  AND (COALESCE(json_extract(event_data, '$.keys'), 0) > 0
+                    OR COALESCE(json_extract(event_data, '$.clicks'), 0) > 0
+                    OR COALESCE(json_extract(event_data, '$.moves'), 0) > 0
+                    OR COALESCE(json_extract(event_data, '$.move_distance_px'), 0) > 0))
+               > (SELECT COUNT(DISTINCT hour * 60 + minute) FROM agg_minute WHERE date = ?1)
+             )",
+            off = crate::queries::LOCAL_MODIFIER_AT_EVENT,
+        ),
+        None => {
+            // 日界不可解析（异常日期串）：退回旧的纯 EXISTS 判定
+            return conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agg_minute WHERE date = ?1)",
+                    params![date],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+        }
+    };
+    let (start, end) = bounds.unwrap();
+    conn.query_row(&sql, params![date, start, end], |r| r.get(0))
+        .unwrap_or(false)
 }
 
 /// agg_daily 是否有 per-app 缓存行（可选限定某本地日期）。

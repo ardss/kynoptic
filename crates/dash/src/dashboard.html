@@ -583,9 +583,47 @@ function esc(s) {
 // 不落盘不外发）。POST 必带 X-Kynoptic-Token——原三重防线全是客户端可控头，
 // 只拦浏览器，拦不住同机进程伪造两个头。
 const KYN_CSRF_TOKEN = "__KYN_CSRF_TOKEN__";
-async function jget(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(url + " → HTTP " + r.status);
+// 可选访问令牌（与 lib.rs /api/* 401 门配套）：优先取 URL ?token=（用户按
+// 文档拼好链接直接打开即自动续用），存入 sessionStorage 后从地址栏摘掉，
+// 避免令牌留在历史记录/复制分享的链接里。此后所有 API 请求经
+// kynHeaders() 携带 X-Kynoptic-Access-Token 头。未启用令牌时服务端忽略
+// 该头，行为与无令牌版本一致。
+let KYN_ACCESS_TOKEN = sessionStorage.getItem("kyn-access-token") || "";
+(function () {
+  const q = new URLSearchParams(location.search);
+  const t = q.get("token");
+  if (t) {
+    KYN_ACCESS_TOKEN = t;
+    try { sessionStorage.setItem("kyn-access-token", t); } catch (_) {}
+    q.delete("token");
+    const rest = q.toString();
+    history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
+  }
+})();
+function kynHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (KYN_ACCESS_TOKEN) h["X-Kynoptic-Access-Token"] = KYN_ACCESS_TOKEN;
+  return h;
+}
+async function jget(url, retried) {
+  const r = await fetch(url, { headers: kynHeaders() });
+  if (r.status === 401 && !retried) {
+    // 访问令牌缺失/失效：给一次手工输入机会，而不是让整页 API 全部失败
+    const t = prompt(document.documentElement.lang === "zh"
+      ? "请输入访问令牌（data\\dashboard-token.txt 的内容）"
+      : "Enter access token (contents of data\\dashboard-token.txt)");
+    if (t) {
+      KYN_ACCESS_TOKEN = t.trim();
+      try { sessionStorage.setItem("kyn-access-token", KYN_ACCESS_TOKEN); } catch (_) {}
+      return jget(url, true);
+    }
+  }
+  if (!r.ok) {
+    // 非 200 时后端正文常为 {"error": 中文原因}（如未来日期校验）：
+    // 取出后交给 showViewError，不再只显示 "URL → HTTP 400"
+    const e = await r.json().catch(() => ({}));
+    throw new Error((e && e.error) || (url + " → HTTP " + r.status));
+  }
   return r.json();
 }
 function fmtBytes(n) {
@@ -663,6 +701,11 @@ async function loadStatus() {
   if (isNaN(d.getTime())) {
     // 时刻解析失败时与 shown 的回退口径对齐：不再误断言"采集器未运行"
     stateTxt = zh ? "事件时刻无法解析" : "event time unparsable";
+  }
+  else if (age < 0) {
+    // 未来时间戳（脏数据/时钟回拨）：age 恒为负会永远命中"采集中"，
+    // 必须单列为异常态，避免采集器死亡被掩盖
+    stateTxt = zh ? "时间戳异常（晚于本机时钟）" : "timestamp anomaly (ahead of local clock)";
   }
   else if (age < 600) stateTxt = zh ? "采集中" : "collecting";
   else if (age < 86400) stateTxt = zh ? "停滞（最后事件 " + Math.round(age/60) + " 分钟前）" : "stale (last event " + Math.round(age/60) + " min ago)";
@@ -843,6 +886,14 @@ async function loadTimeline() {
   /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
   const TL_COLORS = { human: "var(--human)", auto: "var(--auto)", away: "#1a2230" };
   const MIXED_NOTE = zh ? " · 这一小时人和自动化脚本都有操作" : " · mixed minutes (human + automation) count for both";
+  // 进行中的当前小时只过了部分分钟：away 上限改为"已流逝的分钟数"
+  //（用响应自带的 generated_at 计算，不读客户端时钟）。历史小时流逝 >60 分钟，
+  // 自然回退为整 60 分钟上限。
+  const genMs = Date.parse(tl.generated_at);
+  const elapsedMin = b => {
+    const start = Date.parse(b.hour + ":00"); // 本地墙钟，与桶 hour 同口径
+    return (isFinite(genMs) && isFinite(start)) ? (genMs - start) / 60000 : Infinity;
+  };
   // DST 标注：后端 local_offset_note 随响应返回并承诺"供前端标注"（lib.rs）。
   // 窗口内本机偏移发生过变化（跨夏令时），或服务器偏移与本机当前偏移不一致
   // 时，在时间线顶部渲染小字说明（与图例小字同款），历史小时桶 ±1h 不再无声。
@@ -873,7 +924,8 @@ async function loadTimeline() {
     const human = Math.min(60, b.human_min || 0);
     const rawAuto = Math.min(60, b.auto_min || 0);
     const auto = Math.max(0, rawAuto - human);
-    const away = Math.max(0, 60 - Math.max(human, rawAuto));
+    const spanCap = Math.min(60, Math.max(0, elapsedMin(b)));
+    const away = Math.max(0, Math.min(spanCap, 60 - Math.max(human, rawAuto)));
     const mixed = human > 0 && rawAuto > 0;
     const pct1 = (v) => (v / 60 * 100).toFixed(1);
     const evCount = (b.apps || []).reduce((a, x) => a + (x.events || 0), 0);
@@ -987,7 +1039,7 @@ async function loadTopApps() {
     '<span class="app-count">' + t("colEvents") + "</span></div>" +
     a.apps.map(x =>
     '<div class="app-row">' +
-    '<span class="app-label" title="' + esc(x.app) + '">' + esc(x.app) + "</span>" +
+    '<span class="app-label" title="' + esc(x.app) + '">' + esc(prettyApp(x.app)) + "</span>" +
     '<span class="app-track"><span class="app-bar" style="width:' + (x.count / max * 100).toFixed(2) + '%"></span></span>' +
     '<span class="app-count">' + x.count.toLocaleString() + "</span></div>").join("");
 }
@@ -1286,6 +1338,7 @@ async function loadApps() {
     .map(g => '<span style="margin-right:14px"><span class="sw" style="background:' +
       (colorOf[g.app] || "#888") + '"></span>' + esc(prettyApp(g.app)) + "</span>").join("");
   const dt = await jget("/api/daily_top?days=14");
+  if (seq !== APPS_SEQ) return; // 迟到的旧 daily_top 不得覆盖新日期（同上防护）
   const rows = (dt.days_out || []).slice().reverse();
   const cmax = Math.max(1, ...rows.flatMap(r => (r.top || []).map(t => t.count)));
   document.getElementById("daily-top").innerHTML = rows.length
@@ -1417,7 +1470,10 @@ async function loadInput() {
   // 旧版行没有分键字段：总额超出按键明细之和时如实提示（随 7 天窗口滚动自愈）
   const attr = (d.clicks_left || 0) + (d.clicks_right || 0) + (d.clicks_middle || 0)
     + (d.clicks_side1 || 0) + (d.clicks_side2 || 0);
-  const unattr = (d.clicks_total || 0) - attr;
+  let unattr = (d.clicks_total || 0) - attr;
+  // 逐键（granularity=raw）粒度下库中永不产生分键行，分键字段恒为 0：
+  // 此时全部点击都会被算成"未归因"，横幅是误报，不渲染
+  if (d.granularity === "raw") unattr = 0;
   document.getElementById("mouse-unattr").textContent = unattr > 0
     ? t("unattr").replace("{n}", unattr.toLocaleString()) : "";
   // 今日 24 小时输入节奏（复用活动页的柱状图风格）
@@ -1674,26 +1730,41 @@ async function saveSettings() {
     }
     const enabled_monitors = [...document.querySelectorAll(".mon-toggle")]
       .filter(x => x.checked).map(x => x.dataset.id);
+    // 非数字输入（如粘贴 'abc'）parseInt 得 NaN：原先 `|| 0` 会静默把目标/
+    // 桥接存成 0（功能被关闭），现回退为当前已保存值（无则用默认），并提示
+    let fellBack = false;
+    const num = (id, cur, def) => {
+      const v = parseInt(document.getElementById(id).value, 10);
+      if (Number.isNaN(v)) { fellBack = true; return (cur ?? def); }
+      return v;
+    };
+    const oldPort = LAST_SETTINGS ? LAST_SETTINGS.dashboard_port : undefined;
     const body = {
       enabled_monitors: enabled_monitors,
       autostart: document.getElementById("set-autostart").checked,
       input_counts_only: document.getElementById("set-counts").checked,
       vk_frequency_enabled: document.getElementById("set-vkfreq").checked,
-      presence_bridge_minutes: Math.max(0, Math.min(15, parseInt(document.getElementById("set-bridge").value || "2", 10) || 0)),
-      daily_goal_minutes: Math.max(0, Math.min(1440, parseInt(document.getElementById("set-goal").value || "480", 10) || 0)),
+      presence_bridge_minutes: Math.max(0, Math.min(15, num("set-bridge", LAST_SETTINGS && LAST_SETTINGS.presence_bridge_minutes, 2))),
+      daily_goal_minutes: Math.max(0, Math.min(1440, num("set-goal", LAST_SETTINGS && LAST_SETTINGS.daily_goal_minutes, 480))),
       // 审查：端口 0 会落库出"面板打不开"的设置，前端先夹到 1-65535（后端同样校验）
-      dashboard_port: Math.max(1, Math.min(65535, parseInt(document.getElementById("set-port").value || "8422", 10) || 8422))
+      dashboard_port: Math.max(1, Math.min(65535, num("set-port", oldPort, 8422)))
     };
     const r = await fetch("/api/settings", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Kynoptic": "1", "X-Kynoptic-Token": KYN_CSRF_TOKEN },
+      headers: kynHeaders({ "Content-Type": "application/json", "X-Kynoptic": "1", "X-Kynoptic-Token": KYN_CSRF_TOKEN }),
       body: JSON.stringify(body)
     });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
       throw new Error(e.error || ("HTTP " + r.status));
     }
-    settingsMsg(t("saved"), true);
+    let msg = t("saved");
+    if (fellBack) msg += document.documentElement.lang === "zh"
+      ? "（非数字输入已回退为原值）"
+      : " (non-numeric input reverted to previous value)";
+    // 端口只在 serve() 启动时绑定一次，改端口需重启托盘才生效（portNote 文案）
+    if (oldPort !== undefined && body.dashboard_port !== oldPort) msg += " " + t("portNote");
+    settingsMsg(msg, true);
     // 同步缓存：目标环/确认弹窗立刻用新值，不再等刷新页面（Wave18 P1）
     if (!("error" in (body || {}))) LAST_SETTINGS = Object.assign({}, LAST_SETTINGS, body);
   } catch (e) {

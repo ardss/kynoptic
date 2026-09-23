@@ -40,6 +40,22 @@ impl Database {
         id
     }
 
+    /// 某会话在 events 表中的实际行数（COUNT(*) 口径）。
+    ///
+    /// 审查 33-F6：sessions.total_events 的双口径统一——优雅关停此前写
+    /// total_written（把每秒一次的 input_agg UPSERT 逐次累加，Minute 粒度下
+    /// 与实际行数可差约 60 倍），ghost 清扫写 COUNT(*)。现在优雅关停也用
+    /// 本查询取数，两种结束路径天然一致。
+    pub fn session_event_count(&self, session_id: i64) -> i64 {
+        self.reader()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
     /// 结束会话。注意：不再在此触发 daily_agg 重算（消除 db → daily_agg 反向依赖）。
     /// 如需刷新当日聚合，调用方应在结束后显式调用 `daily_agg::recompute_day`。
     pub fn end_session(&self, session_id: i64, total_events: i64, idle_seconds: f64) {
