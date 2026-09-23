@@ -335,7 +335,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_summary",
-            "description": "单指标日聚合 + 与昨日同期对比百分比",
+            "description": "单指标日聚合 + 与前一日对比百分比。响应含 baseline_semantic 标注对比口径：date=今天时为 same_time（前一日至当前同时刻），date 为过去日期时为 full_day（前一日全天总数）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
