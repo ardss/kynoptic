@@ -236,52 +236,42 @@ fn detect_all_empty_db_no_panic() {
     assert_eq!(anomalies.len(), 0);
 }
 
-// ─── 编排层：marathon 剔除 move-only 分钟（agg_minute 缓存路径，时区无关） ────
+// ─── 编排层：marathon 与 presence 同源（剔注入；事件路径，时区无关） ──────────
 
-fn setup_agg_minute() -> rusqlite::Connection {
-    let conn = setup();
-    conn.execute_batch(
-        "CREATE TABLE agg_minute (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            hour INTEGER NOT NULL,
-            minute INTEGER NOT NULL,
-            bucket_id TEXT NOT NULL,
-            sum_value INTEGER,
-            count_value INTEGER,
-            max_rowid INTEGER
-        );",
-    )
-    .expect("create agg_minute");
-    conn
+fn setup_events() -> rusqlite::Connection {
+    // 与纯函数测试同一份 events 表结构（classify_minutes 只读 events）
+    setup()
 }
 
-fn ins_minute(c: &rusqlite::Connection, date: &str, hm: usize, bucket: &str) {
+/// 往 `date`（本地日）的第 `min_of_day` 分钟插一条 input_agg 事件（本地时区无关：
+/// 从 local_day_range 的 UTC 起点推时刻，与 charts.rs 测试同模式）。
+fn ins_minute_event(c: &rusqlite::Connection, date: &str, min_of_day: usize, data: &str) {
+    let (start, _) = kynoptic_core::queries::local_day_range(date).unwrap();
+    let base = chrono::DateTime::parse_from_rfc3339(&start).unwrap();
+    let t = base + chrono::Duration::minutes(min_of_day as i64);
     c.execute(
-        "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value) \
-         VALUES (?1, ?2, ?3, ?4, 1, 1)",
-        rusqlite::params![date, hm / 60, hm % 60, bucket],
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, session_id) \
+         VALUES (?1, 'keyboard', 'input_agg', ?2, 1)",
+        rusqlite::params![t.to_rfc3339(), data],
     )
     .unwrap();
 }
 
-/// 口径（统一 2026-09）：纯 input_moves 分钟不算活跃。
-///
-/// 08:00-10:59 共 180 个键盘分钟，但把 09:30 换成 input_moves-only——
-/// active 序列在 09:29/09:31 之间出现 1 分钟空洞：
-/// - bridge=0：空洞断开 → 最长 90 < 180，不报（若 move 算活跃则 180 连续会误报）；
-/// - bridge=15：1 分钟空洞被补齐 → 连续 180，报马拉松。
+/// 口径修复回归（2026-09）：marathon 必须与 presence 同源——
+/// - 纯人类输入 180 分钟（09:30 为 move-only 空洞）：bridge=0 断开不报，
+///   bridge=15 桥接报 180；
+/// - 同样 180 分钟全是**注入**输入：presence 判 auto、human=0，不得报马拉松
+///   （旧实现读 input_keys 桶会误报「连续在场 120/180 分钟」）。
 #[test]
-fn detect_marathon_ignores_move_only_minutes_and_bridges() {
-    let conn = setup_agg_minute();
+fn detect_marathon_uses_human_minutes_injected_excluded() {
+    let conn = setup_events();
     let date = "2026-06-15";
+    // 08:00-10:59 共 180 分钟；570（09:30）换成 move-only（纯鼠标移动）
     for m in 480..660 {
-        // 08:00 = 第 480 分钟 .. 10:59
         if m == 570 {
-            // 09:30：脚本级纯鼠标抖动分钟
-            ins_minute(&conn, date, m, "input_moves");
+            ins_minute_event(&conn, date, m, r#"{"moves":9,"samples":9}"#);
         } else {
-            ins_minute(&conn, date, m, "input_keys");
+            ins_minute_event(&conn, date, m, r#"{"keys":4,"samples":4}"#);
         }
     }
     // bridge=0：move-only 分钟剔除后空洞断开，不报马拉松
@@ -291,4 +281,24 @@ fn detect_marathon_ignores_move_only_minutes_and_bridges() {
     let out15 = kynoptic_core::anomaly::detect_marathon_session(&conn, date, 15).unwrap();
     assert_eq!(out15.len(), 1);
     assert!(out15[0].message.contains("180"), "{}", out15[0].message);
+
+    // 注入输入不算人在场：清空后重插同样的 180 分钟，但全为 injected_keys
+    conn.execute("DELETE FROM events", []).unwrap();
+    for m in 480..660 {
+        ins_minute_event(
+            &conn,
+            date,
+            m,
+            r#"{"keys":120,"injected_keys":120,"samples":120}"#,
+        );
+    }
+    let d = kynoptic_core::queries::classify_minutes(&conn, date, 15);
+    assert_eq!(d.presence_minutes, 0, "纯注入输入人在场必须为 0");
+    assert_eq!(d.automation_minutes, 180);
+    let out_auto = kynoptic_core::anomaly::detect_marathon_session(&conn, date, 15).unwrap();
+    assert!(
+        out_auto.is_empty(),
+        "注入输入不得伪造马拉松: {:?}",
+        out_auto.iter().map(|a| &a.message).collect::<Vec<_>>()
+    );
 }

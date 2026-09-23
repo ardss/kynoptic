@@ -189,7 +189,7 @@ fn cmd_stats(args: &[String]) -> Result<()> {
         println!("keys:     {}", day.total_keys);
         println!("clicks:   {}", day.total_clicks);
         println!(
-            "active:   {} min ({} h)",
+            "active:   {} min ({:.1} h)",
             day.active_minutes,
             day.active_minutes as f64 / 60.0
         );
@@ -290,7 +290,9 @@ fn cmd_export(args: &[String]) -> Result<()> {
         out = dir
             .join(format!(
                 "kynoptic_export_{}.{}",
-                Utc::now().format("%Y%m%d_%H%M%S"),
+                // 文件名时间戳与导出窗口同口径用本地时间：全站按本地日归档，
+                // UTC 会让本地凌晨导出的文件名日期错位一天
+                chrono::Local::now().format("%Y%m%d_%H%M%S"),
                 ext(&format)
             ))
             .to_string_lossy()
@@ -525,6 +527,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
     md.push_str(&format!("- APM: **{:.1}**\n\n", analysis.apm_avg));
 
     md.push_str("## 专注段\n\n");
+    md.push_str("（按连续键鼠输入分钟判定，无人在场桥接；与仪表盘报告页按「人在场」判定的专注块口径不同，数值不可直接对比。）\n\n");
     if analysis.focus_segments.is_empty() {
         md.push_str("今天没有 ≥ 5 分钟的专注段。\n\n");
     } else {
@@ -1530,29 +1533,13 @@ fn parse_presence_args(args: &[String]) -> Result<i64> {
 // queries::classify_minutes）——dash（overview/timeline）与 cli presence 共用
 // 同一权威实现（剔注入、含点击、混合分钟双计、桥接读 settings）。
 
-/// 前台分钟：窗口切换间隔累计（与 dash api_overview 同口径，不封顶）。
+/// 前台分钟：窗口切换间隔累计——统一走 core 权威实现
+/// queries::foreground_dwell_by_app（剔除 >2h 停摆间隔，与 dash
+/// overview/report、MCP get_top_apps 共用同一实现与封顶策略）。
 fn foreground_minutes(conn: &Connection, start: &str, end: &str) -> i64 {
-    let mut fg_secs: i64 = 0;
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT timestamp FROM events \
-          WHERE event_type = 'window' AND event_action = 'switch' \
-            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
-    ) {
-        if let Ok(rows) = stmt.query_map(params![start, end], |r| r.get::<_, String>(0)) {
-            let stamps: Vec<String> = rows.flatten().collect();
-            let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
-            for pair in stamps.windows(2) {
-                if let (Some(a), Some(b)) = (parse(&pair[0]), parse(&pair[1])) {
-                    // 采集停摆的超长间隔不归属（同 dash 侧，全库审查 P1）
-                    let secs = (b - a).num_seconds();
-                    if secs <= 2 * 3600 {
-                        fg_secs += secs;
-                    }
-                }
-            }
-        }
-    }
-    fg_secs / 60
+    let dwell =
+        queries::foreground_dwell_by_app(conn, start, end, queries::FG_DWELL_STALL_CAP_SECS, false);
+    dwell.iter().map(|(_, s)| *s).sum::<i64>() / 60
 }
 
 /// `kynoptic presence [--days N]`：每日 人在场/自动化/前台 三行式摘要。
@@ -1726,6 +1713,80 @@ fn watchdog_log(msg: &str) {
         {
             let _ = f.write_all(line.as_bytes());
         }
+    }
+}
+
+/// 同类告警去重窗口：常驻模式每 15s 一轮，窗口内同一 kind 只升级一次
+/// （落库+系统通知），防长时间故障期把 events 表刷爆。
+const WATCHDOG_ALERT_DEDUP_SECS: i64 = 1800;
+/// 告警升级是否触发过的原子旗标（--once 模式退出前据此短暂等待，给
+/// 异步系统通知一个渲染窗口）
+static WATCHDOG_ALERT_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 看门狗告警升级通道：异常不再只写 watchdog.log（复核发现生产库 29 分钟
+/// 采集空洞在库/UI 层面零痕迹），同时
+/// 1) 落库为 `notification` 系统事件（event_data 带 source=watchdog/kind/
+///    message），UI 与分析侧可读；沿用既有 action 枚举，不改 schema。
+/// 2) 尽力而为弹一次系统通知（独立线程，不阻塞检查循环）。
+///
+/// 全程尽力而为：库打不开/写失败只留 stderr，不影响看门狗主流程。
+/// 按 kind 去重（进程内存级；常驻进程内窗口 30 分钟）。
+fn watchdog_alert(kind: &str, message: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+    let now_epoch = Utc::now().timestamp();
+    let deduped = {
+        let Ok(mut g) = LAST.lock() else { return };
+        let map = g.get_or_insert_with(HashMap::new);
+        if now_epoch - *map.get(kind).unwrap_or(&0) < WATCHDOG_ALERT_DEDUP_SECS {
+            true
+        } else {
+            map.insert(kind.to_string(), now_epoch);
+            false
+        }
+    };
+    if deduped {
+        return;
+    }
+    WATCHDOG_ALERT_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
+    watchdog_log(&format!("告警[{kind}] {message}"));
+    // 落库：复用 open_db（SCHEMA+迁移），库缺失时也能建全 schema 再插入
+    let db_path = resolve_db();
+    match open_db(&db_path) {
+        Ok(conn) => {
+            let sql = "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                       VALUES (?1, 'system', 'notification', ?2)";
+            if let Err(e) = conn.execute(
+                sql,
+                params![
+                    Utc::now().to_rfc3339(),
+                    // rusqlite 未开 serde_json 特性，Value 不实现 ToSql，落库为 JSON 文本
+                    json!({"source": "watchdog", "kind": kind, "message": message}).to_string(),
+                ],
+            ) {
+                eprintln!("watchdog: 告警事件落库失败: {e}");
+            }
+        }
+        Err(e) => eprintln!("watchdog: 告警事件落库失败(库打不开): {e}"),
+    }
+    // 系统通知（Windows）：MB_ICONWARNING | MB_TOPMOST，独立线程发射
+    #[cfg(target_os = "windows")]
+    {
+        let text: Vec<u16> = format!("kynoptic 告警: {message}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let title: Vec<u16> = "kynoptic watchdog\0".encode_utf16().collect();
+        std::thread::spawn(move || unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                0x0000_0030 | 0x0004_0000,
+            );
+        });
     }
 }
 
@@ -2339,6 +2400,11 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         watchdog_log(
                             "tray 自报心跳写失败(unwritable 旗标, 实地探针证实不可写): 环境故障(磁盘满/目录只读/权限), 仅告警不 kill",
                         );
+                        // 升级告警：环境故障期间采集大概率停摆，只写 log 用户看不见
+                        watchdog_alert(
+                            "heartbeat_unwritable",
+                            "托盘自报心跳文件写失败（磁盘满/目录只读/权限），采集可能已停摆，请检查磁盘与目录权限",
+                        );
                         false
                     }
                 } else {
@@ -2387,16 +2453,29 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                 watchdog_log(
                                     "复查仍未恢复且心跳写权限探测失败(磁盘满/目录只读/ACL 锁死): 判定环境故障, 仅告警不 kill",
                                 );
+                                watchdog_alert(
+                                    "env_unwritable",
+                                    "采集未恢复且磁盘/目录不可写（磁盘满或权限问题），无法自动重启托盘，请人工排查",
+                                );
                             } else {
                                 watchdog_log(&format!(
                                     "复查仍未恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 判定采集挂死, kill kynoptic-tray 以重启"
                                 ));
+                                // 升级告警：采集挂死即数据空洞开始，库/UI 层须留痕
+                                watchdog_alert(
+                                    "collection_stalled",
+                                    "采集挂死（心跳超龄），看门狗正在重启托盘；期间的数据会有空洞",
+                                );
                                 if !kill_tray() {
                                     // 审查 P2：杀失败（AV/权限）不留痕的话，后续每
                                     // 个 --once 周期都重复 40s 睡眠+复查，且托盘
                                     // 永远不会被真正重启。
                                     watchdog_log(
                                         "kill kynoptic-tray 失败(taskkill 非零)，可能被安全软件拦截",
+                                    );
+                                    watchdog_alert(
+                                        "kill_failed",
+                                        "看门狗无法结束挂死的托盘进程（可能被安全软件拦截），采集持续停摆，请人工处理",
                                     );
                                 }
                             }
@@ -2495,6 +2574,10 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                                 let msg = format!("watchdog: 拉起托盘失败: {e}");
                                                 eprintln!("{msg}");
                                                 watchdog_log(&msg);
+                                                watchdog_alert(
+                                                    "spawn_failed",
+                                                    &format!("看门狗拉起托盘失败: {e}，采集停摆中"),
+                                                );
                                                 state.consecutive_failures =
                                                     state.consecutive_failures.saturating_add(1);
                                                 if state.consecutive_failures >= FAILURE_THRESHOLD {
@@ -2506,6 +2589,13 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                                         "连续失败 {} 次，进入 {}s 退避",
                                                         state.consecutive_failures, backoff
                                                     ));
+                                                    watchdog_alert(
+                                                        "backoff",
+                                                        &format!(
+                                                            "托盘连续 {} 次拉起失败，看门狗退避 {}s，期间无采集",
+                                                            state.consecutive_failures, backoff
+                                                        ),
+                                                    );
                                                 }
                                                 save_watchdog_state(&state);
                                             }
@@ -2516,6 +2606,10 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                             // 审查 P2：托盘 exe 缺失此前每分钟静默
                                             // 空转，不留任何痕迹。
                                             watchdog_log("kynoptic-tray.exe 缺失，无法拉起");
+                                            watchdog_alert(
+                                                "tray_missing",
+                                                "kynoptic-tray.exe 缺失，看门狗无法拉起托盘，采集停摆中",
+                                            );
                                         }
                                     }
                                 }
@@ -2540,9 +2634,17 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     "tray-exit.flag 已存在（{}s 前写入），看门狗不拉起托盘；若非本人主动退出托盘，请删除该文件",
                     age
                 ));
+                watchdog_alert(
+                    "exit_flag",
+                    "检测到托盘退出旗标，看门狗已停止拉起托盘；若非本人主动退出，请删除 exe 同目录的 tray-exit.flag",
+                );
             }
             if once {
                 release_watchdog_lock(&lock_path);
+                // 给异步系统通知留渲染窗口（--once 进程退出会杀死通知线程）
+                if WATCHDOG_ALERT_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
                 return Ok(());
             }
             // 锁续命（回归审查 P1）：锁只在启动时创建、从不刷新——120s 后任何

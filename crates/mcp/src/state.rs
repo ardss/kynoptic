@@ -291,12 +291,19 @@ pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, Str
             trunc_echo(date, ECHO_MAX_CHARS)
         )
     })?;
+    // 基准口径：date=今天时为真正「昨日同时刻」；date 为过去日期时前一日已结束，
+    // 返回前一日全天总数。用 baseline_semantic 字段向消费方标注，避免语义漂移不可见。
+    let same_ts = Utc::now() - chrono::Duration::days(1);
+    let baseline_semantic = if same_ts.to_rfc3339() < y_end_r {
+        "same_time"
+    } else {
+        "full_day"
+    };
     let yesterday_same = {
-        let same_ts = Utc::now() - chrono::Duration::days(1);
-        let end = if same_ts.to_rfc3339() < y_end_r {
+        let end = if baseline_semantic == "same_time" {
             same_ts.to_rfc3339()
         } else {
-            y_end_r
+            y_end_r.clone()
         };
         if end <= y_start {
             None
@@ -314,6 +321,7 @@ pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, Str
         "metric": metric,
         "value": value,
         "compared_to": prev_date,
+        "baseline_semantic": baseline_semantic,
         "yesterday_same_period": yesterday_same.map(|v| json!(v)).unwrap_or(Value::Null),
         "change_pct": change_pct.map(|v| json!(v)).unwrap_or(Value::Null),
     }))
@@ -569,7 +577,10 @@ pub fn timeline(
 }
 
 /// 窗口 [from,to) 内各前台应用驻留秒数，降序返回（get_top_apps 数据面）。
-/// 驻留口径与 timeline 相同：switch 事件起点到下一 switch（末段到 to）。
+/// 口径治理（2026-09 统一）：驻留计算统一走 core 权威实现
+/// queries::foreground_dwell_by_app——switch 到下一 switch（末段记到 to），
+/// 超 2 小时的停摆间隔不归属（与 CLI presence / dash overview/report 同一
+/// 实现；此前本函数不封顶，关机停摆被完整计入应用驻留）。
 pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result<Value, String> {
     let from = normalize_bound(from, false)?;
     let to = normalize_bound(to, true)?;
@@ -578,44 +589,9 @@ pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result
             "Invalid range: from ({from}) must be before to ({to})（时间范围无效：from 必须早于 to）"
         ));
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT timestamp, COALESCE(NULLIF(app_name,''), window_title, '(unknown)') \
-             FROM events \
-             WHERE event_type='window' AND event_action='switch' \
-               AND timestamp >= ?1 AND timestamp < ?2 \
-             ORDER BY timestamp ASC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![from, to], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .collect();
-
-    let to_t = chrono::DateTime::parse_from_rfc3339(&to);
-    let mut dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for (i, (ts, app)) in rows.iter().enumerate() {
-        let end = rows
-            .get(i + 1)
-            .map(|(next, _)| next.clone())
-            .unwrap_or_else(|| {
-                to_t.as_ref()
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(|_| ts.clone())
-            });
-        let dur = chrono::DateTime::parse_from_rfc3339(ts)
-            .ok()
-            .zip(chrono::DateTime::parse_from_rfc3339(&end).ok())
-            .map(|(a, b)| (b - a).num_seconds().max(0))
-            .unwrap_or(0);
-        *dwell.entry(app.clone()).or_default() += dur;
-    }
-    let total_apps = dwell.len();
-    let mut ranked: Vec<(String, i64)> = dwell.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let ranked =
+        queries::foreground_dwell_by_app(conn, &from, &to, queries::FG_DWELL_STALL_CAP_SECS, true);
+    let total_apps = ranked.len();
     let truncated = ranked.len() > limit;
     let apps: Vec<Value> = ranked
         .into_iter()
@@ -628,6 +604,7 @@ pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result
         "apps": apps,
         "total_apps": total_apps,
         "truncated": truncated,
+        "dwell_method": queries::FG_DWELL_METHOD,
     }))
 }
 

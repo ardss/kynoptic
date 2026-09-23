@@ -22,7 +22,7 @@
 //!   DB 大小 / CPU / 内存 / 前台应用（复用 MCP `get_current_status` 同一数据面）
 //! - `/api/heatmap?weeks=`           按本地日聚合的活跃度 `[{date,value}]`，缺数天补零
 //! - `/api/apps?days=`               Top 应用排行（window 事件，空名排除）
-//! - `/api/hours?date=`              指定日 24 小时逐时活动量（缺时补零）
+//! - `/api/hours?date=`              指定日 24 小时逐时输入量（按键+点击，缺时补零）
 //! - `/api/settings` (GET/POST)      设置读写（写 settings.json，不触碰 events）
 //! - `/api/diagnostics`              诊断留档文件清单（存在性/mtime/大小/尾部
 //!   20 行，内容净化、不暴露路径；设置页折叠块消费）
@@ -126,9 +126,15 @@ fn reject_future_date(date: &str) -> std::result::Result<(), String> {
 }
 
 pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, String> {
+    // "today" 归一化与 hours/report/apps_grid 同族一致（此前 only summary
+    // 拒绝字面量 today，同面板参数语义打架）
+    let date = match date {
+        "" | "today" => queries::today_local_str(),
+        d => d.to_string(),
+    };
     let (start, end) =
-        queries::local_day_range(date).ok_or_else(|| date_err(date, "YYYY-MM-DD"))?;
-    let totals = queries::day_totals(conn, date);
+        queries::local_day_range(&date).ok_or_else(|| date_err(&date, "YYYY-MM-DD 或 today"))?;
+    let totals = queries::day_totals(conn, &date);
     let top_app = queries::top_apps_today(conn, &start, &end, 1)
         .into_iter()
         .next()
@@ -736,34 +742,19 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         .map(Value::from)
         .unwrap_or(Value::Null);
 
-    // 今日前台应用时长（窗口切换间隔推算；不封顶：连续 N 小时就是 N 小时）
+    // 今日前台应用时长：统一走 core 权威实现 queries::foreground_dwell_by_app
+    // （窗口切换间隔推算，剔除 >2h 停摆间隔；与 CLI presence / report 页 /
+    // MCP get_top_apps 同一份实现与封顶策略——此前各写一份、口径分叉）。
+    // 负间隔按 0（时间戳时区漂移时字符串序可能与瞬时序相反）。
     let mut fg_dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT timestamp, COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') FROM events          WHERE event_type = 'window' AND event_action = 'switch'            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+    for (app, secs) in queries::foreground_dwell_by_app(
+        conn,
+        &start,
+        &end,
+        queries::FG_DWELL_STALL_CAP_SECS,
+        false,
     ) {
-        let rows: Vec<(String, String)> = stmt
-            .query_map(params![&start, &end], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map(|v| v.flatten().collect())
-            .unwrap_or_default();
-        let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
-        for pair in rows.windows(2) {
-            if let (Some(a), Some(b)) = (parse(&pair[0].0), parse(&pair[1].0)) {
-                // 不封顶：连续 N 小时就是 N 小时（审查 DeepSeek）；但必须有下界
-                // 0：SQL 端按 timestamp 字符串排序，时间戳时区偏移漂移时字符串
-                // 序可能与瞬时序相反，(b-a) 为负——无 max(0) 时前台应用会出现
-                // 负分钟数（复核实测 -60，unattended 指标随之更异常）。
-                let secs = (b - a).num_seconds().max(0);
-                // 采集停摆（暂停/看门狗杀/关机）产生的窗口间隔不能记成前台
-                // 时长（全库审查 P1：8 小时关机会变成某应用 8 小时驻留），
-                // 超 2h 的间隔两侧都不归属。
-                if secs > 2 * 3600 {
-                    continue;
-                }
-                *fg_dwell.entry(pair[0].1.clone()).or_insert(0) += secs;
-            }
-        }
+        fg_dwell.insert(app, secs);
     }
     let fg_top = fg_dwell
         .iter()
@@ -908,7 +899,12 @@ pub fn api_apps_at(
     Ok(json!({"days": days, "apps": apps}))
 }
 
-/// GET /api/hours?date= — 指定本地日 24 小时逐时活动量（事件总数），缺时补零。
+/// GET /api/hours?date= — 指定本地日 24 小时逐时输入量（按键+点击），缺时补零。
+///
+/// 口径修复：旧实现直读全部事件条数（含 heartbeat/conn_snapshot 等系统采样
+/// 噪声，实测某小时 97% 以上是采样事件），却在外部文档被当作"黄金时段"消费。
+/// 现改为输入口径：input_agg 分钟行的 keys+clicks 按小时求和；当日无 input_agg
+/// 行（raw 逐键模式）时回退 COUNT(press/click)，与 /api/input 的粒度回退一致。
 pub fn api_hours(conn: &Connection, date: &str) -> std::result::Result<Value, String> {
     let date = match date {
         "" | "today" => queries::today_local_str(),
@@ -916,13 +912,60 @@ pub fn api_hours(conn: &Connection, date: &str) -> std::result::Result<Value, St
     };
     let (start, end) =
         queries::local_day_range(&date).ok_or_else(|| date_err(&date, "YYYY-MM-DD 或 today"))?;
+    let off = queries::LOCAL_MODIFIER_AT_EVENT;
     let mut map = [0i64; 24];
-    for (hour, cnt) in queries::hourly_counts_today(conn, &start, &end) {
-        if (0..24).contains(&hour) {
-            map[hour as usize] = cnt;
+    let mut stmt = conn
+        .prepare(
+            "SELECT CAST(substr(datetime(timestamp, ?1), 12, 2) AS INTEGER) AS hh, \
+                    SUM(MAX(COALESCE(json_extract(event_data,'$.keys'),0),0)) \
+                  + SUM(MAX(COALESCE(json_extract(event_data,'$.clicks'),0),0)) \
+             FROM events \
+             WHERE event_action = 'input_agg' AND timestamp >= ?2 AND timestamp < ?3 \
+               AND json_valid(event_data) GROUP BY hh",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![&off, &start, &end], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut have_minute_rows = false;
+    for (hh, cnt) in rows {
+        have_minute_rows = true;
+        if (0..24).contains(&hh) {
+            map[hh as usize] = cnt.max(0);
         }
     }
-    Ok(json!({"date": date, "values": map}))
+    // raw 粒度回退：无 input_agg 行时按 press/click 原始行计数（不含窗口/采样）
+    if !have_minute_rows {
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(substr(datetime(timestamp, ?1), 12, 2) AS INTEGER) AS hh, COUNT(*) \
+                 FROM events \
+                 WHERE event_type IN ('keyboard','mouse') AND event_action IN ('press','click') \
+                   AND timestamp >= ?2 AND timestamp < ?3 GROUP BY hh",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![&off, &start, &end], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for (hh, cnt) in rows.flatten() {
+            if (0..24).contains(&hh) {
+                map[hh as usize] = cnt.max(0);
+            }
+        }
+    }
+    Ok(json!({
+        "date": date,
+        "values": map,
+        // 口径标注（消费方此前误把本接口当"黄金时段"——真正的黄金时段洞察
+        // 基于 input 密度，随 /api/insights 返回）
+        "note": "value = 每小时输入次数（按键+点击，含自动化注入输入；不含心跳/采样等系统事件）；黄金时段洞察见 /api/insights / value = input counts per hour (keystrokes + clicks, incl. automation-injected input; system sampling events excluded); golden-hours insights come from /api/insights",
+    }))
 }
 
 /// 硬件身份信息（型号 / CPU / GPU 名）。注册表直读、零子进程；
@@ -1078,15 +1121,17 @@ fn latest_device_snapshot(conn: &Connection) -> serde_json::Value {
     serde_json::from_str(&data.unwrap_or_default()).unwrap_or_else(|_| json!({}))
 }
 
-/// GET /api/input?days= — 输入统计聚合（近 `days` 天，含今日）。
+/// GET /api/input?days=&date= — 输入统计聚合（近 `days` 天，含今日）。
 ///
 /// 数据源是 input_agg 分钟计数行（keyboard 行含 per-key 频次 `vk` map，
 /// mouse 行含分键点击/滚轮/移动距离）。只读聚合，缺天补零。
-/// `now` 注入以便测试。
+/// `hourly_date` 指定逐时条形图（hourly_today 字段，字段名向后兼容保留）
+/// 统计哪一天；此前该日恒为今天，请求历史日期会被静默忽略。
 pub fn api_input_at(
     conn: &Connection,
     days: u32,
     today: chrono::NaiveDate,
+    hourly_date: chrono::NaiveDate,
 ) -> std::result::Result<Value, String> {
     let days = days.clamp(1, 365);
     let since_date = today - chrono::Duration::days(i64::from(days) - 1);
@@ -1112,7 +1157,7 @@ pub fn api_input_at(
     let mut key_freq: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut series: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();
-    let today_prefix = today.format("%Y-%m-%d").to_string();
+    let today_prefix = hourly_date.format("%Y-%m-%d").to_string();
     let mut hourly_today: [u64; 24] = [0; 24];
     // 回退判定不能只看行数：一条 event_data 为 NULL/非法 JSON 的脏行会使
     // minute_rows>0 而永远不触发 raw 回退（复现：100 条 raw press + 1 条
@@ -1367,6 +1412,7 @@ pub fn api_input_at(
         "clicks_side1": totals.side1,
         "clicks_side2": totals.side2,
         "hourly_today": hourly_today,
+        "hourly_date": today_prefix.clone(),
         "scroll_ticks": totals.scroll_ticks,
         "moves": totals.moves,
         "move_distance_px": totals.dist_px,
@@ -1453,8 +1499,9 @@ fn insights_compute(
         // Wave20 P0：旧条件 `mouse AND action != 'move'` 在 minute 聚合模式下
         // 把每一行 input_agg（含纯移动、纯注入分钟）都当"一次输入"——
         // 最长专注/深夜/黄金/节律四张卡全部失真。人侧行级判定：
-        // raw press/click 各算一条；input_agg 行仅当 keys/clicks 减注入后 > 0。
-        "SELECT timestamp, event_type, event_action, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE (event_type = 'window'             OR (event_type = 'keyboard' AND event_action = 'press')             OR (event_type = 'mouse' AND event_action = 'click')             OR (event_type IN ('keyboard','mouse') AND event_action = 'input_agg' AND json_valid(event_data)                 AND COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)                   + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) > 0))            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+        // raw press/click 各算一条；input_agg 行仅当 keys/clicks/scroll_ticks
+        // 各自减注入后之和 > 0（与 presence.rs 的 human 口径对齐，滚轮计入）。
+        "SELECT timestamp, event_type, event_action, COALESCE(NULLIF(app_name,''), '') FROM events          WHERE (event_type = 'window'             OR (event_type = 'keyboard' AND event_action = 'press')             OR (event_type = 'mouse' AND event_action = 'click')             OR (event_type IN ('keyboard','mouse') AND event_action = 'input_agg' AND json_valid(event_data)                 AND COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0)                   + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0)                   + COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0) > 0))            AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
     ) {
         if let Ok(rows) = stmt.query_map(params![&start, &end], |r| {
             Ok((
@@ -1495,7 +1542,9 @@ fn insights_compute(
                 "text_en": format!("Still warming up ({n} events so far) — insights appear after 50."),
             }]});
         }
-        return json!({"insights": []});
+        // 空分支附带真实门槛（前端据此渲染"已积累 N/50"，替代曾与门槛不符
+        // 的"采集满一天"静态文案）
+        return json!({"insights": [], "gate": {"events": acts.len(), "required": 50}});
     }
     let fmt_hm = |t: &chrono::DateTime<chrono::FixedOffset>| -> String {
         t.with_timezone(&chrono::Local).format("%H:%M").to_string()
@@ -1688,8 +1737,10 @@ fn insights_compute(
 
 /// GET /api/report?date= — 单日报告：色带时间轴、类别占比、专注时段。
 ///
-/// dwell 分段：window/switch 事件间隔即上一应用的停留时长（不封顶）。
-/// 专注块：间隔 <= presence_bridge 分钟（settings，默认 2，0-15）的连续活动且总长 >=20 分钟。
+/// dwell 分段：window/switch 事件间隔即上一应用的停留时长；相邻间隔超过
+/// queries::FG_DWELL_STALL_CAP_SECS（2 小时停摆）不归属（与 overview/CLI/MCP 同一口径）。
+/// 专注块：间隔 <= presence_bridge 分钟（settings，默认 2，0-15）的连续活动且总长 >=20 分钟，
+/// 口径标识 `criterion: "presence_focus"`（与 CLI 分析的 `input_focus` 区分）。
 pub fn api_report_at(
     conn: &Connection,
     date: &str,
@@ -1730,8 +1781,11 @@ pub fn api_report_at(
         } else {
             (start_min + 1).min(1440)
         };
-        // 审查（DeepSeek 骂评）：不再 120 分钟封顶——连续同应用 3 小时就是
-        // 3 小时前台时长，截断会把深度工作阉割掉；离场判定交给"人在场"指标
+        // 口径治理（2026-09 统一）：与 overview/CLI presence/MCP 同一封顶
+        // 策略——相邻切换间隔超过 2 小时（采集停摆/关机/离场）的部分不归属
+        // 该应用，段在第 120 分钟截断。此前本页不封顶，对同一天比
+        // CLI/overview 多出数百分钟且都自称前台时长。
+        let end_min = end_min.min(start_min + (queries::FG_DWELL_STALL_CAP_SECS / 60) as usize);
         if end_min <= start_min {
             continue;
         }
@@ -1817,7 +1871,10 @@ pub fn api_report_at(
     let focus: Vec<Value> = blocks
         .iter()
         .filter(|(a, b)| b - a >= 20)
-        .map(|(a, b)| json!({"start_min": a, "end_min": b, "minutes": b - a}))
+        .map(|(a, b)| {
+            json!({"start_min": a, "end_min": b, "minutes": b - a,
+                   "criterion": "presence_focus"})
+        })
         .collect();
 
     // 数据起始日（库中最早事件的**本地**日），供前端限制可选日期范围。
@@ -1838,6 +1895,8 @@ pub fn api_report_at(
         "segments": segments,
         "categories": categories,
         "focus": focus,
+        "focus_criterion": "presence_focus",
+        "fg_dwell_method": queries::FG_DWELL_METHOD,
         "data_since": data_since,
     }))
 }
@@ -1867,9 +1926,23 @@ pub fn api_trends_at(
         .map_err(|e| e.to_string())?
         .flatten()
         .collect();
-    let daily: Vec<Value> = rows
-        .iter()
-        .map(|(d, k, c, m)| json!({"date": d, "keys": k, "clicks": c, "active_minutes": m}))
+    // 补零（幽灵零行守卫配套，2026-09）：daily_agg 已不保留无输入日的全零行，
+    // 这里按日历日补齐缺日为 0，保证 daily 恒为 28 行且与日期一一对应——
+    // 报告页趋势图按行号均分宽度并每 7 行标一次日期，缺行会让其后条形整体
+    // 左移、日期标签错位（与 heatmap 逐日 unwrap_or(0) 同一思路）。
+    let mut row_by_date: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for (d, k, c, m) in &rows {
+        row_by_date.insert(d.clone(), (*k, *c, *m));
+    }
+    let daily: Vec<Value> = (0..28)
+        .map(|i| {
+            let d = (since_date + chrono::Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string();
+            let (k, c, m) = row_by_date.get(&d).copied().unwrap_or((0, 0, 0));
+            json!({"date": d, "keys": k, "clicks": c, "active_minutes": m})
+        })
         .collect();
     // 口径（统一 2026-09）：sum7 按日历日对齐——窗口固定 7 个日历日
     // （today-offset-6 ..= today-offset），daily_agg 缺行（缺日）按 0 计。
@@ -1922,7 +1995,7 @@ pub fn api_trends_at(
         // 修复"人在场"假别名（第四口径）：曾经的 presence_minutes = active_minutes
         // 冒充在场（含注入、不桥接）。active_minutes 是 raw 输入口径（daily_agg
         // 派生缓存）；真正的"人在场"权威口径请看 /api/overview。
-        "note": "active_minutes 为 raw 输入分钟口径（每日有键鼠输入的分钟数，来自 daily_agg 派生缓存，不剔注入、不桥接）；在场（human presence）请看 /api/overview / active_minutes is the raw input-minute metric (from the daily_agg cache, not injected-filtered, not bridged); for human presence see /api/overview",
+        "note": "按每日有键鼠输入的分钟数统计；自动化脚本的操作也计入，与总览的「在场」口径不同 / counts minutes with keyboard/mouse input per day; actions by automation tools are included, unlike the presence metric on the overview tab",
     }))
 }
 
@@ -2500,7 +2573,33 @@ pub fn route_req(
                     Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
                 },
             };
-            match api_input_at(conn, days, today_naive()) {
+            // date= 指定逐时条形图统计哪一天（缺省今天；空值 400，与
+            // hours/report 同族一致——此前传 date 会被静默忽略）
+            let hourly = match qdate("date") {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => today_naive(),
+                Ok(Some(d)) => {
+                    let d = if d == "today" {
+                        today_naive()
+                    } else {
+                        match chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d") {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return (
+                                    400,
+                                    "application/json",
+                                    err_json(&date_err(&d, "YYYY-MM-DD 或 today")),
+                                );
+                            }
+                        }
+                    };
+                    if let Err(e) = reject_future_date(&d.to_string()) {
+                        return (400, "application/json", err_json(&e));
+                    }
+                    d
+                }
+            };
+            match api_input_at(conn, days, today_naive(), hourly) {
                 Ok(v) => (200, "application/json", v.to_string()),
                 Err(e) => (400, "application/json", err_json(&e)),
             }

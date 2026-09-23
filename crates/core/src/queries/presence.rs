@@ -104,8 +104,45 @@ pub struct PresenceDay {
 /// 会被折叠到同一个本地钟面值而丢分钟。纪元分钟对两趟天然唯一、严格单调，
 /// 去重与桥接数学完全不变；首末活动在输出时再格式化回本地 "HH:MM"。
 pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> PresenceDay {
+    let (mut human, automation, mixed) = collect_minute_hits(conn, local_day);
+    human.sort_unstable();
+    human.dedup();
+    let bridge = i64::from(bridge_min.min(15));
+    let presence = bridge_count(&human, bridge);
+    // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"（此前按
+    // 行序覆盖在乱序结果集上不可靠，纪元分钟取 min/max 语义精确）。
+    let fmt_epoch_hm = |m: i64| -> Option<String> {
+        chrono::DateTime::from_timestamp(m * 60, 0)
+            .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
+    };
+    let first_activity = human.first().copied().and_then(fmt_epoch_hm);
+    let last_activity = human.last().copied().and_then(fmt_epoch_hm);
+    PresenceDay {
+        presence_minutes: presence,
+        automation_minutes: automation.len() as i64,
+        mixed_minutes: mixed,
+        first_activity,
+        last_activity,
+    }
+}
+
+/// 指定本地日的**人在场纪元分钟序列**（升序去重）——全站唯一权威实现。
+///
+/// 供马拉松等「在场连续性」类异常检测取数：注入输入（injected_keys /
+/// injected_clicks / 注入滚轮）不计入、含滚轮滚动，与 [`classify_minutes`]
+/// / 总览「今日在场」完全同源——自动化脚本把键盘敲得再响也撑不起「人在场」。
+pub fn human_minutes_by_date(conn: &Connection, local_day: &str) -> Vec<i64> {
+    let (mut human, _auto, _mixed) = collect_minute_hits(conn, local_day);
+    human.sort_unstable();
+    human.dedup();
+    human
+}
+
+/// [`classify_minutes`] / [`human_minutes_by_date`] 的共用取数核心：
+/// 返回 (human 纪元分钟, auto 纪元分钟, mixed 分钟数)，均未排序去重。
+fn collect_minute_hits(conn: &Connection, local_day: &str) -> (Vec<i64>, Vec<i64>, i64) {
     let Some((start, end)) = super::local_day_range(local_day) else {
-        return PresenceDay::default();
+        return (Vec::new(), Vec::new(), 0);
     };
     let mut human: Vec<i64> = Vec::new();
     let mut automation: Vec<i64> = Vec::new();
@@ -176,23 +213,72 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
     human.dedup();
     automation.sort_unstable();
     automation.dedup();
-    let bridge = i64::from(bridge_min.min(15));
-    let presence = bridge_count(&human, bridge);
-    // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"（此前按
-    // 行序覆盖在乱序结果集上不可靠，纪元分钟取 min/max 语义精确）。
-    let fmt_epoch_hm = |m: i64| -> Option<String> {
-        chrono::DateTime::from_timestamp(m * 60, 0)
-            .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
+    (human, automation, mixed)
+}
+
+/// 前台应用驻留的「停摆间隔」封顶：相邻窗口切换间隔超过该秒数（如关机、
+/// 暂停采集、看门狗重启造成的空洞）不归属任何应用——8 小时关机不能变成
+/// 某应用 8 小时前台驻留。CLI presence / dash overview / dash report /
+/// MCP get_top_apps 共用同一常量与实现。
+pub const FG_DWELL_STALL_CAP_SECS: i64 = 2 * 3600;
+
+/// 前台驻留口径说明（供 API/MCP 响应显式自述口径）。
+pub const FG_DWELL_METHOD: &str = "按窗口切换间隔累计前台时长，剔除超过 2 小时的停摆间隔";
+
+/// 窗口 `[start, end)`（UTC RFC3339）内各前台应用的驻留秒数——
+/// **前台 dwell 的全站唯一权威实现**（此前 CLI presence、dash overview /
+/// report、MCP get_top_apps 各写一份，封顶策略不一致导致同一问题两个答案）。
+///
+/// 口径：应用驻留 = 本次 switch 到下次 switch 的间隔；相邻间隔超过
+/// `stall_cap_secs`（停摆）不归属；倒序/漂移产生的负间隔按 0 计；
+/// `credit_tail` 为 true 时末次 switch 记到窗口上界（不超过封顶）——
+/// 报告/MCP 的分段视图需要末段，CLI/overview 汇总不需要。
+/// 返回 (app, dwell_secs) 按 dwell 降序、app 升序。
+pub fn foreground_dwell_by_app(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    stall_cap_secs: i64,
+    credit_tail: bool,
+) -> Vec<(String, i64)> {
+    let mut dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT timestamp, COALESCE(NULLIF(app_name,''), NULLIF(window_title,''), '(unknown)') \
+         FROM events \
+         WHERE event_type = 'window' AND event_action = 'switch' \
+           AND timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
+    ) else {
+        return Vec::new();
     };
-    let first_activity = human.first().copied().and_then(fmt_epoch_hm);
-    let last_activity = human.last().copied().and_then(fmt_epoch_hm);
-    PresenceDay {
-        presence_minutes: presence,
-        automation_minutes: automation.len() as i64,
-        mixed_minutes: mixed,
-        first_activity,
-        last_activity,
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![start, end], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map(|v| v.flatten().collect())
+        .unwrap_or_default();
+    let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
+    let parsed: Vec<(chrono::DateTime<chrono::FixedOffset>, &String)> = rows
+        .iter()
+        .filter_map(|(ts, app)| parse(ts).map(|t| (t, app)))
+        .collect();
+    for pair in parsed.windows(2) {
+        // 采集停摆（暂停/看门狗杀/关机）的超长间隔不归属；负间隔按 0
+        // （时间戳时区偏移漂移时字符串序可能与瞬时序相反）。
+        let secs = (pair[1].0 - pair[0].0).num_seconds().max(0);
+        if secs > stall_cap_secs {
+            continue;
+        }
+        *dwell.entry(pair[0].1.clone()).or_insert(0) += secs;
     }
+    if credit_tail {
+        if let (Some(last), Some(end_t)) = (parsed.last(), parse(end)) {
+            let secs = ((end_t - last.0).num_seconds().max(0)).min(stall_cap_secs);
+            *dwell.entry(last.1.clone()).or_insert(0) += secs;
+        }
+    }
+    let mut out: Vec<(String, i64)> = dwell.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// 当前 UTC 时刻的本地偏移修饰符（timeline 等需要把窗口边界与桶换算对齐
