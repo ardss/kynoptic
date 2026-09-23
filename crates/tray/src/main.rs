@@ -351,10 +351,21 @@ fn main() {
     // stalled 布尔位,旧字段全部保留,新旧两代可共存。
     {
         let hb = paths::resolve_heartbeat();
+        // 心跳写失败留档路径（数据目录旁,与采集器错误日志同一文件）;
+        // 数据目录也无写权限时留档本身失败,尽力而为。
+        let hb_err_log = parsed.db.parent().map(|p| p.join("collector-error.log"));
         let hb_handle = thread::Builder::new()
             .name("Heartbeat".into())
             .spawn(move || {
                 let mut prev_flush: u64 = 0;
+                // 心跳写失败计数（磁盘满/exe 目录 ACL 锁死/attrib +R/卷只读）:
+                // 旧实现 `let _` 静默吞掉 → 心跳 mtime 冻结 → watchdog 判挂死
+                // 强杀健康托盘 → 新托盘依旧写不出 → 无限 kill/重启循环,每轮
+                // 丢通道内未 flush 事件。现改为:失败计数随下一拍写入心跳 JSON
+                // （unwritable/wfail 字段,恢复后首个成功写入会把旗标落盘）,
+                // watchdog 见旗标改判环境故障只告警不 kill;并留档
+                // collector-error.log（首次失败 + 之后每 20 次,避免刷盘）。
+                let mut write_failures: u64 = 0;
                 loop {
                     let now = chrono::Utc::now();
                     let flush = kynoptic_core::collector::last_flush_epoch();
@@ -374,15 +385,40 @@ fn main() {
                         && awake.saturating_sub(
                             LAST_FLUSH_AWAKE_SECS.load(std::sync::atomic::Ordering::Relaxed),
                         ) > HEARTBEAT_STALLED_SECS as u64;
+                    // unwritable/wfail 反映的是"上一拍"的写结果:本拍若也失败,
+                    // 旗标留在内存、文件保持旧内容,恢复后随成功写入落盘。
                     let content = format!(
-                        "{{\"pid\":{},\"ts\":\"{}\",\"flush\":{},\"awake\":{},\"stalled\":{}}}",
+                        "{{\"pid\":{},\"ts\":\"{}\",\"flush\":{},\"awake\":{},\"stalled\":{},\"unwritable\":{},\"wfail\":{}}}",
                         std::process::id(),
                         now.to_rfc3339(),
                         flush,
                         awake,
-                        stalled
+                        stalled,
+                        write_failures > 0,
+                        write_failures
                     );
-                    let _ = std::fs::write(&hb, content);
+                    if let Err(e) = std::fs::write(&hb, &content) {
+                        write_failures += 1;
+                        if write_failures == 1 || write_failures.is_multiple_of(20) {
+                            log::error!("心跳文件写入失败(连续 {write_failures} 次): {e}");
+                            if let Some(err_path) = &hb_err_log {
+                                use std::io::Write as _;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(err_path)
+                                {
+                                    let _ = writeln!(
+                                        f,
+                                        "[{}] 心跳文件写入失败(连续 {write_failures} 次): {e}（watchdog 将仅告警不 kill）",
+                                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        write_failures = 0;
+                    }
                     thread::sleep(std::time::Duration::from_secs(30));
                 }
             });
@@ -782,7 +818,11 @@ fn main() {
         let reg = kynoptic_dash::settings::autostart_registry_enabled_pub();
         if reg && !st.autostart {
             st.autostart = true;
-            let _ = kynoptic_dash::settings::save(&parsed.db, &st);
+            // 回写失败不能零留痕：注册表与 settings.json 此后持续不一致，
+            // 至少落 tray.log 告警（不阻塞托盘启动）。
+            if let Err(e) = kynoptic_dash::settings::save(&parsed.db, &st) {
+                log::warn!("注册表→settings.json autostart 回写失败: {e}");
+            }
         }
         apply_autostart(st.autostart);
     }
