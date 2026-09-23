@@ -137,8 +137,14 @@ impl Drop for FileActivityMonitor {
         // 3 线程 + 3 目录句柄。对每个在监视句柄调 CancelIoEx(NULL)，被阻塞
         // 的调用立即以 ERROR_OPERATION_ABORTED 返回，线程外层循环看到
         // stop 旗标后自行退出并关闭句柄。
-        let snapshot: Vec<WatchHandle> = self.live_handles.lock().unwrap().clone();
-        for h in snapshot {
+        // 审查（low）：取消必须与 watch 线程的"移除登记 + 关闭句柄"在同一把
+        // 锁内串行。旧实现 Drop 先快照再锁外逐个 CancelIoEx，watch 线程可在
+        // 快照与取消之间 deregister→CloseHandle，句柄值被其他 CreateFileW 紧邻
+        // 复用时（独立复现程序已观测到同值 204 复用）会误伤无关 IO。锁内取消
+        // 后，watch 线程的关闭只能发生在取消完成之后，不存在对已关闭句柄值的
+        // 取消。
+        let mut table = self.live_handles.lock().unwrap();
+        for h in table.drain(..) {
             unsafe { CancelIoEx(h.0, std::ptr::null_mut()) };
         }
     }
@@ -383,8 +389,7 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
             if tx.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                deregister_handle(&tx.handles, handle);
-                unsafe { CloseHandle(handle) };
+                close_watch_handle(&tx.handles, handle);
                 return;
             }
             let mut returned: u32 = 0;
@@ -446,10 +451,7 @@ fn watch_loop(path: &str, root_name: &str, tx: &RawSender) {
             }
         }
 
-        deregister_handle(&tx.handles, handle);
-        unsafe {
-            CloseHandle(handle);
-        }
+        close_watch_handle(&tx.handles, handle);
     }
 }
 
@@ -458,9 +460,13 @@ fn register_handle(handles: &Mutex<Vec<WatchHandle>>, h: HANDLE) {
     handles.lock().unwrap().push(WatchHandle(h));
 }
 
-/// 句柄关闭前从共享表移除，避免 Drop 对已关闭句柄调 CancelIoEx。
-fn deregister_handle(handles: &Mutex<Vec<WatchHandle>>, h: HANDLE) {
-    handles.lock().unwrap().retain(|x| x.0 != h);
+/// watch 线程侧关闭路径：同一把锁内"先移除登记、再关闭句柄"。
+/// 与 monitor Drop 的锁内 CancelIoEx 互斥串行（审查 low：杜绝 Drop 对已
+/// 关闭且句柄值可能被复用的句柄发起取消），见 FileActivityMonitor::drop。
+fn close_watch_handle(handles: &Mutex<Vec<WatchHandle>>, h: HANDLE) {
+    let mut table = handles.lock().unwrap();
+    table.retain(|x| x.0 != h);
+    unsafe { CloseHandle(h) };
 }
 
 fn open_watch_handle(path: &str) -> HANDLE {
