@@ -27,8 +27,20 @@ jobs:
             exit 1
           }
           Write-Host "version check ok: v$tagVer == $cargoVer"
+      # ci 修复：构建时注入指纹（git hash + 构建时间），/api/status 暴露，
+      # 审查/排障先比对运行态与源码版本，杜绝「源码已修、运行态未修」脱节
       - name: Build release
-        run: cargo build --release -p kynoptic -p kynoptic-tray
+        shell: pwsh
+        run: |
+          $env:KYNOPTIC_GIT_HASH = $env:GITHUB_SHA
+          $env:KYNOPTIC_BUILD_TIME = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          Write-Host "build fingerprint: $env:KYNOPTIC_GIT_HASH @ $env:KYNOPTIC_BUILD_TIME"
+          cargo build --release -p kynoptic -p kynoptic-tray
+      # ci 修复：陈旧产物防线——交付的每个 exe 必须不早于最新源码，
+      # 否则终止发版（先重跑构建）。拦住旧构建混入发布/升级产物。
+      - name: Reject stale build artifacts
+        shell: pwsh
+        run: node scripts/check-fresh-build.mjs target/release kynoptic.exe kynoptic-watchdog.exe kynoptic-tray.exe kynoptic-aggrepair.exe kynoptic-ctl.exe
       - name: Install Inno Setup
         shell: pwsh
         run: |

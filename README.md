@@ -40,8 +40,9 @@ there? The overview card does exactly that arithmetic:
 
 ![Kynoptic dashboard overview](assets/dashboard-hero.png)
 
-> Example from a real day: foreground dwell **20h 1m** vs human presence
-> **10h 14m** → **9h 39m** of "unattended" foreground time — hours the machine
+> Example from a real day: foreground dwell **20h 1m**, human presence
+> **10h 14m**, automation-injected activity **8m** → unattended foreground =
+> 20h 1m − (10h 14m + 8m) = **9h 39m** — hours the machine
 > looked busy while no human was interacting with it (builds, sync jobs,
 > idle-logged-in apps). Raw activity counters would have reported all of it as
 > "usage"; Kynoptic shows you which part was a person.

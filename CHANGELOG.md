@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Collector: the writer connection now applies the same pragmas on open
+  (WAL + busy_timeout) as the read paths. The background aggregation
+  backfill thread holds its own write connection (`BEGIN IMMEDIATE`), so a
+  freshly restarted writer with no busy timeout could immediately hit
+  `SQLITE_BUSY` after a hot reload and silently drop the batch it was
+  about to write; that race window is closed.
+- Dashboard (access control): all responses now also send
+  `Referrer-Policy: no-referrer`, so a token accidentally embedded in a
+  bookmarked `/api/*?token=…` URL is not leaked to other origins if the
+  JSON error page is ever loaded in a browser tab; the 401 body now hints
+  at using the dashboard page (which strips the token from the URL) instead
+  of linking directly to `/api/*`.
+- Dashboard: invalid calendar dates such as `2026-13-45` now report
+  "date format error" instead of the misleading "date is in the future"
+  (the old string comparison ran before any real date parsing).
+- Dashboard: an explicitly empty `?date=` on read endpoints now returns
+  the same 400 "date format error" as other invalid values, instead of
+  silently falling back to today (only a fully omitted parameter falls
+  back).
+- Dashboard: the "unknown monitor id" error no longer echoes the raw
+  attacker-controlled string (response amplification / log-injection
+  surface); it is sanitized the same way as date inputs.
+- Dashboard: settings.json writes clean up their temp file when the final
+  rename fails (file locked by antivirus/backup, ACL denial, disk full) —
+  previously each failed save leaked one `json.tmp.<pid>.<nanos>` file.
+  The tray now logs a warning when the startup autostart sync-back fails
+  instead of discarding the error.
+- Dashboard: hourly buckets for `/api/input`, `/api/apps_grid` and
+  `/api/daily_top` are localized with SQLite `localtime` (timezone
+  resolved per event timestamp) instead of a fixed offset captured at
+  query time, matching every other view; historical hour distributions no
+  longer shift by one hour in timezones with past DST transitions.
+- Dashboard (hardening): the inline dashboard script is now served with a
+  per-request CSP nonce and all inline `onclick`/`onchange` attributes
+  were replaced by delegated listeners; `script-src` no longer allows
+  `unsafe-inline`, restoring a second line of defense behind `esc()` for
+  the 30+ `innerHTML` render paths.
+
 - Dashboard (web): `loadApps` now guards the second `await`
   (`/api/daily_top`) with the same sequence check as the first, so a
   stale response can no longer overwrite the "daily Top 3" table with
@@ -79,11 +117,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expensive multi-day aggregation on every panel poll; pure
   `api_timeline_at` used by tests is unaffected.
 - Single-instance: while upgrading from the session-scoped
-  `Local\KynopticTrayMutex` to the per-user `Global\KynopticTrayMutex\<SID>`
-  name, new builds also acquire and probe the legacy `Local\` name
-  (bridge mutex), so an old tray/collect still running during the upgrade
-  window is detected by new binaries and vice versa — the no-double-writer
-  guarantee no longer lapses across version mixes.
+  `Local\KynopticTrayMutex` to the per-user `Global\KynopticTrayMutex-<SID>`
+  name (single-level name — kernel named objects do not support path-like
+  nesting; the nested `Global\A\B` form fails with ERROR_PATH_NOT_FOUND,
+  the root cause of the 2026-09-23 deployment incident), new builds also
+  acquire and probe the legacy `Local\` name (bridge mutex), so an old
+  tray/collect still running during the upgrade window is detected by new
+  binaries and vice versa — the no-double-writer guarantee no longer lapses
+  across version mixes.
 - Dashboard: new `GET /api/diagnostics` enumerates the known log/archive
   files (collector-error/dashboard-error/watchdog/tray/update/
   dashboard-port) across the data and exe directories with existence,

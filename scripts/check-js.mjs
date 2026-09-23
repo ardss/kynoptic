@@ -7,7 +7,7 @@ import vm from "node:vm";
 
 const htmlPath = process.argv[2] ?? "crates/dash/src/dashboard.html";
 const html = readFileSync(htmlPath, "utf8");
-const re = /<script>([\s\S]*?)<\/script>/g;
+const re = /<script\b[^>]*>([\s\S]*?)<\/script>/g;
 const blocks = [...html.matchAll(re)];
 if (blocks.length === 0) {
   console.error(`no <script> blocks found in ${htmlPath}`);
