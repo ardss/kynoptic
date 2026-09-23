@@ -969,19 +969,32 @@ fn parse_when(s: &str, is_upper_bound: bool) -> Result<String> {
                 // timestamp 列全部由 DateTime<Utc>::to_rfc3339() 写入（+00:00 形），
                 // 边界原样透传 +08:00 等显式偏移字面量，RFC3339 **字符串比较**
                 // 的字典序不等于时间序，窗口会静默算错。镜像 mcp state.rs
-                // normalize_bound 的修法：解析后转 UTC 规范形（+00:00、秒精度）。
-                return Ok(t
-                    .with_timezone(&Utc)
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+                // normalize_bound：转 UTC 规范形（+00:00、秒精度）；to 是排他
+                // 上界，亚秒部分向上取整到下一秒，向下截断会漏掉 [floor(t), t)。
+                let t = t.with_timezone(&Utc);
+                let t = if is_upper_bound && t.timestamp_subsec_nanos() > 0 {
+                    t + chrono::Duration::seconds(1)
+                } else {
+                    t
+                };
+                return Ok(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
             }
             for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
                 if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-                    // 用户输入的是本地钟表时间（审查 P2：按 UTC 补偏移会错 8 小时）
+                    // 用户输入的是本地钟表时间（审查 P2：按 UTC 补偏移会错 8 小时）。
+                    // 同样必须转 UTC 规范形再返回：带 +08:00 后缀的字面量会把
+                    // UTC 行整体判小。DST 空洞（钟面不存在，如春推日）时经
+                    // queries::local_naive_to_utc 顺延到下一有效时刻，不再把
+                    // 本地钟面裸当 UTC。
                     use chrono::TimeZone;
-                    if let Some(local) = chrono::Local.from_local_datetime(&dt).single() {
-                        return Ok(local.to_rfc3339());
-                    }
-                    return Ok(format!("{}+00:00", dt.format("%Y-%m-%dT%H:%M:%S")));
+                    let utc = match chrono::Local.from_local_datetime(&dt).single() {
+                        Some(local) => local.with_timezone(&Utc),
+                        None => match queries::local_naive_to_utc(dt) {
+                            Some(u) => u,
+                            None => chrono::Utc.from_utc_datetime(&dt),
+                        },
+                    };
+                    return Ok(utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
                 }
             }
             Err(Error::InvalidData(format!(
@@ -1094,6 +1107,14 @@ fn cmd_query(args: &[String]) -> Result<()> {
         Some(s) if !s.is_empty() => Some(parse_when(s, true)?),
         _ => None,
     };
+    // 与 MCP get_timeline 同口径：区间倒置/相等时显式报错，不静默返回空集。
+    if let Some(t) = &to {
+        if t.as_str() <= from.as_str() {
+            return Err(Error::InvalidData(format!(
+                "Invalid range: from ({from}) must be before to ({t})（时间范围无效：from 必须早于 to）"
+            )));
+        }
+    }
     let bucket = q
         .bucket
         .as_deref()
@@ -1569,7 +1590,9 @@ fn cmd_presence(args: &[String]) -> Result<()> {
 ///
 /// 共享文件路径契约（见 crates/tray/src/paths.rs，两边必须同步修改）：
 ///   退出旗标 = KYNOPTIC_EXIT_FLAG env > exe 同目录 tray-exit.flag
-///   心跳     = exe 同目录 kynoptic-heartbeat（RFC3339 时间戳，tray 每 30s touch）
+///   心跳     = exe 同目录 kynoptic-heartbeat（JSON {"pid","ts","flush","awake",
+///             "stalled","unwritable","wfail"}，tray 每 30s 重写;unwritable/wfail
+///             为 tray 自报心跳写失败的环境故障旗标,watchdog 只告警不 kill）
 ///   看门狗日志 = exe 同目录 watchdog.log
 const EXIT_FLAG_FILE: &str = "tray-exit.flag";
 const HEARTBEAT_FILE: &str = "kynoptic-heartbeat";
@@ -1626,9 +1649,10 @@ fn heartbeat_path() -> PathBuf {
 }
 
 /// 心跳内容解析（审查 P1：内容升级为 JSON `{"pid","ts","flush","stalled"}`，
-/// 兼容旧版纯 RFC3339 文本）。返回 (内容时间戳, 是否 stalled)。
+/// 兼容旧版纯 RFC3339 文本）。返回 (内容时间戳, 是否 stalled, 是否写失败旗标)。
 /// JSON 解析失败按旧格式回退——两代 tray 滚动升级期互不误判。
-fn heartbeat_parse(content: &str) -> (Option<chrono::DateTime<Utc>>, bool) {
+/// unwritable/wfail 为 tray 自报心跳文件写失败（磁盘满/目录只读等环境故障）。
+fn heartbeat_parse(content: &str) -> (Option<chrono::DateTime<Utc>>, bool, bool) {
     let trimmed = content.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
         let ts = v
@@ -1637,12 +1661,17 @@ fn heartbeat_parse(content: &str) -> (Option<chrono::DateTime<Utc>>, bool) {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc));
         let stalled = v.get("stalled").and_then(|s| s.as_bool()).unwrap_or(false);
-        (ts, stalled)
+        let unwritable = v
+            .get("unwritable")
+            .and_then(|u| u.as_bool())
+            .unwrap_or(false);
+        (ts, stalled, unwritable)
     } else {
         (
             chrono::DateTime::parse_from_rfc3339(trimmed)
                 .ok()
                 .map(|d| d.with_timezone(&Utc)),
+            false,
             false,
         )
     }
@@ -1659,12 +1688,17 @@ fn heartbeat_age_secs(now: chrono::DateTime<Utc>, content: &str) -> Option<i64> 
 /// 心跳是否过期（缺失/不可解析/超龄/stalled 都算过期）。
 /// 审查 P1：stalled=true 表示 tray 自报"采集器在跑但 writer 停滞超 1800s"，
 /// 属采集挂死而非进程死亡——必须同样触发 kill/重启路径。
+/// unwritable=true 表示 tray 自报心跳文件写失败（环境故障）：kill/重启只会
+/// 形成无限循环（新托盘同样写不出心跳），不得判过期，改由告警路径处理。
 fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
     match content {
         Some(c) => {
-            let (_, stalled) = heartbeat_parse(c);
+            let (_, stalled, unwritable) = heartbeat_parse(c);
             if stalled {
                 return true;
+            }
+            if unwritable {
+                return false;
             }
             match heartbeat_age_secs(now, c) {
                 Some(age) => age > HEARTBEAT_MAX_AGE_SECS,
@@ -2041,13 +2075,18 @@ fn mark_spawned(state: &mut WatchdogState, now_epoch: i64, hb_mtime: i64) {
 ///   心跳线程照常写,但采集 writer 停滞超 1800s（采集挂死）——按过期处理
 /// - `HeartbeatRead::Missing` — 文件不存在
 /// - `HeartbeatRead::Unparseable` — 文件存在但解析失败
+/// - `HeartbeatRead::Unwritable` — tray 自报心跳写失败（unwritable=true）：
+///   环境故障（磁盘满/exe 目录只读/ACL 锁死）,kill/重启只会无限循环,不 kill
 ///
 /// 策略区分（tray 每 30s 全量重写心跳文件）：
 /// - 复查回到阈值内 = 睡眠唤醒假象，放行；
 /// - 复查仍超龄（无论是否继续增长）= 心跳 40s 未刷新且超龄，判挂死 kill；
 /// - 复查仍 Stalled = 采集持续停滞（core last_flush_epoch 不前进），判挂死 kill；
 /// - 复查仍 Missing = 写方已死或文件被删，未恢复，kill；
-/// - 复查仍 Unparseable = tray 只写合法内容，垃圾说明写路径损坏，未恢复，kill。
+/// - 复查仍 Unparseable = tray 只写合法内容，垃圾说明写路径损坏，未恢复，kill；
+/// - 复查 Unwritable = 环境故障,只告警不 kill。但旗标可能冻结在旧内容上
+///   （tray 已死）,调用方须先实地探针交叉验证（见 cmd_watchdog）:环境实测
+///   可写时把复查改判 Missing（未恢复,kill）。
 ///
 /// 旧实现 `age_recheck > age_first && age_recheck > MAX` 在首查与复查都是
 /// i64::MAX（文件持续不可读）时恒假，挂死 tray 永不 kill（4-8 小时空洞）。
@@ -2059,6 +2098,8 @@ enum HeartbeatRead {
     Unparseable,
     /// 内容合法但 tray 自报采集停滞（stalled=true）
     Stalled,
+    /// tray 自报心跳文件写失败（环境故障）
+    Unwritable,
     /// 合法时间戳，距今年龄（秒）
     Age(i64),
 }
@@ -2070,22 +2111,67 @@ fn recheck_should_kill(_first: HeartbeatRead, recheck: HeartbeatRead) -> bool {
         HeartbeatRead::Age(_) => true,
         // 审查 P1：复查仍 stalled = 采集持续停滞（进程活着也没用）,判挂死
         HeartbeatRead::Stalled => true,
+        // 复查 unwritable 旗标 = 环境故障,kill/重启只会无限循环,仅告警
+        HeartbeatRead::Unwritable => false,
         // 持续缺失/持续不可解析 = 未恢复（旧 bug 即漏掉这一分支）
         HeartbeatRead::Missing | HeartbeatRead::Unparseable => true,
     }
 }
 
+/// 心跳写权限实地探针（watchdog 侧环境故障守卫）：tray 的 unwritable 旗标在
+/// "每一拍写入都失败"时无法落盘,心跳文件冻结/缺失无法与采集挂死区分,须由
+/// watchdog 实地探测。
+///
+/// 必须真实写入而不能只看 open 成败：磁盘满（ENOSPC）时 open 照样成功,
+/// 只有 write/sync 才会失败——而"磁盘满"正是告警文案点名的环境故障场景。
+/// 文件存在:以写权限打开,在文件尾追加 1 个探针字节后立即截断还原（不改
+/// 心跳内容;真机探针已验证 +R/ACL 拒写时打开即失败,ENOSPC 时 write 即失败,
+/// 正常文件还原后内容逐字节一致）;文件缺失:在心跳目录创建临时探针文件并
+/// 实际写入+sync（覆盖 ENOSPC 与目录只读）。任一失败 = 环境故障。
+fn heartbeat_env_writable() -> bool {
+    use std::io::{Seek, SeekFrom, Write};
+    let path = heartbeat_path();
+    if path.exists() {
+        let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            return false;
+        };
+        let Ok(orig_len) = f.metadata().map(|m| m.len()) else {
+            return false;
+        };
+        if f.seek(SeekFrom::End(0))
+            .and_then(|_| f.write_all(b"K"))
+            .is_err()
+        {
+            return false;
+        }
+        // 截断还原探针字节,尽力而为（写成功后 set_len/sync 失败在实务上
+        // 不可能,但失败也不改判——写路径本身已证实可写）。
+        let _ = f.set_len(orig_len).and_then(|_| f.sync_all());
+        return true;
+    }
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let probe = dir.join(".kynoptic-hb-probe");
+    let created = std::fs::File::create(&probe)
+        .and_then(|mut f| f.write_all(b"K").and_then(|_| f.sync_all()));
+    let _ = std::fs::remove_file(&probe);
+    created.is_ok()
+}
+
 /// 心跳读取分类（纯函数）：content=None 即文件缺失;解析失败归 Unparseable
 /// （首查按 Missing/Unparseable 都视同过期触发复查,区别只在日志与策略注释,
 /// recheck 判定两者等价）。审查 P1：JSON 内容 stalled=true 归 Stalled——
-/// 时间戳新鲜但采集挂死,同样走 kill/重启路径。
+/// 时间戳新鲜但采集挂死,同样走 kill/重启路径。unwritable=true 归 Unwritable
+/// （环境故障,优先级低于 stalled——stalled 是采集自身故障仍须 kill）。
 fn classify_heartbeat(content: Option<&str>, now: chrono::DateTime<Utc>) -> HeartbeatRead {
     match content {
         None => HeartbeatRead::Missing,
         Some(c) => {
-            let (ts, stalled) = heartbeat_parse(c);
+            let (ts, stalled, unwritable) = heartbeat_parse(c);
             match ts {
                 Some(_) if stalled => HeartbeatRead::Stalled,
+                Some(_) | None if unwritable => HeartbeatRead::Unwritable,
                 Some(t) => HeartbeatRead::Age((now - t).num_seconds().max(0)),
                 None => HeartbeatRead::Unparseable,
             }
@@ -2237,7 +2323,27 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     .map(|s| s.trim().to_string())
                     .ok();
                 let hb_first = classify_heartbeat(hb_read.as_deref(), Utc::now());
-                let first_stale = heartbeat_stale(Utc::now(), hb_read.as_deref());
+                // tray 自报心跳写失败（unwritable 旗标）需实地探针交叉验证:
+                // 旗标可能因 30s 写窗口时序冻结在旧内容上（恢复拍先落盘
+                // unwritable=true 的内容,tray 随即崩溃 → 文件永久冻结）,
+                // 此时 heartbeat_stale 对 Unwritable 恒 false,已死的 tray
+                // 将被永久免检。环境实测可写 = 旗标是冻结旧内容,按挂死
+                // 复查处理;实测不可写 = 环境故障,只告警不 kill。
+                let first_stale = if matches!(hb_first, HeartbeatRead::Unwritable) {
+                    if heartbeat_env_writable() {
+                        watchdog_log(
+                            "tray 自报 unwritable 旗标, 但实地探针证实心跳路径可写: 旗标疑为冻结旧内容, 按挂死复查处理",
+                        );
+                        true
+                    } else {
+                        watchdog_log(
+                            "tray 自报心跳写失败(unwritable 旗标, 实地探针证实不可写): 环境故障(磁盘满/目录只读/权限), 仅告警不 kill",
+                        );
+                        false
+                    }
+                } else {
+                    heartbeat_stale(Utc::now(), hb_read.as_deref())
+                };
                 if first_stale {
                     // 睡眠唤醒守卫：等待 40s 后复查（纯函数 recheck_should_kill）
                     // 审查 P1：stalled=true（tray 自报采集停滞）也走此复查路径
@@ -2258,18 +2364,41 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         let hb_recheck_read = std::fs::read_to_string(heartbeat_path())
                             .map(|s| s.trim().to_string())
                             .ok();
-                        let hb_recheck = classify_heartbeat(hb_recheck_read.as_deref(), Utc::now());
+                        let hb_recheck_raw =
+                            classify_heartbeat(hb_recheck_read.as_deref(), Utc::now());
+                        // 复查同样交叉验证 unwritable 旗标（同首查）:40s 后
+                        // 旗标仍在且环境实测可写 = 写方确实未恢复,按持续缺失
+                        // （未恢复）判挂死;实测不可写才豁免。
+                        let hb_recheck = if matches!(hb_recheck_raw, HeartbeatRead::Unwritable) {
+                            if heartbeat_env_writable() {
+                                HeartbeatRead::Missing
+                            } else {
+                                hb_recheck_raw
+                            }
+                        } else {
+                            hb_recheck_raw
+                        };
                         if recheck_should_kill(hb_first, hb_recheck) {
-                            watchdog_log(&format!(
-                                "复查仍未恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 判定采集挂死, kill kynoptic-tray 以重启"
-                            ));
-                            if !kill_tray() {
-                                // 审查 P2：杀失败（AV/权限）不留痕的话，后续每
-                                // 个 --once 周期都重复 40s 睡眠+复查，且托盘
-                                // 永远不会被真正重启。
+                            // 环境故障守卫:tray 的 unwritable 旗标在"每拍写入都
+                            // 失败"时无法落盘（心跳冻结/缺失）,kill 前实地探测
+                            // 心跳写权限;不可写 = kill/重启只会无限循环,改判环境
+                            // 故障仅告警（探测打开失败不改动文件内容）。
+                            if !heartbeat_env_writable() {
                                 watchdog_log(
-                                    "kill kynoptic-tray 失败(taskkill 非零)，可能被安全软件拦截",
+                                    "复查仍未恢复且心跳写权限探测失败(磁盘满/目录只读/ACL 锁死): 判定环境故障, 仅告警不 kill",
                                 );
+                            } else {
+                                watchdog_log(&format!(
+                                    "复查仍未恢复(首次 {hb_first:?} → 复查 {hb_recheck:?}), 判定采集挂死, kill kynoptic-tray 以重启"
+                                ));
+                                if !kill_tray() {
+                                    // 审查 P2：杀失败（AV/权限）不留痕的话，后续每
+                                    // 个 --once 周期都重复 40s 睡眠+复查，且托盘
+                                    // 永远不会被真正重启。
+                                    watchdog_log(
+                                        "kill kynoptic-tray 失败(taskkill 非零)，可能被安全软件拦截",
+                                    );
+                                }
                             }
                         } else {
                             watchdog_log(&format!(
@@ -2279,8 +2408,9 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     } else {
                         watchdog_log("复查期间托盘已退出, 交由下一轮拉起路径处理");
                     }
-                } else {
-                    // 心跳健康：熔断计数清零（P1：手动启动托盘成功即恢复拉起）
+                } else if !matches!(hb_first, HeartbeatRead::Unwritable) {
+                    // 心跳健康：熔断计数清零（P1：手动启动托盘成功即恢复拉起）。
+                    // Unwritable（环境故障,上方已告警）不算健康,不清零。
                     if state.consecutive_failures != 0
                         || state.last_spawn_epoch != 0
                         || state.backoff_until_epoch != 0
@@ -2330,54 +2460,63 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     watchdog_log(
                                         "kynoptic-tray.exe 是符号链接/junction，拒绝拉起（防劫持，请排查）",
                                     );
-                                } else if tray.exists() {
-                                    use std::process::{Command, Stdio};
-                                    const DETACHED_PROCESS: u32 = 0x0000_0008;
-                                    match Command::new(&tray)
-                                        .arg("--minimized")
-                                        .stdin(Stdio::null())
-                                        .stdout(Stdio::null())
-                                        .stderr(Stdio::null())
-                                        .creation_flags(DETACHED_PROCESS)
-                                        .spawn()
-                                    {
-                                        Ok(_) => {
-                                            mark_spawned(
-                                                &mut state,
-                                                now_epoch,
-                                                heartbeat_mtime_epoch(),
-                                            );
-                                            save_watchdog_state(&state);
-                                        }
-                                        Err(e) => {
-                                            // 审查 P2：spawn 失败此前只打 stderr
-                                            //（计划任务下无人看见），state 不动
-                                            // → 判定 Recovered → 下一分钟再 Spawn，
-                                            // 无限 1/min 循环且退出码恒 0。计入
-                                            // 失败走既有退避熔断。
-                                            let msg = format!("watchdog: 拉起托盘失败: {e}");
-                                            eprintln!("{msg}");
-                                            watchdog_log(&msg);
-                                            state.consecutive_failures =
-                                                state.consecutive_failures.saturating_add(1);
-                                            if state.consecutive_failures >= FAILURE_THRESHOLD {
-                                                let backoff =
-                                                    backoff_delay_secs(state.consecutive_failures);
-                                                state.backoff_until_epoch = now_epoch + backoff;
-                                                watchdog_log(&format!(
-                                                    "连续失败 {} 次，进入 {}s 退避",
-                                                    state.consecutive_failures, backoff
-                                                ));
-                                            }
-                                            save_watchdog_state(&state);
-                                        }
+                                } else {
+                                    // 审查：更新替换中断会留下「tray exe 缺失、
+                                    // 仅存 .bak」——拉起前先做孤儿 .bak 恢复，
+                                    // 否则看门狗只会每分钟报「缺失」永不复原。
+                                    if !tray.exists() {
+                                        update::recover_orphan_baks(dir);
                                     }
                                     if tray.exists() {
-                                        watchdog_log("托盘不在且非用户退出,已拉起");
-                                    } else {
-                                        // 审查 P2：托盘 exe 缺失此前每分钟静默
-                                        // 空转，不留任何痕迹。
-                                        watchdog_log("kynoptic-tray.exe 缺失，无法拉起");
+                                        use std::process::{Command, Stdio};
+                                        const DETACHED_PROCESS: u32 = 0x0000_0008;
+                                        match Command::new(&tray)
+                                            .arg("--minimized")
+                                            .stdin(Stdio::null())
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null())
+                                            .creation_flags(DETACHED_PROCESS)
+                                            .spawn()
+                                        {
+                                            Ok(_) => {
+                                                mark_spawned(
+                                                    &mut state,
+                                                    now_epoch,
+                                                    heartbeat_mtime_epoch(),
+                                                );
+                                                save_watchdog_state(&state);
+                                            }
+                                            Err(e) => {
+                                                // 审查 P2：spawn 失败此前只打 stderr
+                                                //（计划任务下无人看见），state 不动
+                                                // → 判定 Recovered → 下一分钟再 Spawn，
+                                                // 无限 1/min 循环且退出码恒 0。计入
+                                                // 失败走既有退避熔断。
+                                                let msg = format!("watchdog: 拉起托盘失败: {e}");
+                                                eprintln!("{msg}");
+                                                watchdog_log(&msg);
+                                                state.consecutive_failures =
+                                                    state.consecutive_failures.saturating_add(1);
+                                                if state.consecutive_failures >= FAILURE_THRESHOLD {
+                                                    let backoff = backoff_delay_secs(
+                                                        state.consecutive_failures,
+                                                    );
+                                                    state.backoff_until_epoch = now_epoch + backoff;
+                                                    watchdog_log(&format!(
+                                                        "连续失败 {} 次，进入 {}s 退避",
+                                                        state.consecutive_failures, backoff
+                                                    ));
+                                                }
+                                                save_watchdog_state(&state);
+                                            }
+                                        }
+                                        if tray.exists() {
+                                            watchdog_log("托盘不在且非用户退出,已拉起");
+                                        } else {
+                                            // 审查 P2：托盘 exe 缺失此前每分钟静默
+                                            // 空转，不留任何痕迹。
+                                            watchdog_log("kynoptic-tray.exe 缺失，无法拉起");
+                                        }
                                     }
                                 }
                             }
@@ -2681,11 +2820,25 @@ mod tests {
         // 原样透传 +08:00 会按字典序比较、窗口静默算错（与 mcp normalize_bound 同修）
         let t = parse_when("2026-09-09T12:30:00+08:00", false).unwrap();
         assert_eq!(t, "2026-09-09T04:30:00+00:00");
-        // 无时区的钟表时间按本地时区解释（审查 P2：按 UTC 补偏移会错 8 小时）
+        // 无时区的钟表时间按本地时区解释后**转 UTC 规范形**：带 +08:00 后缀
+        // 的字面量会把 UTC 行整体判小（审查：字符串字典序 ≠ 时间序）
+        use chrono::TimeZone;
         let naive = parse_when("2026-09-09T12:30", false).unwrap();
-        assert!(naive.starts_with("2026-09-09T12:30:00"), "{naive}");
+        let exp = chrono::Local
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str("2026-09-09T12:30", "%Y-%m-%dT%H:%M")
+                    .unwrap(),
+            )
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        assert_eq!(naive, exp, "{naive}");
         let naive_s = parse_when("2026-09-09T12:30:45", true).unwrap();
-        assert!(naive_s.starts_with("2026-09-09T12:30:45"), "{naive_s}");
+        assert!(
+            naive_s.ends_with("+00:00") && naive_s.len() == 25,
+            "{naive_s}"
+        );
     }
 
     #[test]
@@ -3271,6 +3424,51 @@ mod tests {
             HeartbeatRead::Stalled,
             HeartbeatRead::Age(5)
         ));
+    }
+
+    #[test]
+    fn classify_heartbeat_unwritable_flag_is_env_fault_not_stale() {
+        // 心跳写失败旗标（unwritable/wfail,tray 新格式新增字段）:归 Unwritable,
+        // 不得判过期触发 kill/重启（环境故障 kill 只会无限循环）
+        let now = Utc::now();
+        let fresh = (now - Duration::seconds(10)).to_rfc3339();
+        let unwritable_fresh = format!(
+            r#"{{"pid":1,"ts":"{fresh}","flush":0,"stalled":false,"unwritable":true,"wfail":7}}"#
+        );
+        assert_eq!(
+            classify_heartbeat(Some(&unwritable_fresh), now),
+            HeartbeatRead::Unwritable
+        );
+        // 时间戳冻结（超龄）+ 旗标仍归 Unwritable（环境故障优先于年龄）
+        let old = (now - Duration::seconds(600)).to_rfc3339();
+        let unwritable_old = format!(
+            r#"{{"pid":1,"ts":"{old}","flush":0,"stalled":false,"unwritable":true,"wfail":42}}"#
+        );
+        assert_eq!(
+            classify_heartbeat(Some(&unwritable_old), now),
+            HeartbeatRead::Unwritable
+        );
+        assert!(!heartbeat_stale(now, Some(&unwritable_fresh)));
+        assert!(!heartbeat_stale(now, Some(&unwritable_old)));
+        // stalled 优先级高于 unwritable:采集自身故障仍须 kill
+        let stalled_and_unwritable = format!(
+            r#"{{"pid":1,"ts":"{fresh}","flush":1,"stalled":true,"unwritable":true,"wfail":3}}"#
+        );
+        assert_eq!(
+            classify_heartbeat(Some(&stalled_and_unwritable), now),
+            HeartbeatRead::Stalled
+        );
+        // 旧格式（无该字段）解析不受影响
+        assert!(!heartbeat_stale(now, Some(&healthy_like(&fresh))));
+        // 复查 Unwritable → 放行（环境故障只告警）
+        assert!(!recheck_should_kill(
+            HeartbeatRead::Age(200),
+            HeartbeatRead::Unwritable
+        ));
+    }
+
+    fn healthy_like(fresh: &str) -> String {
+        format!(r#"{{"pid":1,"ts":"{fresh}","flush":0,"stalled":false}}"#)
     }
 
     // === collect 单实例互斥体（P1） ===

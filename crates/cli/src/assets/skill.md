@@ -23,7 +23,7 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
 CLI 解析顺序：`--db <PATH>` 全局参数 > `KYNOPTIC_DB` 环境变量 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。
 CLI 默认路径推导时会打印 `using db: <path>` 到 stderr——**注意核对**，防静默读到错误库。
-仪表盘：http://127.0.0.1:8422/（只读 HTTP；8422 被占会按 8422-8432 → 18422-18432 → 28422-28432 三段回退（可能落到 18422 段），实际端口写在 data\dashboard-port.txt；服务没起来 panel 000 时先找托盘进程）。
+仪表盘：http://127.0.0.1:8422/（只读 HTTP；**端口三段回退仅托盘入口生效**——CLI `kynoptic dashboard` 端口被占会直接报错退出，需 `--port` 另指；实际端口写在 data\dashboard-port.txt；服务没起来 panel 000 时先找托盘进程）。
 
 ## 核心命令
 
@@ -34,7 +34,7 @@ kynoptic stats                    # 输入统计（raw 口径）
 kynoptic report --date today         # 单日报告（--date 也接受 yesterday / YYYY-MM-DD）
 kynoptic analyze --days 7           # 近 7 天逐日专注/碎片/异常分析
 kynoptic analyze --date YYYY-MM-DD  # 单日专注/碎片/异常分析
-kynoptic export --days 7 --out FILE [--format csv|jsonl] [--redact]
+kynoptic export --days 7 --out FILE [--format csv|json|jsonl] [--redact]
 kynoptic db stats                 # 行数/库大小
 kynoptic mcp [--db PATH]           # 启动 MCP 服务器（stdio）；--db 与 KYNOPTIC_DB 均可（--db 内部即经 KYNOPTIC_DB 传递）
 kynoptic update --check            # 只查不装：stdout "UPDATE <ver>" 或 "UP TO DATE (<cur>)"；托盘每日自动检查并把新版本写入 data\update-available.txt（菜单/面板同步提示，绝不自动安装）
@@ -46,7 +46,7 @@ HTTP API（GET 全部只读）：
 `/api/settings`、`/api/status`、`/api/summary`、`/api/input`、
 `/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours`（黄金时段）、
 `/api/apps_grid`、`/api/daily_top`。
-写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（CSRF 三重校验的一部分；Origin 必须与 dashboard-port.txt 里的实际端口一致），body 只传要改的字段。
+写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（Origin 必须与 dashboard-port.txt 里的实际端口一致）；**另有每会话 `X-Kynoptic-Token` 校验**——该令牌由服务端随机生成、仅注入面板页面，外部脚本拿不到，直连 POST 会被 403。外部脚本无法写设置，请引导用户在面板里改，或提示用户手动操作。
 
 ## 口径铁律（引用数字前必读）
 
