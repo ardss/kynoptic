@@ -1,10 +1,10 @@
 ﻿; Kynoptic 安装器脚本（Inno Setup 6）
-; CI: iscc kynoptic.iss /DAppVersion=0.2.2
+; CI: iscc kynoptic.iss /DAppVersion=0.3.0
 ; 缺省值必须与 Cargo.toml/CHANGELOG 的当前版本一致（版本漂移审查：忘传
 ; /DAppVersion 时曾打包出 0.2.0 安装包而二进制是 0.2.2 的自相矛盾产物）。
 
 #ifndef AppVersion
-#define AppVersion "0.2.2"
+#define AppVersion "0.3.0"
 #endif
 
 #define AppName "Kynoptic"
