@@ -84,30 +84,28 @@ pub fn apm_burst_from_data(burst_minutes: &[(String, i64)], hist_avg: f64) -> Ve
     out
 }
 
-/// 马拉松会话：最长连续活跃段 ≥ [`MARATHON_MIN_MINUTES`] 分钟。
+/// 马拉松会话：最长连续**人在场**段 ≥ [`MARATHON_MIN_MINUTES`] 分钟。
 ///
-/// **口径（统一 2026-09）**：
-/// - 活跃分钟先按 `bridge_minutes` 桥接补洞再求最长连续段——相邻间隙
+/// **口径（统一 2026-09，审查修复）**：数据源是
+/// [`queries::human_minutes_by_date`] 的 human 分钟序列（剔注入输入、含滚轮，
+/// 与总览「今日在场」/ presence 完全同源）——此前误用 `active_minutes_by_date`
+/// 的 input_keys/clicks 桶（含自动化注入输入），同一分钟在异常页算"在场"、
+/// 在总览算"自动化"，违背「自动化脚本敲得再响也不算人在场」的承诺。
+///
+/// - human 分钟先按 `bridge_minutes` 桥接补洞再求最长连续段——相邻间隙
 ///   ≤ bridge 分钟（无输入阅读）按连续计。`bridge_minutes` 读 settings 的
 ///   `presence_bridge_minutes`（0-15，默认 2，与 presence/专注块同一口径源）。
-/// - 活跃分钟本身已剔除 move-only 分钟（纯鼠标移动不算活跃，见
-///   [`queries::active_minutes_by_date`]），脚本级鼠标抖动无法伪造马拉松。
 ///
-/// **纯函数**：`active_minutes` 由 [`queries::active_minutes_by_date`] 取出。
-pub fn marathon_from_minutes(active_minutes: &[String], bridge_minutes: u32) -> Vec<Anomaly> {
-    if active_minutes.is_empty() {
+/// **纯函数**：`human_minutes` 为 UTC 纪元分钟序列
+/// （由 [`queries::human_minutes_by_date`] 取出）。
+pub fn marathon_from_epoch_minutes(human_minutes: &[i64], bridge_minutes: u32) -> Vec<Anomaly> {
+    if human_minutes.is_empty() {
         return Vec::new();
     }
     let bridge = i64::from(bridge_minutes.min(15));
-    // 解析为纪元分钟，排序去重后按 bridge 补洞。
-    // **时区语义（交叉审查 P2）**：输入是本地钟面 "YYYY-MM-DDTHH:MM"
-    // （见 [`queries::active_minutes_by_date`]），按**本地时区**解释成真实纪元
-    // 分钟，末端 fmt 也转回本地——否则先 naive-as-UTC 解析再 UTC 格式化，
-    // 回退路径（历史 UTC 原串）会把本地 12:00 显示成 04:00。
-    let mut mins: Vec<i64> = active_minutes
-        .iter()
-        .map(|s| crate::time::local_epoch_minutes_or_zero(s))
-        .collect();
+    // 输入为 UTC 纪元分钟（升序去重由取数方保证，这里再防御一次），
+    // 按 bridge 补洞后求最长连续段。
+    let mut mins: Vec<i64> = human_minutes.to_vec();
     mins.sort_unstable();
     mins.dedup();
     let mut bridged: Vec<i64> = Vec::with_capacity(mins.len());
@@ -149,6 +147,22 @@ pub fn marathon_from_minutes(active_minutes: &[String], bridge_minutes: u32) -> 
     } else {
         Vec::new()
     }
+}
+
+/// [`marathon_from_epoch_minutes`] 的本地钟面串入口：把 "YYYY-MM-DDTHH:MM"
+/// 本地钟面串按**本地时区**折算成纪元分钟再判定（保留给以钟面串为数据源的
+/// 既有调用/测试；新代码请直接用纪元分钟入口）。
+pub fn marathon_from_minutes(active_minutes: &[String], bridge_minutes: u32) -> Vec<Anomaly> {
+    if active_minutes.is_empty() {
+        return Vec::new();
+    }
+    let mut mins: Vec<i64> = active_minutes
+        .iter()
+        .map(|s| crate::time::local_epoch_minutes_or_zero(s))
+        .collect();
+    mins.sort_unstable();
+    mins.dedup();
+    marathon_from_epoch_minutes(&mins, bridge_minutes)
 }
 
 /// 排序 i64 分钟序列的最长连续段长度（相邻差 1 计连续）。
@@ -259,14 +273,16 @@ pub fn detect_apm_burst(conn: &Connection, date: &str) -> Result<Vec<Anomaly>> {
     Ok(apm_burst_from_data(&burst, hist_avg))
 }
 
-/// 马拉松会话检测（编排入口）。`bridge_minutes` 见 [`marathon_from_minutes`]。
+/// 马拉松会话检测（编排入口）。数据源为 [`queries::human_minutes_by_date`]
+/// 的人在场的纪元分钟序列（剔注入、含滚轮，与总览「今日在场」同源）；
+/// `bridge_minutes` 见 [`marathon_from_epoch_minutes`]。
 pub fn detect_marathon_session(
     conn: &Connection,
     date: &str,
     bridge_minutes: u32,
 ) -> Result<Vec<Anomaly>> {
-    let minutes = queries::active_minutes_by_date(conn, date);
-    Ok(marathon_from_minutes(&minutes, bridge_minutes))
+    let minutes = queries::human_minutes_by_date(conn, date);
+    Ok(marathon_from_epoch_minutes(&minutes, bridge_minutes))
 }
 
 /// 新应用突增检测（编排入口）。

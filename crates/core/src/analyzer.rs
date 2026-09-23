@@ -12,12 +12,19 @@ use crate::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 
+/// 段口径标识：本结构恒为 [`FOCUS_CRITERION_INPUT`]。
+/// dash /api/report 的「在场专注块」（human 分钟 + 桥接 + 无切换上限）用
+/// `presence_focus`。AI/外部消费者按此字段区分两个同名指标，不再对账无门。
+pub const FOCUS_CRITERION_INPUT: &str = "input_focus";
+
 /// 一段"输入专注"区间：>= 5 分钟连续键盘/鼠标活动，且中途窗口切换次数 < 阈值。
 /// Wave22 P0 口径标注：这是 **键鼠输入分钟** 口径（无桥接、切换上限），
 /// 与 dashboard /api/report 的"在场专注块"（human 分钟 + 桥接 + 无切换上限）
-/// 是**两个不同指标**，数值不可互换；消费方文案须写明"输入专注"。
+/// 是**两个不同指标**，数值不可互换；每段序列化时携带 `criterion` 字段自述口径。
 #[derive(Debug, Serialize, Clone)]
 pub struct FocusSegment {
+    /// 口径标识（恒为 "input_focus"，与 dash 的 "presence_focus" 区分）
+    pub criterion: String,
     pub start: String,     // ISO8601
     pub end: String,       // ISO8601
     pub duration_min: i64, // 持续分钟数
@@ -106,6 +113,7 @@ where
                 let avg_switches = if dur > 0 { *switches / dur } else { 0 };
                 if avg_switches <= FOCUS_MAX_WINDOW_SWITCHES_PER_MIN {
                     segments.push(FocusSegment {
+                        criterion: FOCUS_CRITERION_INPUT.into(),
                         start: s,
                         end: e,
                         duration_min: dur,

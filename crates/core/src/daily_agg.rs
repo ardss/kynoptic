@@ -90,8 +90,23 @@ pub fn upsert_day(conn: &Connection, date: &str, s: &DayStats) -> Result<bool> {
 /// 返回 0/1 表示是否有变化。`date` 为本地日期 `YYYY-MM-DD`。
 ///
 /// 注意：WHERE 用 `timestamp >= ? AND < ?`（本地午夜→UTC 边界，走 idx_events_timestamp）。
+///
+/// 幽灵零行守卫（审查修复 2026-09）：当日无任何输入事件时不写全零行——
+/// 旧实现无条件 upsert，无事件日也被写入 date 主键的全 0 行，趋势图出现
+/// 假零点；并对历史遗留的全零行做自愈清除（daily_agg 是派生缓存，清的是
+/// 缓存行，events 原始数据不动）。
 pub fn recompute_day(conn: &Connection, date: &str) -> Result<bool> {
     let stats = compute_day(conn, date)?;
+    if stats.keys == 0 && stats.clicks == 0 && stats.active_min == 0 {
+        // 无输入事件日：清除可能存在的全零行（含旧版本遗留的幽灵行），
+        // 有真实数值的历史行不受影响（WHERE 限定三列全 0）。
+        let deleted = conn.execute(
+            "DELETE FROM daily_agg \
+             WHERE date = ?1 AND keys = 0 AND clicks = 0 AND active_minutes = 0",
+            params![date],
+        )?;
+        return Ok(deleted > 0);
+    }
     upsert_day(conn, date, &stats)
 }
 

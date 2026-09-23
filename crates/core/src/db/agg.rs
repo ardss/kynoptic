@@ -11,7 +11,9 @@
 //! - `input_moves`   sum=移动距离(px), count=采样移动次数
 //! - `window_switches` sum=count=窗口切换次数
 //!
-//! agg_daily 只存 `app:<name>` 行（count=该应用当日事件数），供 new_app_surge
+//! agg_daily 只存 `app:<name>` 行——**纯计数桶**（语义定案 2026-09）：
+//! count=该应用当日事件数，sum_value 恒 NULL 且无读取方（见
+//! [`UPSERT_DAILY_APP`] 注释），供 new_app_surge
 //! 的全历史 per-app 统计从 O(全表) 降到 O(聚合行数)。
 //!
 //! **samples 语义（perf3 2026-09 对齐）**：agg_minute 的 count_value（samples）
@@ -66,6 +68,10 @@ ON CONFLICT(date, hour, minute, bucket_id) DO UPDATE SET
     max_event_rowid = MAX(COALESCE(agg_minute.max_event_rowid, 0), excluded.max_event_rowid)
 ";
 
+// `app:<name>` 是**纯计数桶**（语义定案 2026-09）：count_value = 该应用当日
+// 事件数，sum_value 恒为 NULL 且无读取方——消费方必须只按 count_value 求和，
+// 禁止按 sum 列聚合（按 sum 求和会静默得 0/NULL）。agg_minute 各桶则
+// sum/count 皆有语义（见模块头 bucket 语义）。
 const UPSERT_DAILY_APP: &str = "
 INSERT INTO agg_daily (date, bucket_id, sum_value, count_value)
 VALUES (?1, 'app:' || ?2, NULL, ?3)
@@ -433,15 +439,23 @@ fn write_cursor(conn: &Connection, value: &str) {
 }
 
 /// 本地 (date, hour) 块 → UTC RFC3339 `[start, end)` 边界（sargable，走
-/// idx_events_timestamp）。DST 缺失小时回退下一小时顺延边界。
+/// idx_events_timestamp）。
+///
+/// DST 语义（审查修复 2026-09）：
+/// - **start 钟面缺失**（春季跳变的缺口小时，如本地 02:00 不存在）：返回
+///   None，整块跳过——缺口小时里不存在任何钟面时刻，不可能有事件归属该
+///   本地小时，跳过即正确（不是静默丢数据）。
+/// - **end 钟面缺失**：回退为 `start + 1 小时` 的真实下一时刻——旧回退把
+///   naive 钟面直接当 UTC 解释，窗口多出一小时并与下一小时桶完全重叠，
+///   重算时相邻桶重复计入同一批事件。
 fn hour_bounds(date: &str, hour: i64) -> Option<(String, String)> {
     use chrono::{NaiveDate, TimeZone};
     let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
     let naive = day.and_hms_opt(hour as u32, 0, 0)?;
     let start = Local
         .from_local_datetime(&naive)
-        .earliest()
-        .map(|dt| dt.with_timezone(&Utc).to_rfc3339())?;
+        .earliest()?
+        .with_timezone(&Utc);
     let end_naive = if hour >= 23 {
         day.succ_opt()?.and_hms_opt(0, 0, 0)?
     } else {
@@ -450,9 +464,9 @@ fn hour_bounds(date: &str, hour: i64) -> Option<(String, String)> {
     let end = Local
         .from_local_datetime(&end_naive)
         .earliest()
-        .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
-        .or_else(|| Some(Utc.from_utc_datetime(&end_naive).to_rfc3339()))?;
-    Some((start, end))
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(start + chrono::Duration::hours(1));
+    Some((start.to_rfc3339(), end.to_rfc3339()))
 }
 
 fn local_day_bounds(date: &str) -> Option<(String, String)> {

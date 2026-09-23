@@ -58,6 +58,14 @@ fn summary_rejects_bad_date() {
     assert!(api_summary(&conn, "not-a-date").is_err());
 }
 
+// "today" 归一化与 hours/report/apps_grid 同族一致（此前仅 summary 拒绝字面量）
+#[test]
+fn summary_accepts_today_alias() {
+    let conn = mem_conn();
+    let v = api_summary(&conn, "today").unwrap();
+    assert_eq!(v["date"], json!(queries::today_local_str()));
+}
+
 // === timeline 桶化 ===
 
 #[test]
@@ -376,12 +384,15 @@ fn apps_ranks_window_events_and_excludes_empty_names() {
 }
 
 // === hours ===
+// 口径：每小时输入次数（input_agg 的 keys+clicks；无分钟行时回退 press/click
+// 原始行），不再统计 heartbeat/采样等系统事件。
 
 #[test]
 fn hours_fills_24_buckets_with_zeros() {
     let conn = mem_conn();
     insert(&conn, &local_ts(0, 9, 0), "keyboard", "press", None);
-    insert(&conn, &local_ts(0, 9, 30), "window", "switch", Some("code"));
+    insert(&conn, &local_ts(0, 9, 30), "mouse", "click", None);
+    insert(&conn, &local_ts(0, 10, 0), "window", "switch", Some("code")); // 非输入，不计
     insert(&conn, &local_ts(0, 22, 0), "mouse", "click", None);
     let v = api_hours(&conn, "2026-09-09").unwrap();
     assert_eq!(v["date"], json!("2026-09-09"));
@@ -390,6 +401,20 @@ fn hours_fills_24_buckets_with_zeros() {
     assert_eq!(values[9], json!(2));
     assert_eq!(values[22], json!(1));
     assert_eq!(values[8], json!(0), "缺时补零");
+    assert_eq!(values[10], json!(0), "窗口切换不是输入，不再计入");
+    assert!(v["note"].is_string(), "响应自带口径标注");
+}
+
+// input_agg 分钟行优先：keys+clicks 按小时求和，系统采样事件不混入
+#[test]
+fn hours_prefers_input_agg_rows() {
+    let conn = mem_conn();
+    insert_input_agg(&conn, &local_ts(0, 9, 0), r#"{"keys":3,"clicks":2}"#);
+    insert_input_agg(&conn, &local_ts(0, 9, 30), r#"{"keys":1,"clicks":0}"#);
+    insert(&conn, &local_ts(0, 9, 45), "system", "heartbeat", None); // 采样噪声
+    let v = api_hours(&conn, "2026-09-09").unwrap();
+    let values = v["values"].as_array().unwrap();
+    assert_eq!(values[9], json!(6));
 }
 
 #[test]
@@ -1225,6 +1250,37 @@ fn insights_empty_db_returns_empty_list() {
         v["insights"].as_array().unwrap().is_empty(),
         "完全无数据时仍为空列表（不出 warming-up 卡）: {v}"
     );
+    // 空分支附带真实门槛，前端据此渲染"已积累 N/50"
+    assert_eq!(v["gate"]["events"], json!(0));
+    assert_eq!(v["gate"]["required"], json!(50));
+}
+
+// 洞察页人侧判定含滚轮：纯滚轮阅读分钟也算一次输入（与 presence.rs 口径对齐）
+#[test]
+fn insights_counts_scroll_only_minute_as_human_input() {
+    let conn = mem_conn();
+    insert_input_agg(
+        &conn,
+        &local_ts(0, 14, 0),
+        r#"{"keys":0,"clicks":0,"scroll_ticks":12,"injected_keys":0,"injected_clicks":0,"injected_scroll_ticks":0}"#,
+    );
+    // 注入滚轮不算人侧
+    insert_input_agg(
+        &conn,
+        &local_ts(0, 15, 0),
+        r#"{"keys":0,"clicks":0,"scroll_ticks":12,"injected_keys":0,"injected_clicks":0,"injected_scroll_ticks":12}"#,
+    );
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    // 未到 50 门槛时走 warming-up 卡：纯滚轮分钟计 1 条，注入滚轮分钟不计
+    let list = v["insights"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{v}");
+    assert!(
+        list[0]["text_en"].as_str().unwrap().contains("1 events"),
+        "纯滚轮分钟应计 1 条输入事件: {v}"
+    );
 }
 
 // === anomalies：message_en 映射 ===
@@ -1294,18 +1350,31 @@ fn trends_no_presence_alias_and_notes_raw_metric() {
     .unwrap();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
     let v = api_trends_at(&conn, today).unwrap();
-    let d = &v["daily"].as_array().unwrap()[0];
+    // daily 恒为 28 个日历日（缺日补零），按日期定位而非行号
+    let arr = v["daily"].as_array().unwrap();
+    assert_eq!(arr.len(), 28);
+    let d = arr
+        .iter()
+        .find(|x| x["date"] == json!("2026-09-08"))
+        .expect("2026-09-08 应在 28 天窗口内");
     assert_eq!(d["active_minutes"], json!(45));
+    // 窗口内无 daily_agg 行的日子补零（幽灵零行守卫删除全零行后由 API 补齐）
+    assert_eq!(arr[0]["active_minutes"], json!(0));
+    assert_eq!(arr[0]["date"], json!("2026-08-13"));
     // 假别名彻底移除：active_minutes 是 raw 输入口径，不得冒充"人在场"
     assert!(
         d.get("presence_minutes").is_none(),
         "trends 不得再有 presence_minutes 假别名: {d}"
     );
     assert!(v["this_week"].get("presence_minutes").is_none());
-    // note 字段说明口径并指向权威入口
+    // note 字段用平实语言说明口径（含自动化注入，与"在场"口径不同）
     let note = v["note"].as_str().unwrap();
-    assert!(note.contains("active_minutes"), "{note}");
-    assert!(note.contains("/api/overview"), "{note}");
+    assert!(note.contains("自动化脚本"), "{note}");
+    assert!(note.contains("automation"), "{note}");
+    assert!(
+        !note.contains("daily_agg") && !note.contains("raw"),
+        "面向用户的小字不再暴露内部术语: {note}"
+    );
 }
 
 /// 口径（统一 2026-09）：sum7 窗口固定 7 个日历日，daily_agg 缺行按 0 计。
@@ -1332,7 +1401,16 @@ fn trends_sum7_aligned_by_calendar_date_zero_fills_missing_days() {
     assert_eq!(v["this_week"]["active_minutes"], json!(30));
     // 上周（09-03..09-09）7 天全有数据：不受本周缺日影响
     assert_eq!(v["last_week"]["keys"], json!(700));
-    assert_eq!(v["daily"].as_array().unwrap().len(), 13);
+    // daily 恒为 28 个日历日；缺的 09-13 在 daily 里补零（报告页趋势图
+    // 按行号布局，缺行会导致条形/日期标签错位）
+    let arr = v["daily"].as_array().unwrap();
+    assert_eq!(arr.len(), 28);
+    let missing = arr
+        .iter()
+        .find(|x| x["date"] == json!("2026-09-13"))
+        .expect("缺日也应在 28 天窗口内");
+    assert_eq!(missing["active_minutes"], json!(0));
+    assert_eq!(missing["keys"], json!(0));
 }
 
 // === 真 socket 测试（审查清单 A5）：真实 TcpListener + 真实 TCP 连接 ===
@@ -1762,7 +1840,7 @@ fn input_sql_aggregation_matches_row_semantics() {
         r#"{"clicks":4,"clicks_left":3,"clicks_right":1,"scroll_ticks":9,"moves":20,"move_distance_px":500}"#,
     );
     ins(&ts9(3), "mouse", r#"not json"#); // 脏行：跳过
-    let v = api_input_at(&conn, 7, today).unwrap();
+    let v = api_input_at(&conn, 7, today, today).unwrap();
     assert_eq!(v["granularity"], json!("minute"));
     assert_eq!(v["keys_total"], json!(15));
     assert_eq!(v["clicks_total"], json!(4));

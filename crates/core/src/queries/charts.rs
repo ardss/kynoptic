@@ -384,11 +384,12 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
 /// 当日活跃分钟列表（ISO "YYYY-MM-DDTHH:MM"），按时间升序。
 ///
 /// 口径（统一 2026-09）：**剔除 move-only 分钟**——仅当该分钟有 keys 或
-/// clicks 才算活跃（脚本级纯鼠标移动不能伪造活跃/马拉松）。
+/// clicks 才算活跃（脚本级纯鼠标移动不能伪造活跃）。
 ///
-/// 供 [`crate::analyzer::fragmentation_score`] 与
-/// [`crate::anomaly::detect_marathon_session`] 共享——两者此前各写一份
-/// `SELECT DISTINCT substr(timestamp,1,16) WHERE event_type IN ('keyboard','mouse')`。
+/// **注意（2026-09 审查）**：本函数是「键鼠输入活跃」口径（含自动化注入
+/// 输入），仅供 [`crate::analyzer::fragmentation_score`] 等输入类分析使用；
+/// 「人在场」类判定（如马拉松检测）必须用 [`super::human_minutes_by_date`]
+/// （剔注入、含滚轮，与总览在场同源），禁止再把本函数当「在场」数据源。
 pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
     let mut out = Vec::new();
     // 优先读 agg_minute 读缓存（有 keys/clicks 桶行即视为活跃分钟，不含 move-only）

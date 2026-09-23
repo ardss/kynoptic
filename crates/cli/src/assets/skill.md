@@ -43,8 +43,8 @@ kynoptic update --check            # 只查不装：stdout "UPDATE <ver>" 或 "U
 HTTP API（GET 全部只读）：
 `/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶；hours 有效范围 1–744（31 天），超出范围的取值会被收拢到该区间）、
 `/api/insights`（6 张叙事卡）、`/api/report`、`/api/heatmap`、`/api/anomalies`（含 message_en）、
-`/api/settings`、`/api/status`、`/api/summary`、`/api/input`、
-`/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours`（黄金时段）、
+`/api/settings`、`/api/status`、`/api/summary`、`/api/input?date=`（逐时输入序列，date 指定统计哪一天，缺省今天；空值或非法日期返回 400）、
+`/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours?date=`（每小时输入次数，含自动化注入输入；非黄金时段；黄金时段洞察取 /api/insights）、
 `/api/apps_grid`、`/api/daily_top`。
 写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（Origin 必须与 dashboard-port.txt 里的实际端口一致）；**另有每会话 `X-Kynoptic-Token` 校验**——该令牌由服务端随机生成、仅注入面板页面，外部脚本拿不到，直连 POST 会被 403。外部脚本无法写设置，请引导用户在面板里改，或提示用户手动操作。
 

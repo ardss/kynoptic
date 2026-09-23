@@ -272,11 +272,37 @@ fn daily_agg_recompute_recent_days_covers_today_and_yesterday() {
 #[test]
 fn daily_agg_recompute_recent_days_empty_is_zero() {
     let conn = setup_test_db();
-    // 无任何事件 → 仍写出 N 行（每天 0 计数），但返回 changed 计数亦为 N
+    // 幽灵零行守卫（审查修复 2026-09）：无任何事件 → 不写全零行、不产生变化
     let n = kynoptic_core::daily_agg::recompute_recent_days(&conn, 3).unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(n, 0);
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM daily_agg", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(rows, 3);
+    assert_eq!(rows, 0);
+
+    // 自愈：旧版本遗留的全零行在重算时被清除
+    conn.execute(
+        "INSERT INTO daily_agg (date, keys, clicks, active_minutes, apm_avg) \
+         VALUES ('2099-01-01', 0, 0, 0, 0.0)",
+        [],
+    )
+    .unwrap();
+    // "2099-01-01" 不在重算窗口内，应保留——守卫只动被重算且全零的日期
+    kynoptic_core::daily_agg::recompute_recent_days(&conn, 1).unwrap();
+    let kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM daily_agg WHERE date = '2099-01-01'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1, "窗口外的行不受影响");
+
+    // 对遗留全零日显式重算 → 清除
+    let n2 = kynoptic_core::daily_agg::recompute_day(&conn, "2099-01-01").unwrap();
+    assert!(n2, "清除全零行应计为有变化");
+    let ghost: i64 = conn
+        .query_row("SELECT COUNT(*) FROM daily_agg", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ghost, 0);
 }

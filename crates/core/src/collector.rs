@@ -674,7 +674,11 @@ impl Collector {
         // 每秒一次的 input_agg UPSERT 逐次累加，同一会话因结束方式不同可差
         // 约 60 倍。total_written 仅保留给写入吞吐观测（CLI collected 输出）。
         let total = self.db.session_event_count(self.session_id);
-        self.db.end_session(self.session_id, total, 0.0);
+        // 审查：空转时长此前硬编码 0.0，会话内 idle_start/idle_end 事件对
+        // 覆盖的空转/离机时段从未折算进 sessions.idle_seconds（跨日长会话
+        // 统计失真）。与幽灵清扫共用 db 层同一口径回填。
+        let idle_secs = self.db.session_idle_seconds(self.session_id);
+        self.db.end_session(self.session_id, total, idle_secs);
 
         self.finished = true;
         log::info!("采集器已停止");

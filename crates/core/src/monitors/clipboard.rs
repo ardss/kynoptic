@@ -93,7 +93,15 @@ fn read_clipboard_hash() -> Option<(String, [u8; 16], usize)> {
         // 计算长度（Wave20 P2：以 GlobalSize 为上界——异常应用写入未 NUL
         // 终止的数据时纯信任剪贴板会越界读）
         let global_bytes = GlobalSize(handle);
-        let max_u16 = (global_bytes / 2).max(1);
+        // 审查：GlobalSize < 2 时连一个 u16（2 字节）都装不下，按空内容
+        // 处理——此前 `.max(1)` 会强读 1 个 u16，越界读到的字节混入
+        // simple_hash 与 byte_len，污染去重哈希（正是本上界要防的场景）。
+        if global_bytes < 2 {
+            GlobalUnlock(handle);
+            CloseClipboard();
+            return Some(("empty".into(), [0u8; 16], 0));
+        }
+        let max_u16 = global_bytes / 2;
         let mut len = 0usize;
         let mut p = ptr as *const u16;
         while len < max_u16 && *p != 0 {
