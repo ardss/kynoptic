@@ -537,7 +537,7 @@ impl Database {
             return;
         }
         log::info!("正在执行 WAL 检查点...");
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        wal_checkpoint_truncate(&conn);
         // Wave19 性能审查：retention=0 下库是 append-only，空闲页极少，
         // 每日 VACUUM 收益≈0 却要重写整库（1 年 4.5GB = 每天 ~13GB 白烧
         // IO + 等量瞬时磁盘峰值）。空闲页占比 < 10% 直接跳过。
@@ -559,7 +559,7 @@ impl Database {
         }
         // VACUUM 全程经 WAL 重写（把 WAL 再次撑大），故检查点必须放在 VACUUM 之后，
         // 否则"维护后库大小"被未截断的 WAL 虚增近一倍（perf-write 2026-09 实测）。
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        wal_checkpoint_truncate(&conn);
     }
 
     /// 等待后台聚合回填完成（最多 `timeout`）。供测试与需要在回填结束后
@@ -629,6 +629,21 @@ impl Database {
             },
             || log::warn!("daily_agg 刷新跳过：写连接不可用"),
         );
+    }
+}
+
+/// TRUNCATE 检查点（审查 33-F8）：存在活跃 reader（dashboard 常驻只读池 /
+/// core 读池持未结束读事务）时 busy=1，WAL 无法截断——旧实现 execute_batch
+/// 丢弃返回值，「检查点完成」与实际不符。这里读出 busy 状态留痕日志。
+fn wal_checkpoint_truncate(conn: &Connection) {
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        Ok(0) => {}
+        Ok(busy) => log::info!(
+            "WAL 检查点未能截断（busy={busy}，存在活跃 reader），WAL 文件保留（64MB 兜底 PASSIVE 检查点仍有效）"
+        ),
+        Err(e) => log::debug!("WAL 检查点查询失败（跳过）: {e}"),
     }
 }
 

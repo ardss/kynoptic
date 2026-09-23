@@ -508,12 +508,16 @@ impl PendingFlush {
         // 统一锁获取顺序：先 PENDING 再 SUPPRESS（与 drain 一致，审查 P2：
         // 两函数顺序相反构成潜在死锁对）。
         let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
+        // 审查 33-F1：抑制在消费时保留语义，此分支不再写 sup → 只读借用
+        let sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
         // 快照 pending（restore 用）：无论下方走哪个分支，还原时整体放回
         let pending_snapshot = g.clone();
         // 抑制分钟内：残留计数直接丢弃（小值覆盖大终值的口子，二轮审查 P1）
+        // 审查 33-F1：消费时**不得**清除抑制语义——抑制只能由 activate/reset/
+        // drain 的 rollover 管理。此前在此清掉 SUPPRESS_MINUTE 后，collector
+        // 的直写兜底 flush_partial 会拿到无抑制状态，把重启会话的几键小值
+        // 折成 final:false 整行 UPSERT 覆盖上一会话的 final:true 大终值。
         if matches!(sup.as_ref(), Some(k) if *k == cur) {
-            *sup = None;
             return (
                 Vec::new(),
                 PendingFlush {
