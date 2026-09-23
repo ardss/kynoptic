@@ -44,7 +44,7 @@ mod summary;
 /// [`local_offset_modifier`] 固定用**当前时刻**的偏移，跨 DST 的历史日会在
 /// 小时桶上整体错位 1 小时并可跨日溢出。仅用于 SELECT/GROUP BY 投影，
 /// WHERE 仍走可下推索引的 timestamp 裸区间。
-pub(crate) const LOCAL_MODIFIER_AT_EVENT: &str = "localtime";
+pub const LOCAL_MODIFIER_AT_EVENT: &str = "localtime";
 
 /// 计数类查询的默认值（失败时）。
 /// 真正的 SQL 异常会 log warn；`QueryReturnedNoRows` 静默（视为无数据）。
@@ -75,6 +75,30 @@ pub fn get_string(row: &Row<'_>) -> rusqlite::Result<String> {
     row.get(0)
 }
 
+/// 本地钟面时间 → UTC（供「本地日始/用户输入的本地钟面时间」换算共用）。
+///
+/// DST 处理：
+/// - 唯一映射：直接换算；
+/// - 歧义（秋拨重复小时）：取最早者（与旧 `.earliest()` 行为一致）；
+/// - 空洞（春拨本地钟面不存在，如智利/黎巴嫩春推日的午夜）：顺延到下一个
+///   有效时刻（逐小时步进，最多 49 次封顶）——此前兜底把 naive 钟面直接当
+///   UTC 解释，日起点整体错位一个本地偏移量。
+pub fn local_naive_to_utc(naive: chrono::NaiveDateTime) -> Option<chrono::DateTime<Utc>> {
+    use chrono::TimeZone;
+    let mut cur = naive;
+    for _ in 0..49 {
+        match Local.from_local_datetime(&cur) {
+            chrono::LocalResult::Single(t) => return Some(t.with_timezone(&Utc)),
+            chrono::LocalResult::Ambiguous(a, _) => {
+                return Some(a.with_timezone(&Utc));
+            }
+            chrono::LocalResult::None => cur += chrono::Duration::hours(1),
+        }
+    }
+    // 理论不可达（49 小时内必有有效映射）；兜底返回 None（调用方按无窗口处理）
+    None
+}
+
 /// 将「本地某一天」`date`（`YYYY-MM-DD`，用户钟表上的日期）转成
 /// `[start, end)` 的 UTC RFC3339 边界，供 `WHERE timestamp >= start AND timestamp < end`。
 ///
@@ -83,15 +107,11 @@ pub fn get_string(row: &Row<'_>) -> rusqlite::Result<String> {
 ///
 /// `date` 解析失败时返回 `None`，调用方应回退到原始字符串前缀匹配或视为空。
 pub fn local_day_range(date: &str) -> Option<(String, String)> {
-    use chrono::{NaiveDate, TimeZone};
+    use chrono::NaiveDate;
     let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
     let to_utc_rfc3339 = |d: NaiveDate| -> Option<String> {
         let naive = d.and_hms_opt(0, 0, 0)?;
-        Local
-            .from_local_datetime(&naive)
-            .earliest()
-            .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
-            .or_else(|| Some(Utc.from_utc_datetime(&naive).to_rfc3339()))
+        local_naive_to_utc(naive).map(|dt| dt.to_rfc3339())
     };
     let start = to_utc_rfc3339(day)?;
     let end = to_utc_rfc3339(day.succ_opt()?)?;

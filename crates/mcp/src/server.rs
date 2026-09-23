@@ -16,6 +16,21 @@ use serde_json::{json, Value};
 
 use crate::state;
 
+/// 审查修复：stdio 单行长度上限（1MiB）。`reader.lines()` 无界缓冲，超长行
+/// 会被整段缓冲并可能整段回显（内存/带宽放大）；超限行按 -32700 拒绝并跳过，
+/// 会话不中断。正常 MCP 消息远小于此值。
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// 错误回显截断：解析/校验错误不再整段回显入参原文（防带宽放大），
+/// 超过 max_chars 按字符边界截断并加省略标记。
+pub(crate) fn trunc_echo(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{head}…(截断/truncated)")
+}
+
 /// 与 spec 对齐的 MCP protocolVersion（客户端未带版本或版本不受支持时，
 /// 以此默认值应答——Claude Desktop 当前为 2024-11-05 系）。
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -63,7 +78,7 @@ impl McpServer {
             "tools/call" => self.tools_call(&params),
             other => Err(json!({
                 "code": -32601,
-                "message": format!("method not found: {other}"),
+                "message": format!("method not found: {}", trunc_echo(other, 64)),
             })),
         };
 
@@ -120,7 +135,7 @@ impl McpServer {
                         let mut list = Vec::with_capacity(a.len());
                         for v in a {
                             let s = v.as_str().ok_or_else(|| {
-                                format!("groups must be an array of strings, got {v}（groups 必须是字符串数组）")
+                                format!("groups must be an array of strings, got {}（groups 必须是字符串数组）", trunc_echo(&v.to_string(), 64))
                             })?;
                             list.push(s.to_string());
                         }
@@ -128,7 +143,8 @@ impl McpServer {
                     }
                     Some(v) => {
                         return Err(format!(
-                            "groups must be an array of strings, got {v}（groups 必须是字符串数组）"
+                            "groups must be an array of strings, got {}（groups 必须是字符串数组）",
+                            trunc_echo(&v.to_string(), 64)
                         ))
                     }
                 };
@@ -269,9 +285,12 @@ fn parse_limit(args: &Value) -> Result<(usize, Option<usize>), String> {
     match args.get("limit") {
         None | Some(Value::Null) => Ok((20, None)),
         Some(v) => {
-            let n = v
-                .as_i64()
-                .ok_or_else(|| format!("limit must be an integer, got {v}（limit 必须是整数）"))?;
+            let n = v.as_i64().ok_or_else(|| {
+                format!(
+                    "limit must be an integer, got {}（limit 必须是整数）",
+                    trunc_echo(&v.to_string(), 64)
+                )
+            })?;
             if n < 1 {
                 return Err(format!(
                     "limit must be >= 1, got {n}（limit 必须 >= 1，不接受 0 或负数）"
@@ -376,6 +395,50 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// 读取一行（到 `\n` 或 EOF），超过 `max` 字节即停止缓冲并丢弃该行剩余部分
+///（换行符本身已消费）。返回 `None` = 无任何字节的干净 EOF。
+/// 审查修复：替代无界的 `reader.lines()`，超长行不再整段缓冲。
+fn read_line_capped<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    loop {
+        let avail = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            return Ok(if buf.is_empty() { None } else { Some(buf) });
+        }
+        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&avail[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(buf));
+        }
+        let n = avail.len();
+        buf.extend_from_slice(avail);
+        reader.consume(n);
+        if buf.len() > max {
+            // 超限：不再累积，只丢弃到行尾，保证会话可继续
+            loop {
+                let avail = match reader.fill_buf() {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                if avail.is_empty() {
+                    return Ok(Some(buf));
+                }
+                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
+                    return Ok(Some(buf));
+                }
+                let n = avail.len();
+                reader.consume(n);
+            }
+        }
+    }
+}
+
 /// 逐行读取 JSON-RPC 消息并写出响应（换行分隔）。EOF 即退出。
 /// 单行解析失败回 -32700（不中断会话——坏行之后的消息照常处理）。
 pub fn serve<R: BufRead, W: Write + Send + 'static>(
@@ -401,26 +464,40 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
     // 审查 P2：wait_for 并发上限 + EOF 关停信号。live_wait 统计在飞线程数，
     // 超过 MAX_CONCURRENT_WAIT_FOR 直接回错（不再无限 fan-out 出线程）。
     let live_wait = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            // 审查 P1：区分可恢复与终结错误——非 UTF-8 字节已消费可继续会话
-            //（按 parse error 回应）；真实 IO 错误（描述符损坏等）会永久重复
-            // 返回，继续循环就是 -32700 忙等打转，必须退出。
-            let is_utf8 = matches!(
-                line.as_ref().err(),
-                Some(err) if err.kind() == std::io::ErrorKind::InvalidData
-            );
-            if !is_utf8 {
-                break;
-            }
+    let mut reader = reader;
+    loop {
+        let raw = match read_line_capped(&mut reader, MAX_LINE_BYTES) {
+            Ok(Some(raw)) => raw,
+            // 真实 IO 错误（描述符损坏等）会永久重复返回，继续循环就是
+            // -32700 忙等打转，必须退出。
+            Err(_) => break,
+            Ok(None) => break,
+        };
+        let line = if raw.len() > MAX_LINE_BYTES {
+            // 审查修复：单行超长（>1MiB）按 parse error 拒绝，不缓冲不回显原文
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": null,
-                "error": { "code": -32700, "message": "Parse error: invalid UTF-8" },
+                "error": { "code": -32700, "message": "Parse error: line exceeds length limit（单行超长，超过 1MiB 上限）" },
             })
             .to_string();
             respond(&writer, &resp);
             continue;
+        } else {
+            // 审查 P1：非 UTF-8 字节已消费，按 parse error 回应后继续会话
+            match String::from_utf8(raw) {
+                Ok(s) => s,
+                Err(_) => {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": { "code": -32700, "message": "Parse error: invalid UTF-8" },
+                    })
+                    .to_string();
+                    respond(&writer, &resp);
+                    continue;
+                }
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -514,7 +591,7 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
             Err(e) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": null,
-                "error": { "code": -32700, "message": format!("parse error: {e}") },
+                "error": { "code": -32700, "message": format!("parse error: {}", trunc_echo(&e.to_string(), 256)) },
             })),
         };
         if let Some(r) = response {
@@ -639,6 +716,54 @@ mod tests {
         );
         let v: Value = serde_json::from_slice(&out.lock().unwrap()).unwrap();
         assert_eq!(v["error"]["code"], json!(-32700));
+    }
+
+    // ─── 审查修复：单行长度上限 + 错误回显截断 ─────────────────────────
+
+    #[test]
+    fn oversized_line_is_rejected_and_session_continues() {
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        // 超限行（>1MiB 单行，非法 JSON）后跟一条正常 ping——会话必须存活
+        let big = format!("{{\"junk\":\"{}\"\n", "A".repeat(MAX_LINE_BYTES + 16));
+        let input = format!("{big}{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}}\n");
+        serve(
+            std::io::BufReader::new(input.as_bytes()),
+            out.clone(),
+            McpServer::new(":memory:"),
+        );
+        let out_bytes = out.lock().unwrap().clone();
+        // 只允许两行响应：超长拒绝 + ping 应答；总长必须远小于输入（无回显放大）
+        let text = String::from_utf8(out_bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "应有恰好两条响应: {text}");
+        let v1: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v1["error"]["code"], json!(-32700));
+        assert!(lines[0].len() < 512, "拒绝响应不得回显超长原文");
+        let v2: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v2["id"], json!(2));
+        assert_eq!(v2["result"], json!({}));
+    }
+
+    #[test]
+    fn error_echo_is_truncated_for_oversized_params() {
+        // normalize_bound 对超长非法时间串只回显前 64 字符
+        let long = "x".repeat(100_000);
+        let r = state::normalize_bound(&long, false).unwrap_err();
+        assert!(r.len() < 512, "错误信息不得整段回显入参: len={}", r.len());
+        assert!(r.contains("…(截断/truncated)"), "{r}");
+    }
+
+    #[test]
+    fn method_not_found_echo_is_truncated() {
+        let srv = McpServer::new(":memory:");
+        let resp = srv
+            .handle(&json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": format!("m/{}", "y".repeat(100_000))
+            }))
+            .unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.len() < 512, "method 回显不得整段透传");
     }
 
     #[test]

@@ -145,21 +145,30 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
     // LLMHF_INJECTED 归一化为 event_data 的 "injected" 布尔（见
     // keyboard_hook.rs / mouse_hook.rs 落库字段），注入输入不得计入人在场；
     // 旧数据无该字段时 COALESCE 为 0，仍按人算（与旧行为一致）。
-    // substr 出的是 UTC 分钟串 "YYYY-MM-DDTHH:MM"（DISTINCT 已去重；回拨日
-    // 两趟重复本地小时的 UTC 串本就不同，不会互吞），同样折算成纪元分钟。
+    // 取整条 timestamp 解析（DISTINCT 已去重；回拨日两趟重复本地小时的
+    // UTC 串本就不同，不会互吞），折算成纪元分钟。
+    // 审查修复：此前 substr 截前 16 字符后强当无时区 UTC 解析——存量/外部
+    // 写入的带偏移行（如 '+08:00'）会被整体错算一个时区差。现在优先按
+    // RFC3339 整串解析（parse_from_rfc3339 同时接受 'Z' 与 '+08:00' 后缀）
+    // 转 UTC；不可解析的旧行退回原 naive-UTC 路径，与写路径
+    // normalize_timestamp 同口径。
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT substr(timestamp,1,16) FROM events \
+        "SELECT DISTINCT timestamp FROM events \
          WHERE event_action IN ('press','click','scroll') \
            AND timestamp >= ?1 AND timestamp < ?2 \
            AND COALESCE(json_extract(event_data,'$.injected'), 0) = 0",
     ) {
         if let Ok(rows) = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0)) {
-            for minute_str in rows.flatten() {
-                if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&minute_str, "%Y-%m-%dT%H:%M")
-                {
-                    use chrono::TimeZone;
-                    human.push(Utc.from_utc_datetime(&t).timestamp() / 60);
-                }
+            use chrono::TimeZone;
+            for ts in rows.flatten() {
+                let epoch_min = if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                    t.with_timezone(&Utc).timestamp() / 60
+                } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M") {
+                    Utc.from_utc_datetime(&t).timestamp() / 60
+                } else {
+                    continue;
+                };
+                human.push(epoch_min);
             }
         }
     }
@@ -195,4 +204,36 @@ pub fn local_offset_modifier_now() -> String {
         if secs >= 0 { "+" } else { "-" },
         secs.abs()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    /// raw 模式带偏移时间戳修复回归：'2026-09-23T01:00:00+08:00' 这类存量/
+    /// 外部写入行不得被 substr 前 16 字符强当 UTC（旧实现整体错一个时区差）。
+    /// 期望值由同一时区的本地钟面推出，测试在任意时区下都成立。
+    #[test]
+    fn raw_mode_offset_rows_are_not_timezone_shifted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        let day = crate::queries::today_local_str();
+        let offset = Local::now().format("%:z").to_string(); // 如 "+08:00"
+        let ts = format!("{day}T01:00:00{offset}");
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action) VALUES (?1, 'keyboard', 'press')",
+            params![&ts],
+        )
+        .unwrap();
+        let d = classify_minutes(&conn, &day, 2);
+        assert_eq!(
+            d.first_activity.as_deref(),
+            Some("01:00"),
+            "带偏移 {offset} 的行应换算回本地 01:00，实际: {:?}",
+            d.first_activity
+        );
+        assert_eq!(d.last_activity, d.first_activity);
+        assert!(d.presence_minutes >= 1);
+    }
 }

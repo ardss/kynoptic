@@ -168,6 +168,10 @@ fn status_reflects_last_event_ts() {
     assert_eq!(v["today"], json!(queries::today_local_str()));
     assert_eq!(v["read_only"], json!(true));
     assert_eq!(v["bind"], json!("127.0.0.1"));
+    // ci 修复：构建指纹字段必须存在（本地构建缺省 unknown；CI 构建注入
+    // git hash + 构建时间），供审查时比对运行态与源码版本
+    assert!(v["build"]["git_hash"].is_string());
+    assert!(v["build"]["built_at"].is_string());
     // 审查 P2：db_path 只回文件名，不暴露全路径；db_dir_kind 只给目录类别
     assert_eq!(v["db_path"], json!("x.db"));
     assert!(
@@ -469,7 +473,11 @@ fn settings_post_rejects_unknown_id_and_bad_input() {
         &db,
     );
     assert_eq!(code, 400);
-    assert!(out.contains("not_a_monitor"));
+    // 回显经 sanitize_date_echo 净化（whitelist 字母数字/'-'，'_' 被剥除），
+    // 不再原样反射攻击者可控文本（响应放大/日志注入投放面）。
+    assert!(out.contains("未知监控器 id"));
+    assert!(out.contains("notamonitor"));
+    assert!(!out.contains("not_a_monitor"));
     // 非法 JSON → 400
     let (code, _, _) = route_req(&mem_conn(), "POST", "/api/settings", "{oops", &db);
     assert_eq!(code, 400);
@@ -1796,4 +1804,78 @@ fn report_data_since_uses_local_date() {
     };
     assert_eq!(since, expect, "data_since 应为最早事件的本地日");
     let _ = db;
+}
+
+// ─── 本轮修复回归（日期边界 / 空参数 / 幻影日 / 安全头 / host 尾点） ────────
+
+#[test]
+fn invalid_calendar_date_reports_format_error_not_future() {
+    // 2026-13-45 形如日期但历法非法：应报"格式错"，不再误报"在未来"
+    let dir = tmpdir("bad-cal");
+    let (code, _, out) = route_req(&mem_conn(), "GET", "/api/summary?date=2026-13-45", "", &dir);
+    assert_eq!(code, 400);
+    assert!(out.contains("格式错"), "got: {out}");
+    assert!(!out.contains("在未来"), "got: {out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn empty_date_param_is_rejected_not_silently_defaulted() {
+    // `?date=` 显式空值 ≠ 缺省：回 400，与数值参数政策一致
+    let dir = tmpdir("empty-date");
+    let (code, _, out) = route_req(&mem_conn(), "GET", "/api/summary?date=", "", &dir);
+    assert_eq!(code, 400, "got: {out}");
+    assert!(out.contains("不应为空"), "got: {out}");
+    // 缺省（无参数）仍回退今天 → 200
+    let (code2, _, _) = route_req(&mem_conn(), "GET", "/api/summary", "", &dir);
+    assert_eq!(code2, 200);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn trends_excludes_future_phantom_daily_rows() {
+    // 时钟拨快回拨残留的 daily_agg "未来日"幻影行不得泄漏进 trends
+    let conn = mem_conn();
+    conn.execute(
+        "INSERT INTO daily_agg (date, keys, clicks, active_minutes) VALUES ('9999-12-31', 999, 0, 0)",
+        [],
+    )
+    .unwrap();
+    let v = api_trends_at(&conn, today_naive()).unwrap();
+    let daily = v["daily"].as_array().unwrap();
+    assert!(
+        !daily.iter().any(|d| d["date"] == "9999-12-31"),
+        "幻影未来日泄漏: {daily:?}"
+    );
+}
+
+#[test]
+fn security_headers_have_referrer_policy_and_nonce_csp() {
+    let h = security_headers("'self'");
+    assert!(h.contains("Referrer-Policy: no-referrer"), "got: {h}");
+    // script-src 收紧：默认响应不再放行内联脚本
+    assert!(h.contains("script-src 'self';"), "got: {h}");
+    assert!(!h.contains("script-src 'unsafe-inline'"), "got: {h}");
+    // 首页变体：script-src 带随机 nonce
+    let n = fresh_nonce();
+    let hi = security_headers(&format!("'self' 'nonce-{n}'"));
+    assert!(hi.contains("script-src 'self' 'nonce-"), "got: {hi}");
+    // nonce 唯一性（相邻两次生成不重复，128-bit 十六进制）
+    assert_eq!(n.len(), 32);
+    assert_ne!(n, fresh_nonce());
+}
+
+#[test]
+fn loopback_host_strips_trailing_dot_in_browser_forms() {
+    use super::loopback_host_ok;
+    // 浏览器形态：host 部分带尾点
+    assert!(loopback_host_ok("localhost.:8422", 8422));
+    assert!(loopback_host_ok("127.0.0.1.:8422", 8422));
+    // 整串尾点（端口后）
+    assert!(loopback_host_ok("127.0.0.1:8422.", 8422));
+    assert!(loopback_host_ok("localhost.:8422.", 8422));
+    // 无端口 + 尾点
+    assert!(loopback_host_ok("localhost.", 8422));
+    // 非回环仍拒绝
+    assert!(!loopback_host_ok("evil.example.com:8422", 8422));
 }

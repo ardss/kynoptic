@@ -66,7 +66,8 @@ pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) ->
 /// （覆盖式，总占用 ≤ 2MB）。此前追加写无上限：磁盘写满类永久故障下看门狗每
 /// 60s 留档一次，反而加速吃满磁盘。轮转失败退化为截断（宁可丢旧错误留痕，
 /// 不能让日志文件无限膨胀）。
-fn archive_write_failure(msg: &str) {
+/// db 层的启动期异常（空库文件/云同步目录检测）也复用本函数留档。
+pub(crate) fn archive_write_failure(msg: &str) {
     use std::io::Write;
     const MAX_BYTES: u64 = 1024 * 1024;
     let Some(dir) = crate::db::resolve_db_path()
@@ -253,11 +254,24 @@ fn reject_future_events(batch: &mut Vec<Event>) {
     }
 }
 
-fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsize) {
+/// 落库一批事件，返回是否成功（整批全失败时为 false）。
+///
+/// 结构性修复（写失败路径）：insert 层现在**显式**返回「本批全失败」布尔
+/// （db/events.rs，与 input_agg 合法的 rowid=0 严格区分），全失败时——
+/// 1. 不推进 LAST_FLUSH_EPOCH（心跳/停滞看门狗保持真实）；
+/// 2. 不累加 total_written（写入统计不虚增）；
+/// 3. 调用方（writer_loop_inner）**保留 batch 原地重试**并背压：不再无条件
+///    clear 把已 pop 的事件丢掉——磁盘满/锁库恢复后本批仍能落库；重试期间
+///    writer 完全停止从通道 pop（收集循环有 batch_size 容量前置判断，等待
+///    分支也不在满批时 recv），通道被填满后新事件在 send 端计数丢弃
+///    （CHANNEL_DROPPED，看门狗可见），batch 本身不无界增长，符合
+///    「绝不丢已确认数据」与有界内存两条铁律；重试按指数退避（500ms 起,
+///    上限 8s）避免对整批反复做事务尝试。
+fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsize) -> bool {
     // 未来时间戳防线：先于 session 补盖与落库执行（见 reject_future_events）
     reject_future_events(batch);
     if batch.is_empty() {
-        return;
+        return true;
     }
     // 审查 P0：Event::new 硬编码 session_id=None 且全链路无人回填，导致
     // events.session_id 全库为 NULL、sessions.total_events/ghost 清扫失效。
@@ -274,19 +288,8 @@ fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsiz
     // 聚合增量维护与 events 落库在同一事务内完成（审查 P1：两个独立事务之间
     // kill 会留下"events 有 agg 无"的欠聚合且永不自愈）；rowids 与 batch 一一
     // 对应（失败行为 0），事务化后由 insert 层内部直接用于 agg 维护。
-    let rowids = db.insert_events_with_agg(batch);
-    // 审查 HIGH：不能无视插入结果——整批失败（磁盘满/杀毒锁库）时若照旧推进
-    // LAST_FLUSH_EPOCH 并累加 total_written，心跳保持"健康"而数据静默丢失，
-    // 看门狗的停滞检测与写入统计双双失效。落库契约（db/events.rs）：rowids 与
-    // batch 一一对应，失败行为 0；input_agg 行走 UPSERT 本就合法返回 rowid 0
-    // （见 events.rs 对 execute_event 返回语义的注释），故"纯 input_agg 批 +
-    // 全零 rowid"视为成功。真正的整批失败计入 WRITE_FAILURES（由 insert 层
-    // 已计一次），此处不推进心跳时钟、不计 total_written。
-    let landed = rowids.len() == batch.len()
-        && (rowids.iter().any(|&r| r != 0)
-            || batch
-                .iter()
-                .all(|e| e.event_action == crate::types::EventAction::InputAgg));
+    let (rowids, all_failed) = db.insert_events_with_agg(batch);
+    let landed = !all_failed && rowids.len() == batch.len();
     if landed {
         total_written.fetch_add(batch.len(), Ordering::Relaxed);
         // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
@@ -298,12 +301,15 @@ fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsiz
             Ordering::Relaxed,
         );
     } else {
+        // 整批全失败（磁盘满/库锁）：计一次失败、不推进心跳时钟与写入统计。
+        // batch 由调用方保留重试（背压语义见函数头注释）。
         WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         log::error!(
-            "整批落库失败，{} 条事件未计入写入统计，心跳时钟不推进",
+            "整批落库失败，{} 条事件保留待重试，心跳时钟不推进",
             batch.len()
         );
     }
+    landed
 }
 
 fn writer_loop(
@@ -345,8 +351,11 @@ fn writer_loop(
                 // 残余 batch 先落库（panic 可能发生在 flush 之前的任意点）
                 if !batch.is_empty() {
                     log::warn!("Writer panic 后 flush 残余 batch {} 条", batch.len());
-                    write_batch(&db, &mut batch, &total_written);
-                    batch.clear();
+                    let landed = write_batch(&db, &mut batch, &total_written);
+                    // 只在成功时清空；失败保留事件随重启循环继续重试（背压语义）
+                    if landed {
+                        batch.clear();
+                    }
                 }
                 log::error!("Writer 线程 panic: {:?}，1 秒后重启", e);
                 thread::sleep(Duration::from_secs(1));
@@ -368,6 +377,9 @@ fn writer_loop_inner(
     use std::time::Instant;
 
     let mut last_flush = Instant::now();
+    // 持久写失败的指数退避（500ms 起,上限 8s）:整批保留重试时避免每个
+    // 500ms 窗口都对整批重复 reject/session 补盖/事务尝试;成功即复位。
+    let mut fail_backoff = Duration::from_millis(500);
 
     loop {
         // 审查 P1：writer 退出不能只认通道 Disconnected——监控线程持 tx clone
@@ -386,6 +398,11 @@ fn writer_loop_inner(
             return Some(n);
         }
         loop {
+            // 容量前置判断:写失败保留重试期间 batch 已满,绝不再从通道 pop,
+            // 让通道填满、send 端走 CHANNEL_DROPPED 背压（batch 不无界增长）。
+            if batch.len() >= batch_size {
+                break;
+            }
             match rx.try_recv() {
                 Ok(event) => {
                     batch.push(event);
@@ -413,9 +430,19 @@ fn writer_loop_inner(
             batch_size,
             flush_interval,
         ) {
-            write_batch(db, batch, total_written);
-            batch.clear();
-            last_flush = now;
+            // 整批失败时保留 batch 原地重试（写失败背压，见 write_batch 文档）：
+            // batch 恒满，收集循环与等待分支都不再 pop（通道填满后 send 端
+            // 计数丢弃），指数退避后下一轮整批重试——不再无条件 clear 丢批，
+            // batch 也不随失败时长无界增长。
+            let landed = write_batch(db, batch, total_written);
+            if landed {
+                batch.clear();
+                last_flush = now;
+                fail_backoff = Duration::from_millis(500);
+            } else {
+                thread::sleep(fail_backoff);
+                fail_backoff = (fail_backoff * 2).min(Duration::from_secs(8));
+            }
         }
 
         if batch.is_empty() {
@@ -442,6 +469,12 @@ fn writer_loop_inner(
             let until_flush = flush_interval
                 .saturating_sub(now.duration_since(last_flush))
                 .min(Duration::from_millis(500));
+            // 满批（写失败保留重试中）时不得再 recv:recv 出来既装不下也不
+            // 能丢,直接睡到重试点,通道留给 send 端背压。
+            if batch.len() >= batch_size {
+                thread::sleep(until_flush);
+                continue;
+            }
             match rx.recv_timeout(until_flush) {
                 Ok(event) => batch.push(event),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1102,5 +1135,86 @@ mod tests {
         // 通道丢弃/未来时间戳拒绝独立于写失败计数推进（33-F4 拆分口径）
         assert_eq!(watchdog_tick(9, 3, 0, &mut consecutive), 0);
         assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 1);
+    }
+
+    /// 回归：持久写失败（磁盘满/库锁）时 batch 必须有界、send 端背压必须生效。
+    /// 旧实现写失败后仍持续从通道 pop——batch 以事件到达速率无界增长,且通道
+    /// 永远填不满,CHANNEL_DROPPED 计数恒 0（与 write_batch 文档声明相反）。
+    /// 此处用 DROP TABLE 模拟持久写失败：满批后 writer 停止 pop → 通道被
+    /// 生产者填满 → CHANNEL_DROPPED 增加;整个失败窗口内 batch 不超过
+    /// batch_size + 通道容量（停止旗标置位后的尾排空上限）。
+    #[test]
+    fn persistent_write_failure_bounds_batch_and_backpressures_channel() {
+        use crate::types::{EventAction, EventType};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        // 轻量临时目录（对齐 file_activity.rs 测试的做法,无 tempfile 依赖）
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-coll-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        let db = Arc::new(Database::open(db_path.to_str().unwrap()).unwrap());
+        // 制造持久写失败：events 表不存在 → insert_events_with_agg 整批失败
+        db.with_writer(
+            |w| {
+                w.execute("DROP TABLE events", []).unwrap();
+            },
+            || panic!("writer unavailable"),
+        );
+
+        const BATCH: usize = 4;
+        const CHAN: usize = 8;
+        let (tx, rx) = bounded::<Event>(CHAN);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let total_written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped_before = CHANNEL_DROPPED.load(Ordering::Relaxed);
+
+        let db2 = db.clone();
+        let tw2 = total_written.clone();
+        let mut batch = Vec::with_capacity(BATCH);
+        let handle = std::thread::spawn(move || {
+            writer_loop_inner(
+                &rx,
+                &db2,
+                BATCH,
+                Duration::from_millis(200),
+                tw2.as_ref(),
+                &mut batch,
+                &stop2,
+            )
+        });
+        // 生产者持续投递（writer 停止 pop 后通道满,应走 CHANNEL_DROPPED 背压）
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            let _ = send_event(&tx, Event::new(EventAction::Press, EventType::Keyboard));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Release);
+        let final_len = handle.join().unwrap().unwrap_or(0);
+        let dropped = CHANNEL_DROPPED.load(Ordering::Relaxed) - dropped_before;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 背压确实生效：通道被填满,send 端出现丢弃（旧实现恒 0）
+        assert!(dropped > 0, "持久写失败期间通道应填满并触发 send 端丢弃");
+        // batch 有界：失败窗口内不超过 batch_size + 通道容量 + 尾排空余量
+        //（旧实现以到达速率无界增长,本窗口 ~250 次投递远超该上界）
+        assert!(
+            final_len <= BATCH + CHAN,
+            "写失败保留重试的 batch 应有界: got {final_len}"
+        );
+        assert_eq!(
+            total_written.load(Ordering::Relaxed),
+            0,
+            "全失败不得虚增写入统计"
+        );
     }
 }

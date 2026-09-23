@@ -107,6 +107,31 @@ pub fn diagnose_open_failure(path: &std::path::Path) -> String {
     }
 }
 
+/// 判定路径是否处于云同步目录（OneDrive KFM 等）。两项启发式：
+/// 1. 祖先链上有名为 "OneDrive" 的路径组件（大小写不敏感）；
+/// 2. 文件带 Windows CLOUD_FILE_ATTRIBUTE（0x00400000，按需下载/云占位标记，
+///    真机探针验证普通本地文件不带该位）。
+fn is_cloud_sync_path(p: &Path) -> bool {
+    if p.ancestors().any(|a| {
+        a.file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("OneDrive"))
+    }) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const CLOUD_FILE_ATTRIBUTE: u32 = 0x0040_0000;
+        std::fs::metadata(p)
+            .map(|m| m.file_attributes() & CLOUD_FILE_ATTRIBUTE != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 // === 读连接池 ===
 
 struct ReaderPool {
@@ -230,6 +255,29 @@ impl Database {
     pub fn open(path: &str) -> SqlResult<Self> {
         if let Some(parent) = Path::new(path).parent() {
             std::fs::create_dir_all(parent).ok();
+        }
+
+        // 空库文件检测（实测：SQLite 把 0 字节文件当合法新库，SCHEMA 静默建
+        // 全表后满血运行，历史数据凭空消失且零告警——diagnose_open_failure
+        // 只在打开失败时才被调用）。K 盘闪断/同步冲突清理/半截写入都会留下
+        // 0 字节残留。仅留档告警，不阻塞启动（无法区分"被清空"与"首次建库"）。
+        let db_file = Path::new(path);
+        if db_file.is_file()
+            && std::fs::metadata(db_file)
+                .map(|m| m.len() == 0)
+                .unwrap_or(false)
+        {
+            let msg = "检测到空数据库文件（0 字节）：此前的数据可能被外部清空、同步冲突或半截写入覆盖，已按全新库启动";
+            log::warn!("{msg}");
+            crate::collector::archive_write_failure(msg);
+        }
+        // 云同步目录检测：db+wal 双文件被 OneDrive 等独立上传，冲突恢复时
+        // 版本错配即静默丢数据或库损坏（实测 db/wal 错配多为 quick_check=ok
+        // 的静默空库）。仅告警不阻断，面板侧横幅属 dash 域另行接线。
+        if is_cloud_sync_path(db_file) {
+            let msg = "数据库位于云同步目录（OneDrive 等）下：db 与 -wal 双文件被独立上传，恢复/冲突时可能静默丢失数据，建议将数据目录迁移出同步路径";
+            log::warn!("{msg}");
+            crate::collector::archive_write_failure(msg);
         }
 
         let writer = Connection::open(path)?;
@@ -688,4 +736,28 @@ pub(crate) fn lock_writer<'a>(
     }
     log::error!("写锁获取失败，已达最大重试次数，操作跳过");
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 云同步路径检测：路径组件命中 OneDrive 即告警位命中；普通本地文件不命中
+    /// （CLOUD_FILE_ATTRIBUTE=0x400000 在真机探针验证：普通 %TEMP% 文件不带该位）。
+    #[test]
+    fn cloud_sync_path_detected_by_component() {
+        let base = std::env::temp_dir().join(format!("kyn-cloud-probe-{}", std::process::id()));
+        let dir = base.join("OneDrive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.db");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(is_cloud_sync_path(&f), "OneDrive 路径组件必须命中");
+
+        let plain = std::env::temp_dir().join(format!("kyn-not-cloud-{}.db", std::process::id()));
+        std::fs::write(&plain, b"x").unwrap();
+        assert!(!is_cloud_sync_path(&plain), "普通本地文件不得命中");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&plain);
+    }
 }

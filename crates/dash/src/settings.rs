@@ -292,7 +292,12 @@ pub fn save(db_path: &Path, settings: &AppSettings) -> std::io::Result<()> {
     let tmp = path.with_file_name(uniq);
     let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)?;
+    // rename 失败（目标被杀软/备份独占、ACL 拒绝、磁盘满）必须清掉 tmp：
+    // tmp 名每次调用带新纳秒，不清理会随每次失败永久泄漏一个文件。
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     // 写成功即失效缓存（下次 load 重新 stat 读盘）
     if let Ok(mut g) = SETTINGS_CACHE.lock() {
         if g.as_ref().map(|c| c.path.as_path()) == Some(path.as_path()) {

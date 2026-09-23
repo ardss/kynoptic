@@ -193,10 +193,16 @@ mod tests {
             }
         }
         let picked = pick_free_port(base).expect("第一段全占时必须跨段重试");
-        assert_eq!(
-            picked,
-            base + 10_000,
-            "应跨大步长落到第二段首位,实际 {picked}"
+        // 不写死第二段首位:真机探针(netsh excludedportrange)显示 Hyper-V/WSL
+        // 可能把第二段也整个保留（本机 12410-12509 覆盖 12417-12427），生产
+        // 代码正确继续跨到第三段。只断言必须跨过 +10000 大步长落到后续段。
+        assert!(
+            picked >= base + 10_000,
+            "应跨 +10000 大步长落到后续段,实际 {picked}"
+        );
+        assert!(
+            candidate_ports(base).contains(&picked),
+            "落点必须在候选序列内,实际 {picked}"
         );
     }
 

@@ -8,8 +8,12 @@
 //!   成功后刷新到 exe 同目录（文档文件，失败仅告警不回滚）。
 //! - 审查 P0：替换前旧 exe 改名 `.bak` 保留；新 kynoptic.exe 启动失败时
 //!   从 `.bak` 整体还原。校验失败则整体放弃、不动任何旧文件。
-//! - tray 运行中替换失败时：先 taskkill 静默结束（CREATE_NO_WINDOW），
-//!   仍失败则跳过该文件并明确提示"托盘未更新，请退出托盘后重跑 update"。
+//! - 审查（结构修复）：替换两阶段化——全部旧文件先挪 `.bak`，再全部放入
+//!   新文件；任一步失败统一从 `.bak` 还原（rollback 逐项检查结果，失败
+//!   如实报「回滚未完成」），消除逐文件交替 rename 留下「exe 缺失、仅存
+//!   .bak」的中断窗口；入口与 watchdog 拉起前做孤儿 `.bak` 恢复扫描。
+//! - tray 运行中被锁定时：先写退出旗标再 taskkill 静默结束
+//!   （CREATE_NO_WINDOW）解锁；仍失败则整体回滚并要求关闭进程后重跑。
 //! - 若用户是通过包管理器（winget/scoop/cargo）安装的，这里更新会破坏其
 //!   包管理器状态——检测到此类路径特征时拒绝并提示改用对应工具。
 //! - SHA-256 为本文件内手写实现（受"仅允许改 update.rs"约束，不能在
@@ -324,61 +328,27 @@ fn exit_flag_for(exe_dir: &std::path::Path) -> std::path::PathBuf {
     exe_dir.join("tray-exit.flag")
 }
 
-fn replace_with_backup(dest: &std::path::Path, new_file: &std::path::Path) -> (bool, bool) {
-    // (replaced, killed_to_unlock)
-    let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
-    let _ = std::fs::remove_file(&bak);
-    if dest.exists() && std::fs::rename(dest, &bak).is_err() {
-        // 杀托盘前置退出旗标（全库审查 P2：硬杀不写旗标会让看门狗在
-        // kill→rename 窗口把旧托盘拉回来重新锁文件，造成三件套版本漂移）
-        if dest
-            .file_name()
-            .map(|n| n == "kynoptic-tray.exe")
-            .unwrap_or(false)
-        {
-            if let Some(dir) = dest.parent() {
-                let _ = std::fs::write(
-                    exit_flag_for(dir),
-                    "updating
-",
-                );
-            }
-        }
-        let killed = kill_process(&dest.file_name().unwrap_or_default().to_string_lossy());
-        if killed {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        if std::fs::rename(dest, &bak).is_err() {
-            // Wave17 审查 P1：旗标残留会永久压制看门狗拉起——失败路径必须清
-            if let Some(dir) = dest.parent() {
-                let _ = std::fs::remove_file(exit_flag_for(dir));
-            }
-            return (false, killed);
-        }
-    }
-    match std::fs::rename(new_file, dest) {
-        Ok(()) => (true, false),
-        Err(_) => {
-            // 新文件放不进去：还原旧文件
-            if bak.exists() {
-                let _ = std::fs::rename(&bak, dest);
-            }
-            // 旧文件已还原，旗标使命结束（见上：残留会压制看门狗）
-            if let Some(dir) = dest.parent() {
-                let _ = std::fs::remove_file(exit_flag_for(dir));
-            }
-            (false, false)
-        }
-    }
+/// 从 `.bak` 还原单个文件。每步检查结果：旧实现 `let _ =` 吞错，新 exe 被
+/// 杀软以独占句柄锁定时 remove/rename 都会失败，磁盘终态为「新版在位、旧版
+/// 只剩 .bak」，程序却报「已回滚」。返回 false 即还原未完成。
+fn restore_from_bak(dest: &std::path::Path, bak: &std::path::Path) -> bool {
+    let _ = std::fs::remove_file(dest);
+    std::fs::rename(bak, dest).is_ok()
 }
 
-/// 新 exe 启动失败时从 `.bak` 还原（审查 P0-2）
-fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)], reason: &str) {
+/// 更新失败时从 `.bak` 整体还原（审查 P0-2）。返回是否全部还原成功；
+/// 任一失败都如实上报，绝不假报「已回滚」。
+fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)], reason: &str) -> bool {
     eprintln!("{reason}，回滚到旧版本...");
+    let mut ok = true;
     for (dest, bak) in backups {
-        let _ = std::fs::remove_file(dest);
-        if bak.exists() {
-            let _ = std::fs::rename(bak, dest);
+        if bak.exists() && !restore_from_bak(dest, bak) {
+            ok = false;
+            eprintln!(
+                "回滚失败: {} 无法还原（可能被杀软/备份软件锁定），旧版保留于 {}",
+                dest.display(),
+                bak.display()
+            );
         }
     }
     // Wave18 P1：回滚=更新失败退出，托盘已被杀且不会由本进程拉起——
@@ -386,6 +356,24 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)], reason: &str) 
     if let Some(dir) = backups.first().and_then(|(d, _)| d.parent()) {
         let _ = std::fs::remove_file(exit_flag_for(dir));
     }
+    ok
+}
+
+/// 启动期孤儿 `.bak` 恢复扫描（审查：替换流程中断——断电/被 taskkill /T
+/// 波及——会留下「exe 缺失、仅存 .bak」的目录，此前无人复原，watchdog 也
+/// 只会报「缺失，无法拉起」）。五件套任一 dest 缺失而 dest.bak 在位即改名
+/// 还原，返回还原个数。cmd_update 与 watchdog 拉起路径在入口调用。
+pub fn recover_orphan_baks(exe_dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    for name in BIN_NAMES {
+        let dest = exe_dir.join(name);
+        let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
+        if !dest.exists() && bak.exists() && std::fs::rename(&bak, &dest).is_ok() {
+            eprintln!("已从 {} 还原缺失的 {}", bak.display(), dest.display());
+            n += 1;
+        }
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +471,9 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             "检测到本程序为安装版。请重新下载并运行 Kynoptic-Setup 完成升级（自更新仅适用于便携版）".to_string(),
         ));
     }
+    // 审查：上次更新中断可能留下「exe 缺失、仅存 .bak」——更新入口先做
+    // 孤儿恢复，避免在残缺目录上继续替换。
+    recover_orphan_baks(&dir);
 
     let cur = self_update::cargo_crate_version!();
     eprintln!("checking GitHub releases for kynoptic v{cur}...");
@@ -564,52 +555,94 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         }
     }
 
-    // 4. 替换：tray/watchdog 先换，主 exe 最后换（中途失败仍保有可运行主程序）
+    // 4. 替换（结构性重组，替换整体原子化）：旧流程逐文件「bak→放入」交替
+    // 进行，窗口内断电/被杀会留下「exe 缺失、仅存 .bak」。现改为两阶段：
+    // 4a 全部旧文件先挪 .bak（含 tray 解锁），4b 全部新文件放入；任一失败
+    // 统一从 .bak 还原（rollback 逐项检查结果，失败如实上报）。顺序仍为
+    // tray/watchdog 先、主 exe 最后，缩短主 exe 不在位窗口。
     let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut tray_killed = false;
     let mut order: Vec<&str> = BIN_NAMES[1..].to_vec();
     order.push(BIN_NAMES[0]);
-    for name in order {
+
+    // 4a. 备份：旧文件改名 .bak（dest 原不存在时无 .bak，rollback 跳过）
+    for name in &order {
+        let dest = dir.join(name);
+        let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
+        let _ = std::fs::remove_file(&bak);
+        if dest.exists() && std::fs::rename(&dest, &bak).is_err() {
+            // 沿用旧 replace_with_backup 的托盘解锁：先写退出旗标再 taskkill
+            if name == &"kynoptic-tray.exe" {
+                if let Some(d) = dest.parent() {
+                    let _ = std::fs::write(exit_flag_for(d), "updating\n");
+                }
+                if kill_process(name) {
+                    tray_killed = true;
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                if std::fs::rename(&dest, &bak).is_ok() {
+                    backups.push((dest, bak));
+                    continue;
+                }
+                // Wave17 审查 P1：旗标残留会永久压制看门狗拉起——失败路径必须清
+                if let Some(d) = dest.parent() {
+                    let _ = std::fs::remove_file(exit_flag_for(d));
+                }
+            }
+            // 契约同 4b/步骤 5：回滚成败如实上报，绝不假报"已回滚"
+            let rolled = rollback(&backups, &format!("{name} 被占用无法备份"));
+            let detail = if rolled {
+                "已回滚到旧版本".to_string()
+            } else {
+                "回滚未完成：旧版保留于同名 .bak，请关闭占用进程后手动还原".to_string()
+            };
+            return Err(crate::Error::InvalidData(format!(
+                "部分文件被占用未能替换（可能被杀软/备份软件锁定），{detail}；请关闭所有 kynoptic 进程后重跑 update"
+            )));
+        }
+        backups.push((dest, bak));
+    }
+
+    // 4b. 放入新文件；任一失败统一从 .bak 还原
+    for name in &order {
         let (_, src) = downloaded
             .iter()
             .find(|(n, _)| n == name)
             .ok_or_else(|| crate::Error::InvalidData(format!("内部错误：缺少 {name}")))?;
         let dest = dir.join(name);
-        let (replaced, killed) = replace_with_backup(&dest, src);
-        if name == "kynoptic-tray.exe" && killed {
-            tray_killed = true;
+        if std::fs::rename(src, &dest).is_err() {
+            if name == &"kynoptic-tray.exe" && tray_killed {
+                warnings.push("托盘未更新，请退出托盘后重跑 update".to_string());
+            } else {
+                warnings.push(format!("{name} 被占用未更新，请关闭后重跑 update"));
+            }
+            let rolled = rollback(&backups, "新文件放入失败");
+            let detail = if rolled {
+                "已回滚到旧版本".to_string()
+            } else {
+                "回滚未完成：旧版保留于同名 .bak，请关闭占用进程后手动还原".to_string()
+            };
+            let mut msg = format!(
+                "部分文件被占用未能替换（可能被杀软/备份软件锁定），{detail}；请关闭所有 kynoptic 进程后重跑 update"
+            );
+            for w in &warnings {
+                msg.push_str(&format!("；{w}"));
+            }
+            return Err(crate::Error::InvalidData(msg));
         }
-        if replaced {
-            backups.push((
-                dest.clone(),
-                std::path::PathBuf::from(format!("{}.bak", dest.display())),
-            ));
-        } else if name == "kynoptic-tray.exe" {
-            warnings.push("托盘未更新，请退出托盘后重跑 update".to_string());
-        } else {
-            warnings.push(format!("{name} 被占用未更新，请关闭后重跑 update"));
-        }
-    }
-
-    // 修复（审查 medium）：任一五件套未替换即整体失败。旧实现只 push 警告，
-    // 但 rename 失败（如杀软/备份软件以无共享模式持有句柄）时后续
-    // verify_launch 验证的是未被替换的旧 kynoptic.exe（--version 必通过），
-    // 最终仍打印 updated to，造成多 exe 版本漂移。此处校验五件套全部替换，
-    // 任一未换则回滚已换文件并按失败退出，要求用户关闭占用进程后重跑。
-    if backups.len() != BIN_NAMES.len() {
-        rollback(&backups, "部分文件被占用未能替换");
-        return Err(crate::Error::InvalidData(
-            "部分文件被占用未能替换（可能被杀软/备份软件锁定），已回滚到旧版本；请关闭所有 kynoptic 进程后重跑 update"
-                .to_string(),
-        ));
     }
 
     // 5. 新主 exe 启动验证，失败整体回滚（审查 P0-2）
     if !verify_launch(&dir.join("kynoptic.exe")) {
-        rollback(&backups, "新 kynoptic.exe 启动验证失败");
+        if rollback(&backups, "新 kynoptic.exe 启动验证失败") {
+            return Err(crate::Error::InvalidData(
+                "新版本启动失败，已回滚到旧版本".to_string(),
+            ));
+        }
         return Err(crate::Error::InvalidData(
-            "新版本启动失败，已回滚到旧版本".to_string(),
+            "新版本启动失败，且回滚未完成：当前 exe 为新版本，旧版保留于同名 .bak，请手动还原后反馈问题"
+                .to_string(),
         ));
     }
 
@@ -734,5 +767,24 @@ mod tests {
         assert!(!is_stable_release("0.2.1.1.1"), "超过三段必须被过滤");
         assert!(!is_stable_release("0..1"), "空组件必须被过滤");
         assert!(is_stable_release("v0.2.1"), "带 v 前缀的合法 tag 放行");
+    }
+
+    #[test]
+    fn orphan_bak_recovery_restores_missing_exe() {
+        let dir = std::env::temp_dir().join(format!("kynoptic-orphan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // tray exe 缺失 + .bak 在位 → 应还原；完好的 exe + .bak → 不动
+        std::fs::write(dir.join("kynoptic-tray.exe.bak"), b"old").unwrap();
+        std::fs::write(dir.join("kynoptic.exe"), b"cur").unwrap();
+        assert_eq!(recover_orphan_baks(&dir), 1);
+        assert_eq!(
+            std::fs::read(dir.join("kynoptic-tray.exe")).unwrap(),
+            b"old"
+        );
+        assert!(!dir.join("kynoptic-tray.exe.bak").exists());
+        assert_eq!(recover_orphan_baks(&dir), 0, "无孤儿时不应有动作");
+        assert_eq!(std::fs::read(dir.join("kynoptic.exe")).unwrap(), b"cur");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

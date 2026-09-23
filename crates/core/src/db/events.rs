@@ -113,14 +113,17 @@ impl Database {
     /// 审查 P1：events 落库与 agg 增量 UPSERT 原为两个独立事务，中间 kill 即
     /// 欠聚合且无法自愈。合并后两者同生共死：要么 events+agg 都提交，要么都
     /// 回滚（回滚后走逐条降级，同样每条带聚合维护）。
-    /// 返回与 `events` 一一对应的 rowid（同 [`Database::insert_events`]）。
-    pub fn insert_events_with_agg(&self, events: &[Event]) -> Vec<i64> {
+    /// 返回（rowids, 整批全失败布尔）：rowids 与 `events` 一一对应（同
+    /// [`Database::insert_events`]）；布尔位**显式**区分「本批一条都没写进去」
+    /// 与「input_agg 批合法的 rowid=0 成功」——此前调用方只能按全零 rowid 猜，
+    /// 纯 input_agg 批整批失败会被误判成已落库（心跳时钟照常推进）。
+    pub fn insert_events_with_agg(&self, events: &[Event]) -> (Vec<i64>, bool) {
         if events.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         match self.insert_events_with_agg_tx(events) {
-            Ok(rowids) => rowids,
+            Ok(rowids) => (rowids, false),
             Err(first) => {
                 // 审查 P1：外部写者（backfill/agg-heal 分块）可能持有写锁超过
                 // writer 的 busy_timeout，整批事务 SQLITE_BUSY 失败并不代表数据
@@ -130,7 +133,7 @@ impl Database {
                 log::warn!("批量插入（含聚合维护）失败，500ms 后整批重试一次: {first}");
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 match self.insert_events_with_agg_tx(events) {
-                    Ok(rowids) => rowids,
+                    Ok(rowids) => (rowids, false),
                     Err(e) => {
                         note_write_failure(1);
                         log::error!("批量插入（含聚合维护）重试仍失败，降级为逐条: {e}");
@@ -147,17 +150,20 @@ impl Database {
                                         "逐条降级全败后整批兜底重试成功（{} 条）",
                                         events.len()
                                     );
-                                    return rowids2;
+                                    return (rowids2, false);
                                 }
                                 Err(e2) => {
                                     log::error!(
-                                        "整批兜底重试仍失败，{} 条事件丢失: {e2}",
+                                        "整批兜底重试仍失败，{} 条事件全部未落库: {e2}",
                                         events.len()
                                     );
+                                    // 整批全失败显式上抛：调用方（write_batch）据此
+                                    // 不推进心跳时钟、不推进批次游标，并保留事件重试。
+                                    return (rowids, true);
                                 }
                             }
                         }
-                        rowids
+                        (rowids, false)
                     }
                 }
             }
@@ -374,7 +380,7 @@ mod tests {
             .map(|_| Event::new(EventAction::Press, EventType::Keyboard))
             .collect();
         assert_eq!(db.insert_events(&events).len(), 3);
-        assert_eq!(db.insert_events_with_agg(&events).len(), 3);
+        assert_eq!(db.insert_events_with_agg(&events).0.len(), 3);
 
         // 全失败路径（DROP events 表 → 单条执行必然失败）：仍一一对应且全 0
         db.with_writer(
@@ -385,8 +391,48 @@ mod tests {
         );
         let rowids = db.insert_events(&events);
         assert_eq!(rowids, vec![0, 0, 0], "失败行必须 push 0 保持一一对应");
-        let rowids_agg = db.insert_events_with_agg(&events);
+        let (rowids_agg, agg_all_failed) = db.insert_events_with_agg(&events);
         assert_eq!(rowids_agg, vec![0, 0, 0]);
+        assert!(agg_all_failed, "非空批整批失败必须显式报告 all_failed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 结构性修复（写失败路径）：insert 层必须显式区分「纯 input_agg 批整批
+    /// 写入失败」与「input_agg 批合法的 rowid=0 成功」——旧实现两者同为全零
+    /// rowid，write_batch 误判已落库、心跳照常推进。
+    #[test]
+    fn all_failed_flag_is_explicit_for_pure_input_agg_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-aggfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 对照组：正常写纯 input_agg 批 → all_failed=false（rowid 合法为 0）
+        let ok_path = dir.join("ok.db");
+        let ok_db = Database::open(ok_path.to_str().unwrap()).unwrap();
+        let e = Event::new(EventAction::InputAgg, EventType::Keyboard);
+        let (rowids, all_failed) = ok_db.insert_events_with_agg(std::slice::from_ref(&e));
+        assert!(!all_failed, "成功的纯 input_agg 批不得报告全失败");
+        assert_eq!(rowids, vec![0]);
+
+        // 故障组：DROP events 表（等效磁盘故障）→ 纯 input_agg 批全败必须显式上抛
+        let bad_path = dir.join("bad.db");
+        let bad_db = Database::open(bad_path.to_str().unwrap()).unwrap();
+        bad_db.with_writer(
+            |c| {
+                let _ = c.execute("DROP TABLE events", []);
+            },
+            || (),
+        );
+        let (rowids, all_failed) = bad_db.insert_events_with_agg(&[e.clone(), e]);
+        assert!(all_failed, "纯 input_agg 批整批失败必须显式返回 true");
+        assert_eq!(rowids, vec![0, 0]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

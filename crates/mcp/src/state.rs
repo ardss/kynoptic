@@ -22,6 +22,10 @@ use kynoptic_core::queries;
 use kynoptic_core::types::{EventAction, EventType};
 
 use crate::clamp_limit;
+use crate::server::trunc_echo;
+
+/// 错误回显里入参原文的最大字符数（防带宽放大：超长入参不再整段回显）。
+const ECHO_MAX_CHARS: usize = 64;
 
 /// 规范允许的分组（get_current_status 的 `groups` 参数枚举）。
 pub const GROUPS: &[&str] = &["system", "activity", "network", "devices", "security"];
@@ -61,7 +65,8 @@ pub fn current_status(conn: &Connection, groups: Option<&[String]>) -> Result<Va
             for s in g {
                 if !GROUPS.contains(&s.as_str()) {
                     return Err(format!(
-                        "Unknown group: {s} (allowed: {})（未知分组，允许: {}）",
+                        "Unknown group: {} (allowed: {})（未知分组，允许: {}）",
+                        trunc_echo(s, ECHO_MAX_CHARS),
                         GROUPS.join("/"),
                         GROUPS.join("/")
                     ));
@@ -241,13 +246,17 @@ fn s_or_null(v: Option<String>) -> Value {
 pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, String> {
     if !METRICS.contains(&metric) {
         return Err(format!(
-            "Unknown metric: {metric} (allowed: {})（未知指标，允许: {}）",
+            "Unknown metric: {} (allowed: {})（未知指标，允许: {}）",
+            trunc_echo(metric, ECHO_MAX_CHARS),
             METRICS.join("/"),
             METRICS.join("/")
         ));
     }
     let (start, end) = queries::local_day_range(date).ok_or_else(|| {
-        format!("Bad date format: {date}, expected YYYY-MM-DD（日期格式错，应为 YYYY-MM-DD）")
+        format!(
+            "Bad date format: {}, expected YYYY-MM-DD（日期格式错，应为 YYYY-MM-DD）",
+            trunc_echo(date, ECHO_MAX_CHARS)
+        )
     })?;
     // date 晚于今天：数据库不可能有未来数据，直接返回可读错误而非空结果
     let today = queries::today_local_str();
@@ -256,7 +265,9 @@ pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, Str
     if let (Ok(d), Ok(t)) = (d, t) {
         if d > t {
             return Err(format!(
-                "Date {date} is in the future; no data can exist yet（日期 {date} 晚于今天，不可能有数据）"
+                "Date {} is in the future; no data can exist yet（日期 {} 晚于今天，不可能有数据）",
+                trunc_echo(date, ECHO_MAX_CHARS),
+                trunc_echo(date, ECHO_MAX_CHARS)
             ));
         }
     }
@@ -267,9 +278,18 @@ pub fn summary(conn: &Connection, date: &str, metric: &str) -> Result<Value, Str
         .ok()
         .and_then(|d| d.pred_opt())
         .map(|d| d.format("%Y-%m-%d").to_string())
-        .ok_or_else(|| format!("Bad date format: {date}（日期格式错）"))?;
+        .ok_or_else(|| {
+            format!(
+                "Bad date format: {}（日期格式错）",
+                trunc_echo(date, ECHO_MAX_CHARS)
+            )
+        })?;
     let (y_start, y_end_r) = queries::local_day_range(&prev_date).ok_or_else(|| {
-        format!("Cannot resolve previous day of {date}（无法解析 {date} 的前一天）")
+        format!(
+            "Cannot resolve previous day of {}（无法解析 {} 的前一天）",
+            trunc_echo(date, ECHO_MAX_CHARS),
+            trunc_echo(date, ECHO_MAX_CHARS)
+        )
     })?;
     let yesterday_same = {
         let same_ts = Utc::now() - chrono::Duration::days(1);
@@ -400,7 +420,7 @@ fn minute_activity(
 /// 解析失败（非 RFC3339 且非裸日期）时报可读错误（与 get_summary 的日期错误
 /// 同约定），不再静默回退字符串比较——静默回退会让边界按字典序进 SQL，结果
 /// 错误且无提示。
-fn normalize_bound(v: &str, is_to: bool) -> Result<String, String> {
+pub(crate) fn normalize_bound(v: &str, is_to: bool) -> Result<String, String> {
     let b = v.as_bytes();
     if b.len() == 10
         && b[4] == b'-'
@@ -426,7 +446,8 @@ fn normalize_bound(v: &str, is_to: bool) -> Result<String, String> {
             Ok(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
         }
         Err(_) => Err(format!(
-            "Bad date format: {v}, expected RFC3339 or YYYY-MM-DD（时间格式错，应为 RFC3339 或 YYYY-MM-DD）"
+            "Bad date format: {}, expected RFC3339 or YYYY-MM-DD（时间格式错，应为 RFC3339 或 YYYY-MM-DD）",
+            trunc_echo(v, ECHO_MAX_CHARS)
         )),
     }
 }
@@ -676,7 +697,8 @@ pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
 pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
     if !SIGNALS.contains(&signal) {
         return Err(format!(
-            "Unknown signal: {signal} (allowed: {})（未知信号，允许: {}）",
+            "Unknown signal: {} (allowed: {})（未知信号，允许: {}）",
+            trunc_echo(signal, ECHO_MAX_CHARS),
             SIGNALS.join("/"),
             SIGNALS.join("/")
         ));
