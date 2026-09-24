@@ -791,6 +791,23 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
                 "SKILL.md 刷新失败（{err}），可稍后用 skill install 重装"
             )),
         }
+        // 同步刷新用户目录下各 agent 的 skill 副本（.zcode/.claude/.cursor）：
+        // 只刷 exe 目录会留下旧文档误导用法。用下载包里的新内容（运行中的
+        // 旧 exe 内嵌资产仍是旧文档）。失败仅告警。
+        let new_md = std::fs::read_to_string(src).unwrap_or_default();
+        if !new_md.is_empty() {
+            match std::env::var("USERPROFILE")
+                .map_err(|_| "USERPROFILE 未设置".to_string())
+                .and_then(|home| {
+                    crate::skill_install_content(std::path::Path::new(&home), &new_md)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(files) => println!("agent skill 副本已随更新刷新（{} 处）", files.len()),
+                Err(err) => warnings.push(format!(
+                    "agent skill 副本刷新失败（{err}），可稍后用 skill install 重装"
+                )),
+            }
+        }
     }
 
     println!("updated to {new_ver}");
