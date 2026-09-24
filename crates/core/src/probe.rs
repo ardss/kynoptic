@@ -1,6 +1,7 @@
 //! 实机探针（probe）：逐个监控器在真实硬件上跑 N 秒，验证"真的能产出事件"。
 //!
-//! 用法（CLI）：`kynoptic-ctl probe [--monitor ID] [--secs N] [--all]`
+//! 用法（CLI）：`kynoptic-ctl probe [--monitor ID] [--secs N] [--all]
+//! [--first-collect-timeout N]`
 //!
 //! 判定口径：
 //! - 轮询型监控器：PASS = 临时库中出现 ≥1 条该监控器写入的事件；
@@ -233,8 +234,16 @@ fn count_and_sample(db: &crate::db::Database) -> (usize, String) {
     (count.max(0) as usize, sample)
 }
 
+/// 首采等待的硬上限（秒）：无论参数给多大都不超过该值，避免单个慢监控器
+/// 无限期拖住全量探针。
+pub const FIRST_COLLECT_TIMEOUT_CAP: u64 = 420;
+
 /// 对单个监控器跑一次探针。
-pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
+///
+/// `first_collect_timeout`：等待首次采集完成的上限（秒），实际生效值
+/// 取 min(参数, 420)。传 0 时按 `secs*10`（同样封顶 420）推导，使
+/// `--secs` 仍然是总时长上界的近似：首采超时后跳过剩余窗口立即出结果。
+pub fn probe_monitor(id: &str, secs: u64, first_collect_timeout: u64) -> ProbeOutcome {
     let spec = MONITOR_REGISTRY
         .iter()
         .find(|s| s.id == id)
@@ -286,7 +295,14 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
         };
     }
 
-    let first_collect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(420);
+    let effective_fc_timeout = if first_collect_timeout == 0 {
+        secs.saturating_mul(10)
+    } else {
+        first_collect_timeout
+    }
+    .min(FIRST_COLLECT_TIMEOUT_CAP);
+    let first_collect_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(effective_fc_timeout);
     let first_collect_ok;
     let mut panicked;
     loop {
@@ -305,12 +321,16 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    // 窗口内刺激器：为"需要状态变化才出事件"的监控器人为制造变化
-    let _inducers = Inducers::start(id);
+    // 首采等待失败/panic：跳过剩余窗口立即出结果，--secs 只是上限而非下限，
+    // 避免失败监控器再白等一个完整窗口。
+    if first_collect_ok && !panicked {
+        // 窗口内刺激器：为"需要状态变化才出事件"的监控器人为制造变化
+        let _inducers = Inducers::start(id);
 
-    // change-detect 型监控器需要 ≥2 个采集周期；不足时按监控器间隔拉长窗口
-    let window = secs.max(min_window_secs(id));
-    std::thread::sleep(std::time::Duration::from_secs(window.max(3)));
+        // change-detect 型监控器需要 ≥2 个采集周期；不足时按监控器间隔拉长窗口
+        let window = secs.max(min_window_secs(id));
+        std::thread::sleep(std::time::Duration::from_secs(window.max(3)));
+    }
     collector.shutdown();
     // shutdown 只停 writer；monitor 线程看到 SHUTDOWN 后自行退出，不影响读库
 
@@ -331,7 +351,7 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
         note = format!("首次采集 panic：{note}");
         verdict = Verdict::Fail;
     } else if !first_collect_ok {
-        note = format!("首次采集在 420s 内未完成（超时）{note}");
+        note = format!("首次采集在 {effective_fc_timeout}s 内未完成（超时）{note}");
         verdict = Verdict::Fail;
     }
 
@@ -353,12 +373,12 @@ pub fn probe_monitor(id: &str, secs: u64) -> ProbeOutcome {
 }
 
 /// 全量探针：逐个监控器（各自独立临时库），返回全部结果。
-pub fn probe_all(secs: u64) -> Vec<ProbeOutcome> {
+pub fn probe_all(secs: u64, first_collect_timeout: u64) -> Vec<ProbeOutcome> {
     MONITOR_REGISTRY
         .iter()
         .map(|s| {
             println!("probe: {} ...", s.id);
-            let out = probe_monitor(s.id, secs);
+            let out = probe_monitor(s.id, secs, first_collect_timeout);
             println!(
                 "  → {} events={} {}",
                 out.verdict.as_str(),
