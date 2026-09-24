@@ -477,10 +477,14 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
     let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
     let days = days.clamp(1, 30) as usize;
     let mut out: Vec<Value> = Vec::new();
-    for i in 0..days {
-        let date = queries::date_offset_str(-(i as i64));
-        let list =
-            kynoptic_core::anomaly::detect_all_with_bridge(conn, &date, bridge).unwrap_or_default();
+    // 长跨度性能：逐日循环改为一次整窗调用（core detect_all_days_with_bridge，
+    // marathon 的人在场分钟整窗取数一次），逐日结果与旧循环完全一致。
+    let dates: Vec<String> = (0..days)
+        .map(|i| queries::date_offset_str(-(i as i64)))
+        .collect();
+    for (date, list) in kynoptic_core::anomaly::detect_all_days_with_bridge(conn, &dates, bridge)
+        .unwrap_or_default()
+    {
         for a in list {
             if out.len() >= 100 {
                 return json!({"anomalies": out, "truncated": true});
@@ -2149,7 +2153,15 @@ fn settings_payload(s: &AppSettings) -> Value {
 /// / `input_counts_only` / `vk_frequency_enabled` 任一子集；监控器 id 必须全部在
 /// 注册表内，否则 400。写盘后返回新设置；实际变更追加审计行到 settings-audit.log。
 pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
-    let req: Value = serde_json::from_str(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
+    // serde 原文（英文诊断串）不透传：只给行/列定位，细节进日志
+    let req: Value = serde_json::from_str(body).map_err(|e| {
+        log::error!("dashboard: settings 请求体 JSON 解析失败: {e}");
+        format!(
+            "请求体不是合法 JSON（第 {} 行第 {} 列附近）",
+            e.line(),
+            e.column()
+        )
+    })?;
     // fuzz 加固：顶层数组/标量/null 在 get() 上全部落空 → 既往静默 200 并空
     // 转写 settings.json（顺带重排行尾）。显式 400，不留歧义。
     if !req.is_object() {
@@ -2568,11 +2580,13 @@ pub fn route_req(
                 None => 7,
                 Some(v) => match v.parse::<u32>() {
                     // 上限 90：聚合虽已在 SQL 端完成（SUM/json_each，不拉行），
-                    // 但窗口越大单请求扫描成本越高——限制回看跨度防慢查询
+                    // 但窗口越大单请求扫描成本越高——限制回看跨度防慢查询。
+                    // 截断不再无声：响应补 days_requested + note（见下）。
                     Ok(d) => d.clamp(1, 90),
                     Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
                 },
             };
+            let days_requested = qval("days").and_then(|v| v.parse::<u32>().ok());
             // date= 指定逐时条形图统计哪一天（缺省今天；空值 400，与
             // hours/report 同族一致——此前传 date 会被静默忽略）
             let hourly = match qdate("date") {
@@ -2600,7 +2614,20 @@ pub fn route_req(
                 }
             };
             match api_input_at(conn, days, today_naive(), hourly) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    // 静默截断修复（审查）：请求跨度超上限时明示 days_requested
+                    // 与截断说明，风格与 timeline 的 local_offset_note 一致。
+                    if let (Some(req), Some(obj)) = (days_requested, v.as_object_mut()) {
+                        if req > days {
+                            obj.insert("days_requested".into(), json!(req));
+                            obj.insert(
+                                "note".into(),
+                                json!("days 上限为 90，已按 90 天返回 / days is capped at 90; 90 days returned"),
+                            );
+                        }
+                    }
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
@@ -2676,8 +2703,9 @@ pub fn route_req(
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
-        ("GET", _) => (404, "application/json", err_json("not found")),
-        (_, _) => (405, "application/json", err_json("method not allowed")),
+        // 404/405 统一双语文案 + 刷新指引（页面与后端版本不一致的常见场景）
+        ("GET", _) => (404, "application/json", json!({"error": "接口不存在；页面与后端版本可能不一致，请刷新页面 / API not found; the page may be stale, please refresh", "code": "not_found"}).to_string()),
+        (_, _) => (405, "application/json", json!({"error": "请求方法不支持 / Method not allowed", "code": "method_not_allowed"}).to_string()),
     }
 }
 
@@ -2686,8 +2714,51 @@ fn today_naive() -> chrono::NaiveDate {
     Local::now().date_naive()
 }
 
+/// 错误码分类器（err_json 唯一 code 来源）：给校验/数据库类错误一个稳定
+/// ASCII 码，前端按界面语言映射英文文案；消息正文保持中文（中文界面直读）。
+/// 匹配的是本文件各出口已固定的错误消息前缀/特征，不解析任意文本。
+fn err_code(msg: &str) -> &'static str {
+    if msg.contains("在未来") {
+        return "future_date";
+    }
+    if msg.contains("日期格式错") {
+        return "invalid_date";
+    }
+    if msg.contains("不是合法 JSON") {
+        return "invalid_json";
+    }
+    // SQLite 驱动错误原文（表结构缺失/库被锁/打不开等）：原文只进日志，
+    // 不透传给用户（响应里是行动指引文案）。
+    if msg.contains("no such table")
+        || msg.contains("no such column")
+        || msg.contains("database is locked")
+        || msg.contains("unable to open database")
+        || msg.contains("disk I/O error")
+    {
+        return "db_error";
+    }
+    if msg.contains("应为")
+        || msg.contains("不能为空")
+        || msg.contains("不能超过")
+        || msg.contains("未知监控器")
+        || msg.contains("缺失")
+    {
+        return "invalid_param";
+    }
+    "bad_request"
+}
+
+/// 统一错误出口：{"error": 文案, "code": 稳定错误码}。
+/// db_error 类降级为友好文案，原文写面板错误日志便于排查。
 fn err_json(msg: &str) -> String {
-    json!({"error": msg}).to_string()
+    let code = err_code(msg);
+    let shown = if code == "db_error" {
+        log::error!("dashboard: 数据库查询失败: {msg}");
+        "数据库暂时无法读取，请稍后重试；若持续失败请查看面板错误日志 / Database temporarily unreadable, please retry (see dashboard error log if it persists)"
+    } else {
+        msg
+    };
+    json!({"error": shown, "code": code}).to_string()
 }
 
 /// 只读打开：优先走 MCP 工具面同款 `open_reader`（READ_ONLY + 全套 PRAGMA）。
@@ -3026,7 +3097,9 @@ fn handle_client(
                 &mut stream,
                 403,
                 "application/json",
-                "{\"error\":\"cross-origin write blocked\"}",
+                // 403 文案按失败原因区分并双语化：跨站拦截 vs 会话令牌失效
+                //（后者页面刷新即可恢复），前端按 code 给出对应指引。
+                "{\"error\":\"写入被拦截：请求疑似来自其他网页（跨站）。请回到本机面板页面重试 / Write blocked: the request looks cross-site. Go back to the local dashboard page and retry\",\"code\":\"csrf_blocked\"}",
             );
         }
     }
@@ -3079,7 +3152,7 @@ fn handle_client(
             &mut stream,
             403,
             "application/json",
-            "{\"error\":\"missing or invalid session token\"}",
+                "{\"error\":\"会话令牌无效，页面可能已过期，请刷新页面后重试 / Invalid session token; the page may be stale, refresh and retry\",\"code\":\"session_token_invalid\"}",
         );
     }
     while raw.len() < header_end + content_length {

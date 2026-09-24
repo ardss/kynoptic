@@ -546,16 +546,6 @@ impl Database {
         std::fs::metadata(&p).ok().map(|m| m.len())
     }
 
-    /// 被动 checkpoint（不阻塞读写，WAL 超 64MB 时的日常防线）。
-    pub fn checkpoint_passive(&self) {
-        self.with_writer(
-            |w| {
-                let _ = w.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
-            },
-            || {},
-        );
-    }
-
     /// 完整的维护操作：清理 + 欠聚合核对自愈 + WAL 检查点 + VACUUM 压缩
     pub fn maintenance(&self) {
         // 审查 MEDIUM：停机旗标置位即整体跳过——checkpoint/VACUUM 持写互斥体
@@ -689,7 +679,7 @@ fn wal_checkpoint_truncate(conn: &Connection) {
     }) {
         Ok(0) => {}
         Ok(busy) => log::info!(
-            "WAL 检查点未能截断（busy={busy}，存在活跃 reader），WAL 文件保留（64MB 兜底 PASSIVE 检查点仍有效）"
+            "WAL 检查点未能截断（busy={busy}，存在活跃 reader）；journal_size_limit 会在其后下一笔写入把 WAL 回落到 16MB 封顶"
         ),
         Err(e) => log::debug!("WAL 检查点查询失败（跳过）: {e}"),
     }

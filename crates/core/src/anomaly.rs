@@ -285,6 +285,20 @@ pub fn detect_marathon_session(
     Ok(marathon_from_epoch_minutes(&minutes, bridge_minutes))
 }
 
+/// 多日马拉松检测：[`queries::human_minutes_by_days`] 整窗一次取数后逐日跑
+/// 同一检测算法（长跨度 30 天此前按日重扫 events，成本随天数严格线性）。
+/// 返回与 `dates` 一一对应的检测结果。
+pub fn detect_marathon_days(
+    conn: &Connection,
+    dates: &[String],
+    bridge_minutes: u32,
+) -> Result<Vec<Vec<Anomaly>>> {
+    Ok(queries::human_minutes_by_days(conn, dates)
+        .into_iter()
+        .map(|(_, minutes)| marathon_from_epoch_minutes(&minutes, bridge_minutes))
+        .collect())
+}
+
 /// 新应用突增检测（编排入口）。
 pub fn detect_new_app_surge(conn: &Connection, date: &str) -> Result<Vec<Anomaly>> {
     let today = queries::top_apps_by_event_types(conn, date, 20);
@@ -307,10 +321,39 @@ pub fn detect_all_with_bridge(
     date: &str,
     bridge_minutes: u32,
 ) -> Result<Vec<Anomaly>> {
-    let mut all = Vec::new();
-    all.extend(detect_late_night(conn, date)?);
-    all.extend(detect_apm_burst(conn, date)?);
-    all.extend(detect_marathon_session(conn, date, bridge_minutes)?);
-    all.extend(detect_new_app_surge(conn, date)?);
-    Ok(all)
+    detect_all_days_with_bridge(
+        conn,
+        std::slice::from_ref(&date.to_string()),
+        bridge_minutes,
+    )
+    .map(|v| {
+        v.into_iter()
+            .next()
+            .map(|(_, list)| list)
+            .unwrap_or_default()
+    })
+}
+
+/// 多日整合版 [`detect_all_with_bridge`]（长跨度查询路径）：marathon 的
+/// 人在场分钟改为整窗一次取数（[`detect_marathon_days`]），其余三类检测器
+/// 本就消费 agg_minute 缓存、保持逐日调用不变。返回 (日期, 异常列表) 与
+/// `dates` 一一对应，逐日结果与逐日调用 [`detect_all_with_bridge`] 等价。
+pub fn detect_all_days_with_bridge(
+    conn: &Connection,
+    dates: &[String],
+    bridge_minutes: u32,
+) -> Result<Vec<(String, Vec<Anomaly>)>> {
+    let marathons = detect_marathon_days(conn, dates, bridge_minutes)?;
+    dates
+        .iter()
+        .zip(marathons)
+        .map(|(date, marathon)| {
+            let mut all = Vec::new();
+            all.extend(detect_late_night(conn, date)?);
+            all.extend(detect_apm_burst(conn, date)?);
+            all.extend(marathon);
+            all.extend(detect_new_app_surge(conn, date)?);
+            Ok((date.clone(), all))
+        })
+        .collect()
 }
