@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Tray: the watchdog scheduled task now self-checks and self-heals — on
+  tray startup the scheduled task is verified and re-registered if it is
+  missing or broken, so stall alerts keep working without manual repair.
+- MCP: `get_summary` responses now include a `baseline_semantic` field
+  identifying the baseline window's semantics, so AI clients can tell
+  what the baseline numbers actually mean (API contract addition).
+- Dashboard: `/api/anomalies` now rejects `days=0` with 400, matching
+  the MCP `get_anomalies` contract (`days` must be >= 1) — previously it
+  was silently clamped to a 1-day window.
+- CLI (probe): `kynoptic probe` accepts a new
+  `--first-collect-timeout <SECS>` option to override the hard cap on
+  waiting for a monitor's first collection (0, the default, derives it
+  from `--secs`; any value is still capped at 420 s).
+
+### Changed
+
+- CLI (probe): the default first-collection timeout is no longer a fixed
+  420 s — when not set explicitly it is now `min(--secs * 10, 420)`, so
+  `--secs 15` skips a slow monitor after ~150 s and still produces a
+  result instead of idling up to 7 minutes. Pass
+  `--first-collect-timeout` to keep the old ceiling for a given run.
+- Core (privacy): window-title redaction (opt-in) no longer matches only
+  `http://`/`https://` URLs — it truncates at any RFC 3986-shaped
+  `scheme://` prefix (e.g. `ws://`, `wss://`, `vscode://`, `file://`),
+  so titles containing those schemes are now redacted too when the
+  switch is on. The switch default remains off.
+- CLI (probe): the probe subcommand no longer pre-installs the global
+  env_logger, so registering a CaptureLogger (e.g. the polling monitor
+  watchdog) can no longer fail and get misreported as a FAIL after the
+  420 s wait.
+
+- Core (privacy): the location monitor no longer performs any outbound
+  network calls — its former geolocation path was removed and the
+  monitor is local-only now; this tightens the "data never leaves the
+  machine" guarantee for a default-on surface.
+- CLI (read commands): read-only subcommands (`stats`, `query`,
+  `report`, `export`, `analyze`, …) no longer create a database file
+  when none exists, reject future dates instead of silently returning
+  empty results, and cap WAL growth on long read sessions.
+
 ### Fixed
 
 - Docs: the status lines in `README.md`, `README.zh-CN.md`, and `APP.md` now
@@ -126,6 +168,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tray, or CLI path can turn it on, so titles are still stored verbatim.
   The previously misleading "already wired" code comments now say so
   explicitly; behavior is unchanged (default off).
+- Core (storage): a corrupted database is now surfaced to the caller with
+  a clear error plus a degraded flag instead of being swallowed, so the
+  dashboard/tray can show an explicit degraded state instead of
+  pretending data is fine.
+- Installer: the failure path is now idempotent — a failed install cleans
+  up its own partial changes so re-running the installer does not stack
+  duplicate state, and the installer writes the install directory to the
+  user `PATH` so the CLI is reachable from a fresh terminal.
+- Self-update: the updater now avoids file-in-use conflicts (backs off /
+  renames targets that are locked) and swaps only the files that actually
+  differ in a release, instead of touching every asset.
+- Docs: the AI skill doc (`SKILL.md`) now states the data-retention cap
+  in the same terms the code enforces, so AI clients no longer promise a
+  different retention window than the product keeps.
+- Dashboard (API): `/api/insights` no longer returns the internal
+  `dbg` debug field (raw intermediate counts); the endpoint contract did
+  not declare it and no frontend consumed it.
+- Dashboard (security): the per-session CSRF token is now compared with
+  the same constant-time comparison as the access token (previously a
+  plain string compare), closing the timing-contrast inconsistency.
+- Dashboard (security): the CSP nonce now mixes the high-resolution clock
+  into both halves of its 128-bit value (previously only one), removing
+  the theoretical correlation between the two `RandomState` outputs.
+- Docs: `llms.txt` corrected — status line now says v0.3.0, the privacy
+  section acknowledges the tray's once-a-day version check (the `update`
+  subcommand remains user-invoked only), and the CLI subcommand list now
+  matches the actual 18-command dispatch table; `CONTRIBUTING.md`'s
+  release checklist step 6 now counts 10 release assets (matching the
+  `release.yml` upload list); `README.md`'s quick-start `collect` comment
+  now says foreground; `APP.md`'s CLI section version labels unified.
 
 ## [0.3.0] - 2026-09-23
 
@@ -224,6 +296,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the heatmap SVG colors are read from CSS variables at render time instead
   of hardcoded dark hex values, so canvas/SVG pixels follow the system
   theme and keep contrast in Windows high-contrast mode.
+- Dashboard: report page "today" goal card now recomputes the local date
+  per render, so a page left open across midnight no longer applies the
+  server's today presence to yesterday's report.
+- Dashboard: `/api/timeline` DST caveat (`local_offset_note`) is now
+  rendered as a small note when the hour-window crosses a local offset
+  change (or the server offset differs from the browser's).
+- Dashboard: keyboard heatmap uses five distinct color steps (the bottom
+  two quantiles previously shared one color); zero-activity days no longer
+  draw a 2px phantom bar in the trend chart; `fmtBytes` supports TB;
+  per-app colors are derived from a stable name hash so the apps grid and
+  daily-top charts agree; monitors KPI falls back to `0 / 0` on missing
+  fields; unparsable `last_event_ts` no longer claims "collector down".
+- Security: POST /api/settings additionally requires a per-session random
+  token injected into the served page (the previous three CSRF checks were
+  all client-controlled headers); settings-audit.log refuses to follow
+  symlink/reparse-point targets on open.
 
 ### Changed
 
@@ -252,28 +340,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dashboard-port) across the data and exe directories with existence,
   size, mtime and a sanitized 20-line tail (no paths exposed); the
   settings page consumes it in a collapsible "diagnostics" block.
-
-### Fixed
-
-- Dashboard: report page "today" goal card now recomputes the local date
-  per render, so a page left open across midnight no longer applies the
-  server's today presence to yesterday's report.
-- Dashboard: `/api/timeline` DST caveat (`local_offset_note`) is now
-  rendered as a small note when the hour-window crosses a local offset
-  change (or the server offset differs from the browser's).
-- Dashboard: keyboard heatmap uses five distinct color steps (the bottom
-  two quantiles previously shared one color); zero-activity days no longer
-  draw a 2px phantom bar in the trend chart; `fmtBytes` supports TB;
-  per-app colors are derived from a stable name hash so the apps grid and
-  daily-top charts agree; monitors KPI falls back to `0 / 0` on missing
-  fields; unparsable `last_event_ts` no longer claims "collector down".
-- Security: POST /api/settings additionally requires a per-session random
-  token injected into the served page (the previous three CSRF checks were
-  all client-controlled headers); settings-audit.log refuses to follow
-  symlink/reparse-point targets on open.
-
-### Changed
-
 - Docs: README/README.zh-CN clarify the 8422→8432→18422/28422 port
   fallback applies to the tray entry only (the CLI dashboard exits on a
   taken port); APP.md updated to the v0.2.x state (six MCP tools incl.

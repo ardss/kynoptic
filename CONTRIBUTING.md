@@ -56,7 +56,12 @@ Release checklist (execute verbatim, in order):
    `release x.y.z: <summary>`.
 4. Tag `vx.y.z` on that commit and push the tag.
 5. Wait for the `release.yml` workflow to succeed.
-6. Verify: all 8 release assets present; the release-page download link
+6. Verify: all 10 release assets present — the 4 bare exes
+   (`kynoptic.exe`, `kynoptic-watchdog.exe`, `kynoptic-tray.exe`,
+   `kynoptic-ctl.exe`), `kynoptic-aggrepair.exe`, `SKILL.md`, the
+   portable zip, `Kynoptic-Setup-*.exe`, `SHA256SUMS.txt`, and the
+   target-triple zip (authoritative list: the `files:` block in
+   `release.yml`); the release-page download link
    matches the actual asset name
    (`releases/download/vx.y.z/Kynoptic-Setup-x.y.z.exe`);
    SHA256SUMS.txt downloadable.
