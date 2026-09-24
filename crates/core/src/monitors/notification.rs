@@ -3,6 +3,9 @@
 //! 【默认关闭】PS 子进程实现（powershell spawn），待原生 API 重写后再考虑默认启用。
 //!
 //! 通过 PowerShell Get-WinEvent 读取通知相关事件日志。
+//!
+//! 隐私边界：只存通知的来源/事件 id/时间与正文的加盐摘要（前 8 hex）+ 长度，
+//! 正文原文不落库（与 clipboard「只存摘要」披露粒度对齐）。
 
 use crate::monitors::ps::run_ps;
 use crate::types::*;
@@ -69,11 +72,17 @@ $events
                     latest_time = Some(time.clone());
                 }
                 if events.len() < 10 {
+                    // 隐私对齐（与 clipboard 同粒度）：通知正文**不落库**，
+                    // 只存加盐摘要前 8 hex + 字节长度。正文仅在子进程 stdout
+                    // → 本进程内存中转，用于计算摘要后即丢弃。
+                    let msg = parts[3].trim();
+                    let digest = super::clipboard::salted_digest_hex(msg.as_bytes());
                     events.push(json!({
                         "event_id": parts[1].trim().parse::<u32>().unwrap_or(0),
                         "time": time,
                         "source": parts[2].trim(),
-                        "message": parts[3].trim(),
+                        "digest": &digest[..8],
+                        "len": msg.len(),
                     }));
                 }
             }

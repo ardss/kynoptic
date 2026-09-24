@@ -98,6 +98,10 @@ impl Monitor for BrowserMonitor {
             }
             self.last_title.set(title.clone());
 
+            // 标题脱敏（opt-in，见 title_privacy）：默认原样，开启后剥 URL 查询串。
+            // 去重比较仍用原文标题（避免脱敏后不同页面误判为同页）。
+            let title = super::title_privacy::redact_title(&title);
+
             let event = Event::new(EventAction::TabChange, EventType::Window)
                 .data(json!({
                     "browser": proc_name,

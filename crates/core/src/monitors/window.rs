@@ -107,6 +107,9 @@ impl Monitor for WindowMonitor {
 
             log::debug!("window: foreground changed to {:?}", hwnd);
 
+            // 标题脱敏（opt-in，见 title_privacy）：默认原样，开启后剥 URL 查询串
+            let title = super::title_privacy::redact_title(&title);
+
             let event = Event::new(EventAction::Switch, EventType::Window)
                 .data(json!({
                     "hwnd": hwnd as u64,
