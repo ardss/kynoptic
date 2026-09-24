@@ -320,6 +320,11 @@ pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
     let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
     // 只核对最近 7 天（见上方取舍说明）；cutoff 用 UTC RFC3339 与 timestamp 列同构比较。
     let cutoff = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    // agg 侧改为**按候选日**取 MAX(max_event_rowid)：旧实现
+    // `SELECT date, MAX(...) FROM agg_minute GROUP BY date` 是 agg_minute 全表
+    // 扫描，成本随库龄线性增长（24 万行实测 1.3s，每次开库 + 每日维护各一次）。
+    // 现按 (date,hour,minute,bucket_id) 主键索引对窗口内候选日（至多 8 个）
+    // 做索引区间查询，成本只随 7 天窗口的聚合行数走、与库龄无关。
     let sql = format!(
         "SELECT e.d FROM (
            SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d, MAX(id) AS maxid
@@ -329,11 +334,8 @@ pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
              AND timestamp >= '{cutoff}'
            GROUP BY d
          ) e
-         LEFT JOIN (
-           SELECT date, MAX(COALESCE(max_event_rowid, 0)) AS m
-           FROM agg_minute GROUP BY date
-         ) a ON a.date = e.d
-         WHERE COALESCE(a.m, 0) < e.maxid
+         WHERE COALESCE((SELECT MAX(COALESCE(max_event_rowid, 0))
+                         FROM agg_minute WHERE date = e.d), 0) < e.maxid
          ORDER BY e.d",
         off = off,
         cutoff = cutoff,

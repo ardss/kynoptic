@@ -89,6 +89,26 @@ jobs:
       # Cargo.toml 版本，否则终止发版（拦住「源码已发 0.3.0、产物还是 0.2.x」）
       - name: Verify dist version matches Cargo.toml
         run: node scripts/check-dist-version.mjs dist
+      # ci 修复：安装器版本一致性门禁——真实静默安装到临时目录后运行
+      # kynoptic.exe --version，断言与包名一致（拦住「包名 0.2.1、二进制
+      # 自报 0.2.0」型版本漂移，iss 头部注释记载过同型历史事故）。
+      # runner 为一次性环境，安装产生的计划任务/Run 值在步末显式清理。
+      - name: Install installer to temp dir and verify binary version matches package
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
+          $tmp = Join-Path $env:RUNNER_TEMP "kynoptic-vercheck"
+          $p = Start-Process -FilePath "dist/Kynoptic-Setup-$ver.exe" `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$tmp" `
+            -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
+          $vout = (& "$tmp/kynoptic.exe" --version) -join " "
+          Write-Host "kynoptic.exe --version -> '$vout' (package version $ver)"
+          if ($vout -notlike "*$ver*") { throw "version mismatch: package $ver, binary reports '$vout'" }
+          # 清理一次性 runner 上的安装副作用（不清理也会随 runner 销毁，这里显式做）
+          schtasks /Delete /F /TN "Kynoptic Watchdog" 2>$null | Out-Null
+          Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+            -Name "Kynoptic" -ErrorAction SilentlyContinue
       - name: Write release notes
         run: |
           $tag = $env:GITHUB_REF_NAME

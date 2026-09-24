@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dashboard (high-contrast/forced-colors): the 24h timeline three-state
+  bands, their legend markers, and both five-swatch heatmap legends are now
+  drawn via CSS classes/`--hm-*` variables with distinct system-color
+  mappings (plus a stripe pattern on the away band), instead of inline
+  backgrounds that Windows high contrast collapses into one indistinguishable
+  color; the forced-colors heatmap levels are five distinct system colors
+  (previously 5 levels degraded to 3) and the legend swatches follow the same
+  variables as the chart (the fifth swatch no longer shows a stale blue).
+- Dashboard (accessibility): the daily heatmap and today's hourly input SVGs
+  now have accessible names and the heatmap exposes its per-day values as a
+  collapsible text summary (values previously lived only in hover tooltips,
+  unreachable by keyboard, touch, and screen readers); the keyboard/mouse
+  device SVGs got accessible names too.
+- Dashboard (accessibility): the tab bar now implements the ARIA APG tabs
+  keyboard contract (roving tabindex, Arrow/Home/End to move and activate,
+  `aria-controls`/`aria-labelledby` linkage); heatmap range buttons use
+  radiogroup semantics with `aria-checked` and arrow-key support; the
+  today/yesterday/2-days-ago buttons expose `aria-pressed`; the status line,
+  update banner, and anomaly badge are live regions that no longer re-announce
+  on every 30s poll when the text is unchanged.
+- Dashboard (error messages): API errors now carry a stable `code` field;
+  English UIs map validation codes to English text instead of showing raw
+  Chinese; 404/405 return bilingual text with a refresh hint; serde JSON
+  parse errors report only line/column (details go to the log); SQLite errors
+  are downgraded to a friendly bilingual message with the original logged;
+  the 403 write-block and session-token responses are bilingual and
+  distinguishable, and the settings save path offers a token re-entry prompt
+  on 401.
+- Dashboard (`/api/input`): requesting more than the 90-day cap is no longer
+  silently truncated — the response includes `days_requested` and a note.
+- Dashboard (reflow): settings/cards/host grids use `minmax(min(Npx,100%),1fr)`
+  and monitor rows wrap, so a 320px viewport no longer gets a horizontal
+  scrollbar (WCAG 1.4.10).
+- Dashboard (settings): a failed hardware-info load now shows an error with a
+  retry button instead of silently leaving placeholder dashes.
+
 - Dashboard (insights): the human-side row filter now counts scroll-only
   input_agg minutes (keys/clicks/scroll_ticks each minus their injected
   counterpart, aligned with the presence definition), so scroll-only

@@ -169,6 +169,7 @@ fn main() {
                 // filelog 已初始化，warn 落 tray.log 供用户自助定位）
                 log::warn!("已有实例在运行(互斥体已存在)，本实例退出");
                 eprintln!("kynoptic-tray: 已有实例在运行,退出");
+                rejected_start_feedback("已有实例在运行(互斥体已存在)");
                 return;
             }
             // 升级过渡桥：同时持有旧名互斥体——旧版 tray/collect 只持/只探
@@ -184,6 +185,7 @@ fn main() {
                 } else if GetLastError() == ERROR_ALREADY_EXISTS {
                     log::warn!("已有旧版实例在运行(过渡桥互斥体已存在)，本实例退出");
                     eprintln!("kynoptic-tray: 已有实例在运行,退出");
+                    rejected_start_feedback("已有实例在运行(过渡桥互斥体已存在)");
                     return;
                 }
             }
@@ -397,7 +399,14 @@ fn main() {
                         write_failures > 0,
                         write_failures
                     );
-                    if let Err(e) = std::fs::write(&hb, &content) {
+                    // 原子写：先写 .tmp 再 rename 替换。单次 fs::write 在进程
+                    // 被杀（更新 taskkill 窗口/断电）时会留下半截 JSON，被
+                    // watchdog 当异常内容处理。rename 失败兜底直接写（尽力而为）。
+                    let hb_tmp = hb.with_extension("tmp");
+                    let write_res = std::fs::write(&hb_tmp, &content)
+                        .and_then(|_| std::fs::rename(&hb_tmp, &hb))
+                        .or_else(|_| std::fs::write(&hb, &content));
+                    if let Err(e) = write_res {
                         write_failures += 1;
                         if write_failures == 1 || write_failures.is_multiple_of(20) {
                             log::error!("心跳文件写入失败(连续 {write_failures} 次): {e}");
@@ -528,6 +537,24 @@ fn main() {
                         }
                         CheckOutcome::Failed => {
                             // 查询失败：保留已有提示文件不动
+                        }
+                    }
+                    // 平台审查：搭每日子进程通路的便车自检看门狗计划任务——
+                    // 任务被禁用/删除后 watchdog_alert（唯一告警通道）本身就是
+                    // 停摆的组件，托盘是唯一还能说话的进程。每日一次，随本循环。
+                    match query_watchdog_task_health() {
+                        WatchdogTaskHealth::Ok => {}
+                        WatchdogTaskHealth::Disabled => {
+                            alert_watchdog_task_problem(
+                                &db_for_upd,
+                                "计划任务 \"Kynoptic Watchdog\" 处于禁用状态",
+                            );
+                        }
+                        WatchdogTaskHealth::Unavailable => {
+                            alert_watchdog_task_problem(
+                                &db_for_upd,
+                                "无法查询计划任务 \"Kynoptic Watchdog\"（任务可能被删除，或计划任务服务被停用）",
+                            );
                         }
                     }
                     thread::sleep(std::time::Duration::from_secs(24 * 3600));
@@ -966,6 +993,184 @@ fn apply_autostart(enable: bool) {
     }
 }
 
+/// 被拒实例的用户可见反馈（平台审查：GUI 子系统下仅 log::warn + eprintln
+/// 等于"点了没反应"）。双通道：
+/// 1) exe 同目录追加 duplicate-start.log 留痕（无 UI 也能事后排查）;
+/// 2) 弹一次消息框（同步阻塞到用户点掉，反正本实例马上要退出；
+///    既有实例不一定在听命名事件，消息框是最朴素的可靠通道）。
+fn rejected_start_feedback(reason: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("duplicate-start.log"))
+            {
+                let _ = writeln!(
+                    f,
+                    "[{}] {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    reason
+                );
+            }
+        }
+    }
+    let text: Vec<u16> = format!(
+        "Kynoptic 已有一个实例在运行，本次启动已退出。\n\
+         如果托盘里找不到图标，可以结束旧的 kynoptic-tray.exe 进程后再启动。\n\
+         详细原因见程序目录 duplicate-start.log 与数据目录 tray.log。（{reason}）\0"
+    )
+    .encode_utf16()
+    .collect();
+    let title: Vec<u16> = "Kynoptic\0".encode_utf16().collect();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            0x0000_0040, // MB_ICONINFORMATION
+        );
+    }
+}
+
+/// 看门狗计划任务健康自检结果（平台审查：计划任务被禁用/删除后三组件
+/// 全静默——watchdog_alert 是唯一告警通道而它就是被禁用的组件。托盘在
+/// 每日循环里自检一次，把"保护已失效"变成用户可见）。
+enum WatchdogTaskHealth {
+    Ok,
+    /// 任务在但处于禁用状态（含被组策略整体停用后的禁用形态）
+    Disabled,
+    /// 查询失败：任务被删除，或计划任务服务/组策略不可用
+    Unavailable,
+}
+
+/// 判定任务 XML 是否为禁用态（纯函数,单测覆盖）：去空白 + 小写后找
+/// `<enabled>false</enabled>`（真机探针实测：启用任务省略该元素）。
+fn xml_task_disabled(xml: &str) -> bool {
+    let flat: String = xml
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    flat.contains("<enabled>false</enabled>")
+}
+
+/// 查询看门狗计划任务（"Kynoptic Watchdog"）当前状态。
+///
+/// 解析用 `schtasks /Query /TN … /XML` 输出里的 `<Enabled>` 元素——
+/// 真机探针实测（2026-09-24）：禁用任务输出 `<Enabled>false</Enabled>`、
+/// 启用任务省略该元素（默认 true），且 XML 值不随系统语言变化（/FO LIST
+/// 的"已启用/Enabled"文本随 locale 变，不可靠）；任务不存在时 schtasks
+/// 退出码 1。不解析 /FO LIST 的本地化文本。
+fn query_watchdog_task_health() -> WatchdogTaskHealth {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = match std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "Kynoptic Watchdog", "/XML"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("看门狗计划任务自检: schtasks 执行失败: {e}");
+            return WatchdogTaskHealth::Unavailable;
+        }
+    };
+    if !out.status.success() {
+        return WatchdogTaskHealth::Unavailable;
+    }
+    // 去空白 + 小写后找 <enabled>false</enabled>（容忍属性/换行/大小写差异）
+    if xml_task_disabled(&String::from_utf8_lossy(&out.stdout)) {
+        WatchdogTaskHealth::Disabled
+    } else {
+        WatchdogTaskHealth::Ok
+    }
+}
+
+/// 组策略限制提示（尽力而为）：读任务计划程序策略键（平台审查指认的
+/// 禁用位所在），键存在且有值时拼进告警文案供用户排查。只读，不判定。
+fn task_scheduler_policy_hint() -> String {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    const POLICY_KEY: &str = r"SOFTWARE\Policies\Microsoft\Windows\TaskScheduler5.0";
+    let hk = RegKey::predef(HKEY_LOCAL_MACHINE);
+    match hk.open_subkey_with_flags(POLICY_KEY, winreg::enums::KEY_READ) {
+        Ok(k) => {
+            let n = k.enum_values().filter(|v| v.is_ok()).count();
+            if n > 0 {
+                format!("（检测到计划任务组策略键 {POLICY_KEY}，含 {n} 个值，可能是禁用来源）")
+            } else {
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// 最小 JSON 字符串转义（引号与控制字符），供手拼 event_data 文本用。
+fn serde_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 看门狗计划任务异常告警：落库 notification 系统事件（复用 watchdog_alert
+/// 的表结构契约：events(timestamp,'system','notification',JSON 文本)）+
+/// 弹一次系统消息框。全程尽力而为：库打不开只留日志，不影响托盘。
+fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str) {
+    let message = format!(
+        "看门狗计划任务异常：{problem}{}",
+        task_scheduler_policy_hint()
+    );
+    log::warn!("{message}");
+    // rusqlite 未开 serde_json 特性口径下 watchdog 侧也是手拼 JSON 文本落库
+    let payload = format!(
+        "{{\"source\":\"tray\",\"kind\":\"watchdog_task\",\"message\":{}}}",
+        serde_json_string(&message)
+    );
+    match rusqlite::Connection::open(db_path) {
+        Ok(conn) => {
+            if let Err(e) = conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                 VALUES (?1, 'system', 'notification', ?2)",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), payload],
+            ) {
+                log::warn!("看门狗计划任务告警落库失败: {e}");
+            }
+        }
+        Err(e) => log::warn!("看门狗计划任务告警落库失败(库打不开): {e}"),
+    }
+    let text: Vec<u16> = format!(
+        "Kynoptic 的自动保护（看门狗）当前没有生效，程序异常退出时可能不会被自动恢复，数据可能出现空洞。\n\
+         请在计划任务程序里检查名为 \"Kynoptic Watchdog\" 的任务，或重新安装 Kynoptic。\n\
+         （{message}）\0"
+    )
+    .encode_utf16()
+    .collect();
+    let title: Vec<u16> = "Kynoptic 保护已失效\0".encode_utf16().collect();
+    std::thread::spawn(move || unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            0x0000_0030 | 0x0004_0000, // MB_ICONWARNING | MB_TOPMOST
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,5 +1238,25 @@ mod tests {
         let mut last: Option<bool> = Some(true);
         assert!(!apply_autostart_if_changed(true, &mut last));
         assert_eq!(last, Some(true));
+    }
+
+    // === 看门狗计划任务 XML 状态解析（真机探针实测的输出形态） ===
+
+    #[test]
+    fn xml_task_disabled_detection() {
+        // 真机探针（2026-09-24）实测：/Change /DISABLE 后 /Query /XML 含
+        // <Enabled>false</Enabled>；启用任务省略该元素
+        assert!(xml_task_disabled("<Task><Enabled>false</Enabled></Task>"));
+        assert!(!xml_task_disabled("<Task><Enabled>true</Enabled></Task>"));
+        assert!(!xml_task_disabled("<Task><Actions /></Task>"));
+        // 容忍换行/空格/大小写
+        assert!(xml_task_disabled("<Enabled>\r\n false </Enabled>"));
+        assert!(xml_task_disabled("<ENABLED>FALSE</ENABLED>"));
+    }
+
+    #[test]
+    fn json_string_escapes_quotes_and_controls() {
+        assert_eq!(serde_json_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+        assert_eq!(serde_json_string("已启用"), "\"已启用\"");
     }
 }

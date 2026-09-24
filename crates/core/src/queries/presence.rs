@@ -93,6 +93,145 @@ pub struct PresenceDay {
     pub last_activity: Option<String>,
 }
 
+/// 纪元分钟 → 本地日期串（多日分桶用）。每个纪元分钟恰属一个本地日
+/// （本地午夜与分钟边界对齐），DST 回拨日两趟重复本地小时各得不同纪元
+/// 分钟，不会被互吞。
+fn local_date_of_minute(m: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(m * 60, 0).map(|t| {
+        t.with_timezone(&Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    })
+}
+
+/// 纪元分钟格式化为本地 "HH:MM"（首末活动输出用）。
+fn fmt_epoch_hm(m: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(m * 60, 0)
+        .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
+}
+
+/// 整窗分钟命中（单次 SQL）：`[start, end)` 为 UTC RFC3339 边界，返回
+/// (UTC 纪元分钟, human 命中, auto 命中)，按 SQL 行序、未排序。
+///
+/// 性能定案（perf 审查 2026-09）：长跨度（30-365 天）查询此前按日循环、
+/// 每日独立重扫当日 events 做 JSON 提取，成本随天数严格线性（年跨度热
+/// 13.7s）。现改为一次取全窗、再按本地日分桶（见 [`collect_day_hits`]），
+/// SQL 与判定口径逐字不变。
+fn collect_minute_hits_window(conn: &Connection, start: &str, end: &str) -> Vec<(i64, bool, bool)> {
+    // minute 模式：按 UTC 纪元分钟分桶聚合（strftime('%s') 解析 RFC3339 的
+    // 时区后缀，两趟重复本地小时得到不同纪元分钟，不再互吞）。
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute_epoch, \
+                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0, \
+                MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0 \
+         FROM events \
+         WHERE timestamp >= ?1 AND timestamp < ?2 AND event_action = 'input_agg' \
+           AND json_valid(event_data) \
+         GROUP BY minute_epoch",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![start, end], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, bool>(1)?,
+            r.get::<_, bool>(2)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
+}
+
+/// 整窗 raw 模式（opt-in 逐键）人在场纪元分钟（未排序去重）。
+///
+/// 排除注入事件——hook 已把 LLKHF_INJECTED / LLMHF_INJECTED 归一化为
+/// event_data 的 "injected" 布尔（见 keyboard_hook.rs / mouse_hook.rs 落库
+/// 字段），注入输入不得计入人在场；旧数据无该字段时 COALESCE 为 0，仍按
+/// 人算（与旧行为一致）。
+/// 取整条 timestamp 解析（DISTINCT 已去重；回拨日两趟重复本地小时的
+/// UTC 串本就不同，不会互吞），折算成纪元分钟。
+/// 审查修复：此前 substr 截前 16 字符后强当无时区 UTC 解析——存量/外部
+/// 写入的带偏移行（如 '+08:00'）会被整体错算一个时区差。现在优先按
+/// RFC3339 整串解析（parse_from_rfc3339 同时接受 'Z' 与 '+08:00' 后缀）
+/// 转 UTC；不可解析的旧行退回原 naive-UTC 路径，与写路径
+/// normalize_timestamp 同口径。
+fn raw_human_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec<i64> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT timestamp FROM events \
+         WHERE event_action IN ('press','click','scroll') \
+           AND timestamp >= ?1 AND timestamp < ?2 \
+           AND COALESCE(json_extract(event_data,'$.injected'), 0) = 0",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![start, end], |r| r.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    use chrono::TimeZone;
+    let mut out = Vec::new();
+    for ts in rows.flatten() {
+        let epoch_min = if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
+            t.with_timezone(&Utc).timestamp() / 60
+        } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M") {
+            Utc.from_utc_datetime(&t).timestamp() / 60
+        } else {
+            continue;
+        };
+        out.push(epoch_min);
+    }
+    out
+}
+
+/// 按本地日分桶的共用取数核心：对给定日期列表**一次**扫描整窗（分钟 SQL +
+/// raw SQL 各一条），返回 每日 → (human 纪元分钟, auto 纪元分钟, mixed 分钟数)，
+/// 均未排序去重。语义与逐日调用旧 `collect_minute_hits` 完全一致——分钟
+/// 归属按纪元分钟的本地日期判定，与旧实现按日 `[start, end)` 过滤等价。
+fn collect_day_hits(
+    conn: &Connection,
+    local_days: &[String],
+) -> std::collections::HashMap<String, (Vec<i64>, Vec<i64>, i64)> {
+    let mut out: std::collections::HashMap<String, (Vec<i64>, Vec<i64>, i64)> =
+        std::collections::HashMap::new();
+    // 整窗边界 = 各日范围的 min/max；全部不可解析时不发查询
+    let mut wstart: Option<String> = None;
+    let mut wend: Option<String> = None;
+    for (s, e) in local_days.iter().filter_map(|d| super::local_day_range(d)) {
+        wstart = Some(match wstart {
+            Some(cur) if cur.as_str() <= s.as_str() => cur,
+            _ => s,
+        });
+        wend = Some(match wend {
+            Some(cur) if cur.as_str() >= e.as_str() => cur,
+            _ => e,
+        });
+    }
+    let (Some(wstart), Some(wend)) = (wstart, wend) else {
+        return out;
+    };
+    let bucket = |m: i64| local_date_of_minute(m);
+    for (mepoch, human_hit, auto_hit) in collect_minute_hits_window(conn, &wstart, &wend) {
+        let Some(day) = bucket(mepoch) else { continue };
+        let e = out.entry(day).or_default();
+        if human_hit {
+            e.0.push(mepoch);
+        }
+        if auto_hit {
+            if human_hit {
+                e.2 += 1;
+            }
+            e.1.push(mepoch);
+        }
+    }
+    for mepoch in raw_human_minutes_window(conn, &wstart, &wend) {
+        if let Some(day) = bucket(mepoch) {
+            out.entry(day).or_default().0.push(mepoch);
+        }
+    }
+    out
+}
+
 /// 指定本地日的三指标全管线（分类 + raw 补充 + 桥接）——全站唯一入口。
 ///
 /// `local_day` 为 `YYYY-MM-DD` 本地日期；`bridge_min` 为桥接阈值
@@ -104,26 +243,54 @@ pub struct PresenceDay {
 /// 会被折叠到同一个本地钟面值而丢分钟。纪元分钟对两趟天然唯一、严格单调，
 /// 去重与桥接数学完全不变；首末活动在输出时再格式化回本地 "HH:MM"。
 pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> PresenceDay {
-    let (mut human, automation, mixed) = collect_minute_hits(conn, local_day);
-    human.sort_unstable();
-    human.dedup();
+    classify_minutes_multi(
+        conn,
+        std::slice::from_ref(&local_day.to_string()),
+        bridge_min,
+    )
+    .into_iter()
+    .next()
+    .map(|(_, d)| d)
+    .unwrap_or_default()
+}
+
+/// 多日版 [`classify_minutes`]（长跨度查询路径）：N 天循环改为**一次**整窗
+/// SQL，再按本地日分桶跑同一套桥接/首末活动算法。返回顺序与 `local_days`
+/// 一致；逐日结果与逐日调用 [`classify_minutes`] 完全等价。
+pub fn classify_minutes_multi(
+    conn: &Connection,
+    local_days: &[String],
+    bridge_min: u32,
+) -> Vec<(String, PresenceDay)> {
+    let hits = collect_day_hits(conn, local_days);
     let bridge = i64::from(bridge_min.min(15));
-    let presence = bridge_count(&human, bridge);
-    // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"（此前按
-    // 行序覆盖在乱序结果集上不可靠，纪元分钟取 min/max 语义精确）。
-    let fmt_epoch_hm = |m: i64| -> Option<String> {
-        chrono::DateTime::from_timestamp(m * 60, 0)
-            .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
-    };
-    let first_activity = human.first().copied().and_then(fmt_epoch_hm);
-    let last_activity = human.last().copied().and_then(fmt_epoch_hm);
-    PresenceDay {
-        presence_minutes: presence,
-        automation_minutes: automation.len() as i64,
-        mixed_minutes: mixed,
-        first_activity,
-        last_activity,
-    }
+    local_days
+        .iter()
+        .map(|day| {
+            let (mut human, mut automation, mixed) = hits
+                .get(day)
+                .cloned()
+                .unwrap_or_else(|| (Vec::new(), Vec::new(), 0));
+            human.sort_unstable();
+            human.dedup();
+            automation.sort_unstable();
+            automation.dedup();
+            let presence = bridge_count(&human, bridge);
+            // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"。
+            let first_activity = human.first().copied().and_then(fmt_epoch_hm);
+            let last_activity = human.last().copied().and_then(fmt_epoch_hm);
+            (
+                day.clone(),
+                PresenceDay {
+                    presence_minutes: presence,
+                    automation_minutes: automation.len() as i64,
+                    mixed_minutes: mixed,
+                    first_activity,
+                    last_activity,
+                },
+            )
+        })
+        .collect()
 }
 
 /// 指定本地日的**人在场纪元分钟序列**（升序去重）——全站唯一权威实现。
@@ -132,88 +299,26 @@ pub fn classify_minutes(conn: &Connection, local_day: &str, bridge_min: u32) -> 
 /// injected_clicks / 注入滚轮）不计入、含滚轮滚动，与 [`classify_minutes`]
 /// / 总览「今日在场」完全同源——自动化脚本把键盘敲得再响也撑不起「人在场」。
 pub fn human_minutes_by_date(conn: &Connection, local_day: &str) -> Vec<i64> {
-    let (mut human, _auto, _mixed) = collect_minute_hits(conn, local_day);
-    human.sort_unstable();
-    human.dedup();
-    human
+    human_minutes_by_days(conn, &[local_day.to_string()])
+        .into_iter()
+        .next()
+        .map(|(_, m)| m)
+        .unwrap_or_default()
 }
 
-/// [`classify_minutes`] / [`human_minutes_by_date`] 的共用取数核心：
-/// 返回 (human 纪元分钟, auto 纪元分钟, mixed 分钟数)，均未排序去重。
-fn collect_minute_hits(conn: &Connection, local_day: &str) -> (Vec<i64>, Vec<i64>, i64) {
-    let Some((start, end)) = super::local_day_range(local_day) else {
-        return (Vec::new(), Vec::new(), 0);
-    };
-    let mut human: Vec<i64> = Vec::new();
-    let mut automation: Vec<i64> = Vec::new();
-    let mut mixed: i64 = 0;
-    // minute 模式：按 UTC 纪元分钟分桶聚合（strftime('%s') 解析 RFC3339 的
-    // 时区后缀，两趟重复本地小时得到不同纪元分钟，不再互吞）。
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute_epoch, \
-                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0, \
-                MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0 \
-         FROM events \
-         WHERE timestamp >= ?1 AND timestamp < ?2 AND event_action = 'input_agg' \
-           AND json_valid(event_data) \
-         GROUP BY minute_epoch",
-    ) {
-        if let Ok(rows) = stmt.query_map(params![&start, &end], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, bool>(2)?,
-            ))
-        }) {
-            for (mepoch, human_hit, auto_hit) in rows.flatten() {
-                if human_hit {
-                    human.push(mepoch);
-                }
-                if auto_hit {
-                    if human_hit {
-                        mixed += 1;
-                    }
-                    automation.push(mepoch);
-                }
-            }
-        }
-    }
-    // raw 模式（opt-in 逐键）：排除注入事件——hook 已把 LLKHF_INJECTED /
-    // LLMHF_INJECTED 归一化为 event_data 的 "injected" 布尔（见
-    // keyboard_hook.rs / mouse_hook.rs 落库字段），注入输入不得计入人在场；
-    // 旧数据无该字段时 COALESCE 为 0，仍按人算（与旧行为一致）。
-    // 取整条 timestamp 解析（DISTINCT 已去重；回拨日两趟重复本地小时的
-    // UTC 串本就不同，不会互吞），折算成纪元分钟。
-    // 审查修复：此前 substr 截前 16 字符后强当无时区 UTC 解析——存量/外部
-    // 写入的带偏移行（如 '+08:00'）会被整体错算一个时区差。现在优先按
-    // RFC3339 整串解析（parse_from_rfc3339 同时接受 'Z' 与 '+08:00' 后缀）
-    // 转 UTC；不可解析的旧行退回原 naive-UTC 路径，与写路径
-    // normalize_timestamp 同口径。
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT timestamp FROM events \
-         WHERE event_action IN ('press','click','scroll') \
-           AND timestamp >= ?1 AND timestamp < ?2 \
-           AND COALESCE(json_extract(event_data,'$.injected'), 0) = 0",
-    ) {
-        if let Ok(rows) = stmt.query_map(params![&start, &end], |r| r.get::<_, String>(0)) {
-            use chrono::TimeZone;
-            for ts in rows.flatten() {
-                let epoch_min = if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
-                    t.with_timezone(&Utc).timestamp() / 60
-                } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M") {
-                    Utc.from_utc_datetime(&t).timestamp() / 60
-                } else {
-                    continue;
-                };
-                human.push(epoch_min);
-            }
-        }
-    }
-    human.sort_unstable();
-    human.dedup();
-    automation.sort_unstable();
-    automation.dedup();
-    (human, automation, mixed)
+/// 多日版 [`human_minutes_by_date`]：整窗一次 SQL 后按本地日分桶，
+/// 返回顺序与 `local_days` 一致，逐日结果与逐日调用完全等价。
+pub fn human_minutes_by_days(conn: &Connection, local_days: &[String]) -> Vec<(String, Vec<i64>)> {
+    let hits = collect_day_hits(conn, local_days);
+    local_days
+        .iter()
+        .map(|day| {
+            let mut human = hits.get(day).map(|h| h.0.clone()).unwrap_or_default();
+            human.sort_unstable();
+            human.dedup();
+            (day.clone(), human)
+        })
+        .collect()
 }
 
 /// 前台应用驻留的「停摆间隔」封顶：相邻窗口切换间隔超过该秒数（如关机、

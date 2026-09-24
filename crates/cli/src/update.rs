@@ -273,33 +273,134 @@ fn download_file(url: &str, dest: &std::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
-/// 静默强杀进程（taskkill，CREATE_NO_WINDOW 不弹 console 窗）
-#[cfg(windows)]
-fn kill_process(image: &str) -> bool {
-    // 自杀防护（审查 P2）：替换循环里包含主 exe（更新器自身）；rename 运行中
-    // 的 exe 在 Windows 上通常成功，只有失败兜底才走到杀进程——此时按镜像名
-    // 杀会把自己（及一切 kynoptic CLI 会话）中途击毙，托盘已换、回滚不再运行。
-    if let Ok(self_exe) = std::env::current_exe() {
-        if self_exe
-            .file_name()
-            .map(|n| n.to_string_lossy() == image)
-            .unwrap_or(false)
-        {
-            return false;
+/// 更新进行中旗标路径（与 tray-exit.flag 同级，exe 同目录）。置位期间
+/// watchdog 跳过 .bak 恢复与托盘拉起，避免把两阶段替换窗口里的
+/// 「exe 缺失、仅存 .bak」当成中断现场还原出旧版 exe 并拉起。
+fn updating_flag_for(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    exe_dir.join("updating.flag")
+}
+
+/// updating.flag 超过此时长视为残留。正常两阶段替换窗口为秒级（下载已
+/// 完成、只剩改名+放入+验证），远不会到 10 分钟。
+const UPDATING_FLAG_MAX_AGE_SECS: u64 = 600;
+
+/// 旗标在位且未超龄 = 更新确实进行中，应避让，返回 true。旗标超龄 =
+/// 更新器进程在替换窗口内被 taskkill /F 强杀或断电（安装器收尾
+/// DeinitializeSetup 不执行，没有任何清理路径会碰它），残留旗标会永久
+/// 压制 .bak 恢复与托盘拉起，托盘消失且不自愈——此时删除旗标并返回
+/// false，让恢复路径重新接管。读取失败按无旗标处理（不避让，行为与
+/// 旗标不存在一致）。
+pub fn updating_flag_active(exe_dir: &std::path::Path) -> bool {
+    let flag = updating_flag_for(exe_dir);
+    let Ok(meta) = std::fs::metadata(&flag) else {
+        return false;
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs());
+    match age {
+        Some(age) if age <= UPDATING_FLAG_MAX_AGE_SECS => true,
+        _ => {
+            let age_s = age
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "未知".to_string());
+            eprintln!(
+                "updating.flag 已残留（{age_s}s 前写入，超过 {UPDATING_FLAG_MAX_AGE_SECS}s），\
+                 判定更新器中途被强杀，删除旗标并恢复 .bak 恢复/托盘拉起"
+            );
+            let _ = std::fs::remove_file(&flag);
+            false
         }
     }
+}
+
+/// 枚举指定映像名进程的 (pid, 可执行路径)（仅本更新目录过滤用）。
+/// 走 PowerShell CIM：wmic 在新版 Windows 已移除，tasklist 又拿不到路径。
+/// 返回 None = 枚举本身失败（PowerShell 被策略禁用、WMI/CIM 服务异常等），
+/// 与「枚举成功但没有进程」(Some(空)) 严格区分——审查：此前一律返回空
+/// Vec，tray_was_running 误判 false，更新照常报成功而旧版托盘仍在内存里
+/// 静默运行（停留旧版），且全程无告警。
+#[cfg(windows)]
+fn list_process_paths(image: &str) -> Option<Vec<(u32, String)>> {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // windows-sys Win32::System::Threading::CREATE_NO_WINDOW
-    std::process::Command::new("taskkill")
-        .args(["/F", "/IM", image, "/T"])
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='{}'\" | \
+         ForEach-Object {{ \"$($_.ProcessId)|$($_.ExecutablePath)\" }}",
+        image.replace('\'', "")
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .output();
+    let stdout = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return None,
+    };
+    Some(
+        stdout
+            .lines()
+            .filter_map(|l| {
+                let (pid, path) = l.trim().split_once('|')?;
+                Some((pid.parse::<u32>().ok()?, path.to_string()))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(not(windows))]
-fn kill_process(_image: &str) -> bool {
+fn list_process_paths(_image: &str) -> Option<Vec<(u32, String)>> {
+    Some(Vec::new())
+}
+
+/// 进程的可执行路径是否位于 dir 内（前缀比较，含目录分隔符边界）。
+fn path_in_dir(path: &str, dir: &std::path::Path) -> bool {
+    let p = std::path::Path::new(path);
+    let Ok(p) = p.canonicalize() else {
+        return false;
+    };
+    let Ok(d) = dir.canonicalize() else {
+        return false;
+    };
+    p.starts_with(&d)
+}
+
+/// 静默强杀进程（定向 PID，CREATE_NO_WINDOW 不弹 console 窗）。
+/// 旧实现 `taskkill /F /IM <镜像名> /T` 按镜像名机器级击杀，跨目录命中一切
+/// 同名进程（多套部署/沙箱场景全部误杀）。现改为：tasklist 同名枚举后逐 pid
+/// 校验可执行路径属本次更新的 exe 目录才 `taskkill /PID`（与 watchdog 侧
+/// r25 修复后「只杀自己管理的那个托盘」同口径）。任一目标杀成功即返回 true；
+/// 目录外同名进程一律不碰。
+#[cfg(windows)]
+fn kill_process(image: &str, dir: &std::path::Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // windows-sys Win32::System::Threading::CREATE_NO_WINDOW
+    let self_pid = std::process::id();
+    let mut killed = false;
+    // 枚举失败（None）时无目标可杀：杀不掉的事实由调用方据探测结果告警
+    for (pid, path) in list_process_paths(image).unwrap_or_default() {
+        // 自杀防护（审查 P2）：更新器自身也在替换清单的镜像名里，绝不自杀
+        if pid == self_pid {
+            continue;
+        }
+        if !path_in_dir(&path, dir) {
+            continue;
+        }
+        let ok = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string(), "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        killed = killed || ok;
+    }
+    killed
+}
+
+#[cfg(not(windows))]
+fn kill_process(_image: &str, _dir: &std::path::Path) -> bool {
     false
 }
 
@@ -355,6 +456,8 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)], reason: &str) 
     // 旗标残留会让看门狗永久不拉起托盘（等于托盘凭空消失到下次重启）。
     if let Some(dir) = backups.first().and_then(|(d, _)| d.parent()) {
         let _ = std::fs::remove_file(exit_flag_for(dir));
+        // 同理清除更新中旗标：回滚后 watchdog 须恢复 .bak 恢复与拉起职责
+        let _ = std::fs::remove_file(updating_flag_for(dir));
     }
     ok
 }
@@ -363,7 +466,14 @@ fn rollback(backups: &[(std::path::PathBuf, std::path::PathBuf)], reason: &str) 
 /// 波及——会留下「exe 缺失、仅存 .bak」的目录，此前无人复原，watchdog 也
 /// 只会报「缺失，无法拉起」）。五件套任一 dest 缺失而 dest.bak 在位即改名
 /// 还原，返回还原个数。cmd_update 与 watchdog 拉起路径在入口调用。
+/// updating.flag 在位（未超龄）= 更新两阶段替换正在进行：缺失+仅存 .bak 是
+/// 中间态而非中断现场，无条件还原会复活旧版 exe 并被拉起（版本错位），跳过
+/// 本轮。旗标超龄残留时 updating_flag_active 会自行删除并放行恢复。
 pub fn recover_orphan_baks(exe_dir: &std::path::Path) -> usize {
+    if updating_flag_active(exe_dir) {
+        eprintln!("updating.flag 在位（更新进行中），本轮跳过 .bak 恢复");
+        return 0;
+    }
     let mut n = 0;
     for name in BIN_NAMES {
         let dest = exe_dir.join(name);
@@ -566,18 +676,44 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     let mut order: Vec<&str> = BIN_NAMES[1..].to_vec();
     order.push(BIN_NAMES[0]);
 
+    // 更新进行中旗标：4a 前置位，成功收尾/失败回滚时清除。置位期间 watchdog
+    // 跳过 .bak 恢复与托盘拉起（否则每分钟的 watchdog 会在两阶段替换窗口里
+    // 把「exe 缺失、仅存 .bak」还原成旧版 exe 并拉起旧托盘，造成版本错位）。
+    // Windows 上对运行中 exe 的覆盖/rename 实测都会成功，不能依赖「替换失败」
+    // 触发托盘解锁——旗标是 watchdog 避让的唯一可靠信号。
+    let _ = std::fs::write(updating_flag_for(&dir), "updating\n");
+
+    // 替换前记录本目录托盘是否在运行：Windows 上运行中的 exe 会被新文件
+    // 静默覆盖（rename 不失败、tray_killed 不置位），运行中的一定是旧版，
+    // 收尾阶段据此统一换血（见步骤 6 后的托盘重启逻辑）。枚举失败（None：
+    // PowerShell 被禁/CIM 服务异常）时无法确认托盘死活，按「不在运行」处理
+    // 但必须留告警——否则就是又一条「更新报成功、旧版托盘仍在内存运行、
+    // 用户静默停留旧版」的静默路径（审查）。
+    let tray_process_paths = list_process_paths("kynoptic-tray.exe");
+    let tray_was_running = match &tray_process_paths {
+        Some(paths) => paths.iter().any(|(_, p)| path_in_dir(p, &dir)),
+        None => {
+            warnings.push(
+                "无法枚举系统进程（PowerShell 或 WMI/CIM 服务不可用），不能确认旧版托盘是否在运行；\
+                 若更新后托盘仍在运行，请手动退出并重新启动 kynoptic-tray.exe"
+                    .to_string(),
+            );
+            false
+        }
+    };
+
     // 4a. 备份：旧文件改名 .bak（dest 原不存在时无 .bak，rollback 跳过）
     for name in &order {
         let dest = dir.join(name);
         let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
         let _ = std::fs::remove_file(&bak);
         if dest.exists() && std::fs::rename(&dest, &bak).is_err() {
-            // 沿用旧 replace_with_backup 的托盘解锁：先写退出旗标再 taskkill
+            // 沿用旧 replace_with_backup 的托盘解锁：先写退出旗标再定向 taskkill
             if name == &"kynoptic-tray.exe" {
                 if let Some(d) = dest.parent() {
                     let _ = std::fs::write(exit_flag_for(d), "updating\n");
                 }
-                if kill_process(name) {
+                if kill_process(name, &dir) {
                     tray_killed = true;
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
@@ -662,9 +798,15 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         "旧版本已保留为同名 .bak 文件（{}\\*.bak），确认无误后可手动删除",
         dir.display()
     );
-    // 托盘因解锁被杀时负责拉起（审查 P1）：否则更新"成功"后用户托盘凭空
-    // 消失——便携版没有看门狗任务，没人会替我们重启它。
-    if tray_killed {
+    // 托盘换血（审查：Windows 上运行中 exe 被覆盖不报错，旧实现只靠 rename
+    // 失败置位 tray_killed——该分支在本 OS 不可达，更新报成功但旧版托盘仍在
+    // 内存里运行，用户静默停留在旧版）。统一处理两种来源：替换期间被杀的
+    // （tray_killed）与被静默覆盖仍在运行的（tray_was_running）：写退出旗标
+    // → 按 exe 目录定向击杀残留托盘 → 从磁盘拉起新版 → 清旗标。
+    if tray_killed || tray_was_running {
+        let _ = std::fs::write(exit_flag_for(&dir), "updating\n");
+        kill_process("kynoptic-tray.exe", &dir);
+        std::thread::sleep(std::time::Duration::from_millis(500));
         match std::process::Command::new(dir.join("kynoptic-tray.exe"))
             .arg("--minimized")
             .spawn()
@@ -673,11 +815,17 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
                 let _ = std::fs::remove_file(exit_flag_for(&dir));
                 eprintln!("托盘已随更新自动重启");
             }
-            Err(err) => warnings.push(format!(
-                "托盘自动重启失败（{err}），请手动启动 kynoptic-tray.exe"
-            )),
+            Err(err) => {
+                // 旗标残留会永久压制 watchdog 拉起——失败路径也必须清
+                let _ = std::fs::remove_file(exit_flag_for(&dir));
+                warnings.push(format!(
+                    "托盘自动重启失败（{err}），请手动启动 kynoptic-tray.exe"
+                ))
+            }
         }
     }
+    // 全部落定：清除更新中旗标，恢复 watchdog 的 .bak 恢复与拉起职责
+    let _ = std::fs::remove_file(updating_flag_for(&dir));
     for w in warnings {
         eprintln!("警告: {w}");
     }
@@ -785,6 +933,27 @@ mod tests {
         assert!(!dir.join("kynoptic-tray.exe.bak").exists());
         assert_eq!(recover_orphan_baks(&dir), 0, "无孤儿时不应有动作");
         assert_eq!(std::fs::read(dir.join("kynoptic.exe")).unwrap(), b"cur");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphan_bak_recovery_skips_while_updating_flag_present() {
+        // 审查回归：两阶段替换窗口内「exe 缺失、仅存 .bak」是中间态——
+        // updating.flag 在位时必须整轮跳过，否则还原出旧版 exe 并被拉起
+        let dir = std::env::temp_dir().join(format!("kynoptic-orphan-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kynoptic-tray.exe.bak"), b"old").unwrap();
+        std::fs::write(updating_flag_for(&dir), b"updating").unwrap();
+        assert_eq!(recover_orphan_baks(&dir), 0, "更新中不得还原 .bak");
+        assert!(
+            !dir.join("kynoptic-tray.exe").exists(),
+            "旧版 exe 不应被复活"
+        );
+        assert!(
+            dir.join("kynoptic-tray.exe.bak").exists(),
+            ".bak 应保持原位"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

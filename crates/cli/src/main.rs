@@ -134,6 +134,21 @@ fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// 读命令专用打开：库不存在时拒绝并报错（与 dashboard 入口同口径），不静默
+/// 新建空库。旧实现读路径共用 open_db（Connection::open + SCHEMA 会建库），
+/// `stats --db 不存在路径` 会凭空创建空库并输出全零统计、退出码 0——用户把
+/// 「采集从未运行/库被移走」误读成「今天没有活动」。写路径（采集/告警落库）
+/// 仍走 open_db 保留既有建库行为。
+fn open_db_read(path: &Path) -> Result<Connection> {
+    if !path.exists() {
+        return Err(Error::InvalidData(format!(
+            "数据库不存在: {}（先用采集器/ctl 生成，读命令不建库不迁移）",
+            path.display()
+        )));
+    }
+    open_db(path)
+}
+
 fn parse_date(s: &str) -> Result<String> {
     // 接受 YYYY-MM-DD；空 = 今天（本地时区，与 app 的 today_range 同源）
     if s.is_empty() {
@@ -142,6 +157,18 @@ fn parse_date(s: &str) -> Result<String> {
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map(|d| d.format("%Y-%m-%d").to_string())
         .map_err(|e| Error::InvalidData(format!("日期格式错: {e}")))
+        .and_then(|d| {
+            // 与 dash 面板 reject_future_date 同口径：查"明天"得到看似权威的
+            // 全 0 输出（空报告/零统计）比报错更误导，统一在此拒绝
+            let today = queries::today_local_str();
+            if d.as_str() > today.as_str() {
+                Err(Error::InvalidData(format!(
+                    "日期 {d} 在未来（今天 {today}），请检查 --date 参数"
+                )))
+            } else {
+                Ok(d)
+            }
+        })
 }
 
 // === stats ===
@@ -175,7 +202,7 @@ fn cmd_stats(args: &[String]) -> Result<()> {
         i += 1;
     }
     let db_path = resolve_db();
-    let conn = open_db(&db_path)?;
+    let conn = open_db_read(&db_path)?;
     if days == 1 {
         let date = if date.is_empty() {
             queries::today_local_str()
@@ -278,7 +305,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
             (Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000))).to_rfc3339()
         }
     };
-    let conn = open_db(&db_path)?;
+    let conn = open_db_read(&db_path)?;
     // 流式导出（审查 P2：不再把全表载入内存）
     use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
     let row_count = std::sync::Arc::new(AtomicUsize::new(0));
@@ -511,7 +538,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
         i += 1;
     }
     let date = resolve_report_date(&date)?;
-    let conn = open_db(&resolve_db())?;
+    let conn = open_db_read(&resolve_db())?;
     let analysis = analyzer::analyze_day(&conn, &date)?;
     let anomalies = anomaly::detect_all(&conn, &date).unwrap_or_default();
 
@@ -587,7 +614,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
 fn cmd_db(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("stats");
     let db_path = resolve_db();
-    let conn = open_db(&db_path)?;
+    let conn = open_db_read(&db_path)?;
     match sub {
         "stats" => {
             let n_events = queries::count_all_events(&conn);
@@ -725,7 +752,7 @@ fn cmd_analyze(args: &[String]) -> Result<()> {
     // --date 是窗口的最后一天（默认今天）；--days N 往前多看 N-1 天
     let end = parse_date(&date)?;
     let db_path = resolve_db();
-    let conn = open_db(&db_path)?;
+    let conn = open_db_read(&db_path)?;
     let end_d = chrono::NaiveDate::parse_from_str(&end, "%Y-%m-%d")
         .map_err(|e| Error::InvalidData(format!("日期格式错: {e}")))?;
     let dates: Vec<String> = (0..days)
@@ -928,7 +955,7 @@ fn cmd_migrate(_args: &[String]) -> Result<()> {
 /// `kynoptic now`：当前机器状态一行式视图（与 MCP get_current_status 同数据面）。
 fn cmd_now(args: &[String]) -> Result<()> {
     let as_json = args.iter().any(|a| a == "--json");
-    let conn = open_db(&resolve_db())?;
+    let conn = open_db_read(&resolve_db())?;
     let status = kynoptic_mcp::state::current_status(&conn, None).map_err(Error::InvalidData)?;
     if as_json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -1125,7 +1152,7 @@ fn cmd_query(args: &[String]) -> Result<()> {
         .map(parse_bucket)
         .transpose()?;
 
-    let conn = open_db(&resolve_db())?;
+    let conn = open_db_read(&resolve_db())?;
     let sql = match (&bucket, &to) {
         (Some(_), Some(_)) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ? AND timestamp < ? AND event_type = ? ORDER BY timestamp DESC LIMIT ?",
         (Some(_), None) => "SELECT timestamp, event_type, event_action, COALESCE(app_name,''), COALESCE(window_title,'') FROM events WHERE timestamp >= ? AND event_type = ? ORDER BY timestamp DESC LIMIT ?",
@@ -1551,15 +1578,16 @@ fn cmd_presence(args: &[String]) -> Result<()> {
     // "using db: <path>" 打两遍，污染 stderr 且削弱人工核对信号。
     let db_path = resolve_db();
     let bridge = kynoptic_dash::settings::load(&db_path).presence_bridge_minutes;
-    let conn = open_db(&db_path)?;
+    let conn = open_db_read(&db_path)?;
     println!("=== Presence last {days} day(s) (bridge <= {bridge} min) ===");
-    for offset in (1 - days)..=0 {
-        let date = queries::date_offset_str(offset);
-        let Some((start, end)) = queries::local_day_range(&date) else {
-            continue;
+    // 长跨度性能：逐日循环改为一次整窗调用（core classify_minutes_multi，
+    // 单条 SQL 取全窗后按本地日分桶），逐日结果与旧循环完全一致。
+    let dates: Vec<String> = ((1 - days)..=0).map(queries::date_offset_str).collect();
+    for (date, day) in queries::classify_minutes_multi(&conn, &dates, bridge) {
+        let foreground = match queries::local_day_range(&date) {
+            Some((start, end)) => foreground_minutes(&conn, &start, &end),
+            None => 0,
         };
-        let day = queries::classify_minutes(&conn, &date, bridge);
-        let foreground = foreground_minutes(&conn, &start, &end);
         println!("{date} presence:   {} min", day.presence_minutes);
         println!("{date} automation: {} min", day.automation_minutes);
         println!("{date} mixed:      {} min", day.mixed_minutes);
@@ -2144,7 +2172,8 @@ fn mark_spawned(state: &mut WatchdogState, now_epoch: i64, hb_mtime: i64) {
 /// - 复查仍超龄（无论是否继续增长）= 心跳 40s 未刷新且超龄，判挂死 kill；
 /// - 复查仍 Stalled = 采集持续停滞（core last_flush_epoch 不前进），判挂死 kill；
 /// - 复查仍 Missing = 写方已死或文件被删，未恢复，kill；
-/// - 复查仍 Unparseable = tray 只写合法内容，垃圾说明写路径损坏，未恢复，kill；
+/// - 复查仍 Unparseable = 心跳文件持续损坏（半截 JSON 等），文件损坏 ≠ 采集
+///   挂死，kill 无法自愈反而误杀，只告警不 kill；
 /// - 复查 Unwritable = 环境故障,只告警不 kill。但旗标可能冻结在旧内容上
 ///   （tray 已死）,调用方须先实地探针交叉验证（见 cmd_watchdog）:环境实测
 ///   可写时把复查改判 Missing（未恢复,kill）。
@@ -2174,8 +2203,13 @@ fn recheck_should_kill(_first: HeartbeatRead, recheck: HeartbeatRead) -> bool {
         HeartbeatRead::Stalled => true,
         // 复查 unwritable 旗标 = 环境故障,kill/重启只会无限循环,仅告警
         HeartbeatRead::Unwritable => false,
-        // 持续缺失/持续不可解析 = 未恢复（旧 bug 即漏掉这一分支）
-        HeartbeatRead::Missing | HeartbeatRead::Unparseable => true,
+        // 审查：复查仍 Unparseable = 心跳文件持续损坏（如写入中途被杀留下的
+        // 半截 JSON）,是文件损坏不是采集挂死——杀掉 tray 无法让损坏文件自愈,
+        // 反而误杀正常托盘。改判只告警不 kill（旧实现归入 kill 分支,且击杀
+        // 目标 pid 正是从这份损坏内容里宽松解析出来的）。持续 Missing（文件
+        // 确实没了）仍是未恢复,kill。
+        HeartbeatRead::Unparseable => false,
+        HeartbeatRead::Missing => true,
     }
 }
 
@@ -2241,12 +2275,16 @@ fn classify_heartbeat(content: Option<&str>, now: chrono::DateTime<Utc>) -> Hear
 }
 
 /// 从心跳文本提取 `"pid":<u32>`（r25 混沌演练抽出为纯函数 + 单测）。
-/// 仅接受十进制数字；带引号/负数/超 u32 一律 None——这些宽松解析失败的
-/// 情况曾被用来回落按映像名全局击杀（实测误杀任意同名进程，见 kill_tray）。
+/// 仅当整份 JSON serde 解析成功后才提取 pid：旧实现对原始文本宽松
+/// split+parse，进程在写入中途被杀留下的半截 JSON（如 `{"pid":…,"ts":"…`
+/// 截断）也能解析出 pid——击杀目标从损坏内容里得出，且「文件损坏」被
+/// 上层误判为「采集挂死」。解析失败一律 None（按缺失处理，只告警不 kill）。
 fn heartbeat_pid(txt: &str) -> Option<u32> {
-    txt.split("\"pid\":")
-        .nth(1)
-        .and_then(|rest| rest.split([',', '}']).next()?.trim().parse::<u32>().ok())
+    serde_json::from_str::<serde_json::Value>(txt.trim())
+        .ok()?
+        .get("pid")?
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
 }
 
 /// 该 pid 当前运行的映像名是否确为 kynoptic-tray.exe（查 tasklist，
@@ -2467,15 +2505,17 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     "采集挂死（心跳超龄），看门狗正在重启托盘；期间的数据会有空洞",
                                 );
                                 if !kill_tray() {
-                                    // 审查 P2：杀失败（AV/权限）不留痕的话，后续每
-                                    // 个 --once 周期都重复 40s 睡眠+复查，且托盘
-                                    // 永远不会被真正重启。
+                                    // 审查 P2：杀失败不留痕的话，后续每个
+                                    // --once 周期都重复 40s 睡眠+复查，且托盘
+                                    // 永远不会被真正重启。失败原因中性描述：
+                                    // 心跳 pid 可能已失效（旧 pid 已死）或被
+                                    // 安全软件拦截，不一味归因杀软。
                                     watchdog_log(
-                                        "kill kynoptic-tray 失败(taskkill 非零)，可能被安全软件拦截",
+                                        "kill kynoptic-tray 失败(taskkill 非零)：心跳 pid 可能已失效或进程受保护，下一轮重试",
                                     );
                                     watchdog_alert(
                                         "kill_failed",
-                                        "看门狗无法结束挂死的托盘进程（可能被安全软件拦截），采集持续停摆，请人工处理",
+                                        "看门狗无法结束挂死的托盘进程（记录的 pid 可能已失效，或被安全软件拦截），采集持续停摆，请人工处理",
                                     );
                                 }
                             }
@@ -2538,6 +2578,22 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                 if is_reparse_point(&tray) {
                                     watchdog_log(
                                         "kynoptic-tray.exe 是符号链接/junction，拒绝拉起（防劫持，请排查）",
+                                    );
+                                } else if update::updating_flag_active(dir) {
+                                    // 更新两阶段替换进行中：exe 缺失+仅存 .bak 是
+                                    // 中间态，无条件恢复会复活旧版 exe 并拉起
+                                    //（版本错位），跳过本轮等更新收尾。旗标超龄
+                                    // 残留（更新器被强杀/断电，无任何清理路径）
+                                    // 时 updating_flag_active 已删除旗标并放行，
+                                    // 不会走这里——托盘恢复能力保住。
+                                    // 告警而非只留日志（与 tray-exit.flag 同标准，
+                                    // watchdog_alert 按 kind 去重，不刷屏）。
+                                    watchdog_log(
+                                        "updating.flag 在位（更新进行中），本轮跳过托盘拉起与 .bak 恢复",
+                                    );
+                                    watchdog_alert(
+                                        "updating_flag",
+                                        "检测到更新进行中旗标，看门狗暂不恢复托盘；若长时间不见托盘，请删除 exe 同目录的 updating.flag 或重跑安装",
                                     );
                                 } else {
                                     // 审查：更新替换中断会留下「tray exe 缺失、
@@ -2838,6 +2894,19 @@ mod tests {
         assert_eq!(resolve_report_date("").unwrap(), queries::today_local_str());
         assert_eq!(resolve_report_date("2026-09-09").unwrap(), "2026-09-09");
         assert!(resolve_report_date("not-a-date").is_err());
+        // 未来日期拒绝（与 dash 面板 reject_future_date 同口径）：CLI 不再
+        // 静默生成"全 0 的权威报告"，报错并不产出
+        let future = (chrono::NaiveDate::parse_from_str(&queries::today_local_str(), "%Y-%m-%d")
+            .unwrap()
+            + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+        let err = resolve_report_date(&future).unwrap_err().to_string();
+        assert!(err.contains("在未来"), "应拒绝未来日期: {err}");
+        assert!(
+            err.contains(&queries::today_local_str()),
+            "应回显今天: {err}"
+        );
     }
 
     // === skill install（junction 防护 + 原子写） ===
@@ -3464,14 +3533,18 @@ mod tests {
         let first_garbage = HeartbeatRead::Unparseable;
         // 文件持续缺失 → kill
         assert!(recheck_should_kill(first_missing, HeartbeatRead::Missing));
-        // 首查垃圾、复查缺失（及反向）→ kill
+        // 首查垃圾、复查缺失 → kill（文件真没了 = 未恢复）
         assert!(recheck_should_kill(first_garbage, HeartbeatRead::Missing));
-        assert!(recheck_should_kill(
+        // 首查缺失、复查损坏 → 同样按文件损坏处理，不 kill（kill 无法自愈，
+        // 且 tray 存活时损坏内容不代表采集挂死）
+        assert!(!recheck_should_kill(
             first_missing,
             HeartbeatRead::Unparseable
         ));
-        // 文件持续解析失败 → kill（tray 只写合法 RFC3339,垃圾 = 写路径损坏）
-        assert!(recheck_should_kill(
+        // 审查回归：文件持续解析失败（如写入中途被杀留下的半截 JSON）= 文件
+        // 损坏而非采集挂死 → 只告警不 kill（旧实现误判挂死并从损坏内容宽松
+        // 解析 pid 击杀）
+        assert!(!recheck_should_kill(
             first_garbage,
             HeartbeatRead::Unparseable
         ));
@@ -3609,6 +3682,10 @@ mod tests {
         assert_eq!(heartbeat_pid(&fresh), None);
         // 尾随 } 截断正常
         assert_eq!(heartbeat_pid(r#"{"pid":42}"#), Some(42));
+        // 半截 JSON（写入中途被杀）：整份解析失败一律 None，不得宽松解析出 pid
+        assert_eq!(heartbeat_pid(r#"{"pid":999999,"ts":"2026-09-24T12"#), None);
+        assert_eq!(heartbeat_pid(r#"{"pid":42"#), None);
+        assert_eq!(heartbeat_pid(r#"{"pid":42,}"#), None);
     }
 
     #[cfg(windows)]

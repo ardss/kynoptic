@@ -151,6 +151,19 @@ rights as this MCP server — treat MCP access like plain file read access to
 `KYNOPTIC_DB`. The server opens the database read-only and never sends data
 off-machine, but it cannot protect the file from other local processes.
 
+## Troubleshooting
+
+- **Double-clicking the tray icon does nothing**: an instance is already
+  running, so the new one exits immediately. The program directory's
+  `duplicate-start.log` and the data directory's `tray.log` say why.
+  Single-instance is per user, machine-wide — it does not distinguish
+  data directories, so two deployments with different data directories
+  also replace each other, and the later start will not run.
+- **A "protection is not active" notification appears**: the watchdog
+  scheduled task that restarts Kynoptic has been disabled or deleted.
+  Re-enable the `Kynoptic Watchdog` task in Windows Task Scheduler, or
+  reinstall Kynoptic.
+
 ## Performance
 
 Measured on a Ryzen 5 5600X / Windows 11, reproducible from the benchmark

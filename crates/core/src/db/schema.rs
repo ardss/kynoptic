@@ -67,7 +67,11 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
          PRAGMA cache_size=-8000;
          PRAGMA temp_store=MEMORY;
          PRAGMA mmap_size=268435456;
-         PRAGMA busy_timeout=5000;",
+         PRAGMA busy_timeout=5000;
+         -- WAL 高水位封顶（perf 审查 2026-09）：两次维护间隔内 checkpoint
+         -- TRUNCATE 可能因常驻 reader busy 而截断失败，journal_size_limit
+         -- 让 WAL 在其后下一笔写入回落到 16MB（实测不影响写入吞吐）。
+         PRAGMA journal_size_limit=16777216;",
     )
 }
 
