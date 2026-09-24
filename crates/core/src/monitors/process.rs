@@ -82,7 +82,12 @@ impl Monitor for ProcessMonitor {
         "process"
     }
     fn interval(&self) -> Duration {
-        Duration::from_secs(30)
+        // 30s→120s（性能审查）：每 tick 两次全进程快照 + 逐 pid
+        // OpenProcess/GetProcessTimes/GetProcessMemoryInfo 的句柄开销使本
+        // monitor 单开 avg CPU 2~3.2%、每 30s 打出 >10% 单核尖峰（实测
+        // 128 样本），占默认集稳态 CPU 约 7 成。拉长 tick 直接按比例摊薄；
+        // 数据新鲜度由 HEARTBEAT_SECS 心跳与指纹去重语义兜底，契约不变。
+        Duration::from_secs(120)
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
@@ -142,9 +147,13 @@ struct ProcessSnapshot {
 fn collect_processes() -> Option<ProcessSnapshot> {
     // CPU 百分比：原生 GetProcessTimes 差分（占满 1 核 = 100），内部已含
     // 指数移动平均（EMA α=0.3）平滑，见 query_cpu_percent_map 的 v0.1 注。
-    let cpu_map = query_cpu_percent_map();
+    //
+    // 快照合并（性能审查）：旧实现 CPU 采样内部再开一次全进程快照，每 tick
+    // 两次 CreateToolhelp32Snapshot；现在只开一次，遍历中顺手收集 pid 集合
+    // 传给差分采样。
 
     let mut all: Vec<ProcessInfo> = Vec::new();
+    let mut pids: Vec<u32> = Vec::new();
 
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -166,16 +175,16 @@ fn collect_processes() -> Option<ProcessSnapshot> {
                         .position(|&c| c == 0)
                         .unwrap_or(entry.szExeFile.len())],
                 );
+                pids.push(entry.th32ProcessID);
 
                 if !should_skip(&name) {
                     let pid = entry.th32ProcessID;
                     let mem_mb = query_process_memory_mb(pid);
-                    // CPU 从 WMI 批量映射取（按 pid），取不到则为 0
-                    let cpu = cpu_map.get(&pid).copied().unwrap_or(0.0);
+                    // CPU 稍后从批量差分映射统一回填（见函数头注释）
                     all.push(ProcessInfo {
                         pid,
                         name: name.clone(),
-                        cpu_percent: cpu,
+                        cpu_percent: 0.0,
                         memory_mb: mem_mb,
                     });
                 }
@@ -187,6 +196,12 @@ fn collect_processes() -> Option<ProcessSnapshot> {
         }
 
         CloseHandle(snapshot);
+    }
+
+    // 快照遍历完成后再做逐 pid GetProcessTimes 差分（EMA 状态跨 tick 保持）
+    let cpu_map = query_cpu_percent_map(&pids);
+    for p in all.iter_mut() {
+        p.cpu_percent = cpu_map.get(&p.pid).copied().unwrap_or(0.0);
     }
 
     // Top 10 by CPU
@@ -239,11 +254,14 @@ fn query_process_memory_mb(pid: u32) -> f64 {
 
 /// 批量查询所有进程的 CPU 百分比，返回 PID → CPU% 映射（占满 1 核 = 100）。
 ///
+/// pid 集合由调用方从进程快照遍历中顺手收集后传入（性能审查：旧实现内部
+/// 再开一次全进程快照，每 tick 两次 CreateToolhelp32Snapshot）。
+///
 /// v0.1 注：上游实现通过 PowerShell/WMI（Win32_PerfFormattedData_PerfProc_Process）
 /// 批量读取。开源版硬性要求零子进程（见 R8-v01采集裁剪.md），改用原生
 /// GetProcessTimes 差分：两次采样间的 (kernel+user) 时间增量除以墙钟时间增量。
 /// EMA 平滑沿用上游的 α=0.3 口径，抑制瞬时抖动；已退出进程从平滑表淘汰。
-fn query_cpu_percent_map() -> HashMap<u32, f64> {
+fn query_cpu_percent_map(pids: &[u32]) -> HashMap<u32, f64> {
     use std::cell::RefCell;
     use std::time::Instant;
 
@@ -258,24 +276,8 @@ fn query_cpu_percent_map() -> HashMap<u32, f64> {
     }
 
     let now = Instant::now();
-    let mut times: HashMap<u32, u64> = HashMap::new();
+    let mut times: HashMap<u32, u64> = pids.iter().map(|&pid| (pid, 0)).collect();
     unsafe {
-        // 复用进程快照遍历取 PID 集合（避免重复 CreateToolhelp32Snapshot 也无妨，
-        // 这里独立快照：collect_processes 与 CPU 采样的生命周期解耦）。
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot != INVALID_HANDLE_VALUE {
-            let mut entry: PROCESSENTRY32W = zeroed();
-            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-            if Process32FirstW(snapshot, &mut entry) != 0 {
-                loop {
-                    times.insert(entry.th32ProcessID, 0);
-                    if Process32NextW(snapshot, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-            CloseHandle(snapshot);
-        }
         for (pid, total) in times.iter_mut() {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, *pid);
             if handle.is_null() {

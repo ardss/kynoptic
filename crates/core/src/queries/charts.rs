@@ -9,7 +9,10 @@
 
 use rusqlite::{params, Connection};
 
-use super::{get_string, string_or_log, DayTotals, MinuteStat, CLICKS_ROW_EXPR, KEYS_ROW_EXPR};
+use super::{
+    get_string, string_or_log, DayTotals, MinuteStat, CLICKS_ROW_EXPR, HUMAN_KEYS_ROW_EXPR,
+    KEYS_ROW_EXPR,
+};
 use crate::db::agg;
 use crate::db::SqlResult;
 
@@ -34,9 +37,7 @@ pub fn action_breakdown_ordered(
             r.get::<_, i64>(2)?,
         ))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -59,9 +60,7 @@ pub fn top_apps_today(
     if let Ok(rows) = stmt.query_map(params![today, tomorrow, limit], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -88,9 +87,7 @@ pub fn top_windows_today(
     if let Ok(rows) = stmt.query_map(params![today, tomorrow, limit], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -119,9 +116,7 @@ pub fn hourly_counts_today(conn: &Connection, today: &str, tomorrow: &str) -> Ve
     if let Ok(rows) = stmt.query_map(params![&off, today, tomorrow], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -141,9 +136,7 @@ pub fn minute_counts_today(conn: &Connection, today: &str, tomorrow: &str) -> Ve
     if let Ok(rows) = stmt.query_map(params![&off, today, tomorrow], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -167,9 +160,7 @@ pub fn daily_counts_since(conn: &Connection, since: &str) -> Vec<(String, i64)> 
     if let Ok(rows) = stmt.query_map(params![&off, since, &now], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -184,9 +175,7 @@ pub fn keyboard_press_data_today(conn: &Connection, today: &str, tomorrow: &str)
         return out;
     };
     if let Ok(rows) = stmt.query_map(params![today, tomorrow], |r| r.get::<_, String>(0)) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -208,9 +197,7 @@ pub fn mouse_event_data_today(
     if let Ok(rows) = stmt.query_map(params![today, tomorrow], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     }) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
+        out.extend(super::collect_rows_warn(rows, "charts"));
     }
     out
 }
@@ -338,9 +325,7 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
                 switches: r.get::<_, i64>(4)?,
             })
         }) {
-            for row in rows.flatten() {
-                out.push(row);
-            }
+            out.extend(super::collect_rows_warn(rows, "charts"));
         }
         return out;
     }
@@ -376,9 +361,7 @@ pub fn minute_stats_by_date(conn: &Connection, date: &str) -> Vec<MinuteStat> {
     }) else {
         return out;
     };
-    for row in rows.flatten() {
-        out.push(row);
-    }
+    out.extend(super::collect_rows_warn(rows, "charts.minute_stats"));
     out
 }
 
@@ -408,9 +391,7 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
             let minute: i64 = r.get(1)?;
             Ok(format!("{date}T{hour:02}:{minute:02}"))
         }) {
-            for row in rows.flatten() {
-                out.push(row);
-            }
+            out.extend(super::collect_rows_warn(rows, "charts"));
         }
         return out;
     }
@@ -438,9 +419,7 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
     let Ok(rows) = stmt.query_map(params![start, end, off], |r| r.get::<_, String>(0)) else {
         return out;
     };
-    for row in rows.flatten() {
-        out.push(row);
-    }
+    out.extend(super::collect_rows_warn(rows, "charts.active_minutes"));
     out
 }
 
@@ -559,13 +538,20 @@ pub fn top_app_window_in_range(
 /// 区间谓词；`substr(timestamp,1,10)=?` 对整列求值无法走索引，1M 行时每次
 /// 调用退化为全表扫描（~300ms+），get_anomalies(7d) 会累计到秒级。
 pub fn late_night_key_count(conn: &Connection, date: &str, hour_start: i64, hour_end: i64) -> i64 {
-    // 优先读 agg_minute 读缓存（O(当日聚合行数)），缺失回退 events 现算
+    // 优先读 agg_minute 读缓存（O(当日聚合行数)），缺失回退 events 现算。
+    // 人侧口径（审查修复 2026-09）：扣减注入拆桶 `input_keys_injected`，
+    // 纯注入分钟不得计成"深夜按键"；旧缓存无该桶时按 0 注入处理（等价旧行为）。
     if agg::has_minute_for_date(conn, date) {
         return conn
             .query_row(
-                "SELECT CAST(COALESCE(SUM(sum_value), 0) AS INTEGER) FROM agg_minute \
-                 WHERE date = ?1 AND (hour >= ?2 OR hour < ?3) \
-                   AND bucket_id = 'input_keys'",
+                "SELECT CAST(COALESCE(SUM(MAX(COALESCE(k,0) - COALESCE(j,0), 0)), 0) AS INTEGER) FROM (\
+                     SELECT hour, minute, \
+                            SUM(CASE WHEN bucket_id = 'input_keys' THEN COALESCE(sum_value,0) ELSE 0 END) AS k, \
+                            SUM(CASE WHEN bucket_id = 'input_keys_injected' THEN COALESCE(sum_value,0) ELSE 0 END) AS j \
+                     FROM agg_minute \
+                     WHERE date = ?1 AND (hour >= ?2 OR hour < ?3) \
+                       AND bucket_id IN ('input_keys','input_keys_injected') \
+                     GROUP BY hour, minute)",
                 params![date, hour_start, hour_end],
                 |r| r.get::<_, i64>(0),
             )
@@ -603,7 +589,9 @@ pub(crate) fn late_night_key_count_in_range(
 ) -> i64 {
     conn.query_row(
         &format!(
-            "SELECT COALESCE(SUM({KEYS_ROW_EXPR}), 0) FROM events \
+            // 人侧口径（审查修复 2026-09）：HUMAN_KEYS_ROW_EXPR 扣注入，
+            // 自动化注入按键不算"深夜按键"（与 presence/insights 剔注入口径一致）。
+            "SELECT COALESCE(SUM({HUMAN_KEYS_ROW_EXPR}), 0) FROM events \
              WHERE timestamp >= ?1 AND timestamp < ?2 \
                AND (CAST(substr(datetime(timestamp, ?5), 12, 2) AS INTEGER) >= ?3 \
                     OR CAST(substr(datetime(timestamp, ?5), 12, 2) AS INTEGER) < ?4) \
@@ -630,17 +618,28 @@ pub fn daily_agg_avg_apm_before(conn: &Connection, date: &str) -> f64 {
     .unwrap_or(0.0)
 }
 
-/// 当日 top-5 高强度分钟（keys+clicks 合计 ≥ `min_count`），按强度倒序。
+/// 当日 top-5 高强度分钟（人侧 keys+clicks 合计 ≥ `min_count`），按强度倒序。
 ///
 /// 返回 (minute, count)，供 [`crate::anomaly`] 的 APM 突增检测消费。
+/// 人侧口径（审查修复 2026-09）：扣减注入（自动化）输入——纯注入分钟
+/// （{"keys":500,"injected_keys":500}）不再被当成行为突增报警。
 pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(String, i64)> {
     let mut out = Vec::new();
-    // 优先读 agg_minute 读缓存：每分钟 keys+clicks 合计
+    // 优先读 agg_minute 读缓存：每分钟人侧 keys+clicks 合计（扣注入拆桶）
     if agg::has_minute_for_date(conn, date) {
         let Ok(mut stmt) = conn.prepare(
-            "SELECT hour, minute, CAST(SUM(COALESCE(sum_value, 0)) AS INTEGER) AS n \
-             FROM agg_minute \
-             WHERE date = ?1 AND bucket_id IN ('input_keys','input_clicks') \
+            "SELECT hour, minute, CAST(MAX(COALESCE(k,0) - COALESCE(j,0), 0) \
+                 + MAX(COALESCE(c,0) - COALESCE(ic,0), 0) AS INTEGER) AS n \
+             FROM (\
+                 SELECT hour, minute, \
+                        SUM(CASE WHEN bucket_id='input_keys' THEN COALESCE(sum_value,0) ELSE 0 END) AS k, \
+                        SUM(CASE WHEN bucket_id='input_keys_injected' THEN COALESCE(sum_value,0) ELSE 0 END) AS j, \
+                        SUM(CASE WHEN bucket_id='input_clicks' THEN COALESCE(sum_value,0) ELSE 0 END) AS c, \
+                        SUM(CASE WHEN bucket_id='input_clicks_injected' THEN COALESCE(sum_value,0) ELSE 0 END) AS ic \
+                 FROM agg_minute \
+                 WHERE date = ?1 \
+                   AND bucket_id IN ('input_keys','input_keys_injected','input_clicks','input_clicks_injected') \
+                 GROUP BY hour, minute) \
              GROUP BY hour, minute HAVING n >= ?2 \
              ORDER BY n DESC LIMIT 5",
         ) else {
@@ -652,9 +651,7 @@ pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(
             let n: i64 = r.get(2)?;
             Ok((format!("{date}T{hour:02}:{minute:02}"), n))
         }) {
-            for row in rows.flatten() {
-                out.push(row);
-            }
+            out.extend(super::collect_rows_warn(rows, "charts"));
         }
         return out;
     }
@@ -686,8 +683,9 @@ pub(crate) fn top_burst_minutes_in_range(
     let Ok(mut stmt) = conn.prepare(&format!(
         // datetime() 输出为 "YYYY-MM-DD HH:MM"（空格分隔），replace 成 "T" 与
         // agg 缓存路径的分钟串格式保持一致（"YYYY-MM-DDTHH:MM"）。
+        // 人侧口径（审查修复 2026-09）：HUMAN_*_ROW_EXPR 扣注入。
         "SELECT replace(substr(datetime(timestamp, ?4), 1, 16), ' ', 'T'), \
-         SUM({KEYS_ROW_EXPR} + {CLICKS_ROW_EXPR}) AS n \
+         SUM({HUMAN_KEYS_ROW_EXPR} + {HUMAN_CLICKS_ROW_EXPR}) AS n \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 \
            AND event_type IN ('keyboard', 'mouse') \
@@ -696,6 +694,8 @@ pub(crate) fn top_burst_minutes_in_range(
          HAVING n >= ?3 \
          ORDER BY n DESC \
          LIMIT 5",
+        HUMAN_KEYS_ROW_EXPR = super::HUMAN_KEYS_ROW_EXPR,
+        HUMAN_CLICKS_ROW_EXPR = super::HUMAN_CLICKS_ROW_EXPR,
     )) else {
         return out;
     };
@@ -704,8 +704,58 @@ pub(crate) fn top_burst_minutes_in_range(
     }) else {
         return out;
     };
-    for row in rows.flatten() {
-        out.push(row);
+    out.extend(super::collect_rows_warn(rows, "charts.top_burst"));
+    out
+}
+
+/// 当日含注入（自动化）输入的分钟集合（本地 "YYYY-MM-DDTHH:MM"）。
+///
+/// 供 [`crate::anomaly`] 的 APM 突增消息对混合分钟标注"含自动化注入"，
+/// 避免无人值守分钟被渲染成纯行为异常。
+pub fn injected_input_minutes_by_date(
+    conn: &Connection,
+    date: &str,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let off = super::LOCAL_MODIFIER_AT_EVENT;
+    // agg 缓存路径：注入拆桶行即注入分钟
+    if agg::has_minute_for_date(conn, date) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT hour, minute FROM agg_minute \
+             WHERE date = ?1 \
+               AND bucket_id IN ('input_keys_injected','input_clicks_injected') \
+               AND COALESCE(sum_value, 0) > 0 \
+             GROUP BY hour, minute",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map(params![date], |r| {
+            let hour: i64 = r.get(0)?;
+            let minute: i64 = r.get(1)?;
+            Ok(format!("{date}T{hour:02}:{minute:02}"))
+        }) {
+            out.extend(super::collect_rows_warn(rows, "charts.injected_minutes"));
+        }
+        return out;
+    }
+    // events 回退：raw 行认 $.injected，input_agg 行认 $.injected_keys/clicks
+    let Some((start, end)) = super::local_day_range(date) else {
+        return out;
+    };
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT DISTINCT replace(substr(datetime(timestamp, ?3), 1, 16), ' ', 'T') \
+         FROM events \
+         WHERE timestamp >= ?1 AND timestamp < ?2 \
+           AND event_type IN ('keyboard','mouse') \
+           AND event_action IN ('press','click','input_agg') \
+           AND ({INJ_KEYS} + {INJ_CLICKS}) > 0",
+        INJ_KEYS = super::INJECTED_KEYS_ROW_EXPR,
+        INJ_CLICKS = super::INJECTED_CLICKS_ROW_EXPR,
+    )) else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map(params![start, end, off], |r| r.get::<_, String>(0)) {
+        out.extend(super::collect_rows_warn(rows, "charts.injected_minutes"));
     }
     out
 }
@@ -728,9 +778,7 @@ pub fn top_apps_by_event_types(conn: &Connection, date: &str, limit: i64) -> Vec
         if let Ok(rows) = stmt.query_map(params![date, limit], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         }) {
-            for row in rows.flatten() {
-                out.push(row);
-            }
+            out.extend(super::collect_rows_warn(rows, "charts"));
         }
         return out;
     }
@@ -859,6 +907,51 @@ mod tests {
         press(&c, "2026-06-15T10:00:00+00:00"); // 本地 18:00 → 不计
         let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, 6, OFF8);
         assert_eq!(n, 2, "23:30 与 02:00 计入深夜，12:00/18:00 不计入");
+    }
+
+    /// 人侧口径（审查修复 2026-09）：纯注入按键不算"深夜按键"——
+    /// 注入 500 键 + 真人 30 键的深夜分钟只计 30。
+    #[test]
+    fn late_night_excludes_injected_keys() {
+        let c = conn();
+        // 本地 23:30：注入 500（injected=1 的 raw 形态不可得，用 input_agg 形态）
+        ins_ev(
+            &c,
+            "2026-06-15T15:30:00+00:00",
+            "keyboard",
+            "input_agg",
+            Some(r#"{"keys":530,"injected_keys":500,"samples":530}"#),
+        );
+        let n = late_night_key_count_in_range(&c, RANGE.0, RANGE.1, 23, 6, OFF8);
+        assert_eq!(n, 30, "深夜按键必须扣减注入（530-500=30）");
+    }
+
+    /// 人侧口径（审查修复 2026-09）：纯注入分钟不进 top_burst_minutes。
+    #[test]
+    fn top_burst_excludes_injected_only_minutes() {
+        let c = conn();
+        // 纯注入分钟：keys=500, injected_keys=500 → 人侧 0，不得入榜
+        ins_ev(
+            &c,
+            "2026-06-15T04:00:00+00:00",
+            "keyboard",
+            "input_agg",
+            Some(r#"{"keys":500,"injected_keys":500,"samples":500}"#),
+        );
+        // 真人分钟：60 键
+        ins_ev(
+            &c,
+            "2026-06-15T05:00:00+00:00",
+            "keyboard",
+            "input_agg",
+            Some(r#"{"keys":60,"samples":60}"#),
+        );
+        let out = top_burst_minutes_in_range(&c, RANGE.0, RANGE.1, 50, OFF8);
+        assert_eq!(
+            out,
+            vec![("2026-06-15T13:00".to_string(), 60)],
+            "纯注入分钟不得计为行为突增，只应返回真人分钟"
+        );
     }
 
     // ─── 交叉审查 P1：四处 active 分钟口径一致性 ─────────────────────────────

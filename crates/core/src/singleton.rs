@@ -38,12 +38,9 @@ pub fn singleton_mutex_name() -> String {
     // 进程互斥不受影响。后缀限定安全字符集且不含 `\`（名字必须单层，见模块
     // 注释 PATH_NOT_FOUND 教训），不合法即忽略并留痕。
     if let Ok(suffix) = std::env::var("KYNOPTIC_MUTEX_SUFFIX") {
-        let ok = !suffix.is_empty()
-            && suffix.len() <= 64
-            && suffix
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        if ok {
+        // 合法性校验与 [`mutex_suffix_active`]（legacy 桥旁路判定）同源，
+        // 两处不得分叉
+        if mutex_suffix_active() {
             log::warn!("KYNOPTIC_MUTEX_SUFFIX 已设置：单实例互斥体名加后缀 -{suffix}（测试旁路，勿在生产使用）");
             return format!("{base}-{suffix}");
         }
@@ -60,8 +57,31 @@ pub fn singleton_mutex_name() -> String {
 /// - 新探旧：新版进程也能发现尚在运行的旧版实例。
 ///
 /// 主名已是旧名（SID 回退）时返回 None——同名无需第二个句柄。
+///
+/// 沙箱旁路（审查修复 2026-09）：设置了合法 [`KYNOPTIC_MUTEX_SUFFIX`] 时返回
+/// None——后缀即"沙箱演练"语义，演练实例不得再持有/探测生产 legacy 旧名
+/// （否则沙箱第二个实例会撞上生产托盘的旧名互斥体，无法并行启动，与模块
+/// 注释宣称的并行演练矛盾）。
 pub fn legacy_bridge_mutex_name(primary: &str) -> Option<&'static str> {
+    if mutex_suffix_active() {
+        return None;
+    }
     (primary != LEGACY_MUTEX_NAME).then_some(LEGACY_MUTEX_NAME)
+}
+
+/// `KYNOPTIC_MUTEX_SUFFIX` 是否设置了**合法**后缀（与 [`singleton_mutex_name`]
+/// 同一套校验）。供 legacy 桥判断沙箱旁路。
+pub fn mutex_suffix_active() -> bool {
+    match std::env::var("KYNOPTIC_MUTEX_SUFFIX") {
+        Ok(suffix) => {
+            !suffix.is_empty()
+                && suffix.len() <= 64
+                && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        }
+        Err(_) => false,
+    }
 }
 
 /// 查当前进程令牌的用户 SID 字符串（S-1-… 形态）。

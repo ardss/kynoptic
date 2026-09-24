@@ -32,6 +32,21 @@ static KB_HOOK: AtomicU32 = AtomicU32::new(0);
 static KB_LAST_EVENT_MS: AtomicU64 = AtomicU64::new(0);
 /// hook 线程自定义消息：重装 hook（摘钩自愈）
 const WM_APP_REHOOK: u32 = 0x8105;
+/// 摘钩自愈重装的累计次数（成功）与失败次数。此前重装只在 RUST_LOG 层留痕，
+/// 真实掉线频率无法统计（性能审查 low）；计数器经 reinstall_count()/
+/// reinstall_failures() 透传到 /api/diagnostics。进程生命周期累计。
+static KB_REINSTALL_OK: AtomicU64 = AtomicU64::new(0);
+static KB_REINSTALL_FAIL: AtomicU64 = AtomicU64::new(0);
+
+/// 键盘 hook 摘钩自愈成功重装的累计次数（本进程启动以来）。
+pub fn reinstall_count() -> u64 {
+    KB_REINSTALL_OK.load(Ordering::Relaxed)
+}
+
+/// 键盘 hook 摘钩自愈重装失败的累计次数（非 0 需排查 LowLevelHooksTimeout）。
+pub fn reinstall_failures() -> u64 {
+    KB_REINSTALL_FAIL.load(Ordering::Relaxed)
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -228,9 +243,17 @@ impl EventHook for KeyboardHook {
                             hook = h;
                             KB_HOOK.store(h as u32, Ordering::Release);
                             KB_LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
-                            log::info!("keyboard_hook 已重装");
+                            KB_REINSTALL_OK.fetch_add(1, Ordering::Relaxed);
+                            log::info!(
+                                "keyboard_hook 已重装(累计 {} 次)",
+                                KB_REINSTALL_OK.load(Ordering::Relaxed)
+                            );
                         } else {
-                            log::error!("keyboard_hook 重装失败");
+                            KB_REINSTALL_FAIL.fetch_add(1, Ordering::Relaxed);
+                            log::error!(
+                                "keyboard_hook 重装失败(累计失败 {} 次)",
+                                KB_REINSTALL_FAIL.load(Ordering::Relaxed)
+                            );
                         }
                         continue;
                     }

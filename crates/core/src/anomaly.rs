@@ -58,9 +58,23 @@ pub fn late_night_from_count(late_night_keys: i64, date: &str) -> Vec<Anomaly> {
 
 /// APM 突增：某分钟 APM ≥ [`APM_BURST_MULTIPLIER`] × 历史均值。
 ///
-/// **纯函数**：`burst_minutes` 由 [`queries::top_burst_minutes`] 取出，
-/// `hist_avg` 由 [`queries::daily_agg_avg_apm_before`] 取出。无基线（hist_avg ≤ 0）时不报警。
+/// **纯函数**：`burst_minutes` 由 [`queries::top_burst_minutes`] 取出
+/// （人侧口径，已扣注入），`hist_avg` 由 [`queries::daily_agg_avg_apm_before`]
+/// 取出。无基线（hist_avg ≤ 0）时不报警。
+/// `burst_minutes` 数据源 [`queries::top_burst_minutes`] 已扣注入。
 pub fn apm_burst_from_data(burst_minutes: &[(String, i64)], hist_avg: f64) -> Vec<Anomaly> {
+    apm_burst_from_data_with_injected(burst_minutes, hist_avg, &std::collections::HashSet::new())
+}
+
+/// [`apm_burst_from_data`] 的注入标注版：`injected_minutes` 为当日含注入
+/// （自动化）输入的分钟集合（[`queries::injected_input_minutes_by_date`]）。
+/// 命中的突增分钟在消息里标注"含自动化注入"，避免把无人值守分钟渲染成
+/// 纯行为异常（审查修复 2026-09）。
+pub fn apm_burst_from_data_with_injected(
+    burst_minutes: &[(String, i64)],
+    hist_avg: f64,
+    injected_minutes: &std::collections::HashSet<String>,
+) -> Vec<Anomaly> {
     if hist_avg <= 0.0 {
         return Vec::new(); // 没有基线，不报警
     }
@@ -68,12 +82,17 @@ pub fn apm_burst_from_data(burst_minutes: &[(String, i64)], hist_avg: f64) -> Ve
     for (minute, n) in burst_minutes {
         let ratio = *n as f64 / hist_avg;
         if ratio >= APM_BURST_MULTIPLIER {
+            let tag = if injected_minutes.contains(minute) {
+                "（该分钟含自动化注入输入）"
+            } else {
+                ""
+            };
             out.push(Anomaly {
                 kind: "apm_burst".into(),
                 kind_label: "APM 突增".into(),
                 severity: "alert".into(),
                 message: format!(
-                    "APM 突增：{} 达到 {:.0}（历史均值 {:.0} 的 {:.1}x）",
+                    "APM 突增：{} 达到 {:.0}（历史均值 {:.0} 的 {:.1}x）{tag}",
                     minute, *n as f64, hist_avg, ratio
                 ),
                 detail: "持续高强度输入，请检查是否有自动脚本或异常操作。".into(),
@@ -270,7 +289,10 @@ pub fn detect_late_night(conn: &Connection, date: &str) -> Result<Vec<Anomaly>> 
 pub fn detect_apm_burst(conn: &Connection, date: &str) -> Result<Vec<Anomaly>> {
     let hist_avg = queries::daily_agg_avg_apm_before(conn, date);
     let burst = queries::top_burst_minutes(conn, date, APM_BURST_MIN_KEYS);
-    Ok(apm_burst_from_data(&burst, hist_avg))
+    let injected = queries::injected_input_minutes_by_date(conn, date);
+    Ok(apm_burst_from_data_with_injected(
+        &burst, hist_avg, &injected,
+    ))
 }
 
 /// 马拉松会话检测（编排入口）。数据源为 [`queries::human_minutes_by_date`]

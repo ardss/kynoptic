@@ -86,7 +86,38 @@ fn awake_secs() -> u64 {
         .saturating_sub(PROCESS_START_UNBIASED_SECS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// 进程 DPI 感知（性能审查修复：托盘此前 DPI-unaware，GetSystemMetrics
+/// (SM_CXSMICON) 在任何缩放下都返回 96-DPI 的 16px，explorer 位图拉伸导致
+/// 125%+ 缩放下图标发糊；且 DPI-unaware 进程收不到 WM_DPICHANGED，tray.rs
+/// 的「DPI 变化重绘」分支永不触发）。声明 PerMonitorV2 后小图标边长随系统
+/// 缩放（真机探针实测 125% 下 16→20），重绘分支真正生效。托盘是无窗口 UI，
+/// 声明 PMv2 无副作用。失败静默降级为旧的 96-DPI 行为。
+fn set_per_monitor_dpi_aware() {
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+    }
+    let ok = unsafe { SetProcessDpiAwarenessContext(-4) };
+    if ok == 0 {
+        // 旧系统（Win10 1607 前）无此导出/调用失败：退回系统级感知，仍优于
+        // 完全不声明；再失败则维持 DPI-unaware 旧行为。
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetProcessDPIAware() -> i32;
+        }
+        let ok2 = unsafe { SetProcessDPIAware() };
+        if ok2 == 0 {
+            log::warn!("DPI 感知声明失败，托盘图标在高缩放下可能模糊");
+        }
+    }
+}
+
 fn main() {
+    // DPI 感知必须先于任何窗口/图标/GDI 尺寸查询（首个 SM_CXSMICON 读取
+    // 在 tray::run → TrayIcons::create），放 main 最前保证生效。
+    set_per_monitor_dpi_aware();
+
     // 心跳基线先行：QueryUnbiasedInterruptTime 按进程启动时刻取样
     let mut unbiased_raw: u64 = 0;
     unsafe {

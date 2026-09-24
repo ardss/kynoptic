@@ -23,8 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting for a monitor's first collection (0, the default, derives it
   from `--secs`; any value is still capped at 420 s).
 
+- Core: the minute aggregate cache (`agg_minute`) now keeps injected
+  (automation) input in dedicated `input_keys_injected` /
+  `input_clicks_injected` buckets (mirrored by the rebuild/backfill paths so
+  incremental maintenance and a full rebuild agree), and the late-night
+  activity and APM-spike anomaly checks now count human-side input only —
+  automation injection no longer registers as human activity.
+
 ### Changed
 
+- Core (presence): `bridge_count` no longer bridges across long gaps — when
+  the distance between two human-input minutes exceeds the bridge window + 1
+  minute, the hole is no longer counted as presence. This changes the
+  `presence_minutes` numbers shared by overview, insights, and the CLI
+  presence output whenever activity contains holes longer than the bridge
+  window (reviewed invariant: do not rewrite this to a bare
+  `min(gap, diff-1)`).
+- CLI (collect): an unknown monitor id on the command line is now reported
+  as a warning and the run continues with the known monitors; it used to
+  hard-fail. Note the asymmetry with `POST /api/settings`, which still
+  rejects unknown ids.
+- Tray (watchdog): with `--once`, the stall re-check wait is now 30 s
+  (was 40 s), and it can be overridden with the new
+  `KYNOPTIC_WATCHDOG_RECHECK_SECS` environment variable (seconds).
 - CLI (probe): the default first-collection timeout is no longer a fixed
   420 s — when not set explicitly it is now `min(--secs * 10, 420)`, so
   `--secs 15` skips a slow monitor after ~150 s and still produces a
@@ -50,6 +71,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty results, and cap WAL growth on long read sessions.
 
 ### Fixed
+
+- Dashboard (timeline): the hourly timeline's human-presence minutes now merge
+  `raw_human_minutes_window` (raw press/click/scroll rows with `injected=0`)
+  the same way the overview's `classify_minutes` does — previously raw-mode
+  minutes only reached the overview, so under the same bridge threshold the
+  two views systematically disagreed (e.g. 65 vs 81 minutes) and raw-mode
+  users' timeline dropped every raw minute. Requires `kynoptic-core`
+  `raw_human_minutes_window` to be `pub` (one-line visibility change).
+- Dashboard (overview): `unattended_fg_minutes` could go negative
+  (foreground minutes < presence + automation) despite the API note
+  promising "negative values are clamped to 0" — the clamp is now applied.
+- Dashboard (page): the Apps ranking no longer overflows horizontally at a
+  320 px viewport (WCAG 1.4.10 Reflow) — the fixed 150 px app label now
+  shrinks (min 80 px, ellipsis + `title` kept) and the event count can
+  compress.
+- Dashboard (light theme): canvas-drawn pixels are theme-aware again —
+  keyboard heatmap keys/strokes/keycaps and the hourly bar charts (grid,
+  axis labels, bars) read new `--chart-*`/`--kb-*` CSS variables (with
+  light and forced-colors overrides) instead of hardcoded dark colors;
+  axis labels now hit 4.5:1 contrast on the light background (was 2.43:1).
+- Dashboard (settings): a corrupted `settings.json` is now rebuilt on disk
+  with the fallback defaults right after being archived as
+  `settings.json.corrupt.bak`, honoring the "rename and rebuild" contract
+  — previously the file stayed absent until the next save, and
+  `GET /api/settings` silently served defaults with no indication.
+- Docs (README/APP): new "Writing settings from scripts" section documents
+  the four headers a script must send to `POST /api/settings` and where the
+  session token comes from — the 0.2.x-style plain POST is blocked by
+  design (loopback CSRF defenses).
+
 
 - Docs: the status lines in `README.md`, `README.zh-CN.md`, and `APP.md` now
   say v0.3.0 (they still said v0.2 / v0.2.x while `Cargo.toml`, the website,

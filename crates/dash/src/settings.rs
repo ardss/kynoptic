@@ -262,6 +262,18 @@ fn load_uncached(db_path: &Path, path: &Path) -> AppSettings {
                     "settings.json 损坏，已留档为 {}，本次回退默认值",
                     bak.display()
                 );
+                // 兑现「改名留档并重建」承诺（cli/settings.rs 注释同口径）：
+                // 留档后立即把回退的默认值落盘，否则 GET /api/settings 静默
+                // 返回默认、文件却不存在，用户误以为设置已保存；直到下一次
+                // save() 才重新出现。落盘失败仅记日志，不影响本次回退返回。
+                let rebuilt = AppSettings {
+                    autostart: autostart_registry_enabled(),
+                    ..AppSettings::default()
+                };
+                if let Err(e) = save(db_path, &rebuilt) {
+                    log::warn!("settings.json 重建失败：{}", e);
+                }
+                return rebuilt;
             }
             AppSettings {
                 autostart: autostart_registry_enabled(),

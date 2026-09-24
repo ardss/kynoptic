@@ -41,7 +41,7 @@ pub fn minute_classification(
              GROUP BY minute_bucket",
         )
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, bool, bool)> = stmt
+    let rows = stmt
         .query_map(params![off, start, end], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -49,21 +49,22 @@ pub fn minute_classification(
                 r.get::<_, bool>(2)?,
             ))
         })
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .collect();
-    Ok(rows)
+        .map_err(|e| e.to_string())?;
+    Ok(super::collect_rows_warn(
+        rows,
+        "presence.minute_classification",
+    ))
 }
 
 /// 桥接计数：排序去重后的分钟序列里，相邻间隙 <= gap 分钟按"无输入阅读"
 /// 桥接成连续在场段，返回覆盖的分钟总数。
 ///
-/// 审查复核（day-edge overcount 疑点）：每步计入的是「端点分钟本身 1」+
-/// 「桥接补洞 min(diff-1, gap)」，与 `min(diff, gap+1)` 恒等（diff>=1 时
-/// `min(diff, gap+1) == 1 + min(diff-1, gap)`），故总增量恒 <= 墙钟跨度 diff，
-/// 不存在 diff == gap+1 时多记一分钟的情形；整段总数也恒 <= 首末墙钟跨度。
-/// 不得改成裸 `min(gap, diff-1)`——那会把端点分钟本身丢掉，连续分钟序列
-/// （diff=1）计数停滞，详见 cli `bridge_count_bridges_small_gaps_only` 测试。
+/// 间隙守卫（审查修复 2026-09）：仅当 `m - prev <= gap + 1` 时才按
+/// 「端点分钟本身 1」+「桥接补洞 min(diff-1, gap)」计入（diff>=1 时与
+/// `min(diff, gap+1)` 恒等）；超过桥接阈值的长空洞（人根本不在场）只计
+/// 当前在场分钟本身——旧实现无条件 `min(diff, gap+1)` 会把 544 分钟的
+/// 无人空洞折算成 16 分钟"在场"。连续分钟序列（diff=1）仍每步 +1，
+/// 端点分钟不丢（保留旧契约：不得改成裸 `min(gap, diff-1)`）。
 pub fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
     if sorted_minutes.is_empty() {
         return 0;
@@ -71,8 +72,14 @@ pub fn bridge_count(sorted_minutes: &[i64], gap: i64) -> i64 {
     let mut total = 1i64;
     let mut prev = sorted_minutes[0];
     for &m in &sorted_minutes[1..] {
-        let step = (m - prev).min(gap + 1);
-        total += step.max(1);
+        let diff = m - prev;
+        if diff <= gap + 1 {
+            // 可桥接：端点 1 + 补洞 min(diff-1, gap)
+            total += diff.max(1);
+        } else {
+            // 间隙超过桥接阈值：空洞不算在场，只计当前分钟
+            total += 1;
+        }
         prev = m;
     }
     total
@@ -141,7 +148,7 @@ fn collect_minute_hits_window(conn: &Connection, start: &str, end: &str) -> Vec<
     }) else {
         return Vec::new();
     };
-    rows.flatten().collect()
+    super::collect_rows_warn(rows, "presence.minute_hits_window")
 }
 
 /// 整窗 raw 模式（opt-in 逐键）人在场纪元分钟（未排序去重）。
@@ -157,7 +164,7 @@ fn collect_minute_hits_window(conn: &Connection, start: &str, end: &str) -> Vec<
 /// RFC3339 整串解析（parse_from_rfc3339 同时接受 'Z' 与 '+08:00' 后缀）
 /// 转 UTC；不可解析的旧行退回原 naive-UTC 路径，与写路径
 /// normalize_timestamp 同口径。
-fn raw_human_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec<i64> {
+pub fn raw_human_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec<i64> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT DISTINCT timestamp FROM events \
          WHERE event_action IN ('press','click','scroll') \
@@ -171,7 +178,7 @@ fn raw_human_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec<i6
     };
     use chrono::TimeZone;
     let mut out = Vec::new();
-    for ts in rows.flatten() {
+    for ts in super::collect_rows_warn(rows, "presence.raw_human_minutes") {
         let epoch_min = if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
             t.with_timezone(&Utc).timestamp() / 60
         } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M") {

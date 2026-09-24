@@ -173,7 +173,7 @@ fn top5_with_other(mut apps: Vec<(String, i64)>) -> Vec<(String, i64)> {
 /// human_min 口径（与 overview presence 一致，权威实现 queries::minute_classification
 /// + queries::bridge_count）：
 /// - `human_min` = 桥接后分钟数（向后兼容页面显示的字段名）
-/// - `human_min_unbridged` = 未桥接的原始人在场分钟数
+/// - `human_min_unbridged` = 未桥接的原始人在场分钟数（含 raw 模式人侧分钟）
 /// - `human_min_bridged` = 桥接后分钟数（与 human_min 同值，显式字段）
 pub fn api_timeline_at(
     conn: &Connection,
@@ -235,7 +235,14 @@ pub fn api_timeline_at(
         std::collections::HashMap::new();
     // 整窗人侧分钟（epoch 分钟）——供跨小时桥接（Wave20 P1）
     let mut all_human_min: Vec<i64> = Vec::new();
-    let mrows = queries::minute_classification(conn, &start.to_rfc3339(), &end.to_rfc3339(), &off)?;
+    let start_s = start.to_rfc3339();
+    let end_s = end.to_rfc3339();
+    let mrows = queries::minute_classification(conn, &start_s, &end_s, &off)?;
+    // 与 overview classify_minutes 同一 raw 补充口径：raw 模式（opt-in 逐键）
+    // 的 press/click/scroll 人侧分钟只存在于事件行（input_agg 不产生），
+    // 不并入会令 timeline 与 overview 在同一桥接阈值下总数系统性不一致
+    // （overview 多计 raw 分钟）。纪元分钟直接进桥接集，分桶逻辑不变。
+    let raw_min = queries::raw_human_minutes_window(conn, &start_s, &end_s);
     for (minute_bucket, human, auto) in mrows {
         let hour_bucket = minute_bucket.replacen(' ', "T", 1)[..13].to_string();
         if human {
@@ -272,22 +279,50 @@ pub fn api_timeline_at(
     }
     // 整窗桥接展开：把 human 分钟之间的间隙（<= bridge）填上，得到"在场
     // 分钟全集"，再按小时归位。分钟坐标用本地 NaiveDateTime 以对齐小时桶。
+    // raw 人侧分钟（已按 UTC 纪元分钟解析）直接并入桥接全集
+    // 回归修复 2026-09：raw 分钟同时计入各小时桶的"未桥接人侧分钟"——
+    // human_min（桥接集）含 raw 而 human_min_unbridged 不含会令两口径分叉
+    // （纯 raw 输入的小时桶 human_min>0 而 unbridged=0）。与 input_agg 人侧
+    // 分钟重合的 raw 分钟不重复计（同一分钟只算一次）。
+    let mut raw_unbridged: std::collections::HashMap<String, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    {
+        use chrono::TimeZone;
+        for &m in &raw_min {
+            let Some(lt) = Local.timestamp_opt(m * 60, 0).single() else {
+                continue;
+            };
+            let hour_bucket = lt.format("%Y-%m-%dT%H").to_string();
+            let moday = i64::from(lt.hour()) * 60 + i64::from(lt.minute());
+            let already = human_min_of
+                .get(&hour_bucket)
+                .is_some_and(|v| v.contains(&moday));
+            if !already {
+                raw_unbridged.entry(hour_bucket).or_default().insert(moday);
+            }
+        }
+    }
+    all_human_min.extend(raw_min);
     let bridge_gap = i64::from(bridge_min.min(15));
     let mut expanded: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     {
         all_human_min.sort_unstable();
         all_human_min.dedup();
         let human_set: std::collections::HashSet<i64> = all_human_min.iter().copied().collect();
-        for &m in &all_human_min {
+        for (i, &m) in all_human_min.iter().enumerate() {
             *expanded
                 .entry(local_hour_of_epoch_min(m, &off))
                 .or_default() += 1;
+            // 间隙守卫（与 core bridge_count 同口径 2026-09）：仅当下一在场
+            // 分钟距本分钟 <= gap+1（可桥接）才向后补洞；超阈值的长空洞
+            // （人根本不在场）不算在场。
+            let next = all_human_min.get(i + 1).copied();
+            if !next.is_some_and(|nx| nx - m <= bridge_gap + 1) {
+                continue;
+            }
             // 向后填洞：m+1..=m+gap 属于桥接分钟
             let mut n = m + 1;
-            while n <= m + bridge_gap
-                && !human_set.contains(&n)
-                && all_human_min.last().is_some_and(|&last| n <= last)
-            {
+            while n <= m + bridge_gap && !human_set.contains(&n) && next.is_none_or(|nx| n < nx) {
                 *expanded
                     .entry(local_hour_of_epoch_min(n, &off))
                     .or_default() += 1;
@@ -310,7 +345,8 @@ pub fn api_timeline_at(
             .map(|(app, n)| json!({"app": app.trim_end_matches(".exe"), "events": n}))
             .collect();
         let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
-        let unbridged = human as i64;
+        // 未桥接人侧分钟 = input_agg 人侧分钟 + raw 人侧分钟（去重后，见上）
+        let unbridged = human as i64 + raw_unbridged.get(&hour).map_or(0, |s| s.len() as i64);
         // 桥接（Wave20 P1）：先在整段窗口上桥接（跨小时连续段不再被小时
         // 边界截断，与 overview presence 总和一致），再把桥接后的分钟按
         // 所属小时归位。
@@ -671,7 +707,14 @@ pub fn api_diagnostics(db_path: &Path) -> Value {
             }));
         }
     }
-    json!({ "files": entries })
+    // 键盘 hook 摘钩自愈计数（平台域配合改动：keyboard_hook 此前只在
+    // tray.log 留痕，真实掉线频率无法统计）。core 未启 hook 时两值恒 0。
+    json!({
+        "files": entries,
+        "keyboard_hook_reinstalls": kynoptic_core::monitors::keyboard_hook::reinstall_count(),
+        "keyboard_hook_reinstall_failures":
+            kynoptic_core::monitors::keyboard_hook::reinstall_failures(),
+    })
 }
 
 // bridge_count 已下沉到 kynoptic-core（queries::bridge_count），dash/cli 共用。
@@ -775,8 +818,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     // 暂无分钟级前台采样，取保守近似：fg_dwell_min - (presence + automation
     // - mixed)（审查：混合分钟同时计入 presence 与 automation，直接相减会把
     // 它们扣两遍——减并集只扣一次），负值截 0（宁可低估不夸大）。口径随响应返回。
-    let unattended_fg_minutes =
-        fg_total_min.saturating_sub((presence_minutes + automation_minutes - mixed_minutes).max(0));
+    let unattended_fg_minutes = fg_total_min
+        .saturating_sub((presence_minutes + automation_minutes - mixed_minutes).max(0))
+        .max(0);
 
     // "机器值班"第一小时误导防线：数据不满一整天时，该指标只是"开机至今减
     // 去活跃分钟"，人在场不 typing 也被累加。库中最早事件早于本地今日零点
