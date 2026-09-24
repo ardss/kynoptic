@@ -274,7 +274,9 @@ pub fn find_focus_segments(conn: &Connection, date: &str) -> Result<Vec<FocusSeg
 /// 读 [`queries::day_totals`] / [`queries::minute_stats_by_date`] /
 /// [`queries::active_minutes_by_date`]，委托纯函数组装 [`DayAnalysis`]。
 pub fn analyze_day(conn: &Connection, date: &str) -> Result<DayAnalysis> {
-    let totals = queries::day_totals(conn, date);
+    // day_totals 失败上抛（库损坏静默零值修复 2026-09）：analyze_day 本就返回
+    // Result 且 Error::Db 有 From，库损坏必须让 CLI/面板拿到错误而非全零报告。
+    let totals = queries::day_totals(conn, date)?;
     let apm_avg = if totals.active_minutes > 0 {
         (totals.keys + totals.clicks) as f64 / totals.active_minutes as f64
     } else {

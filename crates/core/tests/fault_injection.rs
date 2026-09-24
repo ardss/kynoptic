@@ -80,6 +80,7 @@ fn fi1_writer_stall_recovers_without_panic() {
         input_granularity: InputGranularity::Raw,
         write_flush_interval_secs: 1,
         vk_frequency_enabled: true,
+        redact_titles: false,
     };
     let mut col = start_collection_custom(&enabled, settings, &db_path);
 
@@ -130,6 +131,7 @@ fn fi2_shutdown_storm_ten_rounds_no_deadlock_no_ghosts() {
                     },
                     write_flush_interval_secs: 1,
                     vk_frequency_enabled: true,
+                    redact_titles: false,
                 };
                 let db_path = dir
                     .join(format!("r{round}.db"))
@@ -195,6 +197,7 @@ fn fi3_consumer_death_semantics_and_restart_recovery() {
         input_granularity: InputGranularity::Raw,
         write_flush_interval_secs: 1,
         vk_frequency_enabled: true,
+        redact_titles: false,
     };
     let enabled = hook_only_enabled();
     let mut c1 = start_collection_custom(&enabled, settings, &db_path);

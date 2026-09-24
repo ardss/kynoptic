@@ -141,7 +141,7 @@ fn counts_include_input_agg_rows() {
     let conn = db.reader();
     assert!(agg::has_minute_for_date(&conn, &today));
     assert_eq!(queries::late_night_key_count(&conn, &today, 0, 0), 6); // hour>=0 = 全天
-    assert_eq!(queries::day_totals(&conn, &today).keys, 6);
+    assert_eq!(queries::day_totals(&conn, &today).unwrap().keys, 6);
     drop(conn);
     cleanup(&path);
 }
@@ -220,7 +220,7 @@ fn cached_results_match_legacy_computation() {
     );
 
     // —— 无缓存（events 现算）基准值 ——
-    let legacy_day = queries::day_totals(db.reader().deref(), &today);
+    let legacy_day = queries::day_totals(db.reader().deref(), &today).unwrap();
     let legacy_late_night = queries::late_night_key_count(db.reader().deref(), &today, 0, 0);
     let legacy_burst_max = queries::top_burst_minutes(db.reader().deref(), &today, 100)
         .iter()
@@ -231,7 +231,7 @@ fn cached_results_match_legacy_computation() {
     // —— 建缓存后（agg 读路径）——
     db.update_agg(&events, &(1..=events.len() as i64).collect::<Vec<i64>>());
     let conn = db.reader();
-    let cached_day = queries::day_totals(&conn, &today);
+    let cached_day = queries::day_totals(&conn, &today).unwrap();
     let cached_late_night = queries::late_night_key_count(&conn, &today, 0, 0);
     let cached_burst_max = queries::top_burst_minutes(&conn, &today, 100)
         .iter()
@@ -353,7 +353,7 @@ fn under_agg_self_heals_on_reopen() {
         "重开后该日必须有聚合行（自愈生效）"
     );
     assert_eq!(
-        queries::day_totals(&conn, &today).keys,
+        queries::day_totals(&conn, &today).unwrap().keys,
         1,
         "自愈后聚合计数必须与 events 一致"
     );

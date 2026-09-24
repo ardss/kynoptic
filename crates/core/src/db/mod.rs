@@ -9,7 +9,7 @@
 //! - 自动保留策略（按天数清理旧事件）
 //! - Schema 迁移系统（见 [`schema`])
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +30,70 @@ pub use schema::{apply_pragmas, apply_pragmas_readonly, run_migrations, SCHEMA};
 
 /// rusqlite 结果别名
 pub type SqlResult<T> = rusqlite::Result<T>;
+
+// === 库降级全局标记（库损坏静默零值修复 2026-09） ===
+//
+// 此前库文件损坏（截半/半截写入）时查询静默回退零值，/api/status 无任何
+// 降级标志——用户看到"今天什么都没干"而非"库坏了"。这里用进程级标记承接
+// open 时 quick_check 与 WAL 水位对账的结论，供 dash /api/status 以
+// [`db_degraded_reason`] 暴露为 db_degraded 字段（同进程内生效：tray 进程
+// 同时持有 Database 与面板服务）。
+static DB_DEGRADED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 标记数据库处于降级状态（损坏/数据回退）。只记录首个原因；留档告警与
+/// 0 字节/云同步检测同级（archive_write_failure），不阻塞启动。
+pub fn mark_db_degraded(reason: &str) {
+    log::error!("数据库降级: {reason}");
+    crate::collector::archive_write_failure(&format!("数据库降级: {reason}"));
+    if let Ok(mut guard) = DB_DEGRADED.lock() {
+        if guard.is_none() {
+            *guard = Some(reason.to_string());
+        }
+    }
+}
+
+/// 当前降级原因（None = 正常）。供 dash /api/status 暴露 db_degraded 字段。
+pub fn db_degraded_reason() -> Option<String> {
+    DB_DEGRADED.lock().ok().and_then(|g| g.clone())
+}
+
+/// metadata 表里持久化的 events 水位键名（最近一次正常关闭时的 max(rowid)）。
+const EVENTS_WATERMARK_KEY: &str = "events_watermark_max_rowid";
+
+/// WAL 水位对账（WAL 静默蒸发防护 2026-09）：连接存活期间 WAL 被外部截断/
+/// 删除（云同步冲突、手动清理）时，SQLite 恢复把截断后的尾部当无效帧丢弃——
+/// quick_check=ok、正常启动、已提交事务静默蒸发且零告警。对策：正常停机
+/// （[`Database::mark_stopping`]）把 events max(rowid) 持久化到 metadata 作
+/// 水位；open 时若当前 max(rowid) **回退**到水位之下，说明持久化数据蒸发，
+/// 走 [`mark_db_degraded`] 留档并暴露。同时把水位刷新为当前值（对账一次性）。
+/// 返回回退告警文本（无回退返回 None）。
+fn reconcile_events_watermark(conn: &Connection) -> Option<String> {
+    let current: i64 = conn
+        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    let persisted: i64 = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            params![EVENTS_WATERMARK_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let _ = conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![EVENTS_WATERMARK_KEY, current.to_string()],
+    );
+    if persisted > current {
+        return Some(format!(
+            "events 最大行号从 {persisted} 回退到 {current}：已提交数据丢失（WAL 可能被外部截断/删除，如云同步冲突或手动清理），请检查备份"
+        ));
+    }
+    None
+}
 
 /// 解析数据库文件路径，主应用（lib.rs）与 ctl 共用同一逻辑，避免两者路径不一致。
 ///
@@ -285,9 +349,23 @@ impl Database {
         // 连接（BEGIN IMMEDIATE），热重载重启后新 writer 若 busy_timeout=0 会
         // 立即 SQLITE_BUSY 降级丢批。
         let _ = crate::db::schema::apply_pragmas(&writer);
+        // 打开时 quick_check 廉价门槛（对照 0 字节检测 2026-09）：主库截半等
+        // 损坏下 SCHEMA/查询仍可能"成功"，随后所有端点静默回退零值。open 时
+        // 跑一次 quick_check，非 ok 即走 mark_db_degraded 留档并暴露。
+        match writer.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+            Ok(s) if s != "ok" => mark_db_degraded(&format!(
+                "数据库完整性检查失败: {s}（建议先用副本尝试 kynoptic-aggrepair 或恢复备份）"
+            )),
+            Err(e) => mark_db_degraded(&format!("数据库完整性检查执行失败: {e}")),
+            Ok(_) => {}
+        }
         writer.execute_batch(SCHEMA)?;
         // 迁移失败硬失败（审查 P1）：宁可不启动，不带病运行
         run_migrations(&writer)?;
+        // WAL 水位对账（见 reconcile_events_watermark 文档）
+        if let Some(msg) = reconcile_events_watermark(&writer) {
+            mark_db_degraded(&msg);
+        }
         // 懒回填聚合读缓存（存量库首开一次）——**后台分块执行，不阻塞 open**。
         // perf3 2026-09 P0 实测：1M 事件存量库首开时同步回填把 Database::open
         // 阻塞 10.5 分钟（631,594 ms；目标 <500ms）。改为：open 只做廉价门槛
@@ -429,6 +507,25 @@ impl Database {
     pub fn mark_stopping(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::Release);
+        // 正常停机时持久化 events 水位（供下次 open 的 WAL 回退对账，见
+        // reconcile_events_watermark）。失败仅留日志，不阻塞关停。
+        self.with_writer(
+            |conn| {
+                let n: i64 = conn
+                    .query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap_or(0);
+                if let Err(e) = conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = ?2",
+                    params![EVENTS_WATERMARK_KEY, n.to_string()],
+                ) {
+                    log::warn!("停机水位持久化失败: {e}");
+                }
+            },
+            || log::warn!("停机水位持久化跳过：写连接不可用"),
+        );
     }
 
     fn is_stopping(&self) -> bool {
@@ -749,5 +846,35 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(&plain);
+    }
+
+    /// WAL 水位对账：水位不高于当前 max(rowid) 时正常；回退即报告（WAL 静默
+    /// 蒸发防护，见 reconcile_events_watermark）。
+    #[test]
+    fn watermark_regression_detected() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(x INTEGER PRIMARY KEY, v TEXT); \
+             CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        for _ in 1..=5 {
+            conn.execute("INSERT INTO events(v) VALUES ('e')", [])
+                .unwrap();
+        }
+        // 首次对账：建立水位 5，无回退
+        assert!(reconcile_events_watermark(&conn).is_none());
+        let wm: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'events_watermark_max_rowid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wm, "5");
+        // 模拟已提交行蒸发：当前 max(rowid) 回退到 2，持久化水位仍为 5
+        conn.execute("DELETE FROM events WHERE x > 2", []).unwrap();
+        let msg = reconcile_events_watermark(&conn).expect("回退必须被发现");
+        assert!(msg.contains("回退"), "告警文本须含回退: {msg}");
     }
 }
