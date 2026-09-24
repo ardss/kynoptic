@@ -455,7 +455,7 @@ pub fn create_monitors_for(
         out.push(Box::new(monitors::calendar::CalendarMonitor::default()));
     }
     if want("location") {
-        out.push(Box::new(monitors::location::LocationMonitor::default()));
+        out.push(Box::new(monitors::location::LocationMonitor));
     }
     if want("notification") {
         out.push(Box::new(
