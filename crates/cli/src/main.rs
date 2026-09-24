@@ -863,15 +863,69 @@ fn analyze_day_text(conn: &Connection, date: &str) -> Result<String> {
 }
 
 // === ghost ===
+/// 读当前 daily_agg 全表快照：date → (keys, clicks, active_minutes, apm_avg)。
+/// 供 ghost 重算前后对比，避免历史聚合被静默改写。
+fn snapshot_daily_agg(
+    conn: &Connection,
+) -> std::collections::BTreeMap<String, (i64, i64, i64, f64)> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT date, keys, clicks, active_minutes, apm_avg FROM daily_agg")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (d, k, c, m, a) = row;
+                out.insert(d, (k, c, m, a));
+            }
+        }
+    }
+    out
+}
+
 fn cmd_ghost() -> Result<()> {
     let db_path = resolve_db();
     let db = Database::open(db_path.to_str().unwrap_or("?"))?;
     let n = db.close_ghost_sessions();
     println!("✓ 关闭了 {} 个 session", n);
-    // 重新计算所有天的 daily_agg（让 stats/anomaly 立刻反映新数据）
+    // 重新计算所有天的 daily_agg（让 stats/anomaly 立刻反映新数据）。
+    // 重算前后做快照对比，把被改写/新增/清除的历史日期与前后值列出来，
+    // 杜绝「无提示覆盖」（如早期误删事件受害库升级后被静默改写）。
     let conn = db.reader();
+    let before = snapshot_daily_agg(&conn);
     match daily_agg::recompute_all(&conn) {
-        Ok(d) => println!("  同步更新 daily_agg {} 天", d),
+        Ok(d) => {
+            println!("  同步更新 daily_agg {} 天", d);
+            let after = snapshot_daily_agg(&conn);
+            for (date, new) in &after {
+                match before.get(date) {
+                    Some(old) if old != new => println!(
+                        "  重写 {date}: keys {}→{}, clicks {}→{}, 活跃分钟 {}→{}, apm {:.1}→{:.1}",
+                        old.0, new.0, old.1, new.1, old.2, new.2, old.3, new.3
+                    ),
+                    Some(_) => {}
+                    None => println!(
+                        "  新增 {date}: keys {}, clicks {}, 活跃分钟 {}, apm {:.1}",
+                        new.0, new.1, new.2, new.3
+                    ),
+                }
+            }
+            for (date, old) in &before {
+                if !after.contains_key(date) {
+                    println!(
+                        "  清除 {date}（当日无事件，缓存全零行移除）: 原值 keys {}, clicks {}, 活跃分钟 {}",
+                        old.0, old.1, old.2
+                    );
+                }
+            }
+        }
         Err(e) => eprintln!("  ⚠ daily_agg 更新失败: {e}"),
     }
     Ok(())
@@ -2351,6 +2405,20 @@ fn kill_tray() -> bool {
 }
 
 fn cmd_watchdog(args: &[String]) -> Result<()> {
+    // 产品加固（计划任务劫持整改）：生产任务曾被混沌演练残留劫持、action
+    // 指向 %TEMP% 下的死副本。启动即校验自身 exe 不在用户临时目录，命中则
+    // 拒绝执行——假 watchdog 不再接管"拉起托盘"的职责，也给排障留痕。
+    #[cfg(target_os = "windows")]
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.starts_with(std::env::temp_dir()) {
+            let msg = format!(
+                "watchdog 拒绝执行: 自身位于临时目录 {}（疑似残留/被劫持副本，请用安装器重建计划任务）",
+                exe.display()
+            );
+            eprintln!("watchdog: {msg}");
+            return Err(Error::InvalidData(msg));
+        }
+    }
     let mut once = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -2816,10 +2884,36 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("✗ {e}");
+            eprintln!("✗ {}", enrich_open_failure(&e));
             ExitCode::FAILURE
         }
     }
+}
+
+/// 打开失败文案增强：SQLite 原样文案「unable to open database file」无行动
+/// 指引。命中该文案时先做一次独立的写方式打开探测，判别 Windows 共享冲突
+/// (os error 32，文件被备份/杀毒/同步工具以不共享方式独占) 并给出可行动建议；
+/// 其余情况挂 core 现成的 diagnose_open_failure（只读诊断，不写不动数据）。
+fn enrich_open_failure(e: &Error) -> String {
+    let raw = e.to_string();
+    if !raw.contains("unable to open database file") {
+        return raw;
+    }
+    let db_path = resolve_db();
+    let share_violation = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&db_path)
+        .err()
+        .and_then(|io| io.raw_os_error())
+        .is_some_and(|code| code == 32);
+    if share_violation {
+        return format!(
+            "{raw}\n  → 数据库文件被其他程序独占（常见：备份/杀毒/同步工具），请稍后重试或将数据目录移出扫描范围"
+        );
+    }
+    let diag = kynoptic_core::db::diagnose_open_failure(&db_path);
+    format!("{raw}\n  → {diag}")
 }
 
 #[cfg(test)]
