@@ -228,8 +228,13 @@
 <span class="cm"># <span class="l en">query yesterday's app/window history</span><span class="l zh">查昨天的应用/窗口历史</span></span>
 <span class="kw">$</span> <span class="fn">kynoptic</span> query --from yesterday --bucket app/window --json
 
-<span class="cm"># <span class="l en">or query the history as plain SQL</span><span class="l zh">也可以直接用 SQL 查历史</span></span>
-<span class="kw">$</span> <span class="fn">sqlite3</span> kynoptic.db <span class="str">"SELECT * FROM events"</span></pre>
+<span class="cm"># <span class="l en">or query the history as plain SQL — the database lives in the</span><span class="l zh">也可以直接用 SQL 查历史，库文件在安装目录的 data\kynoptic.db</span></span>
+<span class="cm"># <span class="l en">install folder under data\kynoptic.db, or wherever KYNOPTIC_DB points</span><span class="l zh">（可用环境变量 KYNOPTIC_DB 修改位置）</span></span>
+<span class="kw">$</span> <span class="fn">sqlite3</span> <span class="str">"%LOCALAPPDATA%\Programs\kynoptic\data\kynoptic.db"</span> <span class="str">"SELECT * FROM events"</span>
+
+<span class="cm"># <span class="l en">the DB uses WAL mode: for read-only queries or copying the file,</span><span class="l zh">库使用 WAL 模式：只读查询或复制文件时，请连同 -wal / -shm 文件</span></span>
+<span class="cm"># <span class="l en">keep the -wal and -shm files together and don't truncate them, or you</span><span class="l zh">一起保留，不要单独截断它们，</span></span>
+<span class="cm"># <span class="l en">may lose data</span><span class="l zh">否则可能丢数据</span></span></pre>
       </div>
     </div>
   </div>
