@@ -309,6 +309,8 @@ fn cmd_export(args: &[String]) -> Result<()> {
     // 流式导出（审查 P2：不再把全表载入内存）
     use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
     let row_count = std::sync::Arc::new(AtomicUsize::new(0));
+    // 类型不兼容（未来版本异型行）被跳过的行数——导出必须留痕（"不炸不丢"）
+    let mut skipped = 0usize;
 
     if out.is_empty() {
         // 缺省写到 db 同目录 exports/ 子目录（自动创建），不再落 CWD。
@@ -359,7 +361,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
             ])
             .map_err(map_csv_err)?;
             let rc = row_count.clone();
-            queries::export_events_since_stream(&conn, &cutoff, |r| {
+            skipped += queries::export_events_since_stream(&conn, &cutoff, |r| {
                 rc.fetch_add(1, AOrdering::Relaxed);
                 // 外部可控字段（app_name/window_title/event_data）做公式注入中和
                 let _ = w.write_record(&[
@@ -381,7 +383,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
             let rc = row_count.clone();
             let mut first = true;
             writeln!(f, "[")?;
-            queries::export_events_since_stream(&conn, &cutoff, |r| {
+            skipped += queries::export_events_since_stream(&conn, &cutoff, |r| {
                 let n = rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
@@ -410,7 +412,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
             use std::io::Write;
             let mut f = std::fs::File::create(&out_path)?;
             let rc = row_count.clone();
-            queries::export_events_since_stream(&conn, &cutoff, |r| {
+            skipped += queries::export_events_since_stream(&conn, &cutoff, |r| {
                 rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
@@ -430,6 +432,9 @@ fn cmd_export(args: &[String]) -> Result<()> {
         row_count.load(AOrdering::Relaxed),
         out_path.display()
     );
+    if skipped > 0 {
+        println!("⚠ 有 {skipped} 行因类型不兼容被跳过（详见日志）");
+    }
     Ok(())
 }
 
@@ -1328,6 +1333,13 @@ fn is_reparse_point(p: &Path) -> bool {
 /// 做 reparse point 检查，命中即报错退出。写入用 tmp + rename 原子落盘：
 /// 半程崩溃不会留下截断的 SKILL.md。
 fn skill_install_to(base: &Path) -> Result<Vec<std::path::PathBuf>> {
+    skill_install_content(base, SKILL_MD)
+}
+
+/// 同 skill_install_to，但写入指定内容——自更新流程用它把下载包里的新版
+/// SKILL.md 同步到各 agent 副本（运行中的旧 exe 内嵌资产是旧文档，不能
+/// 直接用 SKILL_MD）。
+fn skill_install_content(base: &Path, md: &str) -> Result<Vec<std::path::PathBuf>> {
     let mut written = Vec::new();
     for dir in SKILL_CLIENT_DIRS {
         let parent = base.join(dir).join("skills");
@@ -1344,7 +1356,7 @@ fn skill_install_to(base: &Path) -> Result<Vec<std::path::PathBuf>> {
             .map_err(|e| Error::InvalidData(format!("创建 {} 失败: {e}", target.display())))?;
         let file = target.join("SKILL.md");
         let tmp = target.join("SKILL.md.tmp");
-        std::fs::write(&tmp, SKILL_MD)
+        std::fs::write(&tmp, md)
             .map_err(|e| Error::InvalidData(format!("写入 {} 失败: {e}", tmp.display())))?;
         std::fs::rename(&tmp, &file)
             .map_err(|e| Error::InvalidData(format!("落盘 {} 失败: {e}", file.display())))?;
@@ -1480,9 +1492,10 @@ fn cmd_collect(args: &[String]) -> Result<()> {
 
     // 设置面板（dashboard /api/settings）写入的 settings.json 是监控器开关
     // 的唯一事实源：collect 启动时读取；--all 显式覆盖为全集。
-    // Wave20 P1：与 POST /api/settings 同一套校验（dash/src/lib.rs）——未知 id
-    // 与空集都报错退出。手改 settings.json 写入空数组会绕过面板守卫，若不拦
-    // 会静默 0 监控器空采（图标绿色但什么都没记）；要暂停请用托盘 Pause。
+    // Wave20 P1：与 POST /api/settings 同一套校验（dash/src/lib.rs）——空集
+    // 报错退出；未知 id 见下方前向容错。手改 settings.json 写入空数组会绕过
+    // 面板守卫，若不拦会静默 0 监控器空采（图标绿色但什么都没记）；要暂停
+    // 请用托盘 Pause。
     let enabled: std::collections::HashSet<String> = if all {
         kynoptic_core::registry::all_monitor_ids()
             .iter()
@@ -1490,15 +1503,31 @@ fn cmd_collect(args: &[String]) -> Result<()> {
             .collect()
     } else {
         let s = crate::settings::load(std::path::Path::new(&db_path));
-        if let Some(bad) = crate::settings::first_invalid_id(&s.enabled_monitors) {
-            return Err(Error::InvalidData(format!("未知监控器 id: {bad}")));
+        // 前向容错（与 load 层「未知字段一律忽略」同口径）：未来版本新增的
+        // 监控器 id 不再整体拒绝启动，而是忽略后用已知集继续采集——否则
+        // 0.4 写入的新 id 会让 0.3 的采集停摆。文件不回写，未知 id 原样
+        // 保留等升级后生效。仅「过滤后为空集」维持硬失败（防静默 0 采集）。
+        let known: std::collections::HashSet<&str> = kynoptic_core::registry::all_monitor_ids()
+            .iter()
+            .copied()
+            .collect();
+        let (known_ids, future_ids): (Vec<_>, Vec<_>) = s
+            .enabled_monitors
+            .into_iter()
+            .partition(|id| known.contains(id.as_str()));
+        if !future_ids.is_empty() {
+            eprintln!(
+                "警告: settings.json 含当前版本未知的监控器 id（可能来自更新版本），已忽略: {}",
+                future_ids.join(", ")
+            );
         }
-        if s.enabled_monitors.is_empty() {
+        let set: std::collections::HashSet<String> = known_ids.into_iter().collect();
+        if set.is_empty() {
             return Err(Error::InvalidData(
                 "enabled_monitors 不能为空（暂停请用托盘菜单）".into(),
             ));
         }
-        s.enabled_monitors.into_iter().collect()
+        set
     };
     eprintln!(
         "kynoptic collect: {} monitors, db = {db_path}. Ctrl+C to stop.",
@@ -1703,6 +1732,26 @@ const FAILURE_THRESHOLD: u32 = 3;
 const BACKOFF_STEPS_SECS: [i64; 3] = [120, 480, 1800];
 /// 睡眠唤醒守卫：心跳超龄后先等 40s 复查，仍超龄才 kill
 const STALE_RECHECK_WAIT_SECS: u64 = 40;
+/// --once 模式的 stale 复查等待：计划任务每分钟一轮，固定 40s 会吃掉大半
+/// 周期；缩短为恰好一个心跳写周期（tray 每 30s touch），保住「等待 ≥ 一个
+/// 心跳周期」的睡眠唤醒守卫语义。
+const ONCE_RECHECK_WAIT_SECS: u64 = 30;
+/// 复查等待的环境覆盖（s）：供排障/特殊部署调整，封顶心跳最大年龄，
+/// 超过 180s 只会让 kill 更迟钝而不会更准确。
+const RECHECK_WAIT_ENV: &str = "KYNOPTIC_WATCHDOG_RECHECK_SECS";
+
+fn stale_recheck_wait_secs(once: bool) -> u64 {
+    if let Ok(v) = std::env::var(RECHECK_WAIT_ENV) {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            return n.min(HEARTBEAT_MAX_AGE_SECS as u64);
+        }
+    }
+    if once {
+        ONCE_RECHECK_WAIT_SECS
+    } else {
+        STALE_RECHECK_WAIT_SECS
+    }
+}
 
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
@@ -2529,12 +2578,13 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     heartbeat_stale(Utc::now(), hb_read.as_deref())
                 };
                 if first_stale {
-                    // 睡眠唤醒守卫：等待 40s 后复查（纯函数 recheck_should_kill）
+                    // 睡眠唤醒守卫：等待后复查（纯函数 recheck_should_kill）
                     // 审查 P1：stalled=true（tray 自报采集停滞）也走此复查路径
+                    let recheck_wait = stale_recheck_wait_secs(once);
                     watchdog_log(&format!(
-                        "心跳缺失/不可读/超龄(>{HEARTBEAT_MAX_AGE_SECS}s)/采集停滞(stalled), 疑似睡眠唤醒/挂死, {STALE_RECHECK_WAIT_SECS}s 后复查"
+                        "心跳缺失/不可读/超龄(>{HEARTBEAT_MAX_AGE_SECS}s)/采集停滞(stalled), 疑似睡眠唤醒/挂死, {recheck_wait}s 后复查"
                     ));
-                    std::thread::sleep(std::time::Duration::from_secs(STALE_RECHECK_WAIT_SECS));
+                    std::thread::sleep(std::time::Duration::from_secs(recheck_wait));
                     let still_running = unsafe {
                         let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
                         if !h.is_null() {
@@ -3268,10 +3318,10 @@ mod tests {
         let bridge_count = queries::bridge_count;
         assert_eq!(bridge_count(&[], 2), 0);
         assert_eq!(bridge_count(&[10], 2), 1);
-        // 10,11,12 连续;12->15 与 15->18 间隙均为 3,各按 cap(bridge+1)=3 补步长
+        // 10,11,12 连续;12->15 与 15->18 间隙均为 3(=bridge+1,可桥接),各 +3
         assert_eq!(bridge_count(&[10, 11, 12, 15, 18], 2), 9);
-        // 间隙 4（缺 3 分钟）同样按 cap=3 补: 1 + 3 = 4
-        assert_eq!(bridge_count(&[10, 14], 2), 4);
+        // 间隙 4(缺 3 分钟)> bridge+1=3:超过桥接阈值,长空洞不算在场,只计两端点
+        assert_eq!(bridge_count(&[10, 14], 2), 2);
         // 连续分钟逐 1 累计
         assert_eq!(bridge_count(&[10, 11, 12, 13], 2), 4);
     }
@@ -3334,10 +3384,10 @@ mod tests {
             "注入分钟 10:07 + 混合分钟 10:08 = 2"
         );
         assert_eq!(day.mixed_minutes, 1, "混合分钟双计，单独返回");
-        // 大间隙按 dash 同款公式只补 bridge+1 步长（cap 后为 3）: 1 + 3 = 4
+        // 间隙 8 分钟 > bridge+1=3:超过桥接阈值,长空洞不算在场,只计两端点 = 2
         assert_eq!(
-            day.presence_minutes, 4,
-            "两个在场分钟 + 间隙按 bridge 上限补步长（与 dash 口径一致）"
+            day.presence_minutes, 2,
+            "两个在场分钟,中间 8 分钟空洞超过桥接阈值不补(与文档口径一致)"
         );
         assert_eq!(f, 60, "前台 = 一次切换间隔 60 分钟");
     }

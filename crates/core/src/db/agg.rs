@@ -10,6 +10,9 @@
 //! - `input_clicks`  sum=点击数
 //! - `input_moves`   sum=移动距离(px), count=采样移动次数
 //! - `window_switches` sum=count=窗口切换次数
+//! - `input_keys_injected` / `input_clicks_injected`  sum=注入（自动化）计数
+//!   （审查修复 2026-09：供深夜活动/APM 突增等异常口径扣减注入、只算人侧；
+//!   旧缓存无该桶时读取方按 0 注入处理，等价旧行为）
 //!
 //! agg_daily 只存 `app:<name>` 行——**纯计数桶**（语义定案 2026-09）：
 //! count=该应用当日事件数，sum_value 恒 NULL 且无读取方（见
@@ -109,6 +112,22 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
                     params![date, hour, minute, "input_keys", keys, samples, rowid],
                 )?;
             }
+            // 注入（自动化）拆桶：与 input_keys 同一快照语义（审查修复 2026-09）
+            let inj_keys = json_counter(e, "injected_keys");
+            if inj_keys > 0 {
+                conn.execute(
+                    UPSERT_MINUTE_SNAPSHOT,
+                    params![
+                        date,
+                        hour,
+                        minute,
+                        "input_keys_injected",
+                        inj_keys,
+                        samples,
+                        rowid
+                    ],
+                )?;
+            }
         }
         (EventType::Mouse, EventAction::InputAgg) => {
             let clicks = json_counter(e, "clicks");
@@ -119,6 +138,21 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
                 conn.execute(
                     UPSERT_MINUTE_SNAPSHOT,
                     params![date, hour, minute, "input_clicks", clicks, samples, rowid],
+                )?;
+            }
+            let inj_clicks = json_counter(e, "injected_clicks");
+            if inj_clicks > 0 {
+                conn.execute(
+                    UPSERT_MINUTE_SNAPSHOT,
+                    params![
+                        date,
+                        hour,
+                        minute,
+                        "input_clicks_injected",
+                        inj_clicks,
+                        samples,
+                        rowid
+                    ],
                 )?;
             }
             if moves > 0 || dist > 0 {
@@ -133,12 +167,25 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
                 UPSERT_MINUTE,
                 params![date, hour, minute, "input_keys", 1, 1, rowid],
             )?;
+            // raw 注入按键（hook 落库 $.injected）同步拆桶
+            if json_flag(e, "injected") {
+                conn.execute(
+                    UPSERT_MINUTE,
+                    params![date, hour, minute, "input_keys_injected", 1, 1, rowid],
+                )?;
+            }
         }
         (EventType::Mouse, EventAction::Click) => {
             conn.execute(
                 UPSERT_MINUTE,
                 params![date, hour, minute, "input_clicks", 1, 1, rowid],
             )?;
+            if json_flag(e, "injected") {
+                conn.execute(
+                    UPSERT_MINUTE,
+                    params![date, hour, minute, "input_clicks_injected", 1, 1, rowid],
+                )?;
+            }
         }
         (EventType::Window, EventAction::Switch) => {
             conn.execute(
@@ -166,6 +213,14 @@ fn json_counter(e: &Event, key: &str) -> i64 {
         .and_then(|v| v.get(key))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
+}
+
+fn json_flag(e: &Event, key: &str) -> bool {
+    e.event_data
+        .as_ref()
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 impl super::Database {
@@ -252,15 +307,30 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
                   MAX(id) AS maxid,
                   SUM({keys_row}) AS keys,
                   SUM({clicks_row}) AS clicks,
+                  SUM({inj_keys_row}) AS ikeys,
+                  SUM({inj_clicks_row}) AS iclicks,
                   SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.move_distance_px'), 0) ELSE 0 END) AS dist,
-                  -- 以下三个 count 与增量维护 apply_event 逐条语义一一对应（perf3 对齐）
+                  -- 以下五个 count 与增量维护 apply_event 逐条语义一一对应（perf3 对齐；
+                  -- 注入桶 count 同口径：raw 注入按行 +1，input_agg 注入按 $.samples，
+                  -- 勿用 ckeys/cclicks 全量充当注入 count——rebuild/backfill 与
+                  -- apply_event 会得到不同的 count_value，回归修复 2026-09）
                   SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1
                            WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS ckeys,
                   SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1
                            WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cclicks,
+                  SUM(CASE WHEN event_type='keyboard' AND event_action='press'
+                             AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
+                           WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
+                             AND COALESCE(json_extract(event_data, '$.injected_keys'), 0) != 0
+                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinkeys,
+                  SUM(CASE WHEN event_type='mouse' AND event_action='click'
+                             AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
+                           WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
+                             AND COALESCE(json_extract(event_data, '$.injected_clicks'), 0) != 0
+                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinclks,
                   SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                            THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END) AS cmoves,
                   SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches
@@ -276,6 +346,10 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
            SELECT d, h, mi, 'input_moves', dist, cmoves, maxid FROM m WHERE dist > 0 OR cmoves > 0
            UNION ALL
            SELECT d, h, mi, 'window_switches', switches, switches, maxid FROM m WHERE switches > 0
+           UNION ALL
+           SELECT d, h, mi, 'input_keys_injected', ikeys, cinkeys, maxid FROM m WHERE ikeys > 0
+           UNION ALL
+           SELECT d, h, mi, 'input_clicks_injected', iclicks, cinclks, maxid FROM m WHERE iclicks > 0
          )
          SELECT d, h, mi, bk, s, c, maxid FROM b;
 
@@ -290,6 +364,8 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
         off = off,
         keys_row = crate::queries::KEYS_ROW_EXPR,
         clicks_row = crate::queries::CLICKS_ROW_EXPR,
+        inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+        inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
     ))?;
 
     let n = conn.query_row("SELECT COUNT(*) FROM agg_minute", [], |r| r.get(0))?;
@@ -499,15 +575,29 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                       MAX(id) AS maxid,
                       SUM({keys_row}) AS keys,
                       SUM({clicks_row}) AS clicks,
+                      SUM({inj_keys_row}) AS ikeys,
+                      SUM({inj_clicks_row}) AS iclicks,
                       SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                                THEN COALESCE(json_extract(event_data, '$.move_distance_px'), 0) ELSE 0 END) AS dist,
-                      -- 以下三个 count 与增量维护 apply_event 逐条语义一一对应（perf3 对齐）
+                      -- 以下五个 count 与增量维护 apply_event 逐条语义一一对应（perf3 对齐；
+                      -- 注入桶 count 同口径：raw 注入按行 +1，input_agg 注入按 $.samples，
+                      -- 勿用 ckeys/cclicks 全量充当注入 count，回归修复 2026-09）
                       SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1
                                WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
                                THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS ckeys,
                       SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1
                                WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                                THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cclicks,
+                      SUM(CASE WHEN event_type='keyboard' AND event_action='press'
+                                 AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
+                               WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
+                                 AND COALESCE(json_extract(event_data, '$.injected_keys'), 0) != 0
+                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinkeys,
+                      SUM(CASE WHEN event_type='mouse' AND event_action='click'
+                                 AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
+                               WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
+                                 AND COALESCE(json_extract(event_data, '$.injected_clicks'), 0) != 0
+                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinclks,
                       SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
                                THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END) AS cmoves,
                       SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches
@@ -524,11 +614,17 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                SELECT mi, 'input_moves', dist, cmoves, maxid FROM m WHERE dist > 0 OR cmoves > 0
                UNION ALL
                SELECT mi, 'window_switches', switches, switches, maxid FROM m WHERE switches > 0
+               UNION ALL
+               SELECT mi, 'input_keys_injected', ikeys, cinkeys, maxid FROM m WHERE ikeys > 0
+               UNION ALL
+               SELECT mi, 'input_clicks_injected', iclicks, cinclks, maxid FROM m WHERE iclicks > 0
              )
              SELECT '{date}', {hour}, mi, bk, s, c, maxid FROM b;",
             off = off,
             keys_row = crate::queries::KEYS_ROW_EXPR,
             clicks_row = crate::queries::CLICKS_ROW_EXPR,
+            inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+            inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
             start = start,
             end = end,
             date = date,

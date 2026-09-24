@@ -167,8 +167,6 @@ pub fn recent(conn: &Connection, limit: i64) -> Vec<(String, i64, i64, i64, f64)
     }) else {
         return out;
     };
-    for row in rows.flatten() {
-        out.push(row);
-    }
+    out.extend(queries::collect_rows_warn(rows, "daily_agg.recent"));
     out
 }

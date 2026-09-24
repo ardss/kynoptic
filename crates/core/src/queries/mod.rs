@@ -67,6 +67,38 @@ pub(crate) fn string_or_log(res: rusqlite::Result<String>, ctx: &str) -> String 
     })
 }
 
+/// 行流收集（审查修复 2026-09，"不炸不丢"）：替代 `rows.flatten()` 的静默
+/// 丢行——未来版本写入的异型行（如 session_id 列被写入 TEXT）会让
+/// query_map 逐行返回 Err(InvalidColumnType)，flatten 无声丢弃后命令仍报
+/// 成功、行数与 db stats 自相矛盾。本 helper 累计跳过行数并 log::warn
+/// （含首条错误），保证丢行留痕。
+pub(crate) fn collect_rows_warn<T, I>(rows: I, ctx: &str) -> Vec<T>
+where
+    I: Iterator<Item = rusqlite::Result<T>>,
+{
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut first_err: Option<rusqlite::Error> = None;
+    for r in rows {
+        match r {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                skipped += 1;
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if skipped > 0 {
+        log::warn!(
+            "查询 {ctx} 有 {skipped} 行因类型不兼容被跳过（首条: {}）",
+            first_err.map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+    out
+}
+
 pub fn get_count_i64(row: &Row<'_>) -> rusqlite::Result<i64> {
     row.get(0)
 }
@@ -180,6 +212,41 @@ pub(crate) const CLICKS_ROW_EXPR: &str = "(CASE \
          WHEN event_type='mouse' AND event_action='click' THEN 1 \
          WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
            THEN MAX(COALESCE(json_extract(event_data, '$.clicks'), 0), 0) \
+         ELSE 0 END)";
+
+/// 注入（自动化）输入的行级计数——与 KEYS/CLICKS_ROW_EXPR 同构，供 agg 缓存
+/// 拆桶（db::agg 的 `input_keys_injected` / `input_clicks_injected` 桶）与
+/// 异常口径扣减使用。raw 行认 hook 落库的 $.injected 布尔；input_agg 行认
+/// $.injected_keys / $.injected_clicks。
+pub(crate) const INJECTED_KEYS_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='keyboard' AND event_action='press' \
+           AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1 \
+         WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
+           THEN MAX(COALESCE(json_extract(event_data, '$.injected_keys'), 0), 0) \
+         ELSE 0 END)";
+
+pub(crate) const INJECTED_CLICKS_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='mouse' AND event_action='click' \
+           AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1 \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+           THEN MAX(COALESCE(json_extract(event_data, '$.injected_clicks'), 0), 0) \
+         ELSE 0 END)";
+
+/// 人侧（剔注入）行级计数 = MAX(keys - injected_keys, 0)。深夜活动 / APM 突增
+/// 等异常口径统一用它——纯注入分钟（{"keys":500,"injected_keys":500}）不得被
+/// 算成"深夜按键"或"行为突增"（审查修复 2026-09：自动化注入不算人）。
+pub(crate) const HUMAN_KEYS_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='keyboard' AND event_action='press' \
+           THEN (CASE WHEN COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 0 ELSE 1 END) \
+         WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
+           THEN MAX(MAX(COALESCE(json_extract(event_data, '$.keys'), 0), 0) - MAX(COALESCE(json_extract(event_data, '$.injected_keys'), 0), 0), 0) \
+         ELSE 0 END)";
+
+pub(crate) const HUMAN_CLICKS_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='mouse' AND event_action='click' \
+           THEN (CASE WHEN COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 0 ELSE 1 END) \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+           THEN MAX(MAX(COALESCE(json_extract(event_data, '$.clicks'), 0), 0) - MAX(COALESCE(json_extract(event_data, '$.injected_clicks'), 0), 0), 0) \
          ELSE 0 END)";
 
 /// 一分钟内的活动统计——供 [`crate::analyzer`] 专注段 / APM 序列消费。

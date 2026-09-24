@@ -54,16 +54,19 @@ pub struct ExportRow {
 /// 导出自 cutoff 以来全部事件（按 id 升序），用于 ctl export。
 /// 流式导出（审查 P2：原实现把全表 collect 进 Vec，千万行级可达数 GB 内存
 /// 且 JSON 双倍峰值）。逐行回调，写一行丢一行。
+///
+/// 返回因类型不兼容（未来版本写入的异型行）被跳过的行数（审查修复
+/// 2026-09：此前 rows.flatten() 静默丢行，命令仍报"✓ 导出 N 行"成功）。
 pub fn export_events_since_stream(
     conn: &Connection,
     cutoff: &str,
     mut sink: impl FnMut(ExportRow),
-) {
+) -> usize {
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, timestamp, event_type, event_action, event_data, app_name, window_title, session_id
          FROM events WHERE timestamp >= ?1 ORDER BY id",
     ) else {
-        return;
+        return 0;
     };
     let Ok(rows) = stmt.query_map(params![cutoff], |r| {
         Ok(ExportRow {
@@ -77,15 +80,27 @@ pub fn export_events_since_stream(
             session_id: r.get(7)?,
         })
     }) else {
-        return;
+        return 0;
     };
-    for row in rows.flatten() {
-        sink(row);
+    let mut skipped = 0usize;
+    for row in rows {
+        match row {
+            Ok(row) => sink(row),
+            Err(e) => {
+                skipped += 1;
+                if skipped == 1 {
+                    log::warn!("export 有异型行被跳过（首条: {e}）");
+                }
+            }
+        }
     }
+    skipped
 }
 
-pub fn export_events_since(conn: &Connection, cutoff: &str) -> Vec<ExportRow> {
+/// 导出自 cutoff 以来全部事件（非流式便捷版）。
+/// 返回 (行, 因类型不兼容被跳过的行数)。
+pub fn export_events_since(conn: &Connection, cutoff: &str) -> (Vec<ExportRow>, usize) {
     let mut out = Vec::new();
-    export_events_since_stream(conn, cutoff, |row| out.push(row));
-    out
+    let skipped = export_events_since_stream(conn, cutoff, |row| out.push(row));
+    (out, skipped)
 }
