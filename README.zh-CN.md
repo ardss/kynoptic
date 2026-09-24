@@ -107,6 +107,38 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 
 之后你的助手就能回答"昨天 CPU 飙高的时候我在干嘛"这类问题——数据始终不离开你的磁盘。
 
+## 用脚本写设置（curl / 自动化）
+
+面板的写接口 `POST /api/settings` 有三道防线（防跨站、防同机滥用、会话令牌），
+脚本直接 POST 会得到 403（`csrf_blocked` 或 `session_token_invalid`）。这是
+刻意设计——面板只监听本机回环，写请求必须证明来自本机面板本身。脚本要写设置，
+四个请求头缺一不可：
+
+```bash
+PORT=8422   # 与面板端口一致（默认 8422，settings.json 里 dashboard_port）
+# 1) 会话令牌只注入在面板首页 HTML 里，先取出来：
+TOKEN=$(curl -s http://127.0.0.1:$PORT/ | sed -n 's/.*KYN_CSRF_TOKEN = "\([^"]*\)".*/\1/p')
+# 2) 四头齐备再 POST：
+curl -s -X POST http://127.0.0.1:$PORT/api/settings \
+  -H "Origin: http://127.0.0.1:$PORT" \
+  -H "X-Kynoptic: 1" \
+  -H "X-Kynoptic-Token: $TOKEN" \
+  -H "X-Kynoptic-Access-Token: <访问令牌>" \
+  -H "Content-Type: application/json" \
+  -d '{"daily_goal_minutes": 480}'
+```
+
+各头的作用：
+
+| 请求头 | 作用 |
+|---|---|
+| `Origin` | 必须是面板自身地址（回环），拦跨站表单 |
+| `X-Kynoptic: 1` | 自定义头，浏览器简单表单发不出，拦跨站 fetch |
+| `X-Kynoptic-Token` | 会话令牌，从 `GET /` 的 HTML 里 `KYN_CSRF_TOKEN` 常量取 |
+| `X-Kynoptic-Access-Token` | 访问令牌；仅当你创建了 `data/dashboard-token.txt` 才需要（其内容即令牌） |
+
+只读接口 `GET /api/*` 不需要前三者，仅在启用了访问令牌时带第四个。
+
 ## 常见问题排查
 
 - **双击托盘图标没反应**：说明已有一个 Kynoptic 实例在运行，本次启动自行退出了。程序目录的 `duplicate-start.log` 和数据目录的 `tray.log` 记录了原因。单实例按用户计、且为机器级——不区分数据目录，因此两个不同数据目录的部署也会互相顶替，后启动的不会运行。

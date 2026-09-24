@@ -151,6 +151,41 @@ rights as this MCP server — treat MCP access like plain file read access to
 `KYNOPTIC_DB`. The server opens the database read-only and never sends data
 off-machine, but it cannot protect the file from other local processes.
 
+## Writing settings from scripts (curl / automation)
+
+The dashboard write endpoint `POST /api/settings` sits behind three defenses
+(cross-site blocking, same-machine proof, and a session token). A plain script
+POST gets a 403 (`csrf_blocked` or `session_token_invalid`). That is by design
+— the dashboard listens on the loopback interface only, and writes must prove
+they come from the local dashboard itself. To write settings from a script,
+send all four headers:
+
+```bash
+PORT=8422   # match the dashboard port (default 8422, dashboard_port in settings.json)
+# 1) The session token is injected only into the dashboard's HTML page; grab it first:
+TOKEN=$(curl -s http://127.0.0.1:$PORT/ | sed -n 's/.*KYN_CSRF_TOKEN = "\([^"]*\)".*/\1/p')
+# 2) Then POST with all four headers:
+curl -s -X POST http://127.0.0.1:$PORT/api/settings \
+  -H "Origin: http://127.0.0.1:$PORT" \
+  -H "X-Kynoptic: 1" \
+  -H "X-Kynoptic-Token: $TOKEN" \
+  -H "X-Kynoptic-Access-Token: <access token>" \
+  -H "Content-Type: application/json" \
+  -d '{"daily_goal_minutes": 480}'
+```
+
+What each header does:
+
+| Header | Purpose |
+|---|---|
+| `Origin` | Must be the dashboard's own (loopback) address; blocks cross-site forms |
+| `X-Kynoptic: 1` | Custom header a plain cross-site form cannot send; blocks cross-site fetches |
+| `X-Kynoptic-Token` | Session token, taken from the `KYN_CSRF_TOKEN` constant in the `GET /` HTML |
+| `X-Kynoptic-Access-Token` | Access token; only needed if you created `data/dashboard-token.txt` (its content is the token) |
+
+Read-only endpoints (`GET /api/*`) do not need the first three; they only need
+the access token when one is enabled.
+
 ## Troubleshooting
 
 - **Double-clicking the tray icon does nothing**: an instance is already

@@ -118,6 +118,14 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 | `watchdog [--db PATH] [--once]` | ✅ | 看门狗心跳（供计划任务调用，确保托盘存活） |
 | `update` | ✅ | 自更新（GitHub releases，SHA256 校验 + 三件套备份 + 失败回滚） |
 
+### 用脚本写设置（POST /api/settings）
+
+面板写接口带三道防线（回环 Origin + `X-Kynoptic: 1` + 页面注入的 `X-Kynoptic-Token`
+会话令牌；启用了访问令牌时另需 `X-Kynoptic-Access-Token`），脚本调用四个头缺一
+不可。完整 curl 配方与各头作用见 README「用脚本写设置 / Writing settings from
+scripts」一节；会话令牌实现在 `crates/dash/src/lib.rs`（`__KYN_CSRF_TOKEN__`
+注入首页），校验顺序：csrf → 访问令牌 → 413 → 会话令牌。
+
 ### Claude Desktop / 任意 MCP 客户端接入
 
 ```json
