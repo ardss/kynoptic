@@ -871,6 +871,63 @@ fn settings_concurrent_save_storm_always_valid_json() {
 
 // === 路由表 ===
 
+// 错误码层（审查修复）：err_json 携带稳定 code；404/405 双语；/api/input
+// 截断不再无声（days_requested + note）。
+#[test]
+fn err_json_carries_stable_code_and_input_notes_truncation() {
+    let conn = mem_conn();
+    let db = Path::new("kyn.db");
+    let code_of = |body: &str| -> String {
+        let v: Value = serde_json::from_str(body).unwrap();
+        v["code"].as_str().unwrap_or("").to_string()
+    };
+    // 未来日期 → future_date
+    let (status, _, body) = route_req(&conn, "GET", "/api/summary?date=2099-01-01", "", db);
+    assert_eq!(status, 400);
+    assert_eq!(code_of(&body), "future_date");
+    // 日期格式错 → invalid_date
+    let (status, _, body) = route_req(&conn, "GET", "/api/summary?date=bad", "", db);
+    assert_eq!(status, 400);
+    assert_eq!(code_of(&body), "invalid_date");
+    // 参数非法 → invalid_param
+    let (status, _, body) = route_req(&conn, "GET", "/api/timeline?hours=nope", "", db);
+    assert_eq!(status, 400);
+    assert_eq!(code_of(&body), "invalid_param");
+    // 404/405 → 稳定 code
+    let (status, _, body) = route_req(&conn, "GET", "/api/nope", "", db);
+    assert_eq!(status, 404);
+    assert_eq!(code_of(&body), "not_found");
+    let (status, _, body) = route_req(&conn, "DELETE", "/api/status", "", db);
+    assert_eq!(status, 405);
+    assert_eq!(code_of(&body), "method_not_allowed");
+    // settings JSON 解析错误 → invalid_json（serde 原文不透传）
+    let (status, _, body) = route_req(&conn, "POST", "/api/settings", "{oops}", db);
+    assert_eq!(status, 400);
+    assert_eq!(code_of(&body), "invalid_json");
+    assert!(!body.contains("key must be a string"), "serde 原文不得透传");
+    // /api/input：请求超 90 天上限时明示 days_requested 与截断说明
+    let (status, _, body) = route_req(&conn, "GET", "/api/input?days=365", "", db);
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["days_requested"],
+        json!(365),
+        "截断必须标注 days_requested"
+    );
+    assert!(
+        v["note"].as_str().unwrap().contains("90"),
+        "截断说明必须出现 90"
+    );
+    // 对照：未截断请求不带 days_requested
+    let (status, _, body) = route_req(&conn, "GET", "/api/input?days=7", "", db);
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        v.get("days_requested").is_none(),
+        "未截断时不得添加标注字段"
+    );
+}
+
 #[test]
 fn route_table_and_error_codes() {
     let conn = mem_conn();

@@ -49,12 +49,25 @@
     html { color-scheme: light; }
   }
   /* Windows 高对比（forced-colors）：UA 会替换 CSS 底色但不碰 canvas/SVG
-     内绘制的像素——色阶改用系统色变量，保证档位区分度与可读性。 */
+     内绘制的像素——色阶改用系统色变量，保证档位区分度与可读性。
+     五档必须五色互异（原先 --hm-1/2 与 --hm-3/4 两两同色，五档退化三档，
+     图例却仍画五格）。--hm-4 用 Highlight，与时间线 --human 的 CanvasText 区分。 */
   @media (forced-colors: active) {
     :root {
-      --hm-0: Canvas; --hm-1: GrayText; --hm-2: GrayText;
-      --hm-3: Highlight; --hm-4: Highlight;
+      --hm-0: Canvas; --hm-1: CanvasText; --hm-2: GrayText;
+      --hm-3: LinkText; --hm-4: Highlight;
     }
+    /* 时间线三态色带：作者 background 会被强制塌成 Canvas，三态不可辨——
+       改映射互异系统色；away（无输入）用斜纹图案做非颜色冗余（WCAG 1.4.1）。 */
+    .tl-human { background: CanvasText; }
+    .tl-auto { background: Highlight; }
+    .tl-away {
+      background: Canvas;
+      background-image: repeating-linear-gradient(45deg, GrayText 0 3px, transparent 3px 7px);
+    }
+    .tl-legend-human { color: CanvasText; }
+    .tl-legend-auto { color: Highlight; }
+    .tl-legend-away { color: GrayText; }
   }
   body {
     margin: 0 auto; background: var(--bg); color: var(--fg);
@@ -104,7 +117,9 @@
   .tab.active { color: var(--fg); background: var(--panel-2);
                 box-shadow: inset 0 -2px 0 var(--brand); }
   /* 卡片 */
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  /* minmax(min(Npx,100%),1fr)：320px 视口（Reflow，WCAG 1.4.10）下
+     固定下限会撑出一维横向滚动——上限随可用宽收缩 */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(230px,100%), 1fr)); gap: 12px; margin-bottom: 18px; }
   .card {
     background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
     padding: 12px 16px; transition: border-color .15s;
@@ -140,10 +155,12 @@
            padding-top: 14px; margin-top: 8px; }
   .err { color: var(--bad); }
   /* 设置 */
-  .settings-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+  .settings-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px,100%), 1fr)); gap: 18px; }
   .settings-group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em;
                        color: var(--faint); margin: 0 0 8px; font-weight: 600; }
-  .mon-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13.5px; }
+  /* flex-wrap：320px 视口下长说明文本换行，不撑出横向滚动（WCAG 1.4.10） */
+  .mon-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13.5px; flex-wrap: wrap; }
+  .mon-row > span { min-width: 0; overflow-wrap: break-word; }
   .mon-row input { accent-color: var(--brand); width: 15px; height: 15px; }
   .mon-row .muted[style*="font-size:10px"] { font-family: var(--font-data); }
   .date-input { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
@@ -177,7 +194,7 @@
   :is(button, .tab, input, .lang-toggle):focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
   #settings-msg.ok { color: var(--ok); } #settings-msg.bad { color: var(--bad); }
   #settings-msg { transition: opacity .6s ease; }
-  .host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px,100%), 1fr)); gap: 10px; }
   .host-item > div:last-child { font-family: var(--font-data); font-size: 14px; margin-top: 2px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 横向条形榜 */
@@ -194,6 +211,19 @@
         margin: 0 2px; vertical-align: -1px; }
   /* 时间线全零小时：斜纹空块 */
   .tl-idle { background: repeating-linear-gradient(45deg, #141a24 0 6px, #1a2230 6px 12px); }
+  /* 时间线三态色带：类替代内联 background，forced-colors 媒体查询才能整体
+     换成系统色（内联样式 UA 不替换，三态会全部塌成 Canvas 同色不可辨） */
+  .tl-human { background: var(--human); }
+  .tl-auto { background: var(--auto); }
+  /* away 兼用斜纹做非颜色冗余：不只靠颜色区分三态（WCAG 1.4.1） */
+  .tl-away {
+    background: #1a2230;
+    background-image: repeating-linear-gradient(45deg, rgba(147,161,179,0.35) 0 3px, transparent 3px 7px);
+  }
+  /* 图例符号：同样只用类上色（内联样式优先级高于类，会盖住 forced-colors 映射） */
+  .tl-legend-human { color: var(--human); }
+  .tl-legend-auto { color: var(--auto); }
+  .tl-legend-away { color: #1a2230; }
   /* "▸ 采集状态" 折叠头：确保按钮在所有层之上、整行可点（修复点击无响应） */
   #ops-toggle { position: relative; z-index: 1; width: 100%; text-align: left;
                 pointer-events: auto; user-select: none; }
@@ -210,20 +240,24 @@
 <header>
   <h1>kynoptic dashboard</h1>
   <button class="lang-toggle" id="lang-btn">中文</button>
-  <div class="muted" id="status-line">loading…</div>
-  <div id="update-banner" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#243040;font-size:13px"></div>
+  <!-- 动态状态对读屏可感知（WCAG 4.1.3）：状态行/更新横幅/异常角标均为 live 区；
+       文本无变化时不重写（loadStatus 内），避免 30s 轮询反复触发播报 -->
+  <div class="muted" id="status-line" aria-live="polite">loading…</div>
+  <div id="update-banner" role="status" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#243040;font-size:13px"></div>
+  <!-- ARIA APG tabs 键盘契约：活动 tab tabindex=0 其余 -1，方向键/Home/End
+       移动并激活（JS 末尾 tablist keydown）；aria-controls/aria-labelledby 双向关联 -->
   <div class="tabs" role="tablist">
-    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview"><span class="l en">Overview</span><span class="l zh">今日概览</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-report"><span class="l en">Report</span><span class="l zh">报告</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps"><span class="l en">Apps</span><span class="l zh">应用</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input"><span class="l en">Input</span><span class="l zh">输入</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge"></span></button>
-    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings"><span class="l en">Settings</span><span class="l zh">设置</span></button>
+    <button type="button" class="tab active" role="tab" aria-selected="true" id="tab-overview" aria-controls="view-overview" tabindex="0"><span class="l en">Overview</span><span class="l zh">今日概览</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-report" aria-controls="view-report" tabindex="-1"><span class="l en">Report</span><span class="l zh">报告</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps" aria-controls="view-apps" tabindex="-1"><span class="l en">Apps</span><span class="l zh">应用</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input" aria-controls="view-input" tabindex="-1"><span class="l en">Input</span><span class="l zh">输入</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights" aria-controls="view-insights" tabindex="-1"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" aria-controls="view-anomalies" tabindex="-1"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge" aria-live="polite"></span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" aria-controls="view-settings" tabindex="-1"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
 </header>
 
-<div id="view-overview" role="tabpanel" aria-label="Overview / 今日概览">
+<div id="view-overview" role="tabpanel" aria-labelledby="tab-overview">
 
 <div class="cards">
   <div class="card">
@@ -285,7 +319,7 @@
 </section>
 </div>
 
-<div id="view-report" role="tabpanel" aria-label="Report / 报告" style="display:none">
+<div id="view-report" role="tabpanel" aria-labelledby="tab-report" style="display:none">
 <div class="cards">
   <div class="card"><div class="label"><span class="l en">presence minutes / goal</span><span class="l zh">在场分钟 / 目标</span></div><div class="value" id="r-goal">–</div></div>
   <div class="card"><div class="label"><span class="l en">last 7 days vs prior 7</span><span class="l zh">近 7 天 vs 前 7 天（滚动窗口，非日历周）</span></div><div class="value small" id="r-week">–</div></div>
@@ -295,9 +329,9 @@
   <h2><span class="l en">day timeline — colored bands per app (pick a day)</span><span class="l zh">日时间轴 — 应用色带（可选日期）</span></h2>
   <div style="margin-bottom:8px">
     <input type="date" id="report-date" class="date-input">
-    <button class="save day-btn btn-ghost" id="day-btn-0" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">today</span><span class="l zh">今天</span></button>
-    <button class="save day-btn btn-ghost" id="day-btn-1" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
-    <button class="save day-btn btn-ghost" id="day-btn-2" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-0" aria-pressed="false" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">today</span><span class="l zh">今天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-1" aria-pressed="false" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">yesterday</span><span class="l zh">昨天</span></button>
+    <button class="save day-btn btn-ghost" id="day-btn-2" aria-pressed="false" style="margin-left:8px;background:var(--surface-btn)"><span class="l en">2 days ago</span><span class="l zh">前天</span></button>
   </div>
   <div id="report-timeline">loading…</div>
   <div id="report-legend" class="muted" style="margin-top:6px"></div>
@@ -316,20 +350,23 @@
 <section>
   <h2 style="display:flex;align-items:center;justify-content:space-between;gap:10px">
     <span><span class="l en">input heatmap (keyboard/mouse minutes per day, incl. automation-injected input)</span><span class="l zh">输入热力图（每日键鼠输入分钟，含自动化注入）</span></span>
-    <span id="hm-range" style="display:inline-flex;gap:4px">
-      <button class="save hm-tab" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
-      <button class="save hm-tab" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
-      <button class="save hm-tab" data-weeks="52" style="padding:2px 12px;font-size:12px"><span class="l en">1yr</span><span class="l zh">一年</span></button>
+    <!-- 互斥区间选择用 radiogroup/radio + aria-checked：读屏可程序化感知选中态 -->
+    <span id="hm-range" role="radiogroup" aria-label="heatmap range / 热力图区间" style="display:inline-flex;gap:4px">
+      <button type="button" class="save hm-tab" role="radio" aria-checked="false" data-weeks="12" style="padding:2px 12px;font-size:12px"><span class="l en">12w</span><span class="l zh">12 周</span></button>
+      <button type="button" class="save hm-tab" role="radio" aria-checked="false" data-weeks="26" style="padding:2px 12px;font-size:12px"><span class="l en">6mo</span><span class="l zh">半年</span></button>
+      <button type="button" class="save hm-tab" role="radio" aria-checked="false" data-weeks="52" style="padding:2px 12px;font-size:12px"><span class="l en">1yr</span><span class="l zh">一年</span></button>
     </span>
   </h2>
   <div id="heatmap">loading…</div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
-    <span class="sw" style="background:#0B0F16;border:1px solid var(--border)"></span>
-    <span class="sw" style="background:#1e3a5f"></span>
-    <span class="sw" style="background:#2d5f94"></span>
-    <span class="sw" style="background:#3b82c4"></span>
-    <span class="sw" style="background:#5BA8FF"></span>
+    <!-- 色块与热力图同一色源（--hm-N 变量）：亮色/高对比主题整体换色；
+         原内联 hex 在 forced-colors 下五个色块全被强制为 Canvas 同色 -->
+    <span class="sw" style="background:var(--hm-0);border:1px solid var(--border)"></span>
+    <span class="sw" style="background:var(--hm-1)"></span>
+    <span class="sw" style="background:var(--hm-2)"></span>
+    <span class="sw" style="background:var(--hm-3)"></span>
+    <span class="sw" style="background:var(--hm-4)"></span>
     <span><span class="l en">more</span><span class="l zh">多</span></span>
   </div>
 </section>
@@ -342,7 +379,7 @@
 </section>
 </div>
 
-<div id="view-apps" role="tabpanel" aria-label="Apps / 应用" style="display:none">
+<div id="view-apps" role="tabpanel" aria-labelledby="tab-apps" style="display:none">
 <section>
   <h2><span class="l en">top apps — last 7 days (window events)</span><span class="l zh">Top 应用 — 近 7 天（窗口事件）</span></h2>
   <div id="top-apps" class="muted">loading…</div>
@@ -362,7 +399,7 @@
 </section>
 </div>
 
-<div id="view-input" role="tabpanel" aria-label="Input / 输入" style="display:none">
+<div id="view-input" role="tabpanel" aria-labelledby="tab-input" style="display:none">
 <div class="cards">
   <div class="card"><div class="label"><span class="l en">keys — 7d</span><span class="l zh">按键 — 7 天</span></div><div class="value" id="i-keys">–</div></div>
   <div class="card"><div class="label"><span class="l en">clicks — 7d</span><span class="l zh">点击 — 7 天</span></div><div class="value" id="i-clicks">–</div></div>
@@ -372,21 +409,21 @@
 
 <section>
   <h2><span class="l en">keyboard heatmap — per-key frequency (counts only, no content; rendered on ANSI-104; includes automation-injected input)</span><span class="l zh">键盘热力图 — 按键频次（仅计数无内容；按 ANSI-104 布局渲染，非标准布局位置会偏；含自动化注入输入）</span></h2>
-  <div class="kb-wrap"><svg id="kb-heatmap" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 910 234"></svg></div>
+  <div class="kb-wrap"><svg id="kb-heatmap" class="kb" role="img" tabindex="0" aria-label="keyboard heatmap, per-key counts in tooltip and in the top-keys list below / 键盘热力图，逐键次数见悬浮提示与下方 Top 按键列表" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 910 234"></svg></div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
-    <span class="sw" style="background:#0B0F16;border:1px solid var(--border)"></span>
-    <span class="sw" style="background:#1e3a5f"></span>
-    <span class="sw" style="background:#2d5f94"></span>
-    <span class="sw" style="background:#3b82c4"></span>
-    <span class="sw" style="background:#5BA8FF"></span>
+    <span class="sw" style="background:var(--hm-0);border:1px solid var(--border)"></span>
+    <span class="sw" style="background:var(--hm-1)"></span>
+    <span class="sw" style="background:var(--hm-2)"></span>
+    <span class="sw" style="background:var(--hm-3)"></span>
+    <span class="sw" style="background:var(--hm-4)"></span>
     <span><span class="l en">more</span><span class="l zh">多</span></span>
   </div>
 </section>
 
 <section>
   <h2><span class="l en">mouse — click map on device (hover for counts)</span><span class="l zh">鼠标 — 按键分布图（悬浮查看次数）</span></h2>
-  <div class="kb-wrap"><svg id="mouse-svg" class="kb" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 560 260"></svg></div>
+  <div class="kb-wrap"><svg id="mouse-svg" class="kb" role="img" tabindex="0" aria-label="mouse click map, per-button counts shown beside the device / 鼠标按键分布图，分键次数标注在设备旁" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 560 260"></svg></div>
   <div class="muted" id="device-line" style="margin-bottom:8px"></div>
   <div class="muted" id="mouse-unattr" style="margin-bottom:8px"></div>
   <div class="muted" id="mouse-extra"></div>
@@ -408,11 +445,11 @@
 </section>
 </div>
 
-<div id="view-insights" role="tabpanel" aria-label="Insights / 洞察" style="display:none">
+<div id="view-insights" role="tabpanel" aria-labelledby="tab-insights" style="display:none">
   <div id="insights-list"></div>
 </div>
 
-<div id="view-anomalies" role="tabpanel" aria-label="Anomalies / 异常" style="display:none">
+<div id="view-anomalies" role="tabpanel" aria-labelledby="tab-anomalies" style="display:none">
   <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Deviation from your own 7-day same-hour baseline — no cloud, no universal thresholds.</span><span class="l zh">基于你自己近 7 天同时段历史基线的偏差检测——没有云端、没有通用阈值，异常只相对你自己的常态。</span></div>
 <section>
   <h2><span class="l en">anomalies — last 7 days</span><span class="l zh">异常 — 近 7 天</span></h2>
@@ -420,7 +457,7 @@
 </section>
 </div>
 
-<div id="view-settings" role="tabpanel" aria-label="Settings / 设置" style="display:none">
+<div id="view-settings" role="tabpanel" aria-labelledby="tab-settings" style="display:none">
 
 <section>
   <h2><span class="l en">this machine</span><span class="l zh">这台电脑</span></h2>
@@ -553,6 +590,7 @@ const T = {
         disconnected: "disconnected — retrying…",
         weekInsufficient: "not enough data for a 7-day comparison ({n} day(s) collected)",
         retry: "retry", loadFailed: "load failed: ",
+        hostFailed: "hardware info failed to load.",
         colApp: "app", colEvents: "events (window switches, not duration)",
         goalOff: "off (no goal set)", dbDirHint: "data: ",
         portNote: "port change takes effect after tray restart" },
@@ -572,6 +610,7 @@ const T = {
         disconnected: "连接断开，正在重试…",
         weekInsufficient: "数据不足 7 天（已积累 {n} 天）",
         retry: "重试", loadFailed: "加载失败：",
+        hostFailed: "硬件信息加载失败。",
         colApp: "应用", colEvents: "按窗口切换事件数（非时长）",
         goalOff: "关闭（未设目标）", dbDirHint: "数据：",
         portNote: "端口修改需重启托盘后生效" }
@@ -607,6 +646,24 @@ function kynHeaders(extra) {
   if (KYN_ACCESS_TOKEN) h["X-Kynoptic-Access-Token"] = KYN_ACCESS_TOKEN;
   return h;
 }
+/* 服务端错误码 → 英文文案（lib.rs err_json 的稳定 code）：后端校验错误正文
+   为中文，英文界面按 code 映射，避免 "load failed: date … 在未来…" 中英混排。
+   表外 code（含 db_error 的双语文案）原样显示后端文案。 */
+const ERR_TEXT = {
+  future_date: "the requested date is in the future",
+  invalid_date: "invalid date format (expected YYYY-MM-DD)",
+  invalid_json: "request body is not valid JSON",
+  invalid_param: "invalid parameter value",
+  not_found: "API not found — the page may be stale, please refresh",
+  method_not_allowed: "method not allowed",
+  csrf_blocked: "write blocked: the request looks cross-site. Go back to the dashboard page and retry",
+  session_token_invalid: "invalid session token — the page may be stale, refresh and retry"
+};
+function apiErrText(e) {
+  const en = document.documentElement.lang !== "zh";
+  if (en && e && e.code && ERR_TEXT[e.code]) return ERR_TEXT[e.code];
+  return (e && e.error) || "";
+}
 async function jget(url, retried) {
   const r = await fetch(url, { headers: kynHeaders() });
   if (r.status === 401 && !retried) {
@@ -621,10 +678,10 @@ async function jget(url, retried) {
     }
   }
   if (!r.ok) {
-    // 非 200 时后端正文常为 {"error": 中文原因}（如未来日期校验）：
-    // 取出后交给 showViewError，不再只显示 "URL → HTTP 400"
+    // 非 200 时后端正文为 {"error", "code"}（如未来日期校验）：
+    // 按 code 取本语言文案后交给 showViewError，不再只显示 "URL → HTTP 400"
     const e = await r.json().catch(() => ({}));
-    throw new Error((e && e.error) || (url + " → HTTP " + r.status));
+    throw new Error(apiErrText(e) || (url + " → HTTP " + r.status));
   }
   return r.json();
 }
@@ -686,7 +743,9 @@ async function loadStatus() {
   // 否则一次瞬时断连后状态行永久红着"连接断开"。
   if (el) el.style.color = "";
   if (!s.last_event_ts) {
-    el.textContent = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + dbStatusText(s);
+    const txt = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + dbStatusText(s);
+    // aria-live 区：文本没变就不重写，30s 轮询不会反复触发读屏播报
+    if (el.textContent !== txt) el.textContent = txt;
     el.title = "";
     return;
   }
@@ -712,7 +771,8 @@ async function loadStatus() {
   else if (age < 600) stateTxt = zh ? "采集中" : "collecting";
   else if (age < 86400) stateTxt = zh ? "停滞（最后事件 " + Math.round(age/60) + " 分钟前）" : "stale (last event " + Math.round(age/60) + " min ago)";
   else stateTxt = zh ? "无事件（采集器可能未运行）" : "no events (collector may be down)";
-  el.textContent = "[" + stateTxt + "] " + s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + dbStatusText(s);
+  const fullTxt = "[" + stateTxt + "] " + s.today + " · " + t("lastEvent") + " " + shown + " · " + t("readOnly") + " · " + dbStatusText(s);
+  if (el.textContent !== fullTxt) el.textContent = fullTxt;
   el.title = t("lastEvent") + " " + utcRaw;
   // 自动更新提示（托盘每日检查线程写入）：有新版本时全页面顶部横幅，
   // 指引用户用托盘菜单一键更新（不自动安装，本地采集软件保持用户掌控）。
@@ -900,8 +960,7 @@ async function loadTimeline() {
     auto: zh ? "自动化" : "automation",
     away: zh ? "无输入" : "away"
   };
-  /* 单一色源：图例与色带同用此常量，避免图例色与条色不一致 */
-  const TL_COLORS = { human: "var(--human)", auto: "var(--auto)", away: "#1a2230" };
+  /* 三态色带/图例符号统一走 .tl-* 类（forced-colors 下整体换系统色） */
   const MIXED_NOTE = zh ? " · 这一小时人和自动化脚本都有操作" : " · mixed minutes (human + automation) count for both";
   // 进行中的当前小时只过了部分分钟：away 上限改为"已流逝的分钟数"
   //（用响应自带的 generated_at 计算，不读客户端时钟）。历史小时流逝 >60 分钟，
@@ -925,9 +984,9 @@ async function loadTimeline() {
     if (shifted) dstNote = '<div class="note" style="margin-bottom:6px;color:var(--dim)">' + esc(tl.local_offset_note) + "</div>";
   }
   el.innerHTML = dstNote + '<div class="note" style="margin-bottom:6px">'
-    + '<span style="color:' + TL_COLORS.human + '">■</span> ' + L.human + '　'
-    + '<span style="color:' + TL_COLORS.auto + '">■</span> ' + L.auto + '　'
-    + '<span style="color:' + TL_COLORS.away + ';border:1px solid var(--border)">■</span> ' + L.away + '</div>'
+    + '<span class="tl-legend-human">■</span> ' + L.human + '　'
+    + '<span class="tl-legend-auto">■</span> ' + L.auto + '　'
+    + '<span class="tl-legend-away" style="border:1px solid var(--border)">■</span> ' + L.away + '</div>'
     + '<div class="note" style="margin-bottom:6px">'
     + (zh
       ? "在场 = 有键鼠或滚轮操作；自动化 = 自动化脚本的操作；无输入 = 该小时内既没有人在场也没有自动化操作的部分。"
@@ -961,10 +1020,10 @@ async function loadTimeline() {
     return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
       '<span style="width:96px;color:var(--dim);flex-shrink:0">' + esc(b.hour.slice(5, 13).replace("T", " ")) + "</span>" +
       '<span style="flex:1;display:flex;height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden">' +
-        '<span style="width:' + pct1(human) + '%;background:' + TL_COLORS.human + '" title="' + L.human + " " + fmtDuration(human) + (mixed ? MIXED_NOTE : "") + '"></span>' +
-        '<span style="width:' + pct1(auto) + '%;background:' + TL_COLORS.auto + '" title="' + L.auto + " " + fmtDuration(rawAuto) + (mixed ? MIXED_NOTE : "") + '"></span>' +
+        '<span class="tl-human" style="width:' + pct1(human) + '%" title="' + L.human + " " + fmtDuration(human) + (mixed ? MIXED_NOTE : "") + '"></span>' +
+        '<span class="tl-auto" style="width:' + pct1(auto) + '%" title="' + L.auto + " " + fmtDuration(rawAuto) + (mixed ? MIXED_NOTE : "") + '"></span>' +
         (away > 0
-          ? '<span style="width:' + pct1(away) + '%;background:' + TL_COLORS.away + '" title="' + L.away + " " + fmtDuration(away) + '"></span>'
+          ? '<span class="tl-away" style="width:' + pct1(away) + '%" title="' + L.away + " " + fmtDuration(away) + '"></span>'
           : "") +
       '</span>' +
       '<span style="width:34%;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(apps) + '">' + esc(apps) + '</span>' +
@@ -989,6 +1048,10 @@ function setHeatmapRange(weeks) {
     b.style.background = on ? "" : "var(--panel-2)";
     b.style.color = on ? "" : "var(--dim)";
     b.style.fontWeight = on ? "600" : "400";
+    // radiogroup 语义：选中态程序化可感知（视觉样式不足以替代，WCAG 4.1.2）
+    b.setAttribute("aria-checked", on ? "true" : "false");
+    // radio 惯例：Tab 只进组一次，组内方向键移动（keydown 见文件末尾委托区）
+    b.tabIndex = on ? 0 : -1;
   });
   loadHeatmap().catch(() => {});
 }
@@ -1012,7 +1075,12 @@ async function loadHeatmap() {
   const cols = Math.ceil(days.length / 7);
   const W = 40 + cols * (cell + gap) + 8, H = 7 * (cell + gap) + 16;
   const HM_LEVELS = hmLevels(); // 每次渲染现读 CSS 变量（主题切换后同步）
-  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
+  const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
+  // aria-label 与其余三图对齐（role=img 会剥离 <title> 后代，无名图对读屏不可达）
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" tabindex="0" aria-label="daily input heatmap, ' + cols + " weeks / 每日输入热力图，共 " + cols + ' 周">';
+  // 数据摘要（可视文本）：格子数值原只存 <title>，键盘/触屏/读屏三路都拿不到
+  //（WCAG 1.1.1/2.1.1）——图下方并列输出每日数值，不再依赖悬停。
+  const summary = days.map(d => esc(d.date) + " " + esc(String(d.value)) + unit).join(" · ");
   // Wave20 P1：列是"今天回溯"对齐的，首行星期 = 第一格的星期，按真实
   // 日期推（原固定 Mon/Wed/Fri/Sun 在非周一开头的窗口里全列错位）。
   // 全部 7 行都标星期，中文用单字（日一二三四五六），英文用单字母。
@@ -1028,7 +1096,6 @@ async function loadHeatmap() {
     const col = Math.floor(i / 7), row = i % 7;
     const x = 40 + col * (cell + gap), y = row * (cell + gap);
     const level = hmLevel(d.value, max);
-    const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
       (level === 0 ? "var(--border)" : "none") + '"><title>' + esc(d.date) + " — " + esc(String(d.value)) + unit + "</title></rect>";
@@ -1042,7 +1109,12 @@ async function loadHeatmap() {
       (zhHm ? "数据积累中，仅最近 " + nonEmpty + " 天有记录"
             : "data still accruing — only the most recent " + nonEmpty + " day(s) have records") + "</div>";
   }
-  el.innerHTML = svg + hint;
+  // 摘要以 details 折叠：可视文本可读（键盘可展开），不把页面撑出百行长列表
+  const summaryHtml = days.length
+    ? '<details class="muted" style="font-size:12px;margin-top:6px"><summary>' +
+      (zhHm ? "查看每日输入数据" : "view daily input values") + "</summary><div>" + summary + "</div></details>"
+    : "";
+  el.innerHTML = svg + hint + summaryHtml;
 }
 /* ─── Top Apps 横向条形榜 ─── */
 async function loadTopApps() {
@@ -1151,7 +1223,12 @@ function syncDayBtns() {
   const v = document.getElementById("report-date").value;
   for (let i = 0; i < 3; i++) {
     const b = document.getElementById("day-btn-" + i);
-    if (b) b.classList.toggle("active", v === dayOffset(i));
+    // aria-pressed：选中态不能只靠 .active class 的颜色/阴影（WCAG 4.1.2）
+    if (b) {
+      const on = v === dayOffset(i);
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    }
   }
 }
 function pickDay(n) {
@@ -1510,7 +1587,8 @@ async function loadInput() {
     const innerW = W - padL - 8, innerH = H - padT - padB;
     const mx = Math.max(1, ...values);
     const bw = innerW / 24;
-    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">';
+    // aria-label：与同页其余图对齐（原无名 role=img 对读屏不可达，WCAG 1.1.1）
+    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" tabindex="0" aria-label="today input rhythm, keys+clicks per hour / 今日逐时输入节奏（按键+点击）">';
     for (let g = 0; g <= 4; g++) {
       const y = padT + innerH - innerH * g / 4;
       svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - 8) + '" y2="' + y +
@@ -1661,8 +1739,32 @@ async function loadHost() {
     : "–";
 }
 let SETTINGS_LOADED = false;
+/* 硬件信息卡失败提示（原 catch(() => {}) 完全静默：失败与无数据在 UI 上
+   不可区分，且是全页唯一吞错点）。占位符换成错误说明 + 重试按钮。 */
+function showHostError() {
+  const grid = document.querySelector(".host-grid");
+  if (!grid) return;
+  let el = document.getElementById("host-error");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "host-error";
+    el.className = "err";
+    el.style.cssText = "margin-top:8px;display:flex;align-items:center;gap:10px";
+    grid.after(el);
+  }
+  el.textContent = t("hostFailed");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "save btn-ghost";
+  btn.textContent = t("retry");
+  btn.onclick = function () {
+    el.remove();
+    loadHost().catch(showHostError);
+  };
+  el.appendChild(btn);
+}
 async function loadSettings() {
-  loadHost().catch(() => {});
+  loadHost().catch(showHostError);
   const s = await jget("/api/settings");
   LAST_SETTINGS = s;
   // 成功才置位（审查：失败后置 true 会让页签静默空白且不再重拉）
@@ -1780,9 +1882,24 @@ async function saveSettings() {
       headers: kynHeaders({ "Content-Type": "application/json", "X-Kynoptic": "1", "X-Kynoptic-Token": KYN_CSRF_TOKEN }),
       body: JSON.stringify(body)
     });
+    if (r.status === 401) {
+      // 令牌缺失/失效与 jget 同一口径：给一次手工输入机会再重试保存
+      btn.disabled = false;
+      const t1 = prompt(document.documentElement.lang === "zh"
+        ? "请输入访问令牌（data\\dashboard-token.txt 的内容）"
+        : "Enter access token (contents of data\\dashboard-token.txt)");
+      if (t1) {
+        KYN_ACCESS_TOKEN = t1.trim();
+        try { sessionStorage.setItem("kyn-access-token", KYN_ACCESS_TOKEN); } catch (_) {}
+        return saveSettings();
+      }
+      throw new Error(document.documentElement.lang === "zh"
+        ? "需要访问令牌（见 data\\dashboard-token.txt）"
+        : "access token required (see data\\dashboard-token.txt)");
+    }
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      throw new Error(e.error || ("HTTP " + r.status));
+      throw new Error(apiErrText(e) || ("HTTP " + r.status));
     }
     let msg = t("saved");
     if (fellBack) msg += document.documentElement.lang === "zh"
@@ -1853,6 +1970,8 @@ function showView(name) {
     if (!tab) continue;
     tab.classList.toggle("active", v === name);
     tab.setAttribute("aria-selected", v === name ? "true" : "false");
+    // roving tabindex（ARIA APG tabs）：Tab 键只在活动页签停留
+    tab.tabIndex = v === name ? 0 : -1;
   }
   clearViewError(name);
   // 审查 P2：重进 settings 页（含点当前已激活页签）不再无条件重拉——
@@ -1948,6 +2067,44 @@ function markDisconnected() {
   on("preset-minimal", "click", () => applyPreset("minimal"));
   on("restore-defaults", "click", () => restoreDefaults());
   on("settings-save", "click", () => saveSettings());
+})();
+/* ─── 键盘模式补全（ARIA APG） ─── */
+/* tablist 方向键漫游：ArrowLeft/Right/Home/End 移动焦点并激活页签。
+   语义承诺（role=tablist）必须与行为一致，否则读屏提示"用方向键切换"失效。 */
+(function () {
+  const tl = document.querySelector(".tabs[role=tablist]");
+  if (!tl) return;
+  tl.addEventListener("keydown", function (e) {
+    const tabs = [...tl.querySelectorAll("[role=tab]")];
+    const cur = tabs.indexOf(document.activeElement);
+    if (cur < 0) return;
+    let next = null;
+    if (e.key === "ArrowLeft") next = (cur + tabs.length - 1) % tabs.length;
+    else if (e.key === "ArrowRight") next = (cur + 1) % tabs.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = tabs.length - 1;
+    if (next === null) return;
+    e.preventDefault();
+    tabs[next].focus();
+    tabs[next].click(); // 激活走既有 showView（含数据加载）
+  });
+})();
+/* 热力图区间 radiogroup：ArrowLeft/Right 在 12w/6mo/1yr 间移动并选中 */
+(function () {
+  const rg = document.getElementById("hm-range");
+  if (!rg) return;
+  rg.addEventListener("keydown", function (e) {
+    const radios = [...rg.querySelectorAll("[role=radio]")];
+    const cur = radios.indexOf(document.activeElement);
+    if (cur < 0) return;
+    let next = null;
+    if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (cur + radios.length - 1) % radios.length;
+    else if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (cur + 1) % radios.length;
+    if (next === null) return;
+    e.preventDefault();
+    radios[next].focus();
+    radios[next].click(); // 选中走既有 setHeatmapRange
+  });
 })();
 </script>
 </body>
