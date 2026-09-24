@@ -11,6 +11,7 @@ use rusqlite::{params, Connection};
 
 use super::{get_string, string_or_log, DayTotals, MinuteStat, CLICKS_ROW_EXPR, KEYS_ROW_EXPR};
 use crate::db::agg;
+use crate::db::SqlResult;
 
 // ─── 图表数据（get_events_today/get_apps/get_hourly/get_timeline/get_trend） ──
 
@@ -447,10 +448,15 @@ pub fn active_minutes_by_date(conn: &Connection, date: &str) -> Vec<String> {
 ///
 /// 此前 [`crate::analyzer::analyze_day`] 手写一条带子查询的 SELECT；现在下沉到
 /// 数据访问层，业务层只做 apm_avg 计算。
-pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
+///
+/// 错误契约（库损坏静默零值修复 2026-09）：查询失败必须上抛而非回退零值——
+/// 聚合 SELECT 恒有一行，Err 只可能是库损坏/IO 故障（如 "database disk image
+/// is malformed"），吞掉后调用方会把"库坏了"当成"今天什么都没干"（此前两处
+/// `else return DayTotals::default()` 的实际后果）。
+pub fn day_totals(conn: &Connection, date: &str) -> SqlResult<DayTotals> {
     // 优先读 agg_minute 读缓存
     if agg::has_minute_for_date(conn, date) {
-        let Ok((keys, clicks, active_minutes)) = conn.query_row(
+        let (keys, clicks, active_minutes) = conn.query_row(
             "SELECT \
                 CAST(COALESCE(SUM(CASE WHEN bucket_id='input_keys' THEN COALESCE(sum_value,0) ELSE 0 END), 0) AS INTEGER), \
                 CAST(COALESCE(SUM(CASE WHEN bucket_id='input_clicks' THEN COALESCE(sum_value,0) ELSE 0 END), 0) AS INTEGER), \
@@ -462,20 +468,18 @@ pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
              FROM agg_minute WHERE date = ?1",
             params![date],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
-        ) else {
-            return DayTotals::default();
-        };
-        return DayTotals {
+        )?;
+        return Ok(DayTotals {
             keys,
             clicks,
             active_minutes,
-        };
+        });
     }
     let (start, end) = match super::local_day_range(date) {
         Some(r) => r,
         None => (date.to_string(), format!("{date}\u{7f}")),
     };
-    let Ok((keys, clicks, active_minutes)) = conn.query_row(
+    let (keys, clicks, active_minutes) = conn.query_row(
         // 口径（统一 2026-09，交叉审查 P1）：move-only 分钟不算活跃，
         // 与 active_minutes_by_date / daily_agg / active_minutes_today 同口径。
         &format!(
@@ -496,14 +500,12 @@ pub fn day_totals(conn: &Connection, date: &str) -> DayTotals {
                 r.get::<_, i64>(2)?,
             ))
         },
-    ) else {
-        return DayTotals::default();
-    };
-    DayTotals {
+    )?;
+    Ok(DayTotals {
         keys,
         clicks,
         active_minutes,
-    }
+    })
 }
 
 /// 在 `[start, end)` 分钟区间内取最频繁的 (app_name, window_title)。
@@ -917,7 +919,7 @@ mod tests {
 
         let check_all = |label: &str| {
             let by_date = super::active_minutes_by_date(&c, &today).len() as i64;
-            let totals = super::day_totals(&c, &today).active_minutes;
+            let totals = super::day_totals(&c, &today).unwrap().active_minutes;
             crate::daily_agg::recompute_day(&c, &today).unwrap();
             let daily: i64 = c
                 .query_row(

@@ -66,6 +66,7 @@ pub mod ps;
 pub mod security;
 pub mod stylus;
 pub mod thermal;
+pub mod title_privacy;
 pub mod uac;
 pub mod vpn;
 pub mod windows_update;

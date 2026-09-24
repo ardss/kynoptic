@@ -25,13 +25,31 @@ pub const LEGACY_MUTEX_NAME: &str = r"Local\KynopticTrayMutex";
 /// 见模块注释的 PATH_NOT_FOUND 教训）。
 /// SID 不可用时回退旧名并 log::warn（降级留痕）。
 pub fn singleton_mutex_name() -> String {
-    match current_user_sid() {
+    let base = match current_user_sid() {
         Some(sid) => format!("Global\\KynopticTrayMutex-{sid}"),
         None => {
             log::warn!("无法获取当前用户 SID，单实例互斥体回退为会话级旧名 {LEGACY_MUTEX_NAME:?}");
             LEGACY_MUTEX_NAME.to_string()
         }
+    };
+    // 测试旁路（仅显式设置时生效）：加后缀得到不同的内核命名对象，使第二个
+    // 托盘/watchdog 可在同用户沙箱内并行演练。真机探针已验证（CreateMutexW，
+    // 2026-09-24）：`-后缀` 名与原名是互不相干的对象（可同时持有），同名跨
+    // 进程互斥不受影响。后缀限定安全字符集且不含 `\`（名字必须单层，见模块
+    // 注释 PATH_NOT_FOUND 教训），不合法即忽略并留痕。
+    if let Ok(suffix) = std::env::var("KYNOPTIC_MUTEX_SUFFIX") {
+        let ok = !suffix.is_empty()
+            && suffix.len() <= 64
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if ok {
+            log::warn!("KYNOPTIC_MUTEX_SUFFIX 已设置：单实例互斥体名加后缀 -{suffix}（测试旁路，勿在生产使用）");
+            return format!("{base}-{suffix}");
+        }
+        log::warn!("KYNOPTIC_MUTEX_SUFFIX 值含不合法字符（仅允许字母数字-_，≤64 长度），已忽略");
     }
+    base
 }
 
 /// 升级过渡桥：新版进程在持有新名之外，还应同时持有/探测旧名

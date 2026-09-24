@@ -9,13 +9,13 @@ description: Use when the user or an agent needs to query, export, or analyze lo
 Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指标：
 - **人在场 presence** = 过滤 AI agent 注入输入（LLKHF_INJECTED）后的真实输入分钟 + 无输入宽限桥接（默认 2 分钟，可配 0-15）
 - **自动化活动 automation** = 被判定为注入的输入分钟数
-- **前台应用时长 fg_dwell** = 窗口驻留推算（不封顶，含人不在场时段）
+- **前台应用时长 fg_dwell** = 窗口驻留推算，剔除超过 2 小时的停摆间隔（含人不在场时段）
 - 派生卡：**机器值班 unattended** = 前台 − 人在场 − 自动化
 
 ## 定位二进制与数据（按序尝试）
 
 1. `%LOCALAPPDATA%\Programs\Kynoptic\kynoptic.exe`（安装版默认位；开始菜单快捷方式指向同处）
-2. `kynoptic` 在 PATH（若有；安装器并不写 PATH，此条仅为用户自配环境的兜底）
+2. `kynoptic` 在 PATH（0.3.x 起安装器会把安装目录写入用户 PATH；旧版本安装的用户需升级安装一次或自配 PATH）
 3. 便携版=解压/拷贝目录下的 kynoptic.exe（与 kynoptic-tray.exe 同目录，data\ 就在其旁）
 
 **两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。数据一律在 exe 同级 data\kynoptic.db（安装与便携相同），dashboard 实际端口看 data\dashboard-port.txt。

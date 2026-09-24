@@ -1,41 +1,21 @@
-//! 位置快照监控（简化版）
+//! 位置快照监控（当前为占位：不采集）
 //!
-//! 【默认关闭】PS 子进程实现（powershell spawn），待原生 API 重写后再考虑默认启用。
+//! 【默认关闭】历史实现通过 PowerShell 调用 ipinfo.io，把用户公网 IP 发给
+//! 第三方服务换取粗略位置——这违反 README「无网络调用（GitHub 版本检查除外）」
+//! 的隐私承诺，外呼已移除。
 //!
-//! 通过 IP 地理位置服务获取粗略位置。仅在位置变化时发送。
+//! 待原生定位 API（Windows 定位服务）实现、且在设置页向用户明确披露数据
+//! 去向之后再考虑恢复采集。在此之前本监控器保持注册（配置兼容）但不产生
+//! 任何事件、不做任何网络访问。
 
-use crate::monitors::ps::run_ps;
 use crate::types::*;
-use serde_json::json;
-use std::cell::Cell;
 use std::time::Duration;
 
-/// Haversine 公式计算两点距离（米）
-fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6371000.0_f64;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin() * (dlat / 2.0).sin()
-        + lat1.to_radians().cos()
-            * lat2.to_radians().cos()
-            * (dlon / 2.0).sin()
-            * (dlon / 2.0).sin();
-    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
-}
-
-pub struct LocationMonitor {
-    prev_lat: Cell<f64>,
-    prev_lon: Cell<f64>,
-    initialized: Cell<bool>,
-}
+pub struct LocationMonitor;
 
 impl Default for LocationMonitor {
     fn default() -> Self {
-        Self {
-            prev_lat: Cell::new(0.0),
-            prev_lon: Cell::new(0.0),
-            initialized: Cell::new(false),
-        }
+        Self
     }
 }
 
@@ -47,54 +27,7 @@ impl Monitor for LocationMonitor {
         Duration::from_secs(300)
     }
 
-    fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
-        let script = r#"
-try {
-  $r = Invoke-RestMethod -Uri 'https://ipinfo.io/json' -TimeoutSec 10 -ErrorAction Stop
-  $loc = $r.loc -split ','
-  "$($r.ip)|$($loc[0])|$($loc[1])|$($r.city)|$($r.region)|$($r.country)"
-} catch { }
-"#;
-        let output = match run_ps(script) {
-            Some(o) if !o.trim().is_empty() => o,
-            _ => return,
-        };
-
-        let parts: Vec<&str> = output.trim().split('|').collect();
-        if parts.len() < 6 {
-            return;
-        }
-
-        let lat: f64 = parts[1].trim().parse().unwrap_or(0.0);
-        let lon: f64 = parts[2].trim().parse().unwrap_or(0.0);
-        if lat == 0.0 && lon == 0.0 {
-            return;
-        }
-
-        let prev_lat = self.prev_lat.get();
-        let prev_lon = self.prev_lon.get();
-
-        // 仅在首次或位置变化 >50m 时发送
-        if self.initialized.get() && haversine(prev_lat, prev_lon, lat, lon) < 50.0 {
-            return;
-        }
-
-        // 模糊精度：保留 3 位小数（约 110m）
-        let blur_lat = (lat * 1000.0).round() / 1000.0;
-        let blur_lon = (lon * 1000.0).round() / 1000.0;
-
-        self.prev_lat.set(lat);
-        self.prev_lon.set(lon);
-        self.initialized.set(true);
-
-        let event = Event::new(EventAction::LocationSnapshot, EventType::Location).data(json!({
-            "latitude": blur_lat,
-            "longitude": blur_lon,
-            "source": "ip_address",
-            "city": parts[3].trim(),
-            "region": parts[4].trim(),
-            "country": parts[5].trim(),
-        }));
-        let _ = tx.try_send(event);
+    fn collect(&self, _tx: &crossbeam_channel::Sender<Event>) {
+        // 占位：不做任何采集，不产生事件，不发起网络请求（见模块注释）。
     }
 }

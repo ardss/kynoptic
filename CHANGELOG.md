@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Docs: the status lines in `README.md`, `README.zh-CN.md`, and `APP.md` now
+  say v0.3.0 (they still said v0.2 / v0.2.x while `Cargo.toml`, the website,
+  and the GitHub release already said 0.3.0).
+- Dashboard (security, opt-in token): the optional access token is no longer
+  accepted via the `?token=` URL query string (a query string ends up in
+  browser history and bookmarks); pass it via the `X-Kynoptic-Access-Token`
+  header or `Authorization: Bearer` instead. The dashboard page likewise no
+  longer picks a token up from the URL — it keeps the sessionStorage flow and
+  the on-page prompt. When no token is enabled, behavior is unchanged.
+
 - Dashboard (high-contrast/forced-colors): the 24h timeline three-state
   bands, their legend markers, and both five-swatch heatmap legends are now
   drawn via CSS classes/`--hm-*` variables with distinct system-color
@@ -100,6 +110,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that the hourly input counts include automation-injected input (the
   values themselves are unchanged; only the labeling, matching the daily
   heatmap).
+- Core (privacy, salted digests): the clipboard/notification summary salt
+  was persisted to the database metadata (`clipboard_salt`) but never used —
+  `salt()` and `set_salt()` each declared their own `OnceLock`, so digests
+  were computed with a fresh per-process random salt. The same clipboard
+  text produced a different digest after every restart, breaking
+  digest-based matching across sessions, and the stored salt was dead data.
+  The two locks are now one module-level `OnceLock`: the salt is loaded
+  from (or first created in) the database metadata at collection start and
+  is the one actually used, so a given plaintext yields a stable digest
+  within a library and a different digest across libraries, as documented.
+- Core (privacy, title redaction): the collection-side title-redaction
+  switch (`CollectorSettings::redact_titles`, `monitors::title_privacy`)
+  is documented as reserved but **not yet wired** — no dashboard setting,
+  tray, or CLI path can turn it on, so titles are still stored verbatim.
+  The previously misleading "already wired" code comments now say so
+  explicitly; behavior is unchanged (default off).
 
 ## [0.3.0] - 2026-09-23
 

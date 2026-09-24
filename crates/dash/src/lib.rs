@@ -32,7 +32,7 @@
 //! **可选访问令牌（Wave31 挂账）**：默认完全无 token，本地数据面照常可用
 //! （本地数据完整铁律：禁默认加锁）。仅当用户显式在 data 目录创建
 //! `dashboard-token.txt`（非空内容即令牌）后，所有 `/api/*` 请求必须携带
-//! `?token=`、`X-Kynoptic-Access-Token` 头或 `Authorization: Bearer <token>`
+//! `X-Kynoptic-Access-Token` 头或 `Authorization: Bearer <token>`
 //! 之一且匹配，否则 401；`/`（静态页）不受限。令牌在 serve 启动时读取一次，
 //! 修改后需重启 dashboard（托盘菜单重启或重开 `kynoptic-ctl dashboard`）。
 
@@ -134,7 +134,9 @@ pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, 
     };
     let (start, end) =
         queries::local_day_range(&date).ok_or_else(|| date_err(&date, "YYYY-MM-DD 或 today"))?;
-    let totals = queries::day_totals(conn, &date);
+    // day_totals 失败必须上抛（库损坏静默零值修复 2026-09）：core 侧已把查询
+    // 错误 Result 化，此处映射为 Err 由路由统一转 503+db_error，不再回退全零。
+    let totals = queries::day_totals(conn, &date).map_err(|e| e.to_string())?;
     let top_app = queries::top_apps_today(conn, &start, &end, 1)
         .into_iter()
         .next()
@@ -533,6 +535,9 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     json!({
         "today": queries::today_local_str(),
         "last_event_ts": queries::latest_event_ts(conn),
+        // 库降级标志（库损坏静默零值修复 2026-09）：core open 时 quick_check /
+        // WAL 水位对账发现损坏即置位（进程级），面板据此显示降级横幅
+        "db_degraded": kynoptic_core::db::db_degraded_reason(),
         "db_path": db_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2456,7 +2461,13 @@ pub fn route_req(
             }
             match api_summary(conn, &date) {
                 Ok(v) => (200, "application/json", v.to_string()),
-                Err(e) => (400, "application/json", err_json(&e)),
+                // 库损坏/读取失败（db_error）映射 503：此前一律 200 全零或 400，
+                // 用户会误以为"今天什么都没干"（库损坏静默零值修复 2026-09）
+                Err(e) => (
+                    if err_code(&e) == "db_error" { 503 } else { 400 },
+                    "application/json",
+                    err_json(&e),
+                ),
             }
         }
         ("GET", "/api/timeline") => {
@@ -2734,6 +2745,7 @@ fn err_code(msg: &str) -> &'static str {
         || msg.contains("database is locked")
         || msg.contains("unable to open database")
         || msg.contains("disk I/O error")
+        || msg.contains("database disk image is malformed")
     {
         return "db_error";
     }
@@ -2995,20 +3007,13 @@ fn token_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// 提取请求方出示的访问令牌：query `?token=` 优先，其次
-/// `X-Kynoptic-Access-Token` 头，最后 `Authorization: Bearer <token>`。
+/// 提取请求方出示的访问令牌：`X-Kynoptic-Access-Token` 头优先，其次
+/// `Authorization: Bearer <token>`。不接受 URL query `?token=`——查询串
+/// 会留存于浏览器历史/书签，削弱令牌保密性（审查裁定移除）。
 fn presented_access_token(
-    path: &str,
     access_header: Option<&str>,
     auth_header: Option<&str>,
 ) -> Option<String> {
-    if let Some((_, q)) = path.split_once('?') {
-        for pair in q.split('&') {
-            if let Some(v) = pair.strip_prefix("token=") {
-                return Some(v.to_string());
-            }
-        }
-    }
     if let Some(v) = access_header {
         return Some(v.trim().to_string());
     }
@@ -3121,7 +3126,7 @@ fn handle_client(
             .unwrap_or("")
             .starts_with("/api");
         if is_api {
-            let ok = presented_access_token(early_path, access_hdr.as_deref(), auth_hdr.as_deref())
+            let ok = presented_access_token(access_hdr.as_deref(), auth_hdr.as_deref())
                 .map(|p| token_eq(&p, expected))
                 .unwrap_or(false);
             if !ok {
@@ -3129,7 +3134,7 @@ fn handle_client(
                     &mut stream,
                     401,
                     "application/json",
-                    "{\"error\":\"unauthorized: missing or invalid access token (do not bookmark/share /api/*?token=... URLs - the token stays in browser history; open the dashboard page instead, which strips the token from the URL)\"}",
+                    "{\"error\":\"unauthorized: missing or invalid access token (pass it via the X-Kynoptic-Access-Token header or Authorization: Bearer; do not put the token in the URL - query strings stay in browser history)\"}",
                 );
             }
         }
@@ -3200,8 +3205,8 @@ fn handle_client(
 
 /// 统一安全响应头（审查 P1：所有响应必带）。`script_src` 由调用方给出：
 /// 普通响应无脚本用 `'self'`；首页内联脚本用每请求随机 nonce（见
-/// `http_simple_index`）。Referrer-Policy 兜底：避免 `?token=` 直链被
-/// 浏览器历史/云同步带离设备后经 Referer 再泄漏。favicon 为 data: URI，
+/// `http_simple_index`）。Referrer-Policy 兜底：避免任何 URL 参数被浏览器
+/// 历史/云同步带离设备后经 Referer 再泄漏。favicon 为 data: URI，
 /// 无外链资源。
 fn security_headers(script_src: &str) -> String {
     format!(
@@ -3330,25 +3335,23 @@ mod access_token_test {
     }
 
     #[test]
-    fn presented_token_from_query_header_or_bearer() {
+    fn presented_token_from_header_or_bearer_only() {
+        // query `?token=` 已移除（审查裁定）：URL 携带令牌一律不认，防其留存
+        // 于浏览器历史/书签
         assert_eq!(
-            presented_access_token("/api/status?token=t1", None, None).as_deref(),
-            Some("t1")
-        );
-        assert_eq!(
-            presented_access_token("/api/status", Some("t2"), None).as_deref(),
+            presented_access_token(Some("t2"), None).as_deref(),
             Some("t2")
         );
         assert_eq!(
-            presented_access_token("/api/status", None, Some("Bearer t3")).as_deref(),
+            presented_access_token(None, Some("Bearer t3")).as_deref(),
             Some("t3")
         );
-        // query 优先；无任何出示 → None
+        // 头优先于 Bearer；无任何出示 → None
         assert_eq!(
-            presented_access_token("/api/status?token=q", Some("h"), Some("Bearer b")).as_deref(),
-            Some("q")
+            presented_access_token(Some("h"), Some("Bearer b")).as_deref(),
+            Some("h")
         );
-        assert!(presented_access_token("/api/status", None, None).is_none());
+        assert!(presented_access_token(None, None).is_none());
     }
 
     /// 用真实 TCP socketpair 直调 handle_client 的最小驱动。
@@ -3416,13 +3419,14 @@ mod access_token_test {
             &req("X-Kynoptic-Access-Token: wrong\r\n"),
         );
         assert!(resp.starts_with("HTTP/1.1 401"));
-        // query / 头 / Bearer 三种携带方式均放行
+        // query `?token=` 携带不再放行（已移除，审查裁定）
         let resp = roundtrip(
             &db,
             Some("s3cret"),
             "GET /api/status?token=s3cret HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
         );
-        assert!(resp.starts_with("HTTP/1.1 200"), "query: {resp}");
+        assert!(resp.starts_with("HTTP/1.1 401"), "query: {resp}");
+        // 头 / Bearer 两种携带方式放行
         let resp = roundtrip(
             &db,
             Some("s3cret"),

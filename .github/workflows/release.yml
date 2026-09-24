@@ -78,11 +78,19 @@ jobs:
           # 只换主 exe 会造成三件套版本漂移。
           Compress-Archive -Path dist/kynoptic.exe, dist/kynoptic-tray.exe, dist/kynoptic-watchdog.exe `
             -DestinationPath "dist/kynoptic-$ver-x86_64-pc-windows-msvc.zip"
-          # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用；覆盖全部 dist 文件，含五件套与自更新 zip）
+          # 校验和（LF 行尾，sha256sum -c 在 Linux/macOS 也可用）
           # 注意：自更新（update.rs）下载的是上面 files 清单里的五个裸 exe 资产，
           # 任何一个缺失都会让 `kynoptic update` 的资产完整性校验失败。
-          $hashes = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
-            ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
+          # 清单只列实际上传到 release 的资产：README.md / LICENSE 仅打包进
+          # 便携 zip 的暂存文件，不上传（历史 v0.3.0 清单曾多列两条悬空条目，
+          # 想逐条核验的用户永远下不到那两个文件）。
+          $uploaded = @('kynoptic.exe','kynoptic-watchdog.exe','kynoptic-tray.exe','kynoptic-ctl.exe','kynoptic-aggrepair.exe','SKILL.md')
+          $hashes = Get-ChildItem dist -File | Where-Object {
+            ($_.Name -in $uploaded) -or
+            ($_.Name -like 'Kynoptic-Portable-*.zip') -or
+            ($_.Name -like 'Kynoptic-Setup-*.exe') -or
+            ($_.Name -like 'kynoptic-*-x86_64-pc-windows-msvc.zip')
+          } | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name }
           $sums = ($hashes -join "`n") + "`n"
           [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", $sums)
       # ci 修复：dist 版本一致性防线——dist 里的 exe 与安装包版本必须等于

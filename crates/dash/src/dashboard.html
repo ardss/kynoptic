@@ -244,6 +244,7 @@
        文本无变化时不重写（loadStatus 内），避免 30s 轮询反复触发播报 -->
   <div class="muted" id="status-line" aria-live="polite">loading…</div>
   <div id="update-banner" role="status" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#243040;font-size:13px"></div>
+  <div id="db-degraded-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #a33;border-radius:6px;background:#3a2020;color:#fdd;font-size:13px"></div>
   <!-- ARIA APG tabs 键盘契约：活动 tab tabindex=0 其余 -1，方向键/Home/End
        移动并激活（JS 末尾 tablist keydown）；aria-controls/aria-labelledby 双向关联 -->
   <div class="tabs" role="tablist">
@@ -624,23 +625,12 @@ function esc(s) {
 // 不落盘不外发）。POST 必带 X-Kynoptic-Token——原三重防线全是客户端可控头，
 // 只拦浏览器，拦不住同机进程伪造两个头。
 const KYN_CSRF_TOKEN = "__KYN_CSRF_TOKEN__";
-// 可选访问令牌（与 lib.rs /api/* 401 门配套）：优先取 URL ?token=（用户按
-// 文档拼好链接直接打开即自动续用），存入 sessionStorage 后从地址栏摘掉，
-// 避免令牌留在历史记录/复制分享的链接里。此后所有 API 请求经
-// kynHeaders() 携带 X-Kynoptic-Access-Token 头。未启用令牌时服务端忽略
-// 该头，行为与无令牌版本一致。
+// 可选访问令牌（与 lib.rs /api/* 401 门配套）：令牌只经提示框输入并存入
+// sessionStorage（跨刷新续用），不再接受 URL ?token= 传递——查询串会留存于
+// 浏览器历史/书签，削弱令牌保密性（服务端已同步移除该分支）。此后所有
+// API 请求经 kynHeaders() 携带 X-Kynoptic-Access-Token 头。未启用令牌时
+// 服务端忽略该头，行为与无令牌版本一致。
 let KYN_ACCESS_TOKEN = sessionStorage.getItem("kyn-access-token") || "";
-(function () {
-  const q = new URLSearchParams(location.search);
-  const t = q.get("token");
-  if (t) {
-    KYN_ACCESS_TOKEN = t;
-    try { sessionStorage.setItem("kyn-access-token", t); } catch (_) {}
-    q.delete("token");
-    const rest = q.toString();
-    history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
-  }
-})();
 function kynHeaders(extra) {
   const h = Object.assign({}, extra || {});
   if (KYN_ACCESS_TOKEN) h["X-Kynoptic-Access-Token"] = KYN_ACCESS_TOKEN;
@@ -784,6 +774,19 @@ async function loadStatus() {
       : "New version v" + s.update_available + " is out — right-click the tray icon and choose Update available to install (installed copies open the download page).";
   } else {
     ub.style.display = "none";
+  }
+  // 数据库降级横幅（库损坏静默零值修复 2026-09）：后端 quick_check / 数据
+  // 回退对账发现问题时显示，避免用户把库损坏误读成"今天什么都没干"。
+  const dg = document.getElementById("db-degraded-banner");
+  if (dg) {
+    if (s.db_degraded) {
+      dg.style.display = "";
+      dg.textContent = zh
+        ? "警告：数据库可能已损坏，部分数据暂时无法读取——" + s.db_degraded + "（建议先备份 data 目录，再尝试修复或恢复备份）。"
+        : "Warning: the database may be corrupted; some data cannot be read right now — " + s.db_degraded + " (back up the data folder first, then try repairing or restoring a backup).";
+    } else {
+      dg.style.display = "none";
+    }
   }
 }
 /* 审查 P2：/api/status 只回 db 文件名 + 目录类别（db_dir_kind），不再暴露

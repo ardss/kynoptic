@@ -200,7 +200,8 @@ pub enum InputGranularity {
 /// 采集器运行设置（代码内默认值；默认值调整属产品决策，见 CODE_NOTES.md §8）。
 #[derive(Debug, Clone, Copy)]
 pub struct CollectorSettings {
-    /// 输入事件存储粒度（默认 Raw）
+    /// 输入事件存储粒度（默认 Minute（计数制）；Raw 为 opt-in，见
+    /// [`InputGranularity`] 文档——只存计数不存内容是隐私边界红线）
     pub input_granularity: InputGranularity,
     /// writer 小批 flush 间隔秒数（默认 30s）。数值是"落库最大延迟"与
     /// "每提交 WAL 页开销主导的磁盘足迹"之间的权衡，仍在校准中。
@@ -215,6 +216,15 @@ pub struct CollectorSettings {
     /// 字段名 `vk_frequency_enabled`，经 `CollectorSettings` 传入
     /// `start_collection_with` / `start_collection_custom` 即生效。
     pub vk_frequency_enabled: bool,
+    /// 窗口/标签页标题脱敏开关（默认 false：标题原文落库，本地数据完整优先；
+    /// 开启后采集侧把标题中 URL 的查询串剥掉，见 monitors::title_privacy）。
+    ///
+    /// **尚未接线（待办）**：设计接线点与 `vk_frequency_enabled` 同模式——
+    /// dash 设置项 `redact_titles` 读写此字段，经 `CollectorSettings` 传入
+    /// `start_collection_with` / `start_collection_custom` 即生效——但 dash
+    /// settings、tray、CLI 目前均未读写该字段，当前没有任何路径能把它置
+    /// true，实际行为恒为「标题原文落库」。
+    pub redact_titles: bool,
 }
 
 impl Default for CollectorSettings {
@@ -223,6 +233,7 @@ impl Default for CollectorSettings {
             input_granularity: InputGranularity::default(),
             write_flush_interval_secs: constants::WRITE_FLUSH_INTERVAL_SECS,
             vk_frequency_enabled: true,
+            redact_titles: false,
         }
     }
 }
@@ -898,6 +909,12 @@ pub fn start_collection_custom(
     // per-key 频次开关（默认 true）：必须在 activate/reset 之后、Hook
     // 启动之前设置，保证本会话从第一个键事件起口径一致。
     input_agg::set_vk_enabled(settings.vk_frequency_enabled);
+    // 标题脱敏开关（默认 false）：settings → CollectorSettings → 全局开关，
+    // window/browser 采集时按此剥 URL 查询串（monitors::title_privacy）。
+    monitors::title_privacy::set_redact_titles(settings.redact_titles);
+    // 剪贴板/通知摘要盐：从库 metadata 加载（首次随机生成并写回），
+    // 保证同一明文在不同库得到不同 digest（monitors::clipboard）。
+    monitors::clipboard::init_salt_from_db(&db);
     let minute_mode = settings.input_granularity == InputGranularity::Minute;
     let mut agg_handle: Option<thread::JoinHandle<()>> = None;
     if minute_mode {
@@ -1096,6 +1113,18 @@ pub fn start_collection_custom(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 隐私边界红线锁定：采集默认粒度必须是 Minute（只存计数）。此前字段
+    /// 注释误写"默认 Raw"——若有人照注释"对齐"实现即击穿红线，此断言直接
+    /// 挡下（编译期/测试期双重事实源）。
+    #[test]
+    fn default_input_granularity_is_minute() {
+        assert_eq!(InputGranularity::default(), InputGranularity::Minute);
+        assert_eq!(
+            CollectorSettings::default().input_granularity,
+            InputGranularity::Minute
+        );
+    }
 
     #[test]
     fn should_flush_on_batch_full_or_interval() {

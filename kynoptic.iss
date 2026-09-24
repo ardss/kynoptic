@@ -111,6 +111,135 @@ var
 
 const
   RunKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  // 用户级 PATH 所在键（PrivilegesRequired=lowest，只碰 HKCU）
+  EnvKeyPath = 'Environment';
+  WM_SETTINGCHANGE = $001A;
+  // HWND_BROADCAST 为 Inno 预定义常量，不重复声明
+  SMTO_ABORTIFHUNG = $0002;
+
+// 广播用的 Win32 API（真机探针验证过调用形状；lParam 传 'Environment'）
+function SendMessageTimeout(hWnd: HWND; Msg: UINT; wParam: Longint;
+  lParam: String; fuFlags, uTimeout: DWORD; var lpdwResult: DWORD): DWORD;
+  external 'SendMessageTimeoutW@user32.dll stdcall';
+
+// 广播环境变量变更，让资源管理器与新开的终端立即看到新 PATH
+//（真机探针验证：SendMessageTimeoutW 广播返回非 0 即成功）
+procedure BroadcastEnvChange();
+var
+  Res: DWORD;
+begin
+  SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment',
+    SMTO_ABORTIFHUNG, 1000, Res);
+end;
+
+// 去掉字符串尾部的分号（不引入 Inno 版本相关的字符串助手）
+function TrimTrailingSemicolons(const S: String): String;
+begin
+  Result := S;
+  while (Length(Result) > 0) and (Result[Length(Result)] = ';') do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+// 按分号切分 PATH 为条目数组（手写切分，兼容全部 Inno 6.x；跳过空条目）
+function SplitPathEntries(const PathVal: String): TArrayOfString;
+var
+  Count, Start, I: Integer;
+begin
+  SetArrayLength(Result, 0);
+  Count := 0;
+  Start := 1;
+  for I := 1 to Length(PathVal) + 1 do begin
+    if (I > Length(PathVal)) or (PathVal[I] = ';') then begin
+      if I > Start then begin
+        SetArrayLength(Result, Count + 1);
+        Result[Count] := Copy(PathVal, Start, I - Start);
+        Count := Count + 1;
+      end;
+      Start := I + 1;
+    end;
+  end;
+end;
+
+// 用户 PATH 是否已含 Dir（分号分隔、大小写不敏感的整项比较）
+function UserPathHasEntry(const PathVal, Dir: String): Boolean;
+var
+  Parts: TArrayOfString;
+  I: Integer;
+begin
+  Result := False;
+  Parts := SplitPathEntries(PathVal);
+  for I := 0 to GetArrayLength(Parts) - 1 do
+    if Uppercase(Trim(Parts[I])) = Uppercase(Dir) then begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+// 安装目录写入用户 PATH（官方文档/README 的 MCP 配置都假设 `kynoptic` 是裸
+// 命令，而安装器此前从不写 PATH，安装版用户照做必然"找不到命令"）。
+// 已存在时不重复追加；写回保留原值的展开类型（含 %VAR% 用 REG_EXPAND_SZ，
+// 真机探针验证：按 DoNotExpand 读写往返不破坏含 %VAR% 条目）。
+procedure AddInstallDirToUserPath();
+var
+  Dir, Cur, NewVal: String;
+  HadValue, HasPercent: Boolean;
+begin
+  Dir := ExpandConstant('{app}');
+  HadValue := RegQueryStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur);
+  if not HadValue then
+    Cur := '';
+  if UserPathHasEntry(Cur, Dir) then
+    Exit;
+  if Cur = '' then
+    NewVal := Dir
+  else
+    NewVal := TrimTrailingSemicolons(Cur) + ';' + Dir;
+  HasPercent := Pos('%', NewVal) > 0;
+  if HadValue and HasPercent then
+    RegWriteExpandStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', NewVal)
+  else
+    RegWriteStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', NewVal);
+  BroadcastEnvChange();
+  Log('install dir appended to user PATH');
+end;
+
+// 卸载对称清理：从用户 PATH 移除安装目录项；移除后为空则删除整个值。
+// 每一项只在与 Dir 全等时剔除，不动用户自配的其它条目。
+procedure RemoveInstallDirFromUserPath();
+var
+  Dir, Cur: String;
+  Parts: TArrayOfString;
+  Keep: TArrayOfString;
+  I, N: Integer;
+begin
+  Dir := ExpandConstant('{app}');
+  if not RegQueryStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur) then
+    Exit;
+  Parts := SplitPathEntries(Cur);
+  SetArrayLength(Keep, 0);
+  for I := 0 to GetArrayLength(Parts) - 1 do
+    if Uppercase(Trim(Parts[I])) <> Uppercase(Dir) then begin
+      N := GetArrayLength(Keep);
+      SetArrayLength(Keep, N + 1);
+      Keep[N] := Parts[I];
+    end;
+  if GetArrayLength(Keep) = 0 then begin
+    RegDeleteValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path');
+  end else begin
+    Cur := '';
+    for I := 0 to GetArrayLength(Keep) - 1 do begin
+      if I > 0 then
+        Cur := Cur + ';';
+      Cur := Cur + Keep[I];
+    end;
+    if Pos('%', Cur) > 0 then
+      RegWriteExpandStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur)
+    else
+      RegWriteStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur);
+  end;
+  BroadcastEnvChange();
+  Log('install dir removed from user PATH');
+end;
 
 // 静默执行外部命令（SW_HIDE 不弹窗），返回是否成功且退出码为 0
 function RunHidden(const Exe, Params: String): Boolean;
@@ -131,11 +260,29 @@ begin
     SW_HIDE, ewWaitUntilTerminated, CmdResult) and (CmdResult = 0);
 end;
 
-// 静默强杀进程树（审查 P1-5：DISABLE 计划任务防不住已在跑的 watchdog）
-procedure KillProcessSilently(const Image: String);
+// 按安装目录精确杀 Kynoptic 进程（0.2.1 曾以同样理由移除 watchdog 的映像名
+// 全局杀 fallback：taskkill /F /IM /T 会扫杀全机同名进程及其子树，任何一次
+// 覆盖升级都会误杀本机另一个独立安装目录里正在运行的生产实例）。改为
+// PowerShell 按 exe 完整路径过滤：只杀 Path 位于 Dir 下的实例；返回杀完
+// 之后仍在运行的同名异目录实例数（>0 即存在另一份安装，提示而非强杀）。
+function KillProcessesInDir(const Dir: String): Integer;
+var
+  TmpFile: String;
+  CmdResult: Integer;
+  Lines: TArrayOfString;
+  Ps: String;
 begin
-  // 忽略返回码：进程本来就没在跑时 taskkill 会返回非 0
-  RunHidden('taskkill', '/F /IM "' + Image + '" /T');
+  Result := 0;
+  TmpFile := ExpandConstant('{tmp}') + '\kyn-killcnt.txt';
+  // $_ 与 $ 外层是 PowerShell 变量，Pascal 字符串不转义 $；单引号用 '' 表示
+  Ps := '-NoProfile -ExecutionPolicy Bypass -Command "$n = @(''kynoptic-watchdog.exe'',''kynoptic-tray.exe'',''kynoptic-ctl.exe''); ' +
+    'Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.Path -like ''' + Dir + '\*'' } | Stop-Process -Force; ' +
+    '@(Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path -notlike ''' + Dir + '\*'') }).Count"';
+  if Exec('cmd.exe', '/C powershell.exe ' + Ps + ' > "' + TmpFile + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, CmdResult) then
+    if LoadStringsFromFile(TmpFile, Lines) then
+      Result := StrToIntDef(Trim(Lines[GetArrayLength(Lines) - 1]), 0);
+  DeleteFile(TmpFile);
 end;
 
 // 文件是否被进程锁定（独占打开失败即锁定；不存在视为未锁定）
@@ -274,18 +421,26 @@ procedure KillLockedApps();
 var
   App: String;
   TryNo: Integer;
+  Foreign: Integer;
 begin
   App := ExpandConstant('{app}');
   for TryNo := 1 to 5 do begin
-    KillProcessSilently('kynoptic-watchdog.exe');
-    KillProcessSilently('kynoptic-tray.exe');
-    KillProcessSilently('kynoptic-ctl.exe');
+    Foreign := KillProcessesInDir(App);
     if (not FileLocked(App + '\kynoptic-tray.exe')) and
        (not FileLocked(App + '\kynoptic-watchdog.exe')) and
        (not FileLocked(App + '\kynoptic-ctl.exe')) then
       Break;
     Log('files still locked, retry kill round ' + IntToStr(TryNo));
     Sleep(1000);
+  end;
+  // 另一份安装目录的实例仍在跑：只留痕/提示，不强杀（升级审查：
+  // 旧实现按映像名全局扫杀会误伤本机其它 Kynoptic 安装）
+  if Foreign > 0 then begin
+    Log('another install dir still runs ' + IntToStr(Foreign) + ' Kynoptic process(es); left untouched');
+    if not WizardSilent then
+      SuppressibleMsgBox('检测到本机另一个安装目录的 Kynoptic 正在运行，本次安装未触碰它。 / ' +
+        'Another Kynoptic installation is still running; it was left untouched.',
+        mbInformation, MB_OK, IDOK);
   end;
 end;
 
@@ -334,6 +489,8 @@ begin
     // 审查 P1-4：双写，避免升级场景半开半关——计划任务与 Run 值在这里统一
     // 收敛终态（此前散在 [Run] 段与 [Registry] 段，退出码被吞、失败不清理）
     FinalizeAutostart();
+    // 安装目录写入用户 PATH（README/官网 MCP 配置假设裸命令 kynoptic 可用）
+    AddInstallDirToUserPath();
   end;
 end;
 
@@ -376,9 +533,9 @@ var
   Leftovers: array[0..13] of String;
 begin
   if CurStep = usUninstall then begin
-    // 审查 P1-6：先静默杀掉 tray 与 watchdog，防止文件占用导致卸载残留
-    KillProcessSilently('kynoptic-tray.exe');
-    KillProcessSilently('kynoptic-watchdog.exe');
+    // 审查 P1-6：先静默杀掉本安装目录的 tray 与 watchdog，防止文件占用导致
+    // 卸载残留（按路径精确杀，不扫杀其它安装目录的同名进程）
+    KillProcessesInDir(ExpandConstant('{app}'));
 
     AppDir := ExpandConstant('{app}');
     DataDir := AppDir + '\data';
@@ -429,6 +586,9 @@ begin
     // Run 自启动值已从 [Registry] 段移除，卸载时由这里对称删除
     //（原 uninsdeletevalue 的等价物）
     RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, '{#RunValueName}');
+    // 安装时写入用户 PATH 的安装目录项，卸载时对称移除（整项全等才剔除，
+    // 不动用户自配条目）
+    RemoveInstallDirFromUserPath();
     // skill install 对称清理（卸载审查）：skill install 曾向三个 AI 客户端
     // home 目录写入 skills/kynoptic/SKILL.md，卸载后残留死技能（指引指向
     // 已不存在的 %LOCALAPPDATA%\Programs\Kynoptic）。整树删除。
