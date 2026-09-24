@@ -92,7 +92,7 @@ git clone https://github.com/ardss/kynoptic
 cd kynoptic
 cargo build --release -p kynoptic
 
-# collect (background, writes to <exe-dir>\data\kynoptic.db by default)
+# collect (foreground, writes to <exe-dir>\data\kynoptic.db by default)
 target\release\kynoptic.exe collect             # foreground collection; tray is the normal entry
 
 # query what was recorded

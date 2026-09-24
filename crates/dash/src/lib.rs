@@ -472,7 +472,8 @@ fn anomaly_message_en(kind: &str, message: &str, at: Option<&str>) -> String {
     }
 }
 
-/// GET /api/anomalies?days= — 与 MCP get_anomalies 同一检测入口，但 marathon
+/// GET /api/anomalies?days= — 与 MCP get_anomalies 同一检测入口（days 须 >= 1，
+/// HTTP 路由层已拒绝 0/负数），但 marathon
 /// 的连续性桥接阈值读 settings 的 `presence_bridge_minutes`（全站连续性口径
 /// 统一源），每条按中文 message 重新参数化 message_en。
 pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
@@ -1741,7 +1742,9 @@ fn insights_compute(
         }));
     }
 
-    json!({"insights": insights, "dbg": {"acts": acts.len(), "switches": switches.len(), "built": insights.len()}})
+    // 调试遗留的 dbg（acts/switches/built 原始计数）已移除：端点契约清单
+    // 未声明该字段，前端无引用；若需排查可在日志侧另行观测。
+    json!({"insights": insights})
 }
 
 /// GET /api/report?date= — 单日报告：色带时间轴、类别占比、专注时段。
@@ -2526,8 +2529,11 @@ pub fn route_req(
             let days = match qval("days") {
                 None => 7,
                 Some(v) => match v.parse::<u32>() {
-                    Ok(d) => d,
+                    // days=0 与负数一并拒绝（400），与 MCP get_anomalies
+                    // 「days 必须 >= 1」口径对齐，不再静默钳为 1 天窗口。
+                    Ok(d) if d >= 1 => d,
                     Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
+                    Ok(_) => return (400, "application/json", err_json("days 应为正整数（>= 1）")),
                 },
             };
             (
@@ -3152,7 +3158,8 @@ fn handle_client(
     // 会话令牌校验（审查 P1 补强：marker/Origin/Sec-Fetch-Site 三防线均为
     // 客户端可控头，只拦浏览器；同机进程还需读到仅本进程注入页面的令牌）。
     // 放在 413 之后，保持"超限 body 必回 413"的既有测试口径。
-    if is_post && token.as_deref() != Some(csrf) {
+    // 与访问令牌同口径：token_eq 恒时比较，避免普通 != 的时序侧信道。
+    if is_post && !token.as_deref().map(|t| token_eq(t, csrf)).unwrap_or(false) {
         return http_simple(
             &mut stream,
             403,
@@ -3245,17 +3252,20 @@ fn http_simple(
 }
 
 /// 每请求随机 nonce（128-bit 十六进制）：std 的 RandomState 种子来自操作
-/// 系统熵，两个独立实例拼够 128 位；再混入纳秒时钟防同进程种子意外重复。
+/// 系统熵，两个独立实例拼够 128 位；两个哈希器各自混入纳秒时钟（h2 用
+/// 黄金比例扭曲，避免同值输入下与 h1 输出相关），防同进程种子意外重复。
 fn fresh_nonce() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     let mut h1 = RandomState::new().build_hasher();
-    let h2 = RandomState::new().build_hasher();
+    let mut h2 = RandomState::new().build_hasher();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     h1.write_u64(nanos);
+    h2.write_u64(nanos ^ 0x9E37_79B9_7F4A_7C15);
+    h2.write_u64(nanos.rotate_left(32));
     format!("{:016x}{:016x}", h1.finish(), h2.finish())
 }
 

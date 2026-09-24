@@ -23,7 +23,9 @@ pub fn redact_titles_enabled() -> bool {
 }
 
 /// 按当前开关处理标题：未开启时原样返回；开启时把标题中的每个
-/// http(s) URL 截断到查询串之前（保留 scheme://host/路径）。
+/// `scheme://` URL 截断到查询串之前（保留 scheme://host/路径）。
+/// scheme 按 RFC 3986 形状识别（字母开头 + 字母数字/+.-
+/// 字符），覆盖 http(s)、ws(s) 及自定义应用协议。
 pub fn redact_title(title: &str) -> String {
     if !redact_titles_enabled() {
         return title.to_string();
@@ -33,8 +35,7 @@ pub fn redact_title(title: &str) -> String {
     let mut i = 0usize;
     while i < title.len() {
         let rest = &lower[i..];
-        let off = rest.find("http://").or_else(|| rest.find("https://"));
-        match off {
+        match find_scheme_url(rest) {
             Some(off) => {
                 let start = i + off;
                 out.push_str(&title[i..start]);
@@ -57,6 +58,31 @@ pub fn redact_title(title: &str) -> String {
         }
     }
     out
+}
+
+/// 在 `hay`（小写副本）中找下一个 `scheme://` 的起始偏移。
+/// scheme 必须以 ASCII 字母开头，后续为字母数字或 `+`/`-`/`.`。
+fn find_scheme_url(hay: &str) -> Option<usize> {
+    let bytes = hay.as_bytes();
+    let mut from = 0usize;
+    while let Some(sep) = hay[from..].find("://") {
+        let pos = from + sep;
+        // 向左扫出 scheme 的起点
+        let mut s = pos;
+        while s > 0 && is_scheme_char(bytes[s - 1]) {
+            s -= 1;
+        }
+        if pos > s && bytes[s].is_ascii_alphabetic() {
+            return Some(s);
+        }
+        // 该处 `://` 前不是合法 scheme，继续向后找
+        from = pos + 3;
+    }
+    None
+}
+
+fn is_scheme_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.'
 }
 
 #[cfg(test)]
@@ -122,6 +148,39 @@ mod tests {
             assert_eq!(
                 redact_title("页面 HTTPS://A.com/p?token=x"),
                 "页面 HTTPS://A.com/p"
+            );
+        });
+    }
+
+    #[test]
+    fn ws_and_custom_schemes_matched() {
+        with_redact(true, || {
+            assert_eq!(
+                redact_title("ws://a.com/socket?token=abc"),
+                "ws://a.com/socket"
+            );
+            assert_eq!(
+                redact_title("wss://a.com/socket?token=abc&sid=1"),
+                "wss://a.com/socket"
+            );
+            assert_eq!(redact_title("vscode://file/x?token=t"), "vscode://file/x");
+            assert_eq!(
+                redact_title("zoommtg://zoom.us/join?action=join"),
+                "zoommtg://zoom.us/join"
+            );
+        });
+    }
+
+    #[test]
+    fn pseudo_scheme_like_text_untouched() {
+        with_redact(true, || {
+            // `://` 前不是字母开头的合法 scheme（含数字/中文/空格），不当作 URL
+            assert_eq!(redact_title("比例 3://2 说明"), "比例 3://2 说明");
+            assert_eq!(redact_title("中文://x?a=1"), "中文://x?a=1");
+            // 本地文件名里的 ? 不是 URL 查询串
+            assert_eq!(
+                redact_title("文件?草稿.txt - 记事本"),
+                "文件?草稿.txt - 记事本"
             );
         });
     }

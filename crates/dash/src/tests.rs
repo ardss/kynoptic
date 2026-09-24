@@ -976,6 +976,10 @@ fn route_table_and_error_codes() {
         route_req(&conn, "GET", "/api/anomalies?days=nope", "", db).0,
         400
     );
+    // days=0 与 MCP get_anomalies（days>=1）同口径：400，不再静默钳为 1 天
+    let (code, _, body) = route_req(&conn, "GET", "/api/anomalies?days=0", "", db);
+    assert_eq!(code, 400, "days=0 须 400（与 MCP 口径一致）");
+    assert!(body.contains("error"));
     assert_eq!(
         route_req(&conn, "GET", "/api/heatmap?weeks=nope", "", db).0,
         400
@@ -1310,6 +1314,23 @@ fn insights_empty_db_returns_empty_list() {
     // 空分支附带真实门槛，前端据此渲染"已积累 N/50"
     assert_eq!(v["gate"]["events"], json!(0));
     assert_eq!(v["gate"]["required"], json!(50));
+}
+
+// 洞察响应不再携带调试遗留 dbg 字段（端点契约清单未声明，前端无引用）
+#[test]
+fn insights_response_has_no_dbg_field() {
+    let conn = mem_conn();
+    for i in 0..51 {
+        insert(&conn, &local_ts(-1, 9, i % 60), "keyboard", "press", None);
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 23, 30))
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let v = api_insights_at(&conn, 2, now);
+    assert!(
+        v.get("dbg").is_none(),
+        "insights 响应不得携带调试字段 dbg: {v}"
+    );
 }
 
 // 洞察页人侧判定含滚轮：纯滚轮阅读分钟也算一次输入（与 presence.rs 口径对齐）

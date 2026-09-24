@@ -67,7 +67,7 @@ Subcommands:
   mcp                                         Run MCP server over stdio
   skill install                               Sync bundled SKILL.md to AI client skill dirs
   --version / -V                              Print version
-  probe     [--monitor ID] [--secs N] [--all] Live per-monitor hardware probe
+  probe     [--monitor ID] [--secs N] [--all] [--first-collect-timeout N] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update [--check]                          Self-update from GitHub releases (--check: report only)
   watchdog [--once]                         Ensure tray is alive (for Task Scheduler)
@@ -1378,12 +1378,14 @@ fn cmd_skill_install() -> Result<()> {
 
 // === probe ===
 
-/// `kynoptic-ctl probe [--monitor ID] [--secs N] [--all]`
+/// `kynoptic-ctl probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]`
 /// 实机探针：逐监控器启用、临时库采集 N 秒，报告事件数与 PASS/FAIL。
 fn cmd_probe(args: &[String]) -> Result<()> {
     let mut monitor = String::new();
     let mut secs: u64 = 15;
     let mut all = false;
+    // 首采等待上限：0 表示按 secs*10 推导（探针内部封顶 420s）
+    let mut fc_timeout: u64 = 0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1399,17 +1401,27 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| Error::InvalidData("--secs 需要一个正整数".into()))?;
             }
+            "--first-collect-timeout" => {
+                i += 1;
+                fc_timeout = args.get(i).and_then(|s| s.parse().ok()).ok_or_else(|| {
+                    // 0 是合法取值：表示按 secs*10（封顶 420）自动推导
+                    Error::InvalidData(
+                        "--first-collect-timeout 需要一个非负整数（0 表示按 secs*10 自动推导）"
+                            .into(),
+                    )
+                })?;
+            }
             "--all" => all = true,
             other => {
                 return Err(Error::InvalidData(format!(
-                    "未知选项: {other}（支持 --monitor/--secs/--all）"
+                    "未知选项: {other}（支持 --monitor/--secs/--all/--first-collect-timeout）"
                 )))
             }
         }
         i += 1;
     }
     if all {
-        let outcomes = kynoptic_core::probe::probe_all(secs);
+        let outcomes = kynoptic_core::probe::probe_all(secs, fc_timeout);
         kynoptic_core::probe::print_matrix(&outcomes);
     } else {
         if monitor.is_empty() {
@@ -1417,7 +1429,7 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                 "probe 需要 --monitor ID 或 --all".into(),
             ));
         }
-        let out = kynoptic_core::probe::probe_monitor(&monitor, secs);
+        let out = kynoptic_core::probe::probe_monitor(&monitor, secs, fc_timeout);
         println!(
             "{} | dep={} | default={} | events={}",
             out.id, out.dep, out.default_enabled, out.events
@@ -2818,9 +2830,10 @@ fn main() -> ExitCode {
     // error! 全部落空。console 子命令补 stderr 输出（默认 warn 起，RUST_LOG
     // 可调）；`kynoptic mcp` 走 stdout 协议不受影响（env_logger 写 stderr）。
     // collect 子命令内部的 env_logger try_init 在此之后会静默让位。
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .try_init()
-        .ok();
+    // probe 例外：必须把全局日志槽让给 probe 的 CaptureLogger，否则
+    // log::set_boxed_logger 失败、捕获缓冲永远为空，"首次采集完成"日志
+    // 等不到，轮询监控器即使已采到事件也被 420s 超时误判 FAIL。
+    // 故先定位子命令，probe 分发前不装 env_logger。
     let args: Vec<String> = std::env::args().skip(1).collect();
     // --version/-V：update.rs 的 verify_launch 依赖 exit 0 判定自更新成功
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -2831,6 +2844,12 @@ fn main() -> ExitCode {
     let sub: String = sub_idx
         .map(|i| args[i].clone())
         .unwrap_or_else(|| "help".to_string());
+    // probe 已在上方让出日志槽；其余子命令正常初始化 env_logger
+    if sub != "probe" {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .try_init()
+            .ok();
+    }
     // 全局 --db（审查 P2）：所有子命令可用，摘出后写入 DB_OVERRIDE 覆盖
     // resolve_db()。rest 先去掉子命令本身，使 --db 在任意位置都被成对摘除。
     // dashboard 自带 --db 解析，保持原样跳过。

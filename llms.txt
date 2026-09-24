@@ -14,14 +14,15 @@
 - Raw events are stored untouched in SQLite. Aggregate tables are
   derived read caches only; the raw layer is append-only and is never
   truncated or cleaned up automatically.
-- Status: v0.1, active development. Language: Rust. License:
+- Status: v0.3.0, active development. Language: Rust. License:
   Apache-2.0.
 
 ## Privacy boundary
 
 - No account, no telemetry, no analytics. Data never leaves the machine
-  by default; the only network call is the user-invoked `update`
-  subcommand (GitHub releases).
+  by default; the only unsolicited network call is the tray's
+  once-a-day version check (GitHub), and the `update` subcommand only
+  runs when the user explicitly invokes it (both hit GitHub releases).
 - Keyboard and mouse are stored as per-minute counts only - never key
   contents. Per-key frequency counts (used by the dashboard heatmap) are
   on by default and can be disabled in settings.
@@ -33,9 +34,11 @@
   (numbered migrations), queries, monitor registry
   (`crates/core/src/registry.rs` is the single source of truth for
   what is enabled by default).
-- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary: `now`,
-  `query`, `stats`, `collect`, `dashboard`, `probe`, and the MCP
-  launcher. Includes a local-only read-only web dashboard.
+- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary with 18
+  subcommands: `now`, `query`, `stats`, `collect`, `dashboard`, `probe`,
+  `mcp`, `export`, `report`, `db`, `analyze`, `ghost`, `autostart`,
+  `migrate`, `skill`, `update`, `watchdog`, `presence`. Includes a
+  local-only read-only web dashboard. Full command reference: APP.md.
 - `crates/dash` - dashboard service and pages (shared by CLI and tray).
 - `crates/mcp` - MCP server over stdio JSON-RPC 2.0.
 - `crates/tray` - pure Win32 tray shell hosting the collector and

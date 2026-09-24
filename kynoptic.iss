@@ -1,10 +1,10 @@
 ﻿; Kynoptic 安装器脚本（Inno Setup 6）
-; CI: iscc kynoptic.iss /DAppVersion=0.3.0
-; 缺省值必须与 Cargo.toml/CHANGELOG 的当前版本一致（版本漂移审查：忘传
-; /DAppVersion 时曾打包出 0.2.0 安装包而二进制是 0.2.2 的自相矛盾产物）。
+; CI: iscc kynoptic.iss /DAppVersion=<版本>（必须外部传入，见下）
+; 版本漂移审查：忘传 /DAppVersion 时曾打包出 0.2.0 安装包而二进制是 0.2.2
+; 的自相矛盾产物。本文件不再持有版本号缺省值，只认 /DAppVersion。
 
 #ifndef AppVersion
-#define AppVersion "0.3.0"
+#error 请以 /DAppVersion=<版本> 显式传入版本号（如 scripts/bump-version.mjs 写入 Cargo.toml 的值）
 #endif
 
 ; 测试隔离后缀（/DTestSuffix=sbox1）：带后缀编译出的安装包使用独立任务名与
