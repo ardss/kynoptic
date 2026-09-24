@@ -225,9 +225,8 @@
 <pre><span class="cm"># <span class="l en">current machine status</span><span class="l zh">当前机器状态</span></span>
 <span class="kw">$</span> <span class="fn">kynoptic</span> now
 
-<span class="cm"># <span class="l en">query history, join any signals</span><span class="l zh">查历史，任意信号组合</span></span>
-<span class="kw">$</span> <span class="fn">kynoptic</span> query --from yesterday \
-    --metric gpu --join window
+<span class="cm"># <span class="l en">query yesterday's app/window history</span><span class="l zh">查昨天的应用/窗口历史</span></span>
+<span class="kw">$</span> <span class="fn">kynoptic</span> query --from yesterday --bucket app/window --json
 
 <span class="cm"># <span class="l en">or query the history as plain SQL</span><span class="l zh">也可以直接用 SQL 查历史</span></span>
 <span class="kw">$</span> <span class="fn">sqlite3</span> kynoptic.db <span class="str">"SELECT * FROM events"</span></pre>
@@ -241,7 +240,7 @@
   <div class="wrap">
     <div class="kicker"><span class="l en">Privacy</span><span class="l zh">隐私</span></div>
     <h2><span class="l en">One paragraph, because it's simple.</span><span class="l zh">一段话讲完，因为它本来就简单。</span></h2>
-    <p class="sub"><span class="l en">Kynoptic records events, not content: which app was in front, for how long, plus machine metrics. No screenshots, no keystroke contents, no OCR — so there is nothing on disk to replay or leak. Everything lands in one SQLite file, there is no upload code path, and the source is open. When you ask your AI a question, the answer is computed on your machine; no third-party LLM is involved unless you plug in your own API key.</span><span class="l zh">Kynoptic 记录的是事件，不是内容：哪个应用在前台、多久、加上机器指标。没有截屏、没有按键内容、没有 OCR——磁盘上不存在可以回放或泄露的东西。一切都在一个 SQLite 文件里，代码里没有上传路径，源码公开。你向 AI 提问时，答案在你的机器上算出来；除非你自己填入 API key，否则没有任何第三方大模型参与。</span></p>
+    <p class="sub"><span class="l en">Kynoptic records events, not content: which app was in front, for how long, plus machine metrics. No screenshots, no keystroke contents, no OCR — so there is nothing on disk to replay or leak. Everything lands in one SQLite file, there is no upload code path, and the source is open. Your data is never sent anywhere. When you ask your AI a question, the answer is computed on your machine; no third-party LLM is involved unless you plug in your own API key.</span><span class="l zh">Kynoptic 记录的是事件，不是内容：哪个应用在前台、多久、加上机器指标。没有截屏、没有按键内容、没有 OCR——磁盘上不存在可以回放或泄露的东西。一切都在一个 SQLite 文件里，代码里没有上传路径，源码公开。你的数据不会被发送到任何地方。你向 AI 提问时，答案在你的机器上算出来；除非你自己填入 API key，否则没有任何第三方大模型参与。</span></p>
   </div>
 </section>
 
@@ -299,7 +298,7 @@
     <h2><span class="l en">Straight answers</span><span class="l zh">直接回答</span></h2>
     <details>
       <summary><span class="l en">Where does my data go?</span><span class="l zh">我的数据去了哪里？</span></summary>
-      <p><span class="l en">Nowhere. It stays in one SQLite file on your machine. There are no servers, no telemetry, and no upload code path — you can verify the process makes no outbound connections.</span><span class="l zh">哪也不去。就在你机器上的一个 SQLite 文件里。没有服务器、没有遥测、没有上传代码路径——你可以自己验证进程没有任何对外连接。</span></p>
+      <p><span class="l en">Nowhere. Your data stays in one SQLite file on your machine. There are no servers, no telemetry, and no upload code path. The only outbound network call is a once-a-day version check against GitHub — a few hundred bytes, and it never installs anything on its own (you can verify this in the README).</span><span class="l zh">哪也不去。你的数据就在你机器上的一个 SQLite 文件里。没有服务器、没有遥测、没有上传代码路径。唯一的外联是每天一次到 GitHub 的版本检查——几百字节，绝不会自动安装任何东西（README 里有说明）。</span></p>
     </details>
     <details>
       <summary><span class="l en">Does it record my screen or my passwords?</span><span class="l zh">会录屏或记录我的密码吗？</span></summary>
@@ -377,14 +376,26 @@ function submitWL(e){
   e.preventDefault();
   var email = document.getElementById('wlemail').value.trim();
   var ok = document.getElementById('wlok');
-  var done = function(){ ok.style.display = 'block'; document.getElementById('wlform').style.display = 'none'; };
+  var form = document.getElementById('wlform');
+  var finish = function(success){
+    if (success) {
+      ok.style.display = 'block';
+      form.style.display = 'none';
+    } else {
+      /* 提交失败时给出 mailto 兜底，不伪装成功 */
+      location.href = 'mailto:' + WL_EMAIL + '?subject=' + encodeURIComponent('[Kynoptic waitlist] ' + email);
+      alert('Submission failed — your mail client has been opened instead. 提交失败，已为你打开邮件客户端，可直接发送邮件。');
+    }
+  };
   fetch('https://formsubmit.co/ajax/' + WL_EMAIL, {
     method: 'POST', headers: {'Accept':'application/json','Content-Type':'application/json'},
     body: JSON.stringify({email: email, _subject: '[Kynoptic waitlist] macOS/Linux notify'})
-  }).then(done).catch(function(){
-    location.href = 'mailto:' + WL_EMAIL + '?subject=' + encodeURIComponent('[Kynoptic waitlist] ' + email);
-    done();
-  });
+  }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(data){
+      var success = res.ok && data.success !== false && data.ok !== false && data.error === undefined;
+      finish(success);
+    });
+  }).catch(function(){ finish(false); });
   return false;
 }
 </script>
