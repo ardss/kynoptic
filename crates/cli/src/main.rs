@@ -35,6 +35,7 @@ use kynoptic_core::{Error, Result};
 // 引用父 crate 的 autostart 模块
 mod autostart;
 mod dashboard;
+mod output;
 mod settings;
 mod update;
 
@@ -75,7 +76,7 @@ Subcommands:
 
 Global options (all subcommands unless noted):
   --db PATH   Explicit db path, overrides the default resolution. When absent, \
-the resolved default path is printed to stderr as \"using db: <path>\". \
+the resolved default path is printed to stderr as \"使用数据库: <path>\". \
 (dashboard keeps its own --db handling)
 ";
 
@@ -119,7 +120,7 @@ fn resolve_db() -> PathBuf {
     let p = kynoptic_core::db::resolve_db_path();
     // 静默变可见：走默认推导时把实际使用的库路径打到 stderr，防止"操作了
     // 陈旧库却以为在操作生产库"类误判（审查 P2 实测案例）。
-    eprintln!("using db: {}", p.display());
+    eprintln!("使用数据库: {}", p.display());
     p
 }
 
@@ -141,9 +142,10 @@ fn open_db(path: &Path) -> Result<Connection> {
 /// 仍走 open_db 保留既有建库行为。
 fn open_db_read(path: &Path) -> Result<Connection> {
     if !path.exists() {
-        return Err(Error::InvalidData(format!(
-            "数据库不存在: {}（先用采集器/ctl 生成，读命令不建库不迁移）",
-            path.display()
+        return Err(Error::InvalidData(output::db_missing(
+            path,
+            "只读命令",
+            "read-only commands",
         )));
     }
     open_db(path)
@@ -212,20 +214,23 @@ fn cmd_stats(args: &[String]) -> Result<()> {
         // 复用 analyzer::analyze_day（消除原 substr(timestamp,1,10)=? 的 WHERE 全表扫描，
         // 并与 cmd_report/cmd_analyze 共享同一套当日聚合逻辑）
         let day = analyzer::analyze_day(&conn, &date)?;
-        println!("=== Stats for {} ===", date);
-        println!("keys:     {}", day.total_keys);
-        println!("clicks:   {}", day.total_clicks);
+        // 输出口径统一走「按键/点击/活跃分钟/每分钟按键数」（审查整改：
+        // 原英文调试风 keys/clicks/apm 与产品其余中文正式风割裂，且 APM
+        // 未标单位口径）。
+        println!("=== {date} 统计 ===");
+        println!("按键:            {}", day.total_keys);
+        println!("点击:            {}", day.total_clicks);
         println!(
-            "active:   {} min ({:.1} h)",
+            "活跃:            {} 分钟（{:.1} 小时）",
             day.active_minutes,
             day.active_minutes as f64 / 60.0
         );
-        println!("apm:      {:.1}", day.apm_avg);
+        println!("每分钟按键数:     {:.1}", day.apm_avg);
     } else {
-        println!("=== Stats for last {} days ===", days);
+        println!("=== 最近 {} 天统计 ===", days);
         println!(
-            "{:<12} {:>7} {:>7} {:>7} {:>7}",
-            "date", "keys", "clicks", "act_min", "apm"
+            "{:<12} {:>8} {:>8} {:>10} {:>14}",
+            "日期", "按键", "点击", "活跃分钟", "每分钟按键数"
         );
         // 与 presence/analyze 同口径：按本地日历日输出满 N 天。daily_agg::recent
         // 的 LIMIT 查询只返回有聚合行的日，无行日历日（未开机整天等）曾被静默
@@ -629,12 +634,12 @@ fn cmd_db(args: &[String]) -> Result<()> {
                 file_size(&db_path.with_extension("db-wal")),
                 file_size(&db_path),
             );
-            println!("=== DB Stats ===");
-            println!("path:        {}", db_path.display());
-            println!("events:      {}", n_events);
-            println!("sessions:    {} ({} ghost)", n_sessions, n_ghost);
-            println!("main file:   {} bytes", size_main);
-            println!("wal file:    {} bytes", size_wal);
+            println!("=== 数据库统计 ===");
+            println!("路径:        {}", db_path.display());
+            println!("事件数:      {}", n_events);
+            println!("会话数:      {}（其中空转 {}）", n_sessions, n_ghost);
+            println!("主文件:      {} 字节", size_main);
+            println!("WAL 文件:    {} 字节", size_wal);
         }
         "cleanup" => {
             // 铁律（审查 P0）：原始 events 永不删——默认只清 sessions；
@@ -699,18 +704,21 @@ fn cmd_db(args: &[String]) -> Result<()> {
             );
         }
         "vacuum" => {
-            println!("正在 VACUUM...");
+            println!("正在整理数据库空间（VACUUM）...");
             conn.execute_batch("VACUUM")?;
             println!("✓ 完成");
         }
         "checkpoint" => {
-            println!("正在 WAL checkpoint...");
+            println!("正在合并 WAL 日志（checkpoint）...");
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
             println!("✓ 完成");
         }
         "recompute-agg" => {
-            let n = daily_agg::recompute_all(&conn)?;
-            println!("✓ 重算 daily_agg，影响 {} 天", n);
+            // 脱敏出口：raw 错误只进日志（审查整改），错误仍以非零退出码上报
+            let n = daily_agg::recompute_all(&conn)
+                .map_err(|e| Error::InvalidData(output::db_failure("重新汇总失败", &e)))?;
+            // 用户词汇：不直出内部表名 daily_agg（审查整改）
+            println!("✓ 重新汇总完成，已更新 {n} 天的统计数据");
         }
         other => {
             return Err(Error::InvalidData(format!(
@@ -899,7 +907,7 @@ fn cmd_ghost() -> Result<()> {
     let db_path = resolve_db();
     let db = Database::open(db_path.to_str().unwrap_or("?"))?;
     let n = db.close_ghost_sessions();
-    println!("✓ 关闭了 {} 个 session", n);
+    println!("✓ 已关闭 {} 个空转会话", n);
     // 重新计算所有天的 daily_agg（让 stats/anomaly 立刻反映新数据）。
     // 重算前后做快照对比，把被改写/新增/清除的历史日期与前后值列出来，
     // 杜绝「无提示覆盖」（如早期误删事件受害库升级后被静默改写）。
@@ -907,17 +915,18 @@ fn cmd_ghost() -> Result<()> {
     let before = snapshot_daily_agg(&conn);
     match daily_agg::recompute_all(&conn) {
         Ok(d) => {
-            println!("  同步更新 daily_agg {} 天", d);
+            // 用户词汇：不直出内部表名 daily_agg（审查整改）
+            println!("  同步更新统计数据 {} 天", d);
             let after = snapshot_daily_agg(&conn);
             for (date, new) in &after {
                 match before.get(date) {
                     Some(old) if old != new => println!(
-                        "  重写 {date}: keys {}→{}, clicks {}→{}, 活跃分钟 {}→{}, apm {:.1}→{:.1}",
+                        "  重写 {date}: 按键 {}→{}, 点击 {}→{}, 活跃分钟 {}→{}, 每分钟按键数 {:.1}→{:.1}",
                         old.0, new.0, old.1, new.1, old.2, new.2, old.3, new.3
                     ),
                     Some(_) => {}
                     None => println!(
-                        "  新增 {date}: keys {}, clicks {}, 活跃分钟 {}, apm {:.1}",
+                        "  新增 {date}: 按键 {}, 点击 {}, 活跃分钟 {}, 每分钟按键数 {:.1}",
                         new.0, new.1, new.2, new.3
                     ),
                 }
@@ -925,13 +934,17 @@ fn cmd_ghost() -> Result<()> {
             for (date, old) in &before {
                 if !after.contains_key(date) {
                     println!(
-                        "  清除 {date}（当日无事件，缓存全零行移除）: 原值 keys {}, clicks {}, 活跃分钟 {}",
+                        "  清除 {date}（当日无事件，缓存全零行移除）: 原值 按键 {}, 点击 {}, 活跃分钟 {}",
                         old.0, old.1, old.2
                     );
                 }
             }
         }
-        Err(e) => eprintln!("  ⚠ daily_agg 更新失败: {e}"),
+        // 脱敏出口：raw 错误（含 SQLite 原文/内部表名）只进日志，终端给
+        // 数据安全 + 重试语义（审查整改：曾把 "database is locked" 原文
+        // 直出终端，且失败不可从退出码感知的口径保持不变——此处不改为
+        // Err，避免破坏 ghost 主流程「空转已关闭」的部分成功语义）。
+        Err(e) => eprintln!("{}", output::db_failure("统计数据更新失败", &e)),
     }
     Ok(())
 }
@@ -945,7 +958,11 @@ fn sync_settings_autostart(enable: bool) {
     if st.autostart != enable {
         st.autostart = enable;
         if let Err(e) = crate::settings::save(&db, &st) {
-            eprintln!("⚠ settings.json 同步失败: {e}（托盘启动时可能回写注册表）");
+            // 脱敏出口：raw 错误只进日志，终端只给后果提示（审查整改）
+            eprintln!(
+                "{}（托盘启动时可能重新开启自启动）",
+                output::db_failure("配置文件同步失败", &e)
+            );
         }
     }
 }
@@ -994,18 +1011,75 @@ fn locate_app_exe() -> Option<std::path::PathBuf> {
     None
 }
 
-// === migrate (delegates to python script) ===
-fn cmd_migrate(_args: &[String]) -> Result<()> {
-    let script = std::env::current_dir()
-        .map(|d| d.join("scripts/migrate_legacy_db.py"))
-        .map_err(Error::Io)?;
-    if !script.exists() {
+// === migrate（执行随包分发的 scripts/migrate_legacy_db.py）===
+fn cmd_migrate(args: &[String]) -> Result<()> {
+    // 脚本优先在 exe 同级 scripts/ 找（安装布局），退回 cwd（开发仓布局）
+    let mut script = None;
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("scripts").join("migrate_legacy_db.py");
+            if cand.exists() {
+                script = Some(cand);
+            }
+        }
+    }
+    if script.is_none() {
+        let cand = std::env::current_dir()
+            .map_err(Error::Io)?
+            .join("scripts")
+            .join("migrate_legacy_db.py");
+        if cand.exists() {
+            script = Some(cand);
+        }
+    }
+    let script = script.ok_or_else(|| {
+        Error::InvalidData("找不到迁移脚本 migrate_legacy_db.py（应随安装包分发）".into())
+    })?;
+
+    let mut cmd_args: Vec<String> = vec![script.display().to_string()];
+    let mut user_target = false;
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--legacy" => {
+                let v = rest
+                    .next()
+                    .ok_or_else(|| Error::InvalidData("--legacy 需要路径".into()))?;
+                cmd_args.push("--legacy".into());
+                cmd_args.push(v.clone());
+            }
+            "--target" => {
+                let v = rest
+                    .next()
+                    .ok_or_else(|| Error::InvalidData("--target 需要路径".into()))?;
+                cmd_args.push("--target".into());
+                cmd_args.push(v.clone());
+                user_target = true;
+            }
+            other => {
+                return Err(Error::InvalidData(format!("migrate 未知参数: {other}")));
+            }
+        }
+    }
+    if !user_target {
+        cmd_args.push("--target".into());
+        cmd_args.push(resolve_db().display().to_string());
+    }
+
+    let status = std::process::Command::new("python")
+        .args(&cmd_args)
+        .status()
+        .map_err(|e| {
+            Error::InvalidData(format!(
+                "无法启动 python（迁移脚本依赖 Python 解释器）: {e}"
+            ))
+        })?;
+    if !status.success() {
         return Err(Error::InvalidData(format!(
-            "找不到迁移脚本: {}",
-            script.display()
+            "迁移脚本退出码: {}",
+            status.code().unwrap_or(-1)
         )));
     }
-    println!("请运行: python {}", script.display());
     Ok(())
 }
 
@@ -1565,7 +1639,7 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     let _ = stop_rx.recv();
     c.shutdown();
     let n = c.total_written.load(Ordering::Relaxed);
-    println!("collected {n} events into {db_path}");
+    println!("已采集 {n} 条事件，写入 {db_path}");
     Ok(())
 }
 
@@ -1670,7 +1744,7 @@ fn foreground_minutes(conn: &Connection, start: &str, end: &str) -> i64 {
 fn cmd_presence(args: &[String]) -> Result<()> {
     let days = parse_presence_args(args)?;
     // 路径只解析一次：旧实现连调两次 resolve_db，默认推导分支会把
-    // "using db: <path>" 打两遍，污染 stderr 且削弱人工核对信号。
+    // "使用数据库: <path>" 打两遍，污染 stderr 且削弱人工核对信号。
     let db_path = resolve_db();
     let bridge = kynoptic_dash::settings::load(&db_path).presence_bridge_minutes;
     let conn = open_db_read(&db_path)?;
@@ -1875,7 +1949,7 @@ static WATCHDOG_ALERT_FIRED: std::sync::atomic::AtomicBool =
 ///
 /// 全程尽力而为：库打不开/写失败只留 stderr，不影响看门狗主流程。
 /// 按 kind 去重（进程内存级；常驻进程内窗口 30 分钟）。
-fn watchdog_alert(kind: &str, message: &str) {
+fn watchdog_alert(kind: &str, message: &str, message_en: &str) {
     use std::collections::HashMap;
     use std::sync::Mutex;
     static LAST: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
@@ -1905,8 +1979,10 @@ fn watchdog_alert(kind: &str, message: &str) {
                 sql,
                 params![
                     Utc::now().to_rfc3339(),
-                    // rusqlite 未开 serde_json 特性，Value 不实现 ToSql，落库为 JSON 文本
-                    json!({"source": "watchdog", "kind": kind, "message": message}).to_string(),
+                    // rusqlite 未开 serde_json 特性，Value 不实现 ToSql，落库为 JSON 文本。
+                    // message_en 与 message 同义（英文版）：面板横幅按界面语言选用，
+                    // 英文 UI 不再直出中文告警正文。
+                    json!({"source": "watchdog", "kind": kind, "message": message, "message_en": message_en}).to_string(),
                 ],
             ) {
                 eprintln!("watchdog: 告警事件落库失败: {e}");
@@ -2571,6 +2647,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         watchdog_alert(
                             "heartbeat_unwritable",
                             "托盘自报心跳文件写失败（磁盘满/目录只读/权限），采集可能已停摆，请检查磁盘与目录权限",
+                            "Tray heartbeat file write failed (disk full, read-only directory, or permission problem); collection may have stalled — check disk space and directory permissions",
                         );
                         false
                     }
@@ -2624,6 +2701,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                 watchdog_alert(
                                     "env_unwritable",
                                     "采集未恢复且磁盘/目录不可写（磁盘满或权限问题），无法自动重启托盘，请人工排查",
+                                    "Collection has not recovered and the disk/directory is not writable (disk full or permission problem); the tray cannot be restarted automatically — manual investigation required",
                                 );
                             } else {
                                 watchdog_log(&format!(
@@ -2633,6 +2711,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                 watchdog_alert(
                                     "collection_stalled",
                                     "采集挂死（心跳超龄），看门狗正在重启托盘；期间的数据会有空洞",
+                                    "Collection is hung (heartbeat overdue); the watchdog is restarting the tray — data collected during this window will have gaps",
                                 );
                                 if !kill_tray() {
                                     // 审查 P2：杀失败不留痕的话，后续每个
@@ -2646,6 +2725,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     watchdog_alert(
                                         "kill_failed",
                                         "看门狗无法结束挂死的托盘进程（记录的 pid 可能已失效，或被安全软件拦截），采集持续停摆，请人工处理",
+                                        "The watchdog could not terminate the hung tray process (the recorded pid may be stale, or security software interfered); collection remains stalled — manual handling required",
                                     );
                                 }
                             }
@@ -2724,6 +2804,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     watchdog_alert(
                                         "updating_flag",
                                         "检测到更新进行中旗标，看门狗暂不恢复托盘；若长时间不见托盘，请删除 exe 同目录的 updating.flag 或重跑安装",
+                                        "Update-in-progress flag detected; the watchdog will not restore the tray for now — if the tray stays missing, delete updating.flag next to the exe or rerun the installer",
                                     );
                                 } else {
                                     // 审查：更新替换中断会留下「tray exe 缺失、
@@ -2763,6 +2844,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                                 watchdog_alert(
                                                     "spawn_failed",
                                                     &format!("看门狗拉起托盘失败: {e}，采集停摆中"),
+                                                    &format!("The watchdog failed to start the tray: {e}; collection is stalled"),
                                                 );
                                                 state.consecutive_failures =
                                                     state.consecutive_failures.saturating_add(1);
@@ -2781,6 +2863,10 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                                             "托盘连续 {} 次拉起失败，看门狗退避 {}s，期间无采集",
                                                             state.consecutive_failures, backoff
                                                         ),
+                                                        &format!(
+                                                            "The tray failed to start {} times in a row; the watchdog backs off for {}s with no collection",
+                                                            state.consecutive_failures, backoff
+                                                        ),
                                                     );
                                                 }
                                                 save_watchdog_state(&state);
@@ -2795,6 +2881,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                             watchdog_alert(
                                                 "tray_missing",
                                                 "kynoptic-tray.exe 缺失，看门狗无法拉起托盘，采集停摆中",
+                                                "kynoptic-tray.exe is missing; the watchdog cannot start the tray and collection is stalled",
                                             );
                                         }
                                     }
@@ -2823,6 +2910,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 watchdog_alert(
                     "exit_flag",
                     "检测到托盘退出旗标，看门狗已停止拉起托盘；若非本人主动退出，请删除 exe 同目录的 tray-exit.flag",
+                    "Tray exit flag detected; the watchdog has stopped starting the tray — if you did not quit the tray yourself, delete tray-exit.flag next to the exe",
                 );
             }
             if once {
