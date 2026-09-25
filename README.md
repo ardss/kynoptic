@@ -196,8 +196,9 @@ the access token when one is enabled.
   also replace each other, and the later start will not run.
 - **A "protection is not active" notification appears**: the watchdog
   scheduled task that restarts Kynoptic has been disabled or deleted.
-  Re-enable the `Kynoptic Watchdog` task in Windows Task Scheduler, or
-  reinstall Kynoptic.
+  Re-enable the `Kynoptic Watchdog <fingerprint>` task in Windows Task
+  Scheduler (the name ends with an 8-character fingerprint of the install
+  directory, e.g. `Kynoptic Watchdog 46516965`), or reinstall Kynoptic.
 
 ## Performance
 
