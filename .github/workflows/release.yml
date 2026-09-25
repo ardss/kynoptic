@@ -106,13 +106,15 @@ jobs:
         run: |
           $ver = $env:GITHUB_REF_NAME.TrimStart("v")
           $tmp = Join-Path $env:RUNNER_TEMP "kynoptic-vercheck"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          $log = Join-Path $tmp "setup.log"
           $p = Start-Process -FilePath "dist/Kynoptic-Setup-$ver.exe" `
-            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$tmp","/LOG=$tmp\setup.log" `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$tmp","/LOG=$log" `
             -Wait -PassThru
-          if ($p.ExitCode -ne 0) {
-            if (Test-Path "$tmp\setup.log") { Get-Content "$tmp\setup.log" -Tail 60 | ForEach-Object { Write-Host "SETUPLOG: $_" } }
-            throw "installer exit code $($p.ExitCode)"
-          }
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if (Test-Path $log) { Get-Content $log -Tail 40 | ForEach-Object { Write-Host "SETUPLOG: $_" } }
+          else { Write-Host "SETUPLOG: (no log file was created)" }
+          if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
           $vout = (& "$tmp/kynoptic.exe" --version) -join " "
           Write-Host "kynoptic.exe --version -> '$vout' (package version $ver)"
           if ($vout -notlike "*$ver*") { throw "version mismatch: package $ver, binary reports '$vout'" }
