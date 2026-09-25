@@ -116,6 +116,48 @@ fn reconcile_events_watermark(conn: &Connection) -> Option<String> {
     None
 }
 
+/// 长路径阈值（实测 2026-09-25：>260 字符的非 verbatim 路径 rusqlite 报
+/// "unable to open database file"，而 std 文件 API 同深度可写成功——SQLite
+/// 走非 verbatim 的 CreateFileW 受 MAX_PATH 限制）。低于 260 留余量触发，
+/// 避免对正常路径做无谓的 verbatim 改写（verbatim 前缀会禁用 `/` 与 `..`
+/// 的常规解析，短路径保持原样行为零变化）。
+const SQLITE_LONG_PATH_THRESHOLD: usize = 240;
+
+/// 把用户提供的库路径规范化为 SQLite 可打开的形式（收口点，[`Database::open`]
+/// 与 CLI 共用）：绝对路径且长度超阈值、又尚未带 verbatim 前缀时，加
+/// `\\?\`（UNC 路径加 `\\?\UNC\`）前缀绕过 MAX_PATH。相对路径与短路径原样返回。
+pub fn normalize_sqlite_path(path: &str) -> String {
+    if path.len() < SQLITE_LONG_PATH_THRESHOLD {
+        return path.to_string();
+    }
+    if path.starts_with(r"\\?\") {
+        return path.to_string();
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
+    let s = absolute.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        return s.into_owned();
+    }
+    if let Some(unc) = s.strip_prefix(r"\\") {
+        return format!(r"\\?\UNC\{unc}");
+    }
+    format!(r"\\?\{s}")
+}
+
+/// 超长路径的人话提示（打开失败时追加在错误信息里，帮用户定位根因，
+/// 而不是只看到 SQLite 的 "unable to open database file"）。阈值 240 字节
+/// 是提前量（留余量做 verbatim 改写），此时路径未必真超 260，文案只说
+/// "接近"不说 "超过"；长度按字符计（非 UTF-8 字节数），与 MAX_PATH 的
+/// 单位一致。
+pub fn long_path_hint(path: &str) -> Option<String> {
+    (path.len() >= SQLITE_LONG_PATH_THRESHOLD).then(|| {
+        format!(
+            "路径长度 {} 个字符，接近 Windows 260 字符路径上限，可能是打不开的原因之一；请把数据库放到更浅的目录，或用较短的 --db 路径",
+            path.chars().count()
+        )
+    })
+}
+
 /// 解析数据库文件路径，主应用（lib.rs）与 ctl 共用同一逻辑，避免两者路径不一致。
 ///
 /// 优先级：
@@ -180,6 +222,7 @@ pub fn resolve_db_path() -> PathBuf {
 /// 把结果转成人类可读的诊断文本（完整 / 损坏 / 打不开）。供打开失败时的
 /// 错误信息组装使用；本函数只读不写、不做任何复制或合并。
 pub fn diagnose_open_failure(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
     match Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
             Ok(msg) if msg == "ok" => "数据库可读且完整；可能为权限/磁盘/文件占用问题".to_string(),
@@ -188,7 +231,13 @@ pub fn diagnose_open_failure(path: &std::path::Path) -> String {
             ),
             Err(e) => format!("quick_check 执行失败: {e}"),
         },
-        Err(e) => format!("数据库无法打开(只读): {e}"),
+        Err(e) => {
+            // 只读也打不开时补长路径根因提示（帮助区分"路径过长"与权限问题）
+            match long_path_hint(&raw) {
+                Some(hint) => format!("数据库无法打开(只读): {e}；{hint}"),
+                None => format!("数据库无法打开(只读): {e}"),
+            }
+        }
     }
 }
 
@@ -338,6 +387,11 @@ impl Drop for BackfillDoneGuard<'_> {
 
 impl Database {
     pub fn open(path: &str) -> SqlResult<Self> {
+        // 长路径收口（审查发现 2026-09-25）：>260 字符路径 SQLite 打不开而
+        // std 文件 API 可以——统一在此规范化为 verbatim 形式，所有调用方
+        // （tray/dash/mcp/CLI 的 Database::open）一次修复。
+        let path_owned = normalize_sqlite_path(path);
+        let path: &str = &path_owned;
         if let Some(parent) = Path::new(path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -365,7 +419,16 @@ impl Database {
             crate::collector::archive_write_failure(msg);
         }
 
-        let writer = Connection::open(path)?;
+        let writer = match Connection::open(path) {
+            Ok(c) => c,
+            Err(e) => {
+                // 打不开时补人话根因提示（超长路径是实测的可打开性陷阱）
+                if let Some(hint) = long_path_hint(path) {
+                    log::error!("数据库打开失败: {e}；{hint}");
+                }
+                return Err(e);
+            }
+        };
         // 审查 P1：writer 也必须带 busy_timeout/WAL——后台回填线程持有独立写
         // 连接（BEGIN IMMEDIATE），热重载重启后新 writer 若 busy_timeout=0 会
         // 立即 SQLITE_BUSY 降级丢批。
@@ -858,6 +921,84 @@ pub(crate) fn lock_writer<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 短路径与已 verbatim 的路径必须原样返回（行为零变化）
+    #[test]
+    fn normalize_sqlite_path_passthrough() {
+        assert_eq!(
+            normalize_sqlite_path("data\\kynoptic.db"),
+            "data\\kynoptic.db"
+        );
+        let short = r"C:\tmp\kynoptic.db";
+        assert_eq!(normalize_sqlite_path(short), short);
+        let verbatim = format!(r"\\?\C:\{}", "x".repeat(300));
+        assert_eq!(normalize_sqlite_path(&verbatim), verbatim);
+    }
+
+    /// 超长绝对路径加 \\?\ 前缀；UNC 超长路径加 \\?\UNC\ 前缀
+    #[test]
+    fn normalize_sqlite_path_prefixes_long_paths() {
+        let long = format!(r"C:\{}", "a\\".repeat(130)); // > 240 字符
+        assert!(long.len() >= SQLITE_LONG_PATH_THRESHOLD);
+        let got = normalize_sqlite_path(&long);
+        assert!(got.starts_with(r"\\?\C:\"), "got {got:?}");
+        // 前缀只是加在最前，路径本体不变
+        assert_eq!(&got[4..], long);
+        let unc = format!(r"\\server\share\{}", "a\\".repeat(130));
+        let got_unc = normalize_sqlite_path(&unc);
+        assert!(
+            got_unc.starts_with(r"\\?\UNC\server\share\"),
+            "got {got_unc:?}"
+        );
+    }
+
+    /// 超长路径提示：只在超阈值时给出，且含人话根因
+    #[test]
+    fn long_path_hint_only_when_long() {
+        assert!(long_path_hint(r"C:\tmp\db.sqlite").is_none());
+        let long = format!(r"C:\{}", "a\\".repeat(130));
+        let hint = long_path_hint(&long).expect("超长路径必须给提示");
+        assert!(hint.contains("260"));
+        // 文案不说"超过"：240-259 区间只是接近上限，不断言不成立的根因
+        assert!(!hint.contains("超过"), "got: {hint}");
+        // 长度按字符计：含中文的路径字节数远大于字符数
+        let cjk = format!(r"C:\{}\db.sqlite", "目录\\".repeat(40));
+        let hint2 = long_path_hint(&cjk).expect("含中文长路径必须给提示");
+        let chars: usize = cjk.chars().count();
+        assert!(
+            hint2.contains(&chars.to_string()),
+            "须按字符数 {chars} 报告: {hint2}"
+        );
+    }
+
+    /// 真实打开验证（端到端）：用规范化后的 verbatim 路径 Database::open
+    /// 必须能在 >260 字符的目录里建库成功（修复前 rusqlite 报
+    /// unable to open database file；实测复现 2026-09-25）。
+    #[test]
+    fn open_long_path_db_end_to_end() {
+        let base = std::env::temp_dir();
+        let mut dir = base.clone();
+        // 逐级加深直到总路径 > 260 字符
+        let seg = "kyn-longpath-probe-level-xxxxxxxx";
+        let mut depth = 0;
+        while dir.to_string_lossy().len() <= 260 && depth < 20 {
+            dir = dir.join(seg);
+            depth += 1;
+        }
+        let db = dir.join("kynoptic.db");
+        assert!(
+            db.to_string_lossy().len() > 260,
+            "测试前置：路径须超 260 字符"
+        );
+        let opened = Database::open(&db.to_string_lossy());
+        match opened {
+            Ok(dbh) => {
+                dbh.mark_stopping();
+            }
+            Err(e) => panic!("超长路径建库失败（normalize 未生效？）: {e}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// 云同步路径检测：路径组件命中 OneDrive 即告警位命中；普通本地文件不命中
     /// （CLOUD_FILE_ATTRIBUTE=0x400000 在真机探针验证：普通 %TEMP% 文件不带该位）。

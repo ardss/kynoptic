@@ -7,18 +7,26 @@
 #error 请以 /DAppVersion=<版本> 显式传入版本号（如 scripts/bump-version.mjs 写入 Cargo.toml 的值）
 #endif
 
-; 测试隔离后缀（/DTestSuffix=sbox1）：带后缀编译出的安装包使用独立任务名与
-; Run 值名、独立输出文件名，可与真实安装并存做沙箱演练。仅测试构建使用，
-; 生产构建不带此参数，命名与历史版本完全一致。AppId 仍为全局唯一（见下），
-; 后缀不能隔离卸载记录，异目录演练卸载时仍会互删注册信息。
+; 测试隔离后缀（/DTestSuffix=sbox1）：带后缀编译出的安装包使用独立的
+; AppId（卸载注册完全隔离，异目录演练卸载不再互删生产注册信息）、独立
+; 任务名与 Run 值名（叠加安装目录指纹，见 [Code] InstallFingerprint）、
+; 独立 skill 目录与独立输出文件名，可与真实安装并存做沙箱演练。仅测试
+; 构建使用；生产构建不带此参数，命名与指纹规则和运行时（core::naming）
+; 完全一致；TestSuffix 构建运行时读 KYNOPTIC_MUTEX_SUFFIX（与 singleton
+; 同一开关）拼同形后缀名，沙箱闭环两侧一致（回归复审修复）。
 #ifdef TestSuffix
-#define WatchdogTaskName "Kynoptic Watchdog-" + TestSuffix
-#define RunValueName "Kynoptic-" + TestSuffix
 #define OutTag "-" + TestSuffix
 #else
-#define WatchdogTaskName "Kynoptic Watchdog"
-#define RunValueName "Kynoptic"
 #define OutTag ""
+#endif
+
+; 生产 AppId 永久不可改动：它是升级/卸载识别的惟一键，改动后旧版本无法被
+; 新安装包覆盖升级。TestSuffix 构建派生独立 AppId（Inno 的 AppId 接受任意
+; 字符串，非 GUID 也可；指向独立卸载注册，不触碰生产的添加/删除程序条目）。
+#ifdef TestSuffix
+#define MyAppId "Kynoptic-Test-" + TestSuffix + "-E761967B-0337-4F1A-B522-1C45B57AFF1D"
+#else
+#define MyAppId "{{E761967B-0337-4F1A-B522-1C45B57AFF1D}"
 #endif
 
 #define AppName "Kynoptic"
@@ -29,9 +37,10 @@
 ; 升级不记忆上次的任务勾选（审查 P1：旧版本默认未勾 autostart，记忆会让
 ; 修复后的默认勾选在升级场景永远不生效）。
 UsePreviousTasks=no
-; 永久不可改动：AppId 是升级/卸载识别的惟一键，改动后旧版本无法被新安装包
-; 覆盖升级，会装出第二份程序并留下无法卸载的旧记录。
-AppId={{E761967B-0337-4F1A-B522-1C45B57AFF1D}
+; 永久不可改动（生产构建）：AppId 是升级/卸载识别的惟一键，改动后旧版本
+; 无法被新安装包覆盖升级，会装出第二份程序并留下无法卸载的旧记录。
+; TestSuffix 构建使用派生 AppId（见文件头），与生产卸载注册完全隔离。
+AppId={#MyAppId}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -93,10 +102,18 @@ Name: "autostart"; Description: "{cm:AutoStartTask}"
 ; FinalizeAutostart），失败路径天然不残留；卸载时由代码对称删除。
 
 [Run]
-; AI 客户端 skill 同步（静默、总是执行；升级覆盖安装也会刷新 SKILL.md）
+; AI 客户端 skill 同步（静默、总是执行；升级覆盖安装也会刷新 SKILL.md）。
+; TestSuffix 构建经 cmd 注入 KYNOPTIC_MUTEX_SUFFIX：skill 写入
+; skills/kynoptic-<suffix>、托盘互斥体加同款后缀，与生产实例完全并行
+;（与 crates/cli skill 目录选择、core/singleton.rs 同一开关，两侧闭环）。
+#ifdef TestSuffix
+Filename: "{cmd}"; Parameters: "/C set KYNOPTIC_MUTEX_SUFFIX={#TestSuffix}&& ""{app}\kynoptic.exe"" skill install"; Flags: runhidden
+Filename: "{cmd}"; Parameters: "/C set KYNOPTIC_MUTEX_SUFFIX={#TestSuffix}&& ""{app}\{#AppExeName}"" --minimized"; Description: "Launch Kynoptic (background tray - right-click the tray icon to open the dashboard / 启动 Kynoptic 后台托盘，右键托盘图标打开面板)"; Flags: nowait postinstall skipifsilent
+#else
 Filename: "{app}\kynoptic.exe"; Parameters: "skill install"; Flags: runhidden
 ; 说明性 Description：让用户知道启动的是后台托盘进程而非窗口程序
 Filename: "{app}\{#AppExeName}"; Description: "Launch Kynoptic (background tray - right-click the tray icon to open the dashboard / 启动 Kynoptic 后台托盘，右键托盘图标打开面板)"; Flags: nowait postinstall skipifsilent
+#endif
 ; 看门狗计划任务不再由 [Run] 段创建：该段执行一次且退出码被吞，任何瞬时失败
 ; 都精确产生"安装 exit=0 + 任务保持旧状 + 无痕迹"。改由 [Code] 的
 ; RebuildWatchdogTask（先删后建+重试+回读校验+日志）在 ssDone（[Run] 之后）
@@ -145,6 +162,98 @@ begin
   while (Length(Result) > 0) and (Result[Length(Result)] = ';') do
     SetLength(Result, Length(Result) - 1);
 end;
+
+// ============================ 按安装目录指纹命名 ============================
+// Wave40 挂账（安装器全局命名空间隔离）：「Kynoptic Watchdog」任务名与
+// 「Kynoptic」Run 值名是全局的，任何一次 /DIR= 指向别处的安装（含沙箱试装）
+// 都会夺走已装实例的任务指向。改为按安装目录指纹派生专属名字，运行时侧
+// （crates/core/src/naming.rs）以同一算法独立实现，两侧必须逐字节一致。
+
+// Int64 → 8 位大写十六进制（Inno PascalScript 无 IntToHex，也不支持函数内
+// const 段，手写等价实现，与 Rust 侧 format!("{:08X}") 对齐）
+function FingerprintToHex(const H: Int64): String;
+var
+  V, I: Integer;
+begin
+  Result := '';
+  V := H;
+  for I := 1 to 8 do begin
+    Result := Copy('0123456789ABCDEF', (V mod 16) + 1, 1) + Result;
+    V := V div 16;
+  end;
+end;
+
+// 安装目录指纹：小写化、去结尾分隔符后，对 UTF-16 码元做 h=5381 起
+// h=(h*33+码元) mod 2^32 的 djb 变体，输出 8 位大写十六进制。用 UTF-16 码元
+// 是为了与 Rust 侧 encode_utf16() 对齐；乘法走 Int64 防溢出，勿改算法。
+function InstallFingerprint(): String;
+var
+  AppDir: String;
+  H: Int64;
+  I: Integer;
+begin
+  AppDir := Lowercase(ExpandConstant('{app}'));
+  while (Length(AppDir) > 0) and
+        ((AppDir[Length(AppDir)] = '\') or (AppDir[Length(AppDir)] = '/')) do
+    SetLength(AppDir, Length(AppDir) - 1);
+  H := 5381;
+  for I := 1 to Length(AppDir) do
+    H := (H * 33 + Ord(AppDir[I])) mod 4294967296;
+  Result := FingerprintToHex(H);
+end;
+
+// 本次安装的看门狗计划任务名：Kynoptic Watchdog [ -后缀] <指纹>
+function WatchdogTaskName(): String;
+begin
+  Result := 'Kynoptic Watchdog';
+#ifdef TestSuffix
+  Result := Result + '-{#TestSuffix}';
+#endif
+  Result := Result + ' ' + InstallFingerprint();
+end;
+
+// 本次安装的 Run 自启动值名：Kynoptic [ -后缀] -<指纹>
+function RunValueName(): String;
+begin
+  Result := 'Kynoptic';
+#ifdef TestSuffix
+  Result := Result + '-{#TestSuffix}';
+#endif
+  Result := Result + '-' + InstallFingerprint();
+end;
+
+// 旧版无指纹全局名（升级窗口 DISABLE 与升级清扫用；TestSuffix 构建绝不碰
+// 生产名字，只认自己旧后缀形态的无指纹名，与 CleanupLegacyAutostart 同规则）
+function LegacyWatchdogTaskName(): String;
+begin
+#ifndef TestSuffix
+  Result := 'Kynoptic Watchdog';
+#else
+  Result := 'Kynoptic Watchdog-{#TestSuffix}';
+#endif
+end;
+
+function LegacyRunValueName(): String;
+begin
+#ifndef TestSuffix
+  Result := 'Kynoptic';
+#else
+  Result := 'Kynoptic-{#TestSuffix}';
+#endif
+end;
+
+// skill 安装目录名（与 crates/cli skill_dir_name() 同规则：TestSuffix 经
+// [Run] 注入的 KYNOPTIC_MUTEX_SUFFIX 写 skills/kynoptic-<suffix>）
+function SkillDirName(): String;
+begin
+  Result := 'kynoptic';
+#ifdef TestSuffix
+  Result := Result + '-{#TestSuffix}';
+#endif
+end;
+
+// 旧版无指纹全局名的升级清扫在 RunHidden 定义之后（CleanupLegacyAutostart），
+// 避免前向引用。
 
 // 按分号切分 PATH 为条目数组（手写切分，兼容全部 Inno 6.x；跳过空条目）
 function SplitPathEntries(const PathVal: String): TArrayOfString;
@@ -247,6 +356,75 @@ begin
   Log('install dir removed from user PATH');
 end;
 
+// 清理指向已消失的用户 Temp 目录的孤儿 PATH 项（实机审查 high：演练装完
+// 直接删目录而不走卸载器会永久残留孤儿项，指向可写的 %TEMP% 构成命令解析
+// 投毒面）。只剔「位于用户 Temp 之下且目录已不存在」的项——不做全盘剔不
+// 存在项，避免误伤 U 盘/网络路径这类暂时不可达的用户自配条目。
+procedure RemoveOrphanTempPathEntries();
+var
+  TempDir, TempDirU, Cur, Entry, EntryU: String;
+  Parts, Keep: TArrayOfString;
+  I, N: Integer;
+begin
+  TempDir := GetEnv('TEMP');
+  if TempDir = '' then
+    Exit;
+  TempDir := Trim(TempDir);
+  while (Length(TempDir) > 0) and (TempDir[Length(TempDir)] = '\') do
+    SetLength(TempDir, Length(TempDir) - 1);
+  TempDirU := Uppercase(TempDir);
+  if not RegQueryStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur) then
+    Exit;
+  Parts := SplitPathEntries(Cur);
+  SetArrayLength(Keep, 0);
+  for I := 0 to GetArrayLength(Parts) - 1 do begin
+    Entry := Trim(Parts[I]);
+    EntryU := Uppercase(Entry);
+    if (Entry <> '') and (Pos(TempDirU, EntryU) = 1) and (not DirExists(Entry)) then
+      Log('removing orphan temp PATH entry: ' + Entry)
+    else begin
+      N := GetArrayLength(Keep);
+      SetArrayLength(Keep, N + 1);
+      Keep[N] := Parts[I];
+    end;
+  end;
+  if GetArrayLength(Keep) = GetArrayLength(Parts) then
+    Exit; // 无变化不回写
+  Cur := '';
+  for I := 0 to GetArrayLength(Keep) - 1 do begin
+    if I > 0 then
+      Cur := Cur + ';';
+    Cur := Cur + Keep[I];
+  end;
+  if Pos('%', Cur) > 0 then
+    RegWriteExpandStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur)
+  else
+    RegWriteStringValue(HKEY_CURRENT_USER, EnvKeyPath, 'Path', Cur);
+  BroadcastEnvChange();
+end;
+
+// skill 目录归属指纹（与 crates/cli 的 SKILL_SOURCE_MARKER 同约定）：
+// 0=指向本次安装目录（可删）；1=指向别处（另一份安装的，不动）；
+// 2=无指纹（旧版安装/历史残留，维持旧版行为删除）。
+function SkillMarkerState(const Dir: String): Integer;
+var
+  Lines: TArrayOfString;
+  S: String;
+begin
+  Result := 2;
+  // LoadStringFromFile 读的是 AnsiString（与 String 类型不匹配），改用
+  // LoadStringsFromFile 取内容行（sidecar 只有一行路径）
+  if not LoadStringsFromFile(Dir + '\.kynoptic-source', Lines) then
+    Exit;
+  if GetArrayLength(Lines) = 0 then
+    Exit;
+  S := Trim(Lines[GetArrayLength(Lines) - 1]);
+  if (S <> '') and (Uppercase(S) = Uppercase(ExpandConstant('{app}'))) then
+    Result := 0
+  else
+    Result := 1;
+end;
+
 // 静默执行外部命令（SW_HIDE 不弹窗），返回是否成功且退出码为 0
 function RunHidden(const Exe, Params: String): Boolean;
 var
@@ -257,13 +435,35 @@ begin
     Result := (CmdResult = 0);
 end;
 
-// 看门狗计划任务是否已存在（升级识别）
-function WatchdogTaskExists(): Boolean;
+// 旧版无指纹全局名的升级清扫（Wave40 挂账）：生产构建清「Kynoptic Watchdog」
+// 任务与「Kynoptic」Run 值；TestSuffix 构建绝不碰生产名字，只清自己旧后缀
+// 形态的无指纹名。调用点：ssDone（新名终态收敛完之后）与卸载收尾。
+procedure CleanupLegacyAutostart();
+begin
+  RunHidden('schtasks', '/Delete /F /TN "' + LegacyWatchdogTaskName() + '"');
+  RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, LegacyRunValueName());
+end;
+
+// 指定任务名的计划任务是否存在（升级识别）
+function TaskNameExists(const TaskName: String): Boolean;
 var
   CmdResult: Integer;
 begin
-  Result := Exec('schtasks', '/Query /TN "{#WatchdogTaskName}"', '',
+  Result := Exec('schtasks', '/Query /TN "' + TaskName + '"', '',
     SW_HIDE, ewWaitUntilTerminated, CmdResult) and (CmdResult = 0);
+end;
+
+// 本次安装的看门狗任务是否已存在（升级识别）
+function WatchdogTaskExists(): Boolean;
+begin
+  Result := TaskNameExists(WatchdogTaskName());
+end;
+
+// 旧版无指纹任务是否存在（legacy→新升级识别：新指纹任务在升级前尚不存在，
+// 只看新名会把 legacy 升级误判成全新安装）
+function LegacyWatchdogTaskExists(): Boolean;
+begin
+  Result := TaskNameExists(LegacyWatchdogTaskName());
 end;
 
 // 按安装目录精确杀 Kynoptic 进程（0.2.1 曾以同样理由移除 watchdog 的映像名
@@ -338,7 +538,7 @@ var
   S: String;
 begin
   TmpFile := ExpandConstant('{tmp}') + '\kyn-task-query.txt';
-  Exec('cmd.exe', '/C schtasks /Query /TN "{#WatchdogTaskName}" /FO LIST /V > "' + TmpFile + '" 2>&1',
+  Exec('cmd.exe', '/C schtasks /Query /TN "' + WatchdogTaskName() + '" /FO LIST /V > "' + TmpFile + '" 2>&1',
     '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
   if LoadStringsFromFile(TmpFile, Lines) then
     for I := 0 to GetArrayLength(Lines) - 1 do begin
@@ -359,9 +559,10 @@ var
 begin
   Result := False;
   // 旧任务可能指向旧 {app} 的死路径；不存在时 /Delete 失败，忽略
-  RunHidden('schtasks', '/Delete /F /TN "{#WatchdogTaskName}"');
+  RunHidden('schtasks', '/Delete /F /TN "' + WatchdogTaskName() + '"');
   for I := 1 to 3 do begin
-    if RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "{#WatchdogTaskName}" /TR "' + Chr(39) +
+    if RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "' + WatchdogTaskName() +
+      '" /TR "' + Chr(39) +
       ExpandConstant('{app}') + '\kynoptic-watchdog.exe' + Chr(39) + ' watchdog --once"') then begin
       Result := True;
       Break;
@@ -379,8 +580,8 @@ procedure RebuildTaskDisabled();
 begin
   if not RebuildWatchdogTask() then
     Log('RebuildTaskDisabled: task rebuild failed, stale task may remain');
-  RunHidden('schtasks', '/Change /TN "{#WatchdogTaskName}" /DISABLE');
-  RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, '{#RunValueName}');
+  RunHidden('schtasks', '/Change /TN "' + WatchdogTaskName() + '" /DISABLE');
+  RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, RunValueName());
   LogWatchdogTaskState();
 end;
 
@@ -458,11 +659,27 @@ begin
   Result := '';
   // 失败/取消补偿基线：记录 DISABLE 前用户自启动选择（补偿本身以机器
   // 实际状态为输入，见 DeinitializeSetup）
+  // G_SetupInitialized 在此置 True（而非 InitializeSetup）：安装真正开始
+  // 碰机器状态前，补偿逻辑才允许动 {app}——向导早期取消（初始化后、复制
+  // 前）不越过守卫，DeinitializeSetup 的补偿全部可达（此前 := True 缺失，
+  // 补偿是死代码，安装失败后看门狗任务停留 DISABLE）。
+  G_SetupInitialized := True;
   G_PostInstallDone := False;
-  G_AutostartWasDisabled := WatchdogTaskExists() and (not RegValueExists(
-    HKEY_CURRENT_USER, RunKeyPath, '{#RunValueName}'));
-  if not RunHidden('schtasks', '/Change /TN "{#WatchdogTaskName}" /DISABLE') then
+  // 失败/取消补偿基线：新旧两套名字都看（回归复审修复：legacy 升级时新指纹
+  // 任务尚不存在，只看新名会把「用户此前显式关闭自启动」误判成默认开启，
+  // 静默升级时会重新启用用户已关闭的自启动）
+  G_AutostartWasDisabled :=
+    (WatchdogTaskExists() and (not RegValueExists(
+      HKEY_CURRENT_USER, RunKeyPath, RunValueName()))) or
+    (LegacyWatchdogTaskExists() and (not RegValueExists(
+      HKEY_CURRENT_USER, RunKeyPath, LegacyRunValueName())));
+  // DISABLE 本名之外还要 DISABLE 旧名（回归复审修复）：legacy 升级的整个
+  // 文件复制阶段旧任务仍指向旧目录的托盘，不禁用会被 watchdog 每分钟拉起
+  // 撞"文件被占用"（审查 P1）；新指纹任务此时尚不存在，/Change 失败仅记日志
+  if not RunHidden('schtasks', '/Change /TN "' + WatchdogTaskName() + '" /DISABLE') then
     Log('Watchdog task DISABLE skipped/failed');
+  if not RunHidden('schtasks', '/Change /TN "' + LegacyWatchdogTaskName() + '" /DISABLE') then
+    Log('Legacy watchdog task DISABLE skipped/failed (not upgraded or already removed)');
   KillLockedApps();
 end;
 
@@ -476,7 +693,7 @@ begin
     //（原 [Registry] 段移到此成功路径，失败/回滚后天然不残留）
     if not RebuildWatchdogTask() then
       Log('FinalizeAutostart: watchdog task rebuild failed');
-    RegWriteStringValue(HKEY_CURRENT_USER, RunKeyPath, '{#RunValueName}',
+    RegWriteStringValue(HKEY_CURRENT_USER, RunKeyPath, RunValueName(),
       '"' + ExpandConstant('{app}') + '\{#AppExeName}" --minimized');
     LogWatchdogTaskState();
   end else begin
@@ -495,8 +712,12 @@ begin
     // 审查 P1-4：双写，避免升级场景半开半关——计划任务与 Run 值在这里统一
     // 收敛终态（此前散在 [Run] 段与 [Registry] 段，退出码被吞、失败不清理）
     FinalizeAutostart();
+    // 旧版无指纹全局名清扫（新名终态收敛完之后再清，防升级窗口空档）
+    CleanupLegacyAutostart();
     // 安装目录写入用户 PATH（README/官网 MCP 配置假设裸命令 kynoptic 可用）
     AddInstallDirToUserPath();
+    // 顺带清理指向已消失 Temp 目录的孤儿 PATH 项（见函数注释）
+    RemoveOrphanTempPathEntries();
   end;
 end;
 
@@ -516,7 +737,7 @@ begin
   if G_PostInstallDone then
     Exit;
   if WatchdogTaskExists() then begin
-    if RunHidden('schtasks', '/Change /TN "{#WatchdogTaskName}" /ENABLE') then
+    if RunHidden('schtasks', '/Change /TN "' + WatchdogTaskName() + '" /ENABLE') then
       Log('compensation: watchdog task re-enabled')
     else
       Log('compensation: watchdog task ENABLE failed');
@@ -595,22 +816,35 @@ begin
     DataDir := AppDir + '\data';
     // Run 自启动值已从 [Registry] 段移除，卸载时由这里对称删除
     //（原 uninsdeletevalue 的等价物）
-    RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, '{#RunValueName}');
+    RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, RunValueName());
+    // 看门狗计划任务对称删除（原 [UninstallRun] 段移到这里：任务名含运行期
+    // 指纹，须用 [Code] 函数现算，不能在 [UninstallRun] 静态展开）+ 旧版
+    // 无指纹全局名清扫（生产）/旧 TestSuffix 名清扫（沙箱）
+    RunHidden('schtasks', '/Delete /F /TN "' + WatchdogTaskName() + '"');
+    CleanupLegacyAutostart();
     // 安装时写入用户 PATH 的安装目录项，卸载时对称移除（整项全等才剔除，
-    // 不动用户自配条目）
+    // 不动用户自配条目）；顺带清理已消失 Temp 目录的孤儿项
     RemoveInstallDirFromUserPath();
-    // skill install 对称清理（卸载审查）：skill install 曾向三个 AI 客户端
-    // home 目录写入 skills/kynoptic/SKILL.md，卸载后残留死技能（指引指向
-    // 已不存在的 %LOCALAPPDATA%\Programs\Kynoptic）。整树删除。
+    RemoveOrphanTempPathEntries();
+    // skill install 对称清理（卸载审查 + 归属比对）：skill install 向三个
+    // AI 客户端 home 目录写入 skills/<SkillDirName>/SKILL.md。卸载只删
+    // 「指纹指向本次安装目录」或「无指纹的旧版残留」；指纹指向别处（另一
+    // 份安装的技能）保持不动，异目录安装/卸载不再互删技能。
     for I := 0 to 2 do begin
       if I = 0 then
-        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.zcode\skills\kynoptic'
+        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.zcode\skills\' + SkillDirName()
       else if I = 1 then
-        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.claude\skills\kynoptic'
+        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.claude\skills\' + SkillDirName()
       else
-        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.cursor\skills\kynoptic';
-      if DirExists(HomeSkillDir) then
-        DelTree(HomeSkillDir, True, True, True);
+        HomeSkillDir := ExpandConstant('{%USERPROFILE}') + '\.cursor\skills\' + SkillDirName();
+      if DirExists(HomeSkillDir) then begin
+        case SkillMarkerState(HomeSkillDir) of
+          0: DelTree(HomeSkillDir, True, True, True);
+          1: Log('skill dir belongs to another install, kept: ' + HomeSkillDir);
+        else
+          DelTree(HomeSkillDir, True, True, True);
+        end;
+      end;
     end;
     if DeleteDataOnUninstall then begin
       DelTree(DataDir, True, True, True);
@@ -623,8 +857,8 @@ begin
   end;
 end;
 
-[UninstallRun]
-Filename: "schtasks"; Parameters: "/Delete /F /TN ""{#WatchdogTaskName}"""; Flags: runhidden; RunOnceId: "DelWatchdog"
+// 原卸载收尾的看门狗任务删除已移入 usPostUninstall 的 [Code]（任务名含
+// 运行期安装目录指纹，须现算，不能在此静态展开）。
 
 [CustomMessages]
 english.AutoStartTask =Start Kynoptic automatically at login (includes the crash-watchdog task; unchecking disables both)

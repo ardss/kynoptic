@@ -12,6 +12,7 @@ pub mod insights;
 pub mod json_util;
 pub mod keyboard_layout;
 pub mod monitors;
+pub mod naming;
 pub mod probe;
 pub mod queries;
 pub mod raw_input_devices;

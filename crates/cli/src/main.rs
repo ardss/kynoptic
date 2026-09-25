@@ -125,9 +125,13 @@ fn resolve_db() -> PathBuf {
 }
 
 fn open_db(path: &Path) -> Result<Connection> {
+    // 跨域最小配合（core 修复 2026-09-25）：--db 超长路径（>260 字符）先过
+    // core 收口的 verbatim 规范化，否则 rusqlite 报 unable to open database
+    // file（实测复现；Database::open 同一收口已覆盖其余调用方）。
+    let normalized = kynoptic_core::db::normalize_sqlite_path(&path.to_string_lossy());
     // 复用 core 的初始化逻辑（SCHEMA + 迁移 + 全套 PRAGMA），
     // 替代原只设 2 个 PRAGMA 的实现——避免 ctl 操作比应用旧的库时缺列。
-    let conn = Connection::open(path)?;
+    let conn = Connection::open(normalized.as_str())?;
     kynoptic_core::db::apply_pragmas(&conn)?;
     conn.execute_batch(kynoptic_core::db::SCHEMA)?;
     // Wave22 P1：不再吞迁移错误——带病运行会让 stats 静默报旧 schema 的数
@@ -347,7 +351,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
     match format.as_str() {
         "csv" => {
             use std::io::Write;
-            let f = std::fs::File::create(&out_path)?;
+            let f = open_export_file(&out_path)?;
             let mut buf = std::io::BufWriter::new(f);
             // P2：写 UTF-8 BOM（EF BB BF），Excel 双击打开才不会把 UTF-8 中文
             // 当 ANSI 读出乱码。仅 CSV——jsonl/json 是程序间交换格式,加 BOM
@@ -384,7 +388,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
         }
         "json" => {
             use std::io::Write;
-            let mut f = std::fs::File::create(&out_path)?;
+            let mut f = open_export_file(&out_path)?;
             let rc = row_count.clone();
             let mut first = true;
             writeln!(f, "[")?;
@@ -415,7 +419,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
         }
         "jsonl" => {
             use std::io::Write;
-            let mut f = std::fs::File::create(&out_path)?;
+            let mut f = open_export_file(&out_path)?;
             let rc = row_count.clone();
             skipped += queries::export_events_since_stream(&conn, &cutoff, |r| {
                 rc.fetch_add(1, AOrdering::Relaxed);
@@ -705,13 +709,24 @@ fn cmd_db(args: &[String]) -> Result<()> {
         }
         "vacuum" => {
             println!("正在整理数据库空间（VACUUM）...");
-            conn.execute_batch("VACUUM")?;
+            conn.execute_batch("VACUUM")
+                .map_err(|e| writable_db_error(&db_path, e))?;
             println!("✓ 完成");
         }
         "checkpoint" => {
             println!("正在合并 WAL 日志（checkpoint）...");
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            println!("✓ 完成");
+            // 与 core 侧 wal_checkpoint_truncate（db/mod.rs）同口径：读出返回
+            // 行的 busy 列。有活跃 reader 时 WAL 实际未截断，须如实上报，
+            // 不能无条件「✓ 完成」。
+            match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
+                r.get::<_, i64>(0)
+            }) {
+                Ok(0) => println!("✓ 完成"),
+                Ok(busy) => println!(
+                    "⚠ WAL 未截断（busy={busy}，存在活跃 reader）；关闭正在读取数据库的程序后重试"
+                ),
+                Err(e) => return Err(writable_db_error(&db_path, e)),
+            }
         }
         "recompute-agg" => {
             // 脱敏出口：raw 错误只进日志（审查整改），错误仍以非零退出码上报
@@ -1398,6 +1413,35 @@ fn is_reparse_point(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// skill 目录名：多实例/沙箱旁路（KYNOPTIC_MUTEX_SUFFIX，与 core/singleton.rs
+/// 同一开关与校验）激活时写 `kynoptic-<suffix>`，与安装器 TestSuffix 构建
+/// 闭环；生产为 `kynoptic`。旁路未设或值非法时一律生产名。
+fn skill_dir_name() -> String {
+    match std::env::var("KYNOPTIC_MUTEX_SUFFIX") {
+        Ok(s)
+            if !s.is_empty()
+                && s.chars().count() <= 64
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+        {
+            format!("kynoptic-{s}")
+        }
+        _ => "kynoptic".to_string(),
+    }
+}
+
+/// 来源指纹 sidecar 文件名：写入安装目录路径，卸载/覆盖前比对归属，防止
+/// 异目录安装互删对方的 skill（与 kynoptic.iss 卸载侧同一约定）。
+pub const SKILL_SOURCE_MARKER: &str = ".kynoptic-source";
+
+/// 本安装目录字符串（来源指纹内容；取不到 exe 路径时为空串，卸载侧对空串
+/// 按不归属处理）。
+fn skill_source_marker_content() -> String {
+    kynoptic_core::naming::install_dir()
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 /// 把内嵌 SKILL.md 写入 base 下的各客户端 skill 目录。返回写入路径列表。
 /// 抽出 base 以便单测注入临时目录。
 ///
@@ -1415,11 +1459,12 @@ fn skill_install_to(base: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// 直接用 SKILL_MD）。
 fn skill_install_content(base: &Path, md: &str) -> Result<Vec<std::path::PathBuf>> {
     let mut written = Vec::new();
+    let source = skill_source_marker_content();
     for dir in SKILL_CLIENT_DIRS {
         let parent = base.join(dir).join("skills");
         std::fs::create_dir_all(&parent)
             .map_err(|e| Error::InvalidData(format!("创建 {} 失败: {e}", parent.display())))?;
-        let target = parent.join("kynoptic");
+        let target = parent.join(skill_dir_name());
         if is_reparse_point(&target) {
             return Err(Error::InvalidData(format!(
                 "{} 是符号链接/junction，拒绝写入（防目录穿越；如非你本人设置请排查）",
@@ -1434,6 +1479,12 @@ fn skill_install_content(base: &Path, md: &str) -> Result<Vec<std::path::PathBuf
             .map_err(|e| Error::InvalidData(format!("写入 {} 失败: {e}", tmp.display())))?;
         std::fs::rename(&tmp, &file)
             .map_err(|e| Error::InvalidData(format!("落盘 {} 失败: {e}", file.display())))?;
+        // 来源指纹 sidecar（同款 tmp+rename）；写失败不阻断 SKILL.md 同步，
+        // 只留日志——缺指纹时卸载侧退化为旧行为（无法比对归属）。
+        let marker = target.join(SKILL_SOURCE_MARKER);
+        if std::fs::write(&marker, &source).is_err() {
+            log::warn!("skill 来源指纹写入失败（{}）", marker.display());
+        }
         written.push(file);
     }
     Ok(written)
@@ -3047,6 +3098,51 @@ fn main() -> ExitCode {
     }
 }
 
+/// 导出文件创建失败增强（审查条目）：File::create 直接 `?` 透传 os error
+/// 不带目标路径，CFA/ACL 拒写场景下用户无从知道被拒的是哪个导出路径。
+fn open_export_file(out_path: &Path) -> Result<std::fs::File> {
+    std::fs::File::create(out_path).map_err(|e| {
+        let mut msg = format!("无法创建导出文件 {}: {e}", out_path.display());
+        if e.raw_os_error() == Some(5) {
+            msg.push_str(
+                "\n  → 该目录可能受「受控文件夹访问」或 ACL 保护，请更换导出目录或为本程序放行",
+            );
+        }
+        Error::InvalidData(msg)
+    })
+}
+
+/// db 写维护命令（vacuum/checkpoint）错误增强：SQLite 只读/拒写时直出英文
+/// 原文（如 attempt to write a readonly database）且不含 db 路径。附上路径，
+/// 对只读/os error 5 追加可行动建议。
+fn writable_db_error(db_path: &Path, e: rusqlite::Error) -> Error {
+    let raw = e.to_string();
+    let readonly = raw.contains("readonly") || raw.contains("os error 5");
+    let mut msg = format!("数据库操作失败 ({}): {raw}", db_path.display());
+    if readonly {
+        msg.push_str("\n  → 数据库或其所在目录只读/被保护，请检查只读属性、ACL 或受控文件夹访问");
+    }
+    Error::InvalidData(msg)
+}
+
+/// 探测目录是否可写（建临时文件即删，尽力而为）。用于区分「文件可读但
+/// 目录拒写」的开库失败场景。
+fn parent_dir_writable(dir: Option<&Path>) -> bool {
+    let Some(dir) = dir else { return true };
+    let probe = dir.join(".kynoptic_write_probe_tmp");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// 打开失败文案增强：SQLite 原样文案「unable to open database file」无行动
 /// 指引。命中该文案时先做一次独立的写方式打开探测，判别 Windows 共享冲突
 /// (os error 32，文件被备份/杀毒/同步工具以不共享方式独占) 并给出可行动建议；
@@ -3070,6 +3166,13 @@ fn enrich_open_failure(e: &Error) -> String {
         );
     }
     let diag = kynoptic_core::db::diagnose_open_failure(&db_path);
+    // 「可读且完整」分支可能误导：文件可读但父目录拒写（ACL/CFA）才是根因，
+    // 用父目录写探测判别后替换文案。
+    if diag.starts_with("数据库可读且完整") && !parent_dir_writable(db_path.parent()) {
+        return format!(
+            "{raw}\n  → 数据库所在目录拒绝写入（可能受 ACL 或「受控文件夹访问」保护），请更换目录或为本程序放行"
+        );
+    }
     format!("{raw}\n  → {diag}")
 }
 
