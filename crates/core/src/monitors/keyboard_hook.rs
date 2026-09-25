@@ -70,7 +70,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
             return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
         }
 
-        // raw 粒度（默认）：原行为——克隆 Sender 后立即释放锁，避免在回调中长时间持锁。
+        // raw 粒度（input_counts_only=false 时的回退分支）：原行为——克隆 Sender 后立即释放锁，避免在回调中长时间持锁。
         let tx = KB_TX.lock().ok().and_then(|g| g.clone());
         if let Some(tx) = tx {
             let kb = &*(lparam as *const KBDLLHOOKSTRUCT);

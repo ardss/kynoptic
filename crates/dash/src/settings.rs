@@ -345,6 +345,13 @@ fn autostart_registry_enabled() -> bool {
     use winreg::RegKey;
     const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const VALUE_NAME: &str = "Kynoptic";
+    // 多实例/沙箱旁路（与 core/singleton.rs 的 KYNOPTIC_MUTEX_SUFFIX 同一
+    // 开关）：副本实例的 settings.json 缺失时绝不继承宿主的注册表自启动
+    // 状态——否则副本保存任意设置都会把宿主的 Run 键覆写为副本 exe 路径
+    //（自启动劫持，平台审查 medium）。
+    if std::env::var_os("KYNOPTIC_MUTEX_SUFFIX").is_some() {
+        return false;
+    }
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(RUN_KEY_PATH)
         .and_then(|k| k.get_value::<String, _>(VALUE_NAME))

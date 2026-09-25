@@ -50,6 +50,12 @@ static DASH_FAILED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 /// 任何静态量接入 UI，图标保持绿色"采集中"，数据静默归零。
 pub static COLLECTOR_FAILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// 采集停滞旗标（审查 high：托盘是唯一说谎的观察面）：心跳线程算出
+/// stalled 后置位——此前 stalled 只喂给看门狗心跳 JSON，托盘图标/tooltip
+/// 永远绿色"采集中"，与面板"停滞"及看门狗强杀互相矛盾。置位后 WM_TIMER
+/// 分支把图标切黄三角、tooltip 换"采集停滞"。
+pub static COLLECTOR_STALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 采集停滞阈值（审查 P1）：采集器在跑且"醒着的时间"内 flush 停滞超过该秒数,
 /// 心跳打 stalled:true。30s 写一轮心跳、正常批次间隔远小于此。
@@ -387,6 +393,9 @@ fn main() {
         // 心跳写失败留档路径（数据目录旁,与采集器错误日志同一文件）;
         // 数据目录也无写权限时留档本身失败,尽力而为。
         let hb_err_log = parsed.db.parent().map(|p| p.join("collector-error.log"));
+        // 停滞告警落库用（审查 high：看门狗 kill 前保证至少一条用户可见提示，
+        // 复用 watchdog_alert 的 notification 落库通道）
+        let hb_db = parsed.db.clone();
         let hb_handle = thread::Builder::new()
             .name("Heartbeat".into())
             .spawn(move || {
@@ -418,6 +427,16 @@ fn main() {
                         && awake.saturating_sub(
                             LAST_FLUSH_AWAKE_SECS.load(std::sync::atomic::Ordering::Relaxed),
                         ) > HEARTBEAT_STALLED_SECS as u64;
+                    // stalled 接线托盘 UI（审查 high）：置位/复位同步静态量，
+                    // WM_TIMER 分支据此切换"采集停滞"提示。上升沿再落一条
+                    // notification 事件——看门狗按 stalled 强杀前用户至少有
+                    // 一次面板可见提示（复用 watchdog_alert 通道）。
+                    let prev_stalled =
+                        COLLECTOR_STALLED.swap(stalled, std::sync::atomic::Ordering::Relaxed);
+                    if stalled && !prev_stalled {
+                        log::error!("采集停滞：writer 已 {}s 未落库，看门狗将介入", HEARTBEAT_STALLED_SECS);
+                        insert_stalled_notice(&hb_db, HEARTBEAT_STALLED_SECS);
+                    }
                     // unwritable/wfail 反映的是"上一拍"的写结果:本拍若也失败,
                     // 旗标留在内存、文件保持旧内容,恢复后随成功写入落盘。
                     let content = format!(
@@ -579,12 +598,14 @@ fn main() {
                             alert_watchdog_task_problem(
                                 &db_for_upd,
                                 "计划任务 \"Kynoptic Watchdog\" 处于禁用状态",
+                                "the scheduled task \"Kynoptic Watchdog\" is disabled",
                             );
                         }
                         WatchdogTaskHealth::Unavailable => {
                             alert_watchdog_task_problem(
                                 &db_for_upd,
                                 "无法查询计划任务 \"Kynoptic Watchdog\"（任务可能被删除，或计划任务服务被停用）",
+                                "the scheduled task \"Kynoptic Watchdog\" could not be queried (the task may have been deleted, or the Task Scheduler service is disabled)",
                             );
                         }
                     }
@@ -706,6 +727,11 @@ fn main() {
                             Ok(c) => {
                                 log::info!("采集器已启动({} 个监控器)", enabled.len());
                                 collector = Some(c);
+                                // 采集真正在跑：清除暂停旗标（paused.flag 与
+                                // paused 内存态同生命周期，恢复即清）
+                                if let Some(dir) = owner_db.parent() {
+                                    let _ = std::fs::remove_file(dir.join("paused.flag"));
+                                }
                                 // 审查 P1：成功启动 = 心跳 stalled 判定的前提成立
                                 COLLECTOR_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
                                 // 成功清零故障旗标（托盘 UI 从 Error 回 Running）
@@ -769,6 +795,11 @@ fn main() {
                         let _ = collector.take();
                         // 审查 P1：Pause 后无采集器,心跳回到纯时间戳语义
                         COLLECTOR_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                        // 暂停旗标落盘（面板 api_status/状态行据此把"用户主动
+                        // 暂停"与"采集停滞/未运行"区分开,与 degraded.flag 同模式）
+                        if let Some(dir) = owner_db.parent() {
+                            let _ = std::fs::write(dir.join("paused.flag"), "paused\n");
+                        }
                     }
                     CollectorCmd::Quit => {
                         if let Some(c) = collector.as_mut() {
@@ -976,7 +1007,10 @@ fn apply_autostart(enable: bool) {
     const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const VALUE_NAME: &str = "Kynoptic";
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY_PATH, winreg::enums::KEY_SET_VALUE) else {
+    let Ok(key) = hkcu.open_subkey_with_flags(
+        RUN_KEY_PATH,
+        winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE,
+    ) else {
         eprintln!("autostart: 打开 Run 键失败");
         return;
     };
@@ -984,6 +1018,21 @@ fn apply_autostart(enable: bool) {
         match std::env::current_exe() {
             Ok(exe) => {
                 let path = format!("\"{}\" --minimized", exe.display());
+                // 防自启动劫持（审查 medium）：多实例旁路（KYNOPTIC_MUTEX_
+                // SUFFIX，与 core/singleton.rs 同一开关）激活时，已有 Run 值
+                // 若指向别的 exe（宿主安装），绝不覆写——否则沙箱/副本实例
+                // 会把宿主的开机自启动劫持到自己的路径。共享的看门狗计划
+                // 任务同样不动（提前返回，跳过末尾 schtasks 块）。
+                if std::env::var_os("KYNOPTIC_MUTEX_SUFFIX").is_some() {
+                    if let Ok(cur) = key.get_value::<String, _>(VALUE_NAME) {
+                        if !cur.is_empty() && cur != path {
+                            log::warn!(
+                                "多实例旁路激活：检测到既有自启动项指向其他程序，保留不动（{cur}）"
+                            );
+                            return;
+                        }
+                    }
+                }
                 if let Err(e) = key.set_value(VALUE_NAME, &path) {
                     eprintln!("autostart: 写入失败 {e}");
                 }
@@ -991,6 +1040,19 @@ fn apply_autostart(enable: bool) {
             Err(e) => eprintln!("autostart: 取 exe 路径失败 {e}"),
         }
     } else {
+        // 旁路激活时同样不删宿主的自启动项（副本退出不该撤销宿主的开机自启）
+        if std::env::var_os("KYNOPTIC_MUTEX_SUFFIX").is_some() {
+            if let Ok(cur) = key.get_value::<String, _>(VALUE_NAME) {
+                let mine = std::env::current_exe()
+                    .ok()
+                    .map(|e| format!("\"{}\" --minimized", e.display()))
+                    .unwrap_or_default();
+                if !cur.is_empty() && cur != mine {
+                    log::warn!("多实例旁路激活：保留既有自启动项不删除（{cur}）");
+                    return;
+                }
+            }
+        }
         let _ = key.delete_value(VALUE_NAME);
     }
     // Wave20 P0：autostart 双写源统一——看门狗计划任务随开关一起
@@ -1025,10 +1087,16 @@ fn apply_autostart(enable: bool) {
 }
 
 /// 被拒实例的用户可见反馈（平台审查：GUI 子系统下仅 log::warn + eprintln
-/// 等于"点了没反应"）。双通道：
+/// 等于"点了没反应"）。
+///
+/// Wave39 挂账修复——此前同步弹模态框，被拒实例在 tasklist 里挂到用户点掉
+/// 为止（空壳无采集器但干扰判断）。改为非阻塞限时方案：
 /// 1) exe 同目录追加 duplicate-start.log 留痕（无 UI 也能事后排查）;
-/// 2) 弹一次消息框（同步阻塞到用户点掉，反正本实例马上要退出；
-///    既有实例不一定在听命名事件，消息框是最朴素的可靠通道）。
+/// 2) 独立线程弹一次消息框，另一线程 3.5s 后按标题找到该对话框并关闭；
+/// 3) 本函数最多 4s 后以 exit(1) 强制收尾——调用点无论如何，被拒实例
+///    都会在 5s 内从进程表消失，同时用户看到过一次可见反馈。
+///
+/// GUI/无 console 场景均覆盖（MessageBoxW 不依赖 console）。
 fn rejected_start_feedback(reason: &str) {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -1055,14 +1123,35 @@ fn rejected_start_feedback(reason: &str) {
     .encode_utf16()
     .collect();
     let title: Vec<u16> = "Kynoptic\0".encode_utf16().collect();
-    unsafe {
+    // 弹框线程（分离态：进程退出时随之消亡，不阻塞）
+    std::thread::spawn(move || unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
             std::ptr::null_mut(),
             text.as_ptr(),
             title.as_ptr(),
             0x0000_0040, // MB_ICONINFORMATION
         );
-    }
+    });
+    // 限时关闭线程：3.5s 后按标题找对话框（#32770 是系统对话框类）投递
+    // WM_CLOSE。找不到（弹框尚慢/已被用户点掉）则放弃，由下面的兜底退出收尾。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let title: Vec<u16> = "Kynoptic\0".encode_utf16().collect();
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+            let dlg = FindWindowW(
+                "#32770\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                title.as_ptr(),
+            );
+            if !dlg.is_null() {
+                PostMessageW(dlg, 0x0010, 0, 0); // WM_CLOSE
+            }
+        }
+    });
+    // 兜底：无论弹框是否已被关闭，4s 后本进程必须消失（验收：被拒实例
+    // 5s 内从进程表退出）。exit(1) 与既有"拒绝启动"退出码一致。
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    std::process::exit(1);
 }
 
 /// 看门狗计划任务健康自检结果（平台审查：计划任务被禁用/删除后三组件
@@ -1121,7 +1210,8 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
 
 /// 组策略限制提示（尽力而为）：读任务计划程序策略键（平台审查指认的
 /// 禁用位所在），键存在且有值时拼进告警文案供用户排查。只读，不判定。
-fn task_scheduler_policy_hint() -> String {
+/// 返回 (中文, 英文) 双语版本，两串同义，供告警落库的 message/message_en。
+fn task_scheduler_policy_hint() -> (String, String) {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     const POLICY_KEY: &str = r"SOFTWARE\Policies\Microsoft\Windows\TaskScheduler5.0";
@@ -1130,12 +1220,15 @@ fn task_scheduler_policy_hint() -> String {
         Ok(k) => {
             let n = k.enum_values().filter(|v| v.is_ok()).count();
             if n > 0 {
-                format!("（检测到计划任务组策略键 {POLICY_KEY}，含 {n} 个值，可能是禁用来源）")
+                (
+                    format!("（检测到计划任务组策略键 {POLICY_KEY}，含 {n} 个值，可能是禁用来源）"),
+                    format!("(Task Scheduler group policy key {POLICY_KEY} present with {n} values; possible source of the disable)"),
+                )
             } else {
-                String::new()
+                (String::new(), String::new())
             }
         }
-        Err(_) => String::new(),
+        Err(_) => (String::new(), String::new()),
     }
 }
 
@@ -1158,19 +1251,52 @@ fn serde_json_string(s: &str) -> String {
     out
 }
 
+/// 采集停滞用户可见提示：落库 notification 系统事件（复用 watchdog_alert
+/// 的通道契约，面板横幅/通知列表据此展示）。全程尽力而为：库打不开只留
+/// 日志，不影响心跳线程。
+fn insert_stalled_notice(db_path: &std::path::Path, stalled_secs: i64) {
+    let message = format!(
+        "采集已停滞（超过 {stalled_secs} 秒没有数据落库），程序将自动尝试恢复；期间的数据可能出现空洞"
+    );
+    // message_en 与 message 同义（英文版）：面板横幅按界面语言选用，
+    // 英文 UI 不再直出中文告警正文
+    let message_en = format!(
+        "Collection has stalled (no data written to the database for over {stalled_secs} seconds); the program will try to recover automatically — data from this window may have gaps"
+    );
+    log::error!("{message}");
+    let payload = format!(
+        "{{\"source\":\"tray\",\"kind\":\"collector_stalled\",\"message\":{},\"message_en\":{}}}",
+        serde_json_string(&message),
+        serde_json_string(&message_en)
+    );
+    match rusqlite::Connection::open(db_path) {
+        Ok(conn) => {
+            if let Err(e) = conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                 VALUES (?1, 'system', 'notification', ?2)",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), payload],
+            ) {
+                log::warn!("采集停滞告警落库失败: {e}");
+            }
+        }
+        Err(e) => log::warn!("采集停滞告警落库失败(库打不开): {e}"),
+    }
+}
+
 /// 看门狗计划任务异常告警：落库 notification 系统事件（复用 watchdog_alert
 /// 的表结构契约：events(timestamp,'system','notification',JSON 文本)）+
 /// 弹一次系统消息框。全程尽力而为：库打不开只留日志，不影响托盘。
-fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str) {
-    let message = format!(
-        "看门狗计划任务异常：{problem}{}",
-        task_scheduler_policy_hint()
-    );
+fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem_en: &str) {
+    let (hint, hint_en) = task_scheduler_policy_hint();
+    let message = format!("看门狗计划任务异常：{problem}{hint}");
+    // message_en 与 message 同义（英文版）：面板横幅按界面语言选用
+    let message_en = format!("Watchdog scheduled task problem: {problem_en}{hint_en}");
     log::warn!("{message}");
     // rusqlite 未开 serde_json 特性口径下 watchdog 侧也是手拼 JSON 文本落库
     let payload = format!(
-        "{{\"source\":\"tray\",\"kind\":\"watchdog_task\",\"message\":{}}}",
-        serde_json_string(&message)
+        "{{\"source\":\"tray\",\"kind\":\"watchdog_task\",\"message\":{},\"message_en\":{}}}",
+        serde_json_string(&message),
+        serde_json_string(&message_en)
     );
     match rusqlite::Connection::open(db_path) {
         Ok(conn) => {
