@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Dashboard: watchdog alerts now have a "cleared" counterpart. The
+  collection watchdog and the tray stall detector each record a
+  `collection_recovered` notification event when collection resumes.
+  On the CLI side the recovery gate is a persisted pending-alert marker
+  (stall-family alerts only), so it survives the per-minute fresh
+  `watchdog --once` process and fires on the first healthy heartbeat
+  after an alert — including the watchdog-killed-tray restart path;
+  user-initiated exit and update-in-progress alerts do not set it. The
+  tray side fires on the stall falling edge, only when the collector is
+  actually running and writing again. And
+  `/api/status` now pairs the newest event within 24h: if it is a
+  recovery event the banner flips to a neutral "alert cleared (time)"
+  message instead of showing "collection is hung…" for up to 24 hours
+  while the tray icon and heartbeat JSON already reported healthy.
+  `/api/status` also exposes the event's `at` timestamp for the cleared
+  time display.
+- Dashboard: the keyboard heatmap now closes its key-set accounting.
+  VK 13 is shared by the main Enter and the numpad ⏎; the count is now
+  rendered on one key only and the other is annotated "counted with
+  Enter", removing the DOM double-count. Virtual keys present in
+  `key_freq` but outside the ANSI-104 layout (e.g. some media keys) are
+  no longer silently invisible — a note below the map reports how many
+  presses and distinct keys fall outside the layout.
+- Dashboard: the daily heatmap (12/26/52-week views) now renders month
+  abbreviation labels above the first column of each month (GitHub-style),
+  alongside the existing weekday labels.
+
 ### Changed
 
 - Dashboard: unified query-parameter semantics across all GET API

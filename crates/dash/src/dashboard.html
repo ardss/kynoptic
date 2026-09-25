@@ -872,7 +872,9 @@ async function loadStatus() {
     }
   }
   // 看门狗告警横幅（修复：cli watchdog_alert 落库的 notification 系统事件
-  // 此前全仓无消费方，采集空洞在 UI 零痕迹）。后端只回近 24h 内最新一条。
+  // 此前全仓无消费方，采集空洞在 UI 零痕迹）。后端只回近 24h 内最新一条；
+  // 最新一条是恢复事件（kind=collection_recovered，cli 心跳恢复路径 /
+  // tray 停滞下降沿落库）时横幅翻转为「已解除」，不再滞留 24 小时。
   const wb = document.getElementById("watchdog-banner");
   if (wb) {
     const wa = s.watchdog_alert;
@@ -881,7 +883,22 @@ async function loadStatus() {
       // 按界面语言选同义文案：落库的 message 是中文原文，英文界面用
       // message_en（写入方同时落两语）；旧数据无 message_en 时回退原文
       const wamsg = zh ? wa.message : (wa.message_en || wa.message);
-      wb.textContent = t("watchdogAlert").replace("{m}", wamsg);
+      if (wa.recovered) {
+        // 已解除：横幅换成中性配色 + 解除时刻（at 为带时区偏移的 RFC3339，
+        // Date 按正确时点解析），与状态行时间戳同口径
+        const d = wa.at ? new Date(wa.at) : null;
+        const at = d && !isNaN(d.getTime()) ? d.toLocaleTimeString() : "";
+        wb.style.borderColor = "var(--border)";
+        wb.style.background = "#243040";
+        wb.style.color = "";
+        wb.textContent = zh
+          ? "系统告警已解除" + (at ? "（" + at + "）：" : "：") + wamsg
+          : "system alert cleared" + (at ? " (" + at + "): " : ": ") + wamsg;
+      } else {
+        wb.style.borderColor = "";
+        wb.style.background = "";
+        wb.textContent = t("watchdogAlert").replace("{m}", wamsg);
+      }
     } else {
       wb.style.display = "none";
     }
@@ -1173,8 +1190,10 @@ async function loadHeatmap() {
   }
   const max = Math.max(1, ...days.map(d => d.value));
   const cell = 14, gap = 3;
+  // 顶部留白给月份缩写标签（GitHub 热力图样式），格子整体下移
+  const top = 14;
   const cols = Math.ceil(days.length / 7);
-  const W = 40 + cols * (cell + gap) + 8, H = 7 * (cell + gap) + 16;
+  const W = 40 + cols * (cell + gap) + 8, H = top + 7 * (cell + gap) + 8;
   const HM_LEVELS = hmLevels(); // 每次渲染现读 CSS 变量（主题切换后同步）
   // 零档 = "无输入"，改用 --hm-idle（与图例色块同步）：旧 --hm-0 与 --hm-1
   // 对比度仅 1.14:1，仅 1 天有数据时整张图肉眼完全均一，"零"与"少"分不清
@@ -1194,11 +1213,22 @@ async function loadHeatmap() {
                         : ["S", "M", "T", "W", "T", "F", "S"];
   for (let r = 0; r < 7; r++) {
     const dow = (firstDow + r) % 7;
-    svg += '<text x="30" y="' + (r * (cell + gap) + cell - 2) + '" fill="var(--faint)" font-size="10" text-anchor="end">' + dowNames[dow] + "</text>";
+    svg += '<text x="30" y="' + (top + r * (cell + gap) + cell - 2) + '" fill="var(--faint)" font-size="10" text-anchor="end">' + dowNames[dow] + "</text>";
   }
+  // 月份缩写标签（修复：52 周视图此前只有星期单字、无任何月份标识）：
+  // 每个月份首次出现的列在顶部标注月份，跨数月的窗口月份可读。
+  const monthNames = zhHm
+    ? ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"]
+    : ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  let lastColMonth = -1;
   days.forEach((d, i) => {
     const col = Math.floor(i / 7), row = i % 7;
-    const x = 40 + col * (cell + gap), y = row * (cell + gap);
+    const mo = +d.date.slice(5, 7) - 1;
+    if (mo !== lastColMonth) {
+      lastColMonth = mo;
+      svg += '<text x="' + (40 + col * (cell + gap)) + '" y="10" fill="var(--faint)" font-size="10">' + monthNames[mo] + "</text>";
+    }
+    const x = 40 + col * (cell + gap), y = top + row * (cell + gap);
     const level = hmLevel(d.value, max);
     svg += '<rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell +
       '" rx="3" fill="' + HM_LEVELS[level] + '" stroke="' +
@@ -1290,15 +1320,31 @@ function renderKeyboard(freq) {
   emptyHint.style.display = isEmpty ? "" : "none";
   emptyHint.textContent = isEmpty ? t("noData") : "";
   wrap.style.display = isEmpty ? "none" : "";
-  if (isEmpty) { svg.innerHTML = ""; return; }
+  if (isEmpty) {
+    svg.innerHTML = "";
+    // 布局外按键说明条挂在 wrap 外（wrap 的下一个兄弟节点），不随 wrap
+    // 隐藏；切到无数据日期时必须同步清空，否则残留上一个有数据日期的旧
+    // 文案，与「无数据」提示同屏矛盾。
+    const kbNotesEmpty = document.getElementById("kb-notes");
+    if (kbNotesEmpty) { kbNotesEmpty.textContent = ""; kbNotesEmpty.style.display = "none"; }
+    return;
+  }
   const vals = Object.entries(freq).filter(([k]) => +k !== 32); // 空格独占上色会淹没全局
   const max = Math.max(1, ...vals.map(([, v]) => v));
   const ns = "http://www.w3.org/2000/svg";
   svg.innerHTML = "";
+  const zhKb = document.documentElement.lang === "zh";
+  // 键集闭合（修复）：KB_ROWS 里 vk13 出现两次（主键区 Enter 与小键盘 ⏎
+  // 共用虚拟键），同一计数此前被渲染到两颗键，DOM 合计虚增。现重复 vk
+  // 只在首次出现的键上计数/上色，另一颗标注「与 Enter 合并统计」。
+  const seenVks = new Set();
   for (const [x, y, w, h, vk, label] of KB_ROWS) {
       const g = document.createElementNS(ns, "g");
       const rect = document.createElementNS(ns, "rect");
-      const v = freq[vk] || 0;
+      const dup = seenVks.has(vk);
+      seenVks.add(vk);
+      const v = dup ? 0 : (freq[vk] || 0);
+      const dupNote = zhKb ? "与 Enter 合并统计" : "counted with Enter";
       rect.setAttribute("x", x * KB_U + KB_PAD);
       rect.setAttribute("y", y * KB_U + KB_PAD);
       rect.setAttribute("width", w * KB_U - KB_PAD * 2);
@@ -1316,10 +1362,32 @@ function renderKeyboard(freq) {
       t.setAttribute("fill", v ? cssVar("--kb-ink", "#E4EBF4") : cssVar("--kb-idle-ink", "#7A8AA0"));
       t.textContent = label;
       const title = document.createElementNS(ns, "title");
-      title.textContent = label + ": " + (freq[vk] || 0).toLocaleString();
+      title.textContent = dup ? label + " (" + dupNote + ")" : label + ": " + (freq[vk] || 0).toLocaleString();
       g.appendChild(rect); g.appendChild(t); g.appendChild(title);
       svg.appendChild(g);
   }
+  // 键集闭合（修复）：key_freq 里未被 ANSI-104 布局覆盖的虚拟键（如部分
+  // 多媒体键）此前静默不可见，现汇总条数与次数在此说明，不再整键丢失。
+  let kbNotes = document.getElementById("kb-notes");
+  if (!kbNotes) {
+    kbNotes = document.createElement("div");
+    kbNotes.id = "kb-notes";
+    kbNotes.className = "muted";
+    kbNotes.style.fontSize = "12px";
+    kbNotes.style.marginTop = "6px";
+    wrap.parentElement.insertBefore(kbNotes, wrap.nextSibling);
+  }
+  const mappedVks = new Set(KB_ROWS.map(r => r[4]));
+  const unmapped = Object.entries(freq)
+    .filter(([k, v]) => !mappedVks.has(+k) && v > 0)
+    .sort((a, b) => b[1] - a[1]);
+  const unmappedSum = unmapped.reduce((s, [, v]) => s + v, 0);
+  kbNotes.textContent = unmappedSum > 0
+    ? (zhKb
+        ? "另有 " + unmappedSum.toLocaleString() + " 次按键来自上方 104 键布局之外的键（如媒体键），共 " + unmapped.length + " 种，未在图上着色。"
+        : "Another " + unmappedSum.toLocaleString() + " presses are on keys outside the 104-key layout above (e.g. media keys), " + unmapped.length + " distinct key(s), not colored in the map.")
+    : "";
+  kbNotes.style.display = unmappedSum > 0 ? "" : "none";
 }
 // 24h × Top 应用堆叠条（选定日期）+ 近 14 天每日 Top3
 // ─── 报告页：色带时间轴 / 类别占比 / 专注块 / 目标 / 趋势 ───
