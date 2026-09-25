@@ -56,6 +56,14 @@ pub static COLLECTOR_FAILED: std::sync::atomic::AtomicBool =
 /// 分支把图标切黄三角、tooltip 换"采集停滞"。
 pub static COLLECTOR_STALLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// 看门狗计划任务不健康旗标（平台审查：任务被禁用/删除后每日循环模态框+
+/// 重复落库是打扰源）。每日自检发现 Disabled/Unavailable 时置位，托盘
+/// tooltip 据此持续提示；模态框与 events 落库只在进程内首次发现时各做一次。
+pub static WATCHDOG_TASK_UNHEALTHY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 本进程内是否已弹过/落过看门狗任务告警（各一次，之后靠 tooltip 持续承载）。
+static WATCHDOG_TASK_ALERTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 采集停滞阈值（审查 P1）：采集器在跑且"醒着的时间"内 flush 停滞超过该秒数,
 /// 心跳打 stalled:true。30s 写一轮心跳、正常批次间隔远小于此。
@@ -302,7 +310,7 @@ fn main() {
                 }
                 if cand != 0 {
                     if let Some(dir) = dash_db.parent() {
-                        let _ = std::fs::write(dir.join("dashboard-port.txt"), format!("{cand}\n"));
+                        write_port_file(dir, &format!("{cand}\n"));
                     }
                 }
                 DASH_FAILED.store(2, std::sync::atomic::Ordering::Relaxed);
@@ -329,7 +337,7 @@ fn main() {
             // 全部候选失败:port.txt 写 "unavailable",错误留档 dashboard-error.log
             DASH_FAILED.store(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(dir) = dash_db.parent() {
-                let _ = std::fs::write(dir.join("dashboard-port.txt"), "unavailable\n");
+                write_port_file(dir, "unavailable\n");
                 if let Some(err) = last_err {
                     let msg = format!(
                         "[{}] dashboard 所有候选端口绑定失败: {err}\n",
@@ -436,6 +444,13 @@ fn main() {
                     if stalled && !prev_stalled {
                         log::error!("采集停滞：writer 已 {}s 未落库，看门狗将介入", HEARTBEAT_STALLED_SECS);
                         insert_stalled_notice(&hb_db, HEARTBEAT_STALLED_SECS);
+                    } else if !stalled && prev_stalled && running && flush > 0 {
+                        // 停滞解除（横幅滞留修复的 tray 侧配合）：下降沿且采集
+                        // 确在跑（running 且 flush>0，排除托盘退出/重启造成的
+                        // 伪恢复），落一条 kind=collection_recovered 解除事件，
+                        // 面板横幅翻转为「已解除」，不再滞留 24h。
+                        log::info!("采集停滞已恢复：writer 恢复落库");
+                        insert_recovered_notice(&hb_db);
                     }
                     // unwritable/wfail 反映的是"上一拍"的写结果:本拍若也失败,
                     // 旗标留在内存、文件保持旧内容,恢复后随成功写入落盘。
@@ -592,14 +607,17 @@ fn main() {
                     // 平台审查：搭每日子进程通路的便车自检看门狗计划任务——
                     // 任务被禁用/删除后 watchdog_alert（唯一告警通道）本身就是
                     // 停摆的组件，托盘是唯一还能说话的进程。每日一次，随本循环。
+                    // 健康态清旗标（tooltip 回正常）；异常态置旗标（tooltip 持续
+                    // 提示），模态框与落库只在进程内首次发现时各做一次。
+                    let task = kynoptic_core::naming::install_dir()
+                        .map(|d| kynoptic_core::naming::watchdog_task_name(&d))
+                        .unwrap_or_else(kynoptic_core::naming::legacy_watchdog_task_name);
                     match query_watchdog_task_health() {
-                        WatchdogTaskHealth::Ok => {}
+                        WatchdogTaskHealth::Ok => {
+                            WATCHDOG_TASK_UNHEALTHY.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
                         WatchdogTaskHealth::Disabled => {
-                            let task = kynoptic_core::naming::install_dir()
-                                .map(|d| kynoptic_core::naming::watchdog_task_name(&d))
-                                .unwrap_or_else(|| {
-                                    kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string()
-                                });
+                            WATCHDOG_TASK_UNHEALTHY.store(true, std::sync::atomic::Ordering::Relaxed);
                             alert_watchdog_task_problem(
                                 &db_for_upd,
                                 &format!("计划任务 \"{task}\" 处于禁用状态"),
@@ -607,11 +625,7 @@ fn main() {
                             );
                         }
                         WatchdogTaskHealth::Unavailable => {
-                            let task = kynoptic_core::naming::install_dir()
-                                .map(|d| kynoptic_core::naming::watchdog_task_name(&d))
-                                .unwrap_or_else(|| {
-                                    kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string()
-                                });
+                            WATCHDOG_TASK_UNHEALTHY.store(true, std::sync::atomic::Ordering::Relaxed);
                             alert_watchdog_task_problem(
                                 &db_for_upd,
                                 &format!("无法查询计划任务 \"{task}\"（任务可能被删除，或计划任务服务被停用）"),
@@ -994,6 +1008,18 @@ impl Debounce {
     }
 }
 
+/// dashboard-port.txt 原子写：先写 .tmp 再 rename 替换（rename 失败兜底
+/// 直接写,尽力而为）。单次 fs::write 先建文件后写内容,读取方（托盘首启
+/// 引导/菜单）在毫秒级窗口内会读到空串或半截内容,与心跳文件同一修法。
+fn write_port_file(dir: &std::path::Path, content: &str) {
+    let target = dir.join("dashboard-port.txt");
+    let tmp = dir.join("dashboard-port.txt.tmp");
+    if std::fs::write(&tmp, content).is_ok() && std::fs::rename(&tmp, &target).is_ok() {
+        return;
+    }
+    let _ = std::fs::write(&target, content);
+}
+
 /// autostart 是否需要写注册表（纯函数,单测覆盖）：上次已同步同一值则跳过。
 fn autostart_needs_write(enable: bool, last_applied: &Option<bool>) -> bool {
     *last_applied != Some(enable)
@@ -1023,10 +1049,11 @@ fn apply_autostart(enable: bool) {
             kynoptic_core::naming::run_value_name(&d),
             kynoptic_core::naming::watchdog_task_name(&d),
         ),
-        // 取不到 exe 路径的极端情况退回旧全局名（至少保持旧行为可用）
+        // 取不到 exe 路径的极端情况退回旧名（沙箱旁路时带同形后缀，见
+        // core::naming；至少保持旧行为可用）
         None => (
-            kynoptic_core::naming::LEGACY_RUN_VALUE_NAME.to_string(),
-            kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string(),
+            kynoptic_core::naming::legacy_run_value_name(),
+            kynoptic_core::naming::legacy_watchdog_task_name(),
         ),
     };
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -1059,13 +1086,15 @@ fn apply_autostart(enable: bool) {
                 if let Err(e) = key.set_value(&value_name, &path) {
                     eprintln!("autostart: 写入失败 {e}");
                 } else {
-                    // 升级清扫：旧版无指纹全局值名指向本 exe 时删掉，避免新旧双自启动
-                    if let Ok(legacy) =
-                        key.get_value::<String, _>(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
-                    {
+                    // 升级清扫：旧版无指纹值名（沙箱旁路时带同形后缀，见
+                    // core::naming）指向本 exe 时删掉，避免新旧双自启动
+                    let legacy_name = kynoptic_core::naming::legacy_run_value_name();
+                    if let Ok(legacy) = key.get_value::<String, _>(&legacy_name) {
                         if legacy.contains(&path) {
-                            let _ = key.delete_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME);
-                            log::info!("已清理旧版全局自启动值 Kynoptic（升级到按目录指纹命名）");
+                            let _ = key.delete_value(&legacy_name);
+                            log::info!(
+                                "已清理旧版全局自启动值 {legacy_name}（升级到按目录指纹命名）"
+                            );
                         }
                     }
                 }
@@ -1092,12 +1121,11 @@ fn apply_autostart(enable: bool) {
         // 分支同判定：只清指向自己的，不动其他安装的值）
         if let Ok(exe) = std::env::current_exe() {
             let mine = format!("\"{}\" --minimized", exe.display());
-            if let Ok(legacy) =
-                key.get_value::<String, _>(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
-            {
+            let legacy_name = kynoptic_core::naming::legacy_run_value_name();
+            if let Ok(legacy) = key.get_value::<String, _>(&legacy_name) {
                 if legacy.contains(&mine) {
-                    let _ = key.delete_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME);
-                    log::info!("已清理旧版全局自启动值 Kynoptic（指向本 exe 的残留项）");
+                    let _ = key.delete_value(&legacy_name);
+                    log::info!("已清理旧版全局自启动值 {legacy_name}（指向本 exe 的残留项）");
                 }
             }
         }
@@ -1238,7 +1266,7 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
     // Wave40 挂账：旧全局名 "Kynoptic Watchdog" 只在取不到 exe 路径时兜底）
     let task_name = match kynoptic_core::naming::install_dir() {
         Some(d) => kynoptic_core::naming::watchdog_task_name(&d),
-        None => kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string(),
+        None => kynoptic_core::naming::legacy_watchdog_task_name(),
     };
     let out = match std::process::Command::new("schtasks")
         .args(["/Query", "/TN", &task_name, "/XML"])
@@ -1252,14 +1280,14 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
         }
     };
     if !out.status.success() {
-        // 免安装器升级兜底（绿色替换二进制）：指纹任务尚不存在时探旧全局名
-        // 任务，仅当其 XML 指向本 exe 才采信（认任务不认名字，避免误读其他
-        // 安装或陌生遗留任务）；沙箱旁路不探生产 legacy 名。正常安装器升级
-        // 会在 ssDone 清掉旧任务，此兜底只在升级窗口/免安装器场景生效。
-        if !kynoptic_core::singleton::mutex_suffix_active() {
-            if let Some(health) = legacy_task_health_if_ours(&task_name) {
-                return health;
-            }
+        // 免安装器升级兜底（绿色替换二进制）：指纹任务尚不存在时探旧名任务，
+        // 仅当其 XML 指向本安装目录才采信（认任务不认名字，避免误读其他
+        // 安装或陌生遗留任务）。旧名与 mutex_suffix 同拼（core::naming）：
+        // 沙箱旁路探「Kynoptic Watchdog-<后缀>」，不碰生产 legacy 名，沙箱
+        // 也能演练 legacy 升级窗口。正常安装器升级会在 ssDone 清掉旧任务，
+        // 此兜底只在升级窗口/免安装器场景生效。
+        if let Some(health) = legacy_task_health_if_ours(&task_name) {
+            return health;
         }
         // 自检找不到自己的任务：按日志告警，不静默（Wave40 挂账）
         log::warn!(
@@ -1276,19 +1304,19 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
     }
 }
 
-/// 免安装器升级兜底：旧全局名 `Kynoptic Watchdog` 任务存在且 XML 指向本
-/// exe 时，按其状态返回健康态；否则 None（调用方继续走 Unavailable 告警）。
-/// 只查询，不改任务。
+/// 免安装器升级兜底：旧名（`Kynoptic Watchdog`，沙箱旁路时
+/// `Kynoptic Watchdog-<后缀>`，见 core::naming）任务存在且 XML 指向本
+/// 安装目录时，按其状态返回健康态；否则 None（调用方继续走 Unavailable
+/// 告警）。只查询，不改任务。
 fn legacy_task_health_if_ours(missing_task_name: &str) -> Option<WatchdogTaskHealth> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe().ok()?;
-    let exe_lower = exe.to_string_lossy().to_lowercase();
     let out = std::process::Command::new("schtasks")
         .args([
             "/Query",
             "/TN",
-            kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME,
+            kynoptic_core::naming::legacy_watchdog_task_name().as_str(),
             "/XML",
         ])
         .creation_flags(CREATE_NO_WINDOW)
@@ -1298,7 +1326,15 @@ fn legacy_task_health_if_ours(missing_task_name: &str) -> Option<WatchdogTaskHea
         return None;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.to_lowercase().contains(&exe_lower) {
+    // 生产机半迁移态实测（2026-09-25）：legacy 任务的 Command 是同目录的
+    // kynoptic-watchdog.exe，不是托盘 exe——按本 exe 完整路径 contains 永远
+    // 不命中，兜底形同虚设（tray.log 持续误报"自启动保护可能失效"）。改为
+    // 按安装目录比对：任务 XML 指向本 exe 同目录下的程序即采信。
+    let exe_dir_lower = exe
+        .parent()
+        .map(|d| d.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if exe_dir_lower.is_empty() || !stdout.to_lowercase().contains(&exe_dir_lower) {
         return None;
     }
     log::info!(
@@ -1354,6 +1390,30 @@ fn serde_json_string(s: &str) -> String {
     out
 }
 
+/// 告警落库专用连接（平台审查：裸 rusqlite::Connection::open 的
+/// busy_timeout=0 在 core writer 持锁（WAL+BEGIN IMMEDIATE）时 INSERT 立即
+/// SQLITE_BUSY——采集停滞告警恰在 writer 卡死占锁时最写不进去）。这里：
+/// 1) busy_timeout=5000 与 core schema::apply_pragmas 同口径；
+/// 2) events 表不存在时按 0001_init.sql 同一 DDL 补建（与 cli open_db 口径
+///    一致；只补 events 一张表，其余表由 core writer 的 SCHEMA 负责）。
+fn open_alert_conn(db_path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_action TEXT NOT NULL,
+            event_data TEXT,
+            app_name TEXT,
+            window_title TEXT,
+            session_id INTEGER
+        );",
+    )?;
+    Ok(conn)
+}
+
 /// 采集停滞用户可见提示：落库 notification 系统事件（复用 watchdog_alert
 /// 的通道契约，面板横幅/通知列表据此展示）。全程尽力而为：库打不开只留
 /// 日志，不影响心跳线程。
@@ -1372,7 +1432,7 @@ fn insert_stalled_notice(db_path: &std::path::Path, stalled_secs: i64) {
         serde_json_string(&message),
         serde_json_string(&message_en)
     );
-    match rusqlite::Connection::open(db_path) {
+    match open_alert_conn(db_path) {
         Ok(conn) => {
             if let Err(e) = conn.execute(
                 "INSERT INTO events (timestamp, event_type, event_action, event_data)
@@ -1380,15 +1440,63 @@ fn insert_stalled_notice(db_path: &std::path::Path, stalled_secs: i64) {
                 rusqlite::params![chrono::Utc::now().to_rfc3339(), payload],
             ) {
                 log::warn!("采集停滞告警落库失败: {e}");
+                // 落库失败多留一档磁盘留痕（writer 长占锁时 events 可能始终
+                // 写不进，collector-error.log 是面板可见的最后兜底）
+                if let Some(dir) = db_path.parent() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("collector-error.log"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[{}] 采集停滞告警落库失败: {e}（{message}）",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                        );
+                    }
+                }
             }
         }
         Err(e) => log::warn!("采集停滞告警落库失败(库打不开): {e}"),
     }
 }
 
+/// 采集停滞恢复提示（横幅滞留修复的 tray 侧配合）：停滞上升沿落过告警后，
+/// 下降沿（writer 恢复落库）落一条 kind=collection_recovered 的 notification
+/// 系统事件，面板横幅据此从「采集停滞」翻转为「已解除」，不再滞留 24h。
+/// 复用 insert_stalled_notice 的表结构契约，全程尽力而为：库打不开只留日志。
+fn insert_recovered_notice(db_path: &std::path::Path) {
+    let message = "采集停滞已恢复，数据已恢复正常落库（此前的停滞告警自动解除）";
+    // message_en 与 message 同义（英文版）：面板横幅按界面语言选用
+    let message_en =
+        "The collection stall has recovered and data is being written normally again (the earlier stall alert is now cleared)";
+    log::info!("{message}");
+    let payload = format!(
+        "{{\"source\":\"tray\",\"kind\":\"collection_recovered\",\"message\":{},\"message_en\":{}}}",
+        serde_json_string(message),
+        serde_json_string(message_en)
+    );
+    match open_alert_conn(db_path) {
+        Ok(conn) => {
+            if let Err(e) = conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                 VALUES (?1, 'system', 'notification', ?2)",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), payload],
+            ) {
+                log::warn!("采集恢复事件落库失败: {e}");
+            }
+        }
+        Err(e) => log::warn!("采集恢复事件落库失败(库打不开): {e}"),
+    }
+}
+
 /// 看门狗计划任务异常告警：落库 notification 系统事件（复用 watchdog_alert
 /// 的表结构契约：events(timestamp,'system','notification',JSON 文本)）+
-/// 弹一次系统消息框。全程尽力而为：库打不开只留日志，不影响托盘。
+/// 进程内首次发现时弹一次限时自动关闭的消息框（平台审查：旧实现每日循环
+/// 弹永不自动关闭的 MB_TOPMOST 模态框强抢焦点；现在模态只弹一次、events
+/// 落库也只落一条，之后的持续提示交给托盘 tooltip 与面板横幅承载）。
+/// 全程尽力而为：库打不开只留日志，不影响托盘。
 fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem_en: &str) {
     let (hint, hint_en) = task_scheduler_policy_hint();
     let message = format!("看门狗计划任务异常：{problem}{hint}");
@@ -1401,7 +1509,20 @@ fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem
         serde_json_string(&message),
         serde_json_string(&message_en)
     );
-    match rusqlite::Connection::open(db_path) {
+    // 告警只做一次：落库 + 模态框都由 WATCHDOG_TASK_ALERTED 门闩（内存序
+    // Relaxed 足够：两次漏告警的后果只是少一条提示，tooltip 旗标仍在）
+    if WATCHDOG_TASK_ALERTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    match open_alert_conn(db_path) {
         Ok(conn) => {
             if let Err(e) = conn.execute(
                 "INSERT INTO events (timestamp, event_type, event_action, event_data)
@@ -1413,6 +1534,8 @@ fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem
         }
         Err(e) => log::warn!("看门狗计划任务告警落库失败(库打不开): {e}"),
     }
+    // 限时自动关闭（复用 rejected_start_feedback 的模式）：弹框线程 + 3.5s
+    // 后按标题 FindWindowW 投 WM_CLOSE。模态框只此一次，不再每天打扰。
     let text: Vec<u16> = format!(
         "Kynoptic 的自动保护（看门狗）当前没有生效，程序异常退出时可能不会被自动恢复，数据可能出现空洞。\n\
          请在计划任务程序里检查本安装目录对应的看门狗计划任务（任务名含安装路径指纹），或重新安装 Kynoptic。\n\
@@ -1428,6 +1551,20 @@ fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem
             title.as_ptr(),
             0x0000_0030 | 0x0004_0000, // MB_ICONWARNING | MB_TOPMOST
         );
+    });
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let title: Vec<u16> = "Kynoptic 保护已失效\0".encode_utf16().collect();
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+            let dlg = FindWindowW(
+                "#32770\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                title.as_ptr(),
+            );
+            if !dlg.is_null() {
+                PostMessageW(dlg, 0x0010, 0, 0); // WM_CLOSE
+            }
+        }
     });
 }
 

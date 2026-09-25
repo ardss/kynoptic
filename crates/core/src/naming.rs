@@ -85,9 +85,37 @@ fn watchdog_task_name_with(dir: &std::path::Path, suffix: Option<&str>) -> Strin
     }
 }
 
-/// 升级清扫用：旧版本的无指纹全局名（新安装器在安装/卸载时清掉它们）。
-pub const LEGACY_RUN_VALUE_NAME: &str = "Kynoptic";
-pub const LEGACY_WATCHDOG_TASK_NAME: &str = "Kynoptic Watchdog";
+/// 升级清扫/升级窗口识别用：旧版本的无指纹全局名（新安装器在安装/卸载时
+/// 清掉它们）。沙箱旁路激活时与 mutex_suffix 同拼出 `Kynoptic-<后缀>` /
+/// `Kynoptic Watchdog-<后缀>`，与安装器 TestSuffix 构建的
+/// LegacyRunValueName/LegacyWatchdogTaskName 同形（kynoptic.iss）——否则
+/// 沙箱装的运行时探不到沙箱安装器构造的 legacy 值/任务，无法演练 legacy
+/// 升级窗口；生产（无后缀）路径仍是无后缀旧名，行为不变。真机探针
+/// 2026-09-25：两种带后缀形态均被 schtasks / HKCU Run 键接受并读写。
+pub fn legacy_run_value_name() -> String {
+    legacy_run_value_name_with(mutex_suffix().as_deref())
+}
+
+/// [`legacy_run_value_name`] 的纯函数核（后缀显式传入，便于单测不经环境变量）。
+fn legacy_run_value_name_with(suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) => format!("Kynoptic-{s}"),
+        None => "Kynoptic".to_string(),
+    }
+}
+
+/// [`legacy_run_value_name`] 的任务名对应物。
+pub fn legacy_watchdog_task_name() -> String {
+    legacy_watchdog_task_name_with(mutex_suffix().as_deref())
+}
+
+/// [`legacy_watchdog_task_name`] 的纯函数核（后缀显式传入，便于单测不经环境变量）。
+fn legacy_watchdog_task_name_with(suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) => format!("Kynoptic Watchdog-{s}"),
+        None => "Kynoptic Watchdog".to_string(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -151,6 +179,30 @@ mod tests {
         assert_ne!(
             watchdog_task_name_with(dir, Some("sbox1")),
             watchdog_task_name_with(dir, None)
+        );
+    }
+
+    // legacy 兜底名与安装器 TestSuffix 构建的 LegacyRunValueName /
+    // LegacyWatchdogTaskName（kynoptic.iss）同形：无后缀 = 旧全局名，
+    // 带后缀 = 「Kynoptic-<后缀>」/「Kynoptic Watchdog-<后缀>」（真机探针
+    // 2026-09-25：两种带后缀形态均被 schtasks / HKCU Run 键接受并读写）。
+    #[test]
+    fn legacy_names_follow_mutex_suffix() {
+        assert_eq!(legacy_run_value_name_with(None), "Kynoptic");
+        assert_eq!(legacy_watchdog_task_name_with(None), "Kynoptic Watchdog");
+        assert_eq!(
+            legacy_run_value_name_with(Some("sbox42")),
+            "Kynoptic-sbox42"
+        );
+        assert_eq!(
+            legacy_watchdog_task_name_with(Some("sbox42")),
+            "Kynoptic Watchdog-sbox42"
+        );
+        // 带后缀与不带后缀是不同的名字（沙箱不夺生产 legacy 名）
+        assert_ne!(legacy_run_value_name_with(Some("sbox42")), "Kynoptic");
+        assert_ne!(
+            legacy_watchdog_task_name_with(Some("sbox42")),
+            "Kynoptic Watchdog"
         );
     }
 

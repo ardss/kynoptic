@@ -18,7 +18,7 @@ mod imp {
     fn value_name() -> String {
         match kynoptic_core::naming::install_dir() {
             Some(d) => kynoptic_core::naming::run_value_name(&d),
-            None => kynoptic_core::naming::LEGACY_RUN_VALUE_NAME.to_string(),
+            None => kynoptic_core::naming::legacy_run_value_name(),
         }
     }
 
@@ -39,11 +39,12 @@ mod imp {
         }
         // 用 set_value + &str 而不是 set_raw_value（winreg 0.52 API）
         key.set_value(value_name(), &cmd)?;
-        // 升级清扫：旧版无指纹全局值名指向本 exe 时删掉，避免新旧双自启动
-        if let Ok(legacy) = key.get_value::<String, _>(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
-        {
+        // 升级清扫：旧版无指纹值名（沙箱旁路时带同形后缀，见 core::naming）
+        // 指向本 exe 时删掉，避免新旧双自启动
+        let legacy_name = kynoptic_core::naming::legacy_run_value_name();
+        if let Ok(legacy) = key.get_value::<String, _>(&legacy_name) {
             if legacy.contains(&format!("\"{}\"", exe_path.display())) {
-                let _ = key.delete_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME);
+                let _ = key.delete_value(&legacy_name);
             }
         }
         Ok(())
@@ -63,11 +64,10 @@ mod imp {
         if result.is_ok() {
             if let Ok(exe) = std::env::current_exe() {
                 let mine = format!("\"{}\"", exe.display());
-                if let Ok(legacy) =
-                    key.get_value::<String, _>(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
-                {
+                let legacy_name = kynoptic_core::naming::legacy_run_value_name();
+                if let Ok(legacy) = key.get_value::<String, _>(&legacy_name) {
                     if legacy.contains(&mine) {
-                        let _ = key.delete_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME);
+                        let _ = key.delete_value(&legacy_name);
                     }
                 }
             }
@@ -104,7 +104,7 @@ mod imp {
     /// 旧版无指纹全局值名指向本 exe 时返回其值（升级窗口回退查询用）。
     fn legacy_value_if_ours(key: &RegKey) -> Option<String> {
         let legacy: String = key
-            .get_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
+            .get_value(kynoptic_core::naming::legacy_run_value_name())
             .ok()?;
         if legacy.is_empty() {
             return None;
