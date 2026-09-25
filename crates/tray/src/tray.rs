@@ -107,15 +107,96 @@ fn version_gt(a: &str, b: &str) -> bool {
 
 /// 实际 dashboard 端口：优先读 db 目录下 dashboard-port.txt（bind 成功才写）。
 fn dashboard_port_actual(fallback: u16) -> u16 {
+    match dashboard_port_file() {
+        Some(p) => p,
+        None => fallback,
+    }
+}
+
+/// 读 dashboard-port.txt：bind 成功 → Some(端口)；写明 "unavailable"（面板
+/// 故障）→ None 但调用方可用 [`dashboard_unavailable`] 区分；无文件/内容怪
+/// → None。统一解析口径（平台审查：旧 dashboard_port_actual 对 "unavailable"
+/// parse 失败后静默回退请求端口，打开死链）。
+fn dashboard_port_file() -> Option<u16> {
     let db = kynoptic_core::db::resolve_db_path();
+    let dir = db.parent()?;
+    let txt = std::fs::read_to_string(dir.join("dashboard-port.txt")).ok()?;
+    txt.trim().parse::<u16>().ok()
+}
+
+/// 面板故障判定：port.txt 写明 unavailable，或 dash 线程报告候选耗尽
+/// （DASH_FAILED=1）。此态下任何端口 URL 都是必然拒绝连接的死链。
+fn dashboard_unavailable(db: &std::path::Path) -> bool {
+    if crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        return true;
+    }
     if let Some(dir) = db.parent() {
         if let Ok(txt) = std::fs::read_to_string(dir.join("dashboard-port.txt")) {
-            if let Ok(p) = txt.trim().parse::<u16>() {
-                return p;
+            if txt.trim().eq_ignore_ascii_case("unavailable") {
+                return true;
             }
         }
     }
-    fallback
+    false
+}
+
+/// 首次运行引导的后台执行体：等 dashboard-port.txt 出现（bind 成功即写，
+/// 上限 60s）再开浏览器；超时或面板故障改开数据目录并留提示文件。只在
+/// 首开标记写入后的那次运行执行（调用方已写标记，本函数不再判断）。
+fn first_run_open_dashboard(data_dir: &std::path::Path) {
+    let port_file = data_dir.join("dashboard-port.txt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut port: Option<u16> = None;
+    let mut failed = false;
+    while std::time::Instant::now() < deadline {
+        match std::fs::read_to_string(&port_file) {
+            Ok(txt) => {
+                let s = txt.trim();
+                if s.eq_ignore_ascii_case("unavailable") {
+                    // 面板故障（所有候选端口绑定失败）：等也没有，走失败路径
+                    failed = true;
+                    break;
+                }
+                match s.parse::<u16>() {
+                    Ok(p) => {
+                        port = Some(p);
+                        break;
+                    }
+                    // 其余解析失败：写入方是普通 fs::write（先建文件后写内容），
+                    // 毫秒级窗口内会读到空串/半截数字。与 dashboard_port_file
+                    // 同口径——视为「还没写完，继续等」，不判面板永久失败。
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                }
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
+    match port {
+        Some(p) => {
+            let url: Vec<u16> = format!("http://127.0.0.1:{p}\0").encode_utf16().collect();
+            open_with_shell(&url);
+            log::info!("首次运行：已用默认浏览器打开面板 http://127.0.0.1:{p}");
+        }
+        None => {
+            // 超时（60s 内未 bind）/面板故障：开数据目录 + 留提示文件
+            let reason = if failed {
+                "面板启动失败（所有候选端口绑定失败），无法自动打开\n\
+                 Dashboard failed to start (all candidate ports failed to bind); it could not be opened automatically"
+            } else {
+                "面板尚未就绪（等待超时），未能自动打开；稍后可从托盘菜单「打开面板」重试\n\
+                 The dashboard was not ready in time (timed out) and could not be opened automatically; retry later via the tray menu \"Open Dashboard\""
+            };
+            let _ = std::fs::write(data_dir.join("first-open-error.txt"), format!("{reason}\n"));
+            log::warn!(
+                "首次运行引导：{}（改开数据目录）",
+                reason.split('（').next().unwrap_or(reason)
+            );
+            use std::os::windows::ffi::OsStrExt;
+            let mut wide: Vec<u16> = data_dir.as_os_str().encode_wide().collect();
+            wide.push(0);
+            open_with_shell(&wide);
+        }
+    }
 }
 
 /// 数据库降级旗标轮询：core 在 mark_db_degraded 时写 <数据目录>\degraded.flag
@@ -146,9 +227,10 @@ impl TrayCtx {
             // 双语（装机审查：托盘是英文系统之外用户唯一常驻可见面）
             TrayState::Running => "Kynoptic: collecting / 采集中 · 右键菜单",
             TrayState::Paused => "Kynoptic: paused / 已暂停",
-            // Error 态区分来源：采集器故障 > 数据库降级 > 采集停滞 > 面板故障
-            //（审查：stalled/降级此前只喂给看门狗/面板横幅，托盘永远绿色
-            //"采集中"，与面板"停滞"及看门狗强杀互相矛盾）
+            // Error 态区分来源：采集器故障 > 数据库降级 > 采集停滞 > 看门狗
+            // 保护未生效 > 面板故障（审查：stalled/降级此前只喂给看门狗/面板
+            // 横幅，托盘永远绿色"采集中"，与面板"停滞"及看门狗强杀互相矛盾；
+            // 看门狗任务异常的模态框只弹一次，此 tooltip 持续承载该状态）
             TrayState::Error => {
                 if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
                     "Kynoptic: collector error / 采集异常"
@@ -156,6 +238,9 @@ impl TrayCtx {
                     "Kynoptic: database degraded / 数据库降级"
                 } else if crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed) {
                     "Kynoptic: stalled / 采集停滞"
+                } else if crate::WATCHDOG_TASK_UNHEALTHY.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    "Kynoptic: autostart protection not working / 自动保护未生效"
                 } else {
                     "Kynoptic: dashboard error / 面板异常"
                 }
@@ -244,6 +329,25 @@ impl TrayCtx {
                 // 审查 P2：冷启动时 dashboard 可能晚于 2s 才落到回退段端口
                 //（如 18422），点菜单时以 dashboard-port.txt 为准，避免打开
                 // 请求端口的死链接。
+                // 平台审查修复：面板故障（port.txt="unavailable"/DASH_FAILED=1）
+                // 时任何端口 URL 都是必然拒绝连接的死链——改开数据目录定位
+                // dashboard-error.log（与 UpdateError 项同模式），不再零反馈。
+                if dashboard_unavailable(&self.args.db) {
+                    log::warn!(
+                        "打开面板被拒：dashboard 处于故障态，改开数据目录查看 dashboard-error.log"
+                    );
+                    let dir = self
+                        .args
+                        .db
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    use std::os::windows::ffi::OsStrExt;
+                    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+                    wide.push(0);
+                    open_with_shell(&wide);
+                    return;
+                }
                 let port = dashboard_port_actual(self.args.port);
                 let url: Vec<u16> = format!("http://127.0.0.1:{}\0", port)
                     .encode_utf16()
@@ -410,10 +514,16 @@ fn open_with_shell(path_wide: &[u16]) {
 fn append_item(menu: win::HMENU, id: MenuId, state: TrayState) {
     unsafe {
         // Error 态的"恢复采集"按故障来源分文案（审查 medium：tooltip 区分
-        // 采集/面板异常，菜单项却一律 Resume——面板故障时点它修不了面板）
+        // 采集/面板异常，菜单项却一律 Resume——面板故障时点它修不了面板）；
+        // "打开面板"在面板故障时同样换文案（行为是打开数据目录看原因）
         let label = match id {
             MenuId::TogglePause if state == TrayState::Error => MenuId::TogglePause
                 .resume_label(crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1),
+            MenuId::OpenDashboard
+                if crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1 =>
+            {
+                MenuId::dashboard_label(true)
+            }
             _ => id.label(state),
         };
         let text: Vec<u16> = format!("{label}\0").encode_utf16().collect();
@@ -643,18 +753,21 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
         // 首次运行引导（审查 medium：面板入口只藏在 tooltip/右键菜单里，
         // 新用户不悬停就不知道有网页面板）：数据目录无 ran-first-open 标记
         // 时用默认浏览器打开一次面板并写标记（此后永不再自动弹）。
-        // 冷启动库文件缺失时 dashboard 可能尚未就绪，浏览器会显示拒绝连接
-        // ——刷新即可，属可接受的尽力而为。
+        // 平台审查修复：冷启动时 dash 线程等库文件最多 60s 才 bind，旧实现
+        // 只等 2s 就取端口，端口漂移场景首开 URL 必然是死链（用户对产品的
+        // 第一次接触就是"拒绝连接"）。改为在后台线程等 dashboard-port.txt
+        // 出现（bind 成功的既成信号，已有文件协议）再开浏览器，上限 60s；
+        // 超时/面板故障改开数据目录并留提示文件（update-error.txt 同模式）。
+        // 后台线程执行，不阻塞托盘消息循环。
         if let Some(dir) = args.db.parent() {
             let marker = dir.join("ran-first-open.txt");
             if !marker.exists() {
                 let _ = std::fs::write(&marker, chrono::Utc::now().to_rfc3339());
-                let port = dashboard_port_actual(args.port);
-                let url: Vec<u16> = format!("http://127.0.0.1:{port}\0")
-                    .encode_utf16()
-                    .collect();
-                open_with_shell(&url);
-                log::info!("首次运行：已用默认浏览器打开面板 http://127.0.0.1:{port}");
+                let dir = dir.to_path_buf();
+                std::thread::Builder::new()
+                    .name("FirstOpen".into())
+                    .spawn(move || first_run_open_dashboard(&dir))
+                    .ok();
             }
         }
 

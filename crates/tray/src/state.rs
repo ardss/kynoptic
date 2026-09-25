@@ -60,6 +60,16 @@ impl MenuId {
         }
     }
 
+    /// 面板故障态的"打开面板"项文案（平台审查：此态下点击必然打开拒绝
+    /// 连接的死链，行为实为打开数据目录查看原因，文案必须如实）。
+    pub fn dashboard_label(dash_failed: bool) -> &'static str {
+        if dash_failed {
+            "面板不可用，查看原因 / Dashboard unavailable, view reason"
+        } else {
+            "打开面板 / Open Dashboard"
+        }
+    }
+
     /// 一键更新菜单项文案(单一来源,Wave17 P1:此前调用侧自拼文案与
     /// 此处措辞漂移)。安装版只能打开下载页,不做虚假的 "install" 承诺。
     pub fn update_menu_label(version: &str, installed: bool) -> String {
