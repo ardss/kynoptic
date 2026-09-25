@@ -110,6 +110,10 @@ var
   // 升级前用户是否已显式关闭自启动（Run 值缺失 + 任务存在）。
   G_PostInstallDone: Boolean;
   G_AutostartWasDisabled: Boolean;
+  // InitializeSetup 走完才允许补偿逻辑碰机器状态：初始化本身失败（如命令行
+  // 检测抛异常）时 {app} 未初始化，补偿自己也会炸，且可能误动另一目录/生产
+  // 的计划任务（0.3.1 发布门禁实测教训）。
+  G_SetupInitialized: Boolean;
 
 const
   RunKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run';
@@ -384,19 +388,18 @@ end;
 // 不算命中）
 function HasSwitchS(): Boolean;
 var
-  Cmd: String;
-  P: Integer;
+  I: Integer;
+  S: String;
 begin
   Result := False;
-  Cmd := Uppercase(Trim(ExpandConstant('{cmdline}')));
-  P := Pos('/S', Cmd);
-  while P > 0 do begin
-    if (P + 1 >= Length(Cmd)) or (Cmd[P + 2] = ' ') or (Cmd[P + 2] = '"') or (Cmd[P + 2] = #9) then begin
+  // 用 ParamStr 逐参数比较（{cmdline} 不是 Inno 常量，ExpandConstant 会抛
+  // Unknown constant 使 InitializeSetup 致命失败——0.3.1 发布门禁实测翻车）
+  for I := 1 to ParamCount() do begin
+    S := Uppercase(Trim(ParamStr(I)));
+    if (S = '/S') or (S = '-S') then begin
       Result := True;
       Exit;
     end;
-    Cmd := Copy(Cmd, P + 2, MaxInt);
-    P := Pos('/S', Cmd);
   end;
 end;
 
@@ -406,6 +409,7 @@ function InitializeSetup(): Boolean;
 begin
   Result := True;
   G_PostInstallDone := False;
+  G_SetupInitialized := False;
   if HasSwitchS() then begin
     // /S 不被 Inno 识别，会弹出交互向导挂死无人值守安装：显式报错退出，
     // 引导改用 /SILENT 或 /VERYSILENT（配合 /SUPPRESSMSGBOXES 时直接中止）
@@ -505,6 +509,10 @@ procedure DeinitializeSetup();
 var
   CmdResult: Integer;
 begin
+  // 初始化没走完就结束（命令行检测抛异常等）：什么都不补偿——此时 {app}
+  // 未初始化，任何 ExpandConstant 都会再炸一次，且可能误动生产/另一目录的
+  // 计划任务（0.3.1 发布门禁实测教训）。
+  if not G_SetupInitialized then Exit;
   if G_PostInstallDone then
     Exit;
   if WatchdogTaskExists() then begin
