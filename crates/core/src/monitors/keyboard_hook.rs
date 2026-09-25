@@ -198,6 +198,15 @@ impl EventHook for KeyboardHook {
                                 if GetCursorPos(&mut cur) == 0 {
                                     continue;
                                 }
+                                // 锁屏/切会话期间键盘静默属正常现象（session 监控
+                                // 的 WTS 通知提供精确锁态），不参与摘钩判定：
+                                // 复位连拍，防止把健康 hook 误判摘钩、虚增
+                                // keyboard_hook_reinstalls 指标。
+                                if crate::monitors::session::session_locked() {
+                                    stale_beats = 0;
+                                    prev = cur;
+                                    continue;
+                                }
                                 let moved = cur.x != prev.x || cur.y != prev.y;
                                 prev = cur;
                                 let stale = now_ms()
