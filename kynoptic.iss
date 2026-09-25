@@ -71,6 +71,8 @@ Source: "dist\kynoptic-ctl.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\README.md"; DestDir: "{app}"; Flags: ignoreversion
 ; SKILL.md 随安装包分发（AI 客户端 skill，见 [Run] 段 skill install）
 Source: "crates\cli\src\assets\skill.md"; DestDir: "{app}"; DestName: "SKILL.md"; Flags: ignoreversion
+; migrate 子命令依赖的迁移脚本（kynoptic-ctl 按 exe 同级 scripts\ 解析）
+Source: "scripts\migrate_legacy_db.py"; DestDir: "{app}\scripts"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"

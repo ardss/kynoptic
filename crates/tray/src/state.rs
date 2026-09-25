@@ -11,6 +11,8 @@ pub enum MenuId {
     UpdateNow = 1005,
     /// 关于（打开项目主页；全应用唯一的版本可见入口之一）
     About = 1006,
+    /// 一键更新未能启动（update-error.txt 在场）的提示项：点击打开数据目录
+    UpdateError = 1007,
     Quit = 1004,
 }
 
@@ -24,24 +26,37 @@ impl MenuId {
             1004 => Some(Self::Quit),
             1005 => Some(Self::UpdateNow),
             1006 => Some(Self::About),
+            1007 => Some(Self::UpdateError),
             _ => None,
         }
     }
 
-    /// 当前状态下的菜单文案(Wave17 双语化:托盘是常驻可见面,口径与
-    /// dashboard/安装器对齐;Pause/Resume 随状态切换)。
+    /// 当前状态下的菜单文案(Wave17 双语化:托盘是常驻可见面)。
+    /// 双语规范（审查 low）：全产品统一「中文 / English」——中文在前，
+    /// 半角「 / 」分隔（安装器消息、postinstall 同规则，ci 域维护）。
     pub fn label(self, state: TrayState) -> &'static str {
         match self {
-            Self::OpenDashboard => "Open Dashboard / 打开面板",
+            Self::OpenDashboard => "打开面板 / Open Dashboard",
             Self::TogglePause => match state {
-                TrayState::Running => "Pause / 暂停采集",
-                TrayState::Paused | TrayState::Error => "Resume / 恢复采集",
+                TrayState::Running => "暂停采集 / Pause",
+                TrayState::Paused | TrayState::Error => "恢复采集 / Resume",
             },
-            Self::OpenDataFolder => "Open data folder / 打开数据目录",
+            Self::OpenDataFolder => "打开数据目录 / Open data folder",
             // 版本号动态拼在调用侧(见 update_menu_label;此处仅测试锚点)
-            Self::UpdateNow => "Update available / 发现新版本",
-            Self::About => "About Kynoptic (github) / 关于",
-            Self::Quit => "Quit / 退出",
+            Self::UpdateNow => "发现新版本 / Update available",
+            Self::UpdateError => "更新未能启动，查看原因 / Update did not start, view reason",
+            Self::About => "关于 Kynoptic (github) / About",
+            Self::Quit => "退出 / Quit",
+        }
+    }
+
+    /// Error 态的恢复项文案（按故障来源分：面板故障时 Resume 修不了面板，
+    /// 必须如实说，否则点了没反应还伴随图标闪烁）。
+    pub fn resume_label(&self, dash_failed: bool) -> &'static str {
+        if dash_failed {
+            "面板不可用（详见数据目录 dashboard-error.log） / Dashboard unavailable (see dashboard-error.log in the data folder)"
+        } else {
+            "恢复采集 / Resume"
         }
     }
 
@@ -49,9 +64,9 @@ impl MenuId {
     /// 此处措辞漂移)。安装版只能打开下载页,不做虚假的 "install" 承诺。
     pub fn update_menu_label(version: &str, installed: bool) -> String {
         if installed {
-            format!("New version v{version} - open download page / 新版本 v{version} - 打开下载页")
+            format!("新版本 v{version} - 打开下载页 / New version v{version} - open download page")
         } else {
-            format!("Update to v{version} / 更新到 v{version}")
+            format!("更新到 v{version} / Update to v{version}")
         }
     }
 }
@@ -109,11 +124,30 @@ mod tests {
             MenuId::TogglePause,
             MenuId::OpenDataFolder,
             MenuId::Quit,
+            MenuId::UpdateError,
         ] {
             assert_eq!(MenuId::from_command(id as u32), Some(id));
         }
         assert_eq!(MenuId::from_command(0), None);
         assert_eq!(MenuId::from_command(9999), None);
+    }
+
+    #[test]
+    fn error_resume_label_says_dashboard_when_dash_failed() {
+        // 审查 medium：面板故障时菜单不得许诺"恢复采集"
+        let l = MenuId::TogglePause.resume_label(true);
+        assert!(l.contains("面板不可用") && l.contains("dashboard-error.log"));
+        assert!(!l.contains("恢复采集"));
+        let r = MenuId::TogglePause.resume_label(false);
+        assert!(r.contains("恢复采集"));
+        // 双语规范：中文在前、半角 " / " 分隔
+        for label in [
+            MenuId::OpenDashboard.label(TrayState::Running),
+            MenuId::Quit.label(TrayState::Paused),
+        ] {
+            let zh = label.split(" / ").next().unwrap_or("");
+            assert!(!zh.is_empty() && !zh.is_ascii(), "{label} 应中文在前");
+        }
     }
 
     #[test]

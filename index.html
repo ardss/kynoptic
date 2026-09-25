@@ -169,6 +169,7 @@
 <span class="a"><span class="l en">15:10–15:26  Chrome · 23 tabs — MDN, GitHub issues</span><span class="l zh">15:10–15:26  Chrome · 23 个标签页 —— MDN、GitHub issues</span></span>
 <span class="a"><span class="l en">15:26–15:58  Steam + game session — GPU 82%, 71°C, fan up</span><span class="l zh">15:26–15:58  Steam + 游戏 —— GPU 82%、71°C、风扇提速</span></span>
 <span class="dim"><span class="l en">source: local SQLite file, 214 KB</span><span class="l zh">来源：本地 SQLite 文件，214 KB</span></span></pre>
+      <p style="font-size:12.5px;color:var(--muted);text-align:center;margin-top:10px"><span class="l en">Sample output — a fresh install starts empty and fills up as you use your machine. Browser tabs and GPU/temperature lines require enabling the browser and GPU monitors in settings (off by default).</span><span class="l zh">示例输出——新装的机器一开始是空的，数据随使用逐步积累。浏览器标签页和 GPU/温度两行需要先在设置中启用 browser 和 GPU 监控器（默认关闭）。</span></p>
     </div>
   </div>
 </header>
@@ -178,7 +179,7 @@
   <div class="wrap">
     <div class="kicker"><span class="l en">What you can do with it</span><span class="l zh">它能帮你做什么</span></div>
     <h2><span class="l en">Ask your AI about your computer.</span><span class="l zh">直接问 AI 关于这台电脑的事。</span></h2>
-    <p class="sub"><span class="l en">Your AI assistant already knows everything on the internet. Kynoptic gives it the one thing it's missing: what actually happened on your machine.</span><span class="l zh">AI 助手知道整个互联网，却不知道你的电脑上发生过什么。Kynoptic 补上的正是这块空白。</span></p>
+    <p class="sub"><span class="l en">Your AI assistant already knows everything on the internet. Kynoptic gives it the one thing it's missing: what actually happened on your machine. Browser pages and GPU/temperature questions need the corresponding monitors enabled in settings — app usage and machine basics are on by default.</span><span class="l zh">AI 助手知道整个互联网，却不知道你的电脑上发生过什么。Kynoptic 补上的正是这块空白。浏览器页面、GPU 温度这两类问题需要先在设置中启用对应监控器；应用使用和机器基本指标默认开启。</span></p>
     <div class="grid3">
       <div class="case">
         <div class="icon">01</div>
@@ -207,7 +208,7 @@
   <div class="wrap">
     <div class="kicker"><span class="l en">Quick start</span><span class="l zh">快速上手</span></div>
     <h2><span class="l en">Two minutes. Any AI.</span><span class="l zh">两分钟，接上任何 AI。</span></h2>
-    <p class="sub"><span class="l en">Install the app, add one block to your MCP client config — your AI can now query your machine's history.</span><span class="l zh">装上应用，在 MCP 客户端配置里加一段——AI 就能查询这台机器的历史了。</span></p>
+    <p class="sub"><span class="l en">Install the app, add one block to your MCP client config — your AI can now query your machine's history. Two things to expect: the installer is unsigned, so Windows SmartScreen may show a warning on first launch (choose "More info" → "Run anyway"); and after installing, restart your MCP client (Claude Desktop / Cursor) so it picks up the new PATH before filling in the config.</span><span class="l zh">装上应用，在 MCP 客户端配置里加一段——AI 就能查询这台机器的历史了。有两件事提前说明：安装包未签名，首次运行时 Windows SmartScreen 可能弹提示（选"更多信息"→"仍要运行"）；装完后请先重启 MCP 客户端（Claude Desktop / Cursor），让它读到新的 PATH，再填配置。</span></p>
     <div class="qs">
       <div class="code">
         <div class="cap"><span class="l en">1 · Claude Desktop / Cursor — MCP config</span><span class="l zh">1 · Claude Desktop / Cursor —— MCP 配置</span></div>
@@ -245,7 +246,7 @@
   <div class="wrap">
     <div class="kicker"><span class="l en">Privacy</span><span class="l zh">隐私</span></div>
     <h2><span class="l en">One paragraph, because it's simple.</span><span class="l zh">一段话讲完，因为它本来就简单。</span></h2>
-    <p class="sub"><span class="l en">Kynoptic records events, not content: which app was in front, for how long, plus machine metrics. No screenshots, no keystroke contents, no OCR — so there is nothing on disk to replay or leak. Everything lands in one SQLite file, there is no upload code path, and the source is open. Your data is never sent anywhere. When you ask your AI a question, the answer is computed on your machine; no third-party LLM is involved unless you plug in your own API key.</span><span class="l zh">Kynoptic 记录的是事件，不是内容：哪个应用在前台、多久、加上机器指标。没有截屏、没有按键内容、没有 OCR——磁盘上不存在可以回放或泄露的东西。一切都在一个 SQLite 文件里，代码里没有上传路径，源码公开。你的数据不会被发送到任何地方。你向 AI 提问时，答案在你的机器上算出来；除非你自己填入 API key，否则没有任何第三方大模型参与。</span></p>
+    <p class="sub"><span class="l en">Kynoptic records events, not screen content: which app was in front, for how long, plus machine metrics. No screenshots, no OCR. By default keyboard data is stored only as per-minute counts and per-key frequency — never the text you typed. A raw per-keystroke recording mode also exists and is off by default; it can be turned on in settings if you explicitly want it. Everything lands in one local SQLite file — the app itself has no upload code path, and the source is open. When you ask your AI a question, the answer is computed on your machine; no third-party LLM is involved unless you plug in your own API key.</span><span class="l zh">Kynoptic 记录的是事件，不是屏幕内容：哪个应用在前台、多久、加上机器指标。没有截屏、没有 OCR。默认情况下，键盘数据只按每分钟计数和每个按键的频次存储——不会存你输入的文字。软件里也存在逐键原始记录模式，默认关闭，只有你在设置中明确开启才会记录。一切都在本地一个 SQLite 文件里——应用本身没有上传代码路径，源码公开。你向 AI 提问时，答案在你的机器上算出来；除非你自己填入 API key，否则没有任何第三方大模型参与。</span></p>
   </div>
 </section>
 
@@ -307,7 +308,7 @@
     </details>
     <details>
       <summary><span class="l en">Does it record my screen or my passwords?</span><span class="l zh">会录屏或记录我的密码吗？</span></summary>
-      <p><span class="l en">No screens, ever. Kynoptic stores counts and metadata (which app, how many keys), not what you typed — key content is never recorded, only per-key frequency counts. If that's still more than you want, per-key frequency counting can be turned off in settings.</span><span class="l zh">永不录屏。Kynoptic 存的是计数和元数据（哪个应用、按了多少键），不是你输入的内容——从不记录按键内容，只有每个按键的频次计数。如果你连这个也不想要，可以在设置里关闭每键频次采集。</span></p>
+      <p><span class="l en">No screens, ever. Kynoptic stores counts and metadata (which app, how many keys), not what you typed. By default keyboard data is only per-minute counts and per-key frequency counts; a raw per-keystroke recording mode also exists and is off by default — it only records if you turn it on in settings. If you'd rather have no keyboard data at all, the whole keyboard monitor can be turned off in settings.</span><span class="l zh">永不录屏。Kynoptic 存的是计数和元数据（哪个应用、按了多少键），不是你输入的内容。默认情况下，键盘数据只有每分钟计数和每个按键的频次；软件里也存在逐键原始记录模式，默认关闭——只有你在设置里开启才会记录。如果你完全不想采集键盘数据，也可以在设置里直接关闭整个键盘监控。</span></p>
     </details>
     <details>
       <summary><span class="l en">How much resource does it use?</span><span class="l zh">资源占用多大？</span></summary>
@@ -339,7 +340,7 @@
         <button class="btn btn-primary" type="submit"><span class="l en">Notify me</span><span class="l zh">发布时通知我</span></button>
       </form>
       <p class="ok" id="wlok"><span class="l en">Got it — we'll email you when macOS / Linux are ready.</span><span class="l zh">收到，macOS / Linux 版发布时发邮件通知你。</span></p>
-      <p class="note"><span class="l en">Prefer to watch the code? Star the repo instead — releases are announced there too.</span><span class="l zh">更想盯代码？直接 Star 仓库，Release 也会同步发在那里。</span></p>
+      <p class="note"><span class="l en">Your email is processed by the third-party form service FormSubmit.co solely to send this notification. Prefer to watch the code? Star the repo instead — releases are announced there too.</span><span class="l zh">你的邮箱由第三方表单服务 FormSubmit.co 处理，仅用于发送发布通知。更想盯代码？直接 Star 仓库，Release 也会同步发在那里。</span></p>
     </div>
   </div>
 </section>

@@ -48,9 +48,12 @@ pub fn parse_args(args: &[String]) -> Result<(u16, PathBuf)> {
 pub fn cmd_dashboard(args: &[String]) -> Result<()> {
     let (port, db_path) = parse_args(args)?;
     if !db_path.exists() {
-        return Err(Error::InvalidData(format!(
-            "数据库不存在: {}（先用采集器/ctl 生成，dashboard 不建库不迁移）",
-            db_path.display()
+        // 双语文案与 main.rs open_db_read 同源（output::db_missing），
+        // 面板不建库不迁移的口径不变（审查整改：原纯中文单语掉队）。
+        return Err(Error::InvalidData(crate::output::db_missing(
+            &db_path,
+            "面板",
+            "dashboard",
         )));
     }
     kynoptic_dash::serve(&db_path, port, true)

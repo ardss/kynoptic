@@ -57,6 +57,27 @@ pub fn db_degraded_reason() -> Option<String> {
     DB_DEGRADED.lock().ok().and_then(|g| g.clone())
 }
 
+/// 降级旗标文件名（写在 db 同目录，托盘每 2s 轮询，与 dashboard-port.txt
+/// 同模式——降级此前只有面板横幅一个用户可见面，托盘图标保持绿色）。
+const DEGRADED_FLAG: &str = "degraded.flag";
+
+/// [`mark_db_degraded`] 的带路径版：额外在 db 目录写 degraded.flag，
+/// 让托盘（跨进程）也能看到降级状态。旗标写入尽力而为，失败不影响留档。
+pub fn mark_db_degraded_at(db_file: &Path, reason: &str) {
+    mark_db_degraded(reason);
+    if let Some(dir) = db_file.parent() {
+        let _ = std::fs::write(dir.join(DEGRADED_FLAG), format!("{reason}\n"));
+    }
+}
+
+/// 健康库打开时清除遗留降级旗标（上次运行降级、本次正常 → 旗标不得残留，
+/// 否则托盘永远黄三角）。尽力而为。
+pub fn clear_degraded_flag(db_file: &Path) {
+    if let Some(dir) = db_file.parent() {
+        let _ = std::fs::remove_file(dir.join(DEGRADED_FLAG));
+    }
+}
+
 /// metadata 表里持久化的 events 水位键名（最近一次正常关闭时的 max(rowid)）。
 const EVENTS_WATERMARK_KEY: &str = "events_watermark_max_rowid";
 
@@ -353,10 +374,16 @@ impl Database {
         // 损坏下 SCHEMA/查询仍可能"成功"，随后所有端点静默回退零值。open 时
         // 跑一次 quick_check，非 ok 即走 mark_db_degraded 留档并暴露。
         match writer.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
-            Ok(s) if s != "ok" => mark_db_degraded(&format!(
-                "数据库完整性检查失败: {s}（建议先用副本尝试 kynoptic-aggrepair 或恢复备份）"
-            )),
-            Err(e) => mark_db_degraded(&format!("数据库完整性检查执行失败: {e}")),
+            Ok(s) if s != "ok" => mark_db_degraded_at(
+                std::path::Path::new(path),
+                &format!(
+                    "数据库完整性检查失败: {s}（建议先用副本尝试 kynoptic-aggrepair 或恢复备份）"
+                ),
+            ),
+            Err(e) => mark_db_degraded_at(
+                std::path::Path::new(path),
+                &format!("数据库完整性检查执行失败: {e}"),
+            ),
             Ok(_) => {}
         }
         writer.execute_batch(SCHEMA)?;
@@ -364,7 +391,10 @@ impl Database {
         run_migrations(&writer)?;
         // WAL 水位对账（见 reconcile_events_watermark 文档）
         if let Some(msg) = reconcile_events_watermark(&writer) {
-            mark_db_degraded(&msg);
+            mark_db_degraded_at(std::path::Path::new(path), &msg);
+        } else if db_degraded_reason().is_none() {
+            // 本次 open 各项检查全部健康：清除上次运行可能遗留的降级旗标
+            clear_degraded_flag(std::path::Path::new(path));
         }
         // 懒回填聚合读缓存（存量库首开一次）——**后台分块执行，不阻塞 open**。
         // perf3 2026-09 P0 实测：1M 事件存量库首开时同步回填把 Database::open

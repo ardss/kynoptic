@@ -24,6 +24,7 @@
 //! - `/api/apps?days=`               Top 应用排行（window 事件，空名排除）
 //! - `/api/hours?date=`              指定日 24 小时逐时输入量（按键+点击，缺时补零）
 //! - `/api/settings` (GET/POST)      设置读写（写 settings.json，不触碰 events）
+//! - `/api/autostart-status`         autostart 保存读回（settings 值 vs 注册表 Run 键现状）
 //! - `/api/diagnostics`              诊断留档文件清单（存在性/mtime/大小/尾部
 //!   20 行，内容净化、不暴露路径；设置页折叠块消费）
 //!
@@ -516,6 +517,20 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
     let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
     let days = days.clamp(1, 30) as usize;
     let mut out: Vec<Value> = Vec::new();
+    // 基线数据量（近 7 个本地日里有事件的天数）：空结果 ≠ "已检查、一切正常"
+    // ——装机头几天基线一条都没有，检测根本无从发生。前端据此区分"基线积累中"
+    // 与真正的"未检测到异常"。
+    let baseline_days: i64 = queries::local_day_range(&queries::date_offset_str(-6))
+        .map(|(start, _)| {
+            conn.query_row(
+                "SELECT COUNT(DISTINCT substr(datetime(timestamp, 'localtime'), 1, 10)) \
+                 FROM events WHERE timestamp >= ?1",
+                params![&start],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        })
+        .unwrap_or(0);
     // 长跨度性能：逐日循环改为一次整窗调用（core detect_all_days_with_bridge，
     // marathon 的人在场分钟整窗取数一次），逐日结果与旧循环完全一致。
     let dates: Vec<String> = (0..days)
@@ -526,7 +541,7 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
     {
         for a in list {
             if out.len() >= 100 {
-                return json!({"anomalies": out, "truncated": true});
+                return json!({"anomalies": out, "truncated": true, "baseline_days": baseline_days});
             }
             let at = a.at.clone();
             let message_en = anomaly_message_en(&a.kind, &a.message, at.as_deref());
@@ -542,12 +557,54 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
             }));
         }
     }
-    json!({"anomalies": out, "truncated": false})
+    json!({"anomalies": out, "truncated": false, "baseline_days": baseline_days})
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
 /// db_path 只返回文件名（审查 P2：全路径暴露安装目录/用户名等本机拓扑）；
 /// 另带 db_dir_kind 提示数据目录性质（exe 同目录 / 其他），不暴露具体路径。
+/// 访问令牌是否已启用（serve 启动时读到非空 dashboard-token.txt 即置位）。
+/// api_status 回 token_required 供前端页脚/状态行动态切换（默认 false，
+/// 未启用令牌时与旧行为一致）。
+static ACCESS_TOKEN_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// serve 实际绑定成功的端口（bind 失败/未启动为 0）。api_status 回
+/// actual_port：配置端口被占自动回退后，面板设置页能显示真实生效端口
+///（此前配置值 8422 与实际回退端口在 UI 上无从对照）。
+static ACTUAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// 实际监听端口（0 = 未知，调用方自行判空）。
+pub fn actual_port() -> u16 {
+    ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 最近 24h 内的看门狗告警事件（event_type='system', event_action='notification'，
+/// 由 cli watchdog_alert 落库）。此前该事件是死数据——注释承诺「UI 可读」但
+/// 全仓无消费方；面板顶部横幅消费它，采集空洞在 UI 层面不再零痕迹。
+fn latest_watchdog_alert(conn: &Connection) -> Option<Value> {
+    let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let raw = conn
+        .query_row(
+            "SELECT event_data FROM events \
+             WHERE event_type = 'system' AND event_action = 'notification' \
+               AND timestamp >= ?1 ORDER BY id DESC LIMIT 1",
+            params![&since],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    // 只透出 kind/message/message_en 三个字段（与写入方 watchdog_alert 的
+    // 载荷一致，message_en 为同义英文版，供英文界面选用），不回显完整
+    // event_data，避免未来字段变化把内部结构漏进 UI。
+    Some(json!({
+        "kind": v.get("kind").and_then(|x| x.as_str()).unwrap_or(""),
+        "message": v.get("message").and_then(|x| x.as_str()).unwrap_or(""),
+        "message_en": v.get("message_en").and_then(|x| x.as_str()).unwrap_or(""),
+    }))
+}
+
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
     // 构建指纹（ci 修复）：审查/排障先比对运行态与源码版本——曾实际发生
     // 旧 exe 上探测令牌门全 200 的「源码已修但运行态未修」脱节。CI 构建
@@ -575,6 +632,13 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         // 库降级标志（库损坏静默零值修复 2026-09）：core open 时 quick_check /
         // WAL 水位对账发现损坏即置位（进程级），面板据此显示降级横幅
         "db_degraded": kynoptic_core::db::db_degraded_reason(),
+        // 用户主动暂停旗标（托盘 Pause 写 paused.flag、采集成功启动时清除）：
+        // 面板状态行据此把"用户主动暂停"与"采集停滞/未运行"区分开，
+        // 与 degraded.flag 同为落盘旗标、按存在性读取
+        "paused": db_path
+            .parent()
+            .map(|d| d.join("paused.flag").exists())
+            .unwrap_or(false),
         "db_path": db_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -582,6 +646,12 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         "db_dir_kind": db_dir_kind(db_path),
         "bind": "127.0.0.1",
         "read_only": true,
+        // 可选访问令牌是否启用（true 时页脚不再宣称"无需鉴权"）
+        "token_required": ACCESS_TOKEN_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+        // 实际绑定端口（0 = 未知；与配置端口不同即发生了自动回退）
+        "actual_port": ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed),
+        // 近 24h 看门狗告警（null = 无），面板顶部横幅消费
+        "watchdog_alert": latest_watchdog_alert(conn),
         "update_available": update_available,
         "build": {
             "git_hash": git_hash,
@@ -2183,6 +2253,8 @@ fn settings_payload(s: &AppSettings) -> Value {
         .map(|m| {
             json!({
                 "id": m.id,
+                "desc_en": m.desc.0,
+                "desc_zh": m.desc.1,
                 "default_enabled": m.default_enabled,
                 "sensitivity": m.sensitivity.as_str(),
             })
@@ -2528,7 +2600,12 @@ pub fn route_req(
                         return (
                             400,
                             "application/json",
-                            err_json(&format!("hours 应为正整数（收到 {v:?}）")),
+                            // 回显用 Display + sanitize（{:?} 会把输入包上引号转义，
+                            // 像调试输出透传给中文界面；面向用户消息禁用 Debug 格式）
+                            err_json(&format!(
+                                "hours 应为正整数（收到 {}）",
+                                sanitize_date_echo(&v)
+                            )),
                         );
                     }
                 },
@@ -2755,6 +2832,18 @@ pub fn route_req(
             api_diagnostics(db_path).to_string(),
         ),
         ("GET", "/api/settings") => (200, "application/json", api_settings(db_path).to_string()),
+        // 自启同步读回（设置保存回执修复）：settings.json 已落盘，但注册表 Run 键
+        // 由 tray 进程防抖后异步写入、失败只进 tray.log。面板保存后延迟读回比对，
+        // 两者不一致时把"已保存"降级为"自启同步失败"。
+        ("GET", "/api/autostart-status") => (
+            200,
+            "application/json",
+            json!({
+                "autostart": settings::load(db_path).autostart,
+                "registry_run_present": settings::autostart_registry_enabled_pub(),
+            })
+            .to_string(),
+        ),
         ("POST", "/api/settings") => {
             // 读-改-写整段串行化（审查 P1：并发 POST 会用旧快照覆盖对方字段）
             static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2938,9 +3027,12 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         )))
     })?;
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    // 回显实际端口给 api_status（设置页"实际监听端口"展示）
+    ACTUAL_PORT.store(bound, std::sync::atomic::Ordering::Relaxed);
     // 可选访问令牌（Wave31 挂账）：默认 None（无 token，行为不变）；用户
     // 显式创建 data\dashboard-token.txt 后所有 /api/* 要求携带匹配令牌。
     let access_token = load_access_token(db_path);
+    ACCESS_TOKEN_ENABLED.store(access_token.is_some(), std::sync::atomic::Ordering::Relaxed);
     if access_token.is_some() {
         log::info!("dashboard: 访问令牌已启用（/api/* 需携带 token，见 dashboard-token.txt）");
     }
@@ -3184,7 +3276,9 @@ fn handle_client(
                     &mut stream,
                     401,
                     "application/json",
-                    "{\"error\":\"unauthorized: missing or invalid access token (pass it via the X-Kynoptic-Access-Token header or Authorization: Bearer; do not put the token in the URL - query strings stay in browser history)\"}",
+                    // code=unauthorized：前端按码映射中英文案并显示"需要访问令牌"
+                    // 状态（不再把在线服务涂红成断连），见 dashboard.html ERR_TEXT
+                    "{\"error\":\"unauthorized: missing or invalid access token (pass it via the X-Kynoptic-Access-Token header or Authorization: Bearer; do not put the token in the URL - query strings stay in browser history)\",\"code\":\"unauthorized\"}",
                 );
             }
         }

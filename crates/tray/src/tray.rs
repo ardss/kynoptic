@@ -118,6 +118,24 @@ fn dashboard_port_actual(fallback: u16) -> u16 {
     fallback
 }
 
+/// 数据库降级旗标轮询：core 在 mark_db_degraded 时写 <数据目录>\degraded.flag
+///（与 dashboard-port.txt 同模式），健康库重启 open 时清除。托盘每 2s 查一次
+/// 文件存在性，把"数据库降级"接到黄三角图标——此前降级只有面板横幅一个
+/// 用户可见面，托盘三态机没有降级态。
+fn db_degraded(db: &std::path::Path) -> bool {
+    db.parent()
+        .map(|d| d.join("degraded.flag").exists())
+        .unwrap_or(false)
+}
+
+/// 一键更新失败提示文件（数据目录 update-error.txt）：update.log 打不开
+///（磁盘满/ACL）导致更新未启动时写入，菜单动态插入提示项；用户点过即清。
+fn update_failed_pending(db: &std::path::Path) -> bool {
+    db.parent()
+        .map(|d| d.join("update-error.txt").exists())
+        .unwrap_or(false)
+}
+
 impl TrayCtx {
     fn icon(&self) -> win::HICON {
         self.icons.for_state(self.state)
@@ -128,10 +146,16 @@ impl TrayCtx {
             // 双语（装机审查：托盘是英文系统之外用户唯一常驻可见面）
             TrayState::Running => "Kynoptic: collecting / 采集中 · 右键菜单",
             TrayState::Paused => "Kynoptic: paused / 已暂停",
-            // Error 态区分来源：采集器故障 vs dashboard 故障（审查 P1）
+            // Error 态区分来源：采集器故障 > 数据库降级 > 采集停滞 > 面板故障
+            //（审查：stalled/降级此前只喂给看门狗/面板横幅，托盘永远绿色
+            //"采集中"，与面板"停滞"及看门狗强杀互相矛盾）
             TrayState::Error => {
                 if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
                     "Kynoptic: collector error / 采集异常"
+                } else if db_degraded(&self.args.db) {
+                    "Kynoptic: database degraded / 数据库降级"
+                } else if crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed) {
+                    "Kynoptic: stalled / 采集停滞"
                 } else {
                     "Kynoptic: dashboard error / 面板异常"
                 }
@@ -183,6 +207,11 @@ impl TrayCtx {
                 .collect();
                 AppendMenuW(menu, MF_STRING, MenuId::UpdateNow as usize, text.as_ptr());
             }
+            // 一键更新未能启动的用户可见反馈（审查 low：此前只落 tray.log，
+            // 托盘不弹气泡等于完全静默）。提示项点击 = 打开数据目录看原因并清除。
+            if update_failed_pending(&self.args.db) {
+                append_item(menu, MenuId::UpdateError, self.state);
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
             append_item(menu, MenuId::Quit, self.state);
 
@@ -229,7 +258,14 @@ impl TrayCtx {
                 }
                 TrayState::Paused | TrayState::Error => {
                     let _ = self.cmd_tx.send(CollectorCmd::Resume);
-                    self.set_state(hwnd, TrayState::Running);
+                    // 面板故障（DASH_FAILED=1）时 Resume 修不了面板（dash 线程
+                    // 候选耗尽后已退出，全仓无重启路径）：不做图标乐观翻转，
+                    // 否则 2s 后 WM_TIMER 重读旗标打回 Error，绿↔黄闪烁。
+                    if self.state != TrayState::Error
+                        || crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) != 1
+                    {
+                        self.set_state(hwnd, TrayState::Running);
+                    }
                 }
             },
             MenuId::OpenDataFolder => {
@@ -305,14 +341,38 @@ impl TrayCtx {
                             }
                         } else {
                             // 审查修复：update.log 打不开（磁盘满/ACL）此前
-                            // 静默不启动更新且无任何反馈
-                            log::error!(
-                                "update.log 无法打开（{:?}），一键更新未启动",
-                                db_dir.join("update.log")
+                            // 静默不启动更新且无任何反馈。现在：原因猜测 +
+                            // 下一步动作落日志与提示文件，菜单动态出现
+                            // UpdateError 提示项，点击打开数据目录并清除。
+                            let msg = format!(
+                                "[{}] 一键更新未能启动：无法写入更新日志 update.log（磁盘空间不足或权限受限？）。请到下载页手动获取新版本：https://github.com/ardss/kynoptic/releases/latest\n",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                             );
+                            log::error!(
+                                "update.log 无法打开（{}），一键更新未启动",
+                                db_dir.join("update.log").display()
+                            );
+                            let _ = std::fs::write(db_dir.join("update-error.txt"), &msg);
                         }
                     }
                 }
+            }
+            MenuId::UpdateError => {
+                // 打开数据目录让用户看到 update-error.txt 的原因与下一步指引，
+                // 提示即清（下次更新失败会重新出现）
+                let dir = self
+                    .args
+                    .db
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                if let Some(d) = self.args.db.parent() {
+                    let _ = std::fs::remove_file(d.join("update-error.txt"));
+                }
+                use std::os::windows::ffi::OsStrExt;
+                let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+                wide.push(0);
+                open_with_shell(&wide);
             }
             MenuId::About => {
                 let url: Vec<u16> = String::from("https://github.com/ardss/kynoptic\0")
@@ -349,7 +409,14 @@ fn open_with_shell(path_wide: &[u16]) {
 
 fn append_item(menu: win::HMENU, id: MenuId, state: TrayState) {
     unsafe {
-        let text: Vec<u16> = format!("{}\0", id.label(state)).encode_utf16().collect();
+        // Error 态的"恢复采集"按故障来源分文案（审查 medium：tooltip 区分
+        // 采集/面板异常，菜单项却一律 Resume——面板故障时点它修不了面板）
+        let label = match id {
+            MenuId::TogglePause if state == TrayState::Error => MenuId::TogglePause
+                .resume_label(crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1),
+            _ => id.label(state),
+        };
+        let text: Vec<u16> = format!("{label}\0").encode_utf16().collect();
         AppendMenuW(menu, MF_STRING, id as usize, text.as_ptr());
     }
 }
@@ -397,17 +464,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 器属主线程都不能直接碰 UI）。采集器故障（COLLECTOR_FAILED，
             // DB 损坏/被锁/磁盘满/启用集为空）优先级最高——数据静默归零
             // 是最严重的用户可见后果，此前没有任何静态量接入 UI。
-            let want = if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
-                Some(TrayState::Error)
-            } else {
-                match crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
-                    1 => Some(TrayState::Error),
-                    2 => Some(TrayState::Running),
-                    _ => None,
-                }
-            };
-            if let Some(w) = want {
-                if let Some(c) = ctx.as_mut() {
+            if let Some(c) = ctx.as_mut() {
+                let want = if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                    Some(TrayState::Error)
+                } else if db_degraded(&c.args.db)
+                    || crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // 数据库降级（degraded.flag）/采集停滞（心跳 stalled）：都切
+                    // 黄三角，tooltip 由 tip_text 按来源区分
+                    Some(TrayState::Error)
+                } else {
+                    match crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                        1 => Some(TrayState::Error),
+                        2 => Some(TrayState::Running),
+                        _ => None,
+                    }
+                };
+                if let Some(w) = want {
                     if c.state != w && c.state != TrayState::Paused {
                         c.set_state(hwnd, w);
                     }
@@ -565,6 +638,24 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
             KillTimer(hwnd, 1);
             DestroyWindow(hwnd);
             return false;
+        }
+
+        // 首次运行引导（审查 medium：面板入口只藏在 tooltip/右键菜单里，
+        // 新用户不悬停就不知道有网页面板）：数据目录无 ran-first-open 标记
+        // 时用默认浏览器打开一次面板并写标记（此后永不再自动弹）。
+        // 冷启动库文件缺失时 dashboard 可能尚未就绪，浏览器会显示拒绝连接
+        // ——刷新即可，属可接受的尽力而为。
+        if let Some(dir) = args.db.parent() {
+            let marker = dir.join("ran-first-open.txt");
+            if !marker.exists() {
+                let _ = std::fs::write(&marker, chrono::Utc::now().to_rfc3339());
+                let port = dashboard_port_actual(args.port);
+                let url: Vec<u16> = format!("http://127.0.0.1:{port}\0")
+                    .encode_utf16()
+                    .collect();
+                open_with_shell(&url);
+                log::info!("首次运行：已用默认浏览器打开面板 http://127.0.0.1:{port}");
+            }
         }
 
         // 上下文挂在窗口上;进程生命周期即托盘生命周期,Box::leak 有意为之
