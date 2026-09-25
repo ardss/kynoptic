@@ -22,7 +22,7 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 
 数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
 CLI 解析顺序：`--db <PATH>` 全局参数 > `KYNOPTIC_DB` 环境变量 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。
-CLI 默认路径推导时会打印 `using db: <path>` 到 stderr——**注意核对**，防静默读到错误库。
+CLI 默认路径推导时会打印 `使用数据库: <path>` 到 stderr——**注意核对**，防静默读到错误库。
 仪表盘：http://127.0.0.1:8422/（只读 HTTP；**端口三段回退仅托盘入口生效**——CLI `kynoptic dashboard` 端口被占会直接报错退出，需 `--port` 另指；实际端口写在 data\dashboard-port.txt；服务没起来 panel 000 时先找托盘进程）。
 
 ## 核心命令
