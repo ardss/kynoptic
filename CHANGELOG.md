@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Dashboard: unified query-parameter semantics across all GET API
+  endpoints. Duplicate parameters now consistently take the first
+  occurrence (date params previously took the last, numeric the first);
+  explicitly empty values (`?date=`, `?days=`) now return 400 for
+  numeric params too instead of silently falling back to the default;
+  numeric params below their lower bound (including 0) return 400 with
+  an error message stating the valid range, replacing the previous
+  split wording; values above the cap are still clamped with 200 but
+  the response now annotates the clamp with `X_requested` + `note`
+  (previously only `/api/input` did this; `/api/anomalies` also sets
+  `truncated=true` when its 30-day window is capped); unrecognized or
+  wrongly-cased query parameters are echoed in an `ignored_params`
+  array (mirroring POST `/api/settings`'s `ignored`), so `?DATE=…` is
+  no longer silently dropped. API docs in
+  `crates/cli/src/assets/skill.md` updated accordingly.
+
 ## [0.3.1] - 2026-09-25
 
 ### Added

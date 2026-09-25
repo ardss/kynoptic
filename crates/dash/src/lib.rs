@@ -2538,34 +2538,74 @@ pub fn route_req(
         Some((p, q)) => (p, q),
         None => (path, ""),
     };
-    let qval = |key: &str| -> Option<String> {
+    // 查询参数统一解析（审查修复）：①重复参数一律取首个（此前日期族取
+    // 末个、数值族取首个，同一请求语义方向相反）；②显式空串一律 400
+    // （此前数值族静默回缺省、日期族 400，与"非法值不静默放行"政策自相
+    // 矛盾）；③数值参数错误文案写明实际有效域。
+    let first_val = |key: &str| -> Option<&str> {
         query.split('&').find_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            (k == key && !v.is_empty()).then(|| v.to_string())
+            (k == key).then_some(v)
         })
     };
-    // 日期参数专用：显式空值（`?date=`）≠ 缺省。空串回 400，与
-    // hours/days 等数值参数"非法值不静默放行"的政策一致；仅参数完全
-    // 缺省时才回退今天。
+    // 日期参数：显式空值（`?date=`）≠ 缺省，空串回 400；仅完全缺省才回退今天。
     let qdate = |key: &str| -> std::result::Result<Option<String>, String> {
-        let mut present = false;
-        let mut val = None;
-        for kv in query.split('&') {
-            if let Some((k, v)) = kv.split_once('=') {
-                if k == key {
-                    present = true;
-                    if !v.is_empty() {
-                        val = Some(v.to_string());
-                    }
-                }
-            }
-        }
-        if present && val.is_none() {
-            Err(format!("{key} 不应为空（缺省用今天，或给 YYYY-MM-DD）"))
-        } else {
-            Ok(val)
+        match first_val(key) {
+            None => Ok(None),
+            Some("") => Err(format!("{key} 不应为空（缺省用今天，或给 YYYY-MM-DD）")),
+            Some(v) => Ok(Some(v.to_string())),
         }
     };
+    // 数值参数：低于下界（含 0/负数）→ 400；超上界 → 保留原值，端点钳制
+    // 后在响应标注 X_requested + note（不再无声）；非数字 → 400，文案含
+    // 有效域，调用方可据此纠正取值。
+    let qnum = |key: &str, lo: u32, hi: u32| -> std::result::Result<Option<u32>, String> {
+        match first_val(key) {
+            None => Ok(None),
+            Some("") => Err(format!("{key} 不应为空")),
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) if n < lo => Err(format!("{key} 应为 {lo}-{hi} 整数（收到 {n}）")),
+                Ok(n) => Ok(Some(n)),
+                Err(_) => Err(format!(
+                    "{key} 应为 {lo}-{hi} 整数（收到 {}）",
+                    sanitize_date_echo(v)
+                )),
+            },
+        }
+    };
+    // 超上界钳制标注（推广 /api/input 的 days_requested+note 模式）。
+    fn cap_note(obj: &mut serde_json::Map<String, Value>, key: &str, req: u32, hi: u32) {
+        obj.insert(format!("{key}_requested"), json!(req));
+        obj.insert(
+            "note".into(),
+            json!(format!(
+                "{key} 上限为 {hi}，已按 {hi} 返回 / {key} is capped at {hi}; {hi} returned"
+            )),
+        );
+    }
+    // 未识别/大小写错误的查询参数回显（与 POST /api/settings 的 ignored
+    // 对称）：只认精确小写键名，`?DATE=…` 此前被静默丢弃。裸参数（无 '='，
+    // 如 `?flag`）整段视为键名，同样回显；空段（如结尾 `&`）跳过。
+    let ignored_params = |known: &[&str]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for kv in query.split('&') {
+            let k = match kv.split_once('=') {
+                Some((k, _)) => k,
+                None => kv,
+            };
+            if !k.is_empty() && !known.contains(&k) && !out.iter().any(|x| x == k) {
+                out.push(k.to_string());
+            }
+        }
+        out
+    };
+    fn add_ignored(v: &mut Value, ignored: Vec<String>) {
+        if !ignored.is_empty() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ignored_params".into(), json!(ignored));
+            }
+        }
+    }
 
     match (method, route_path) {
         ("GET", "/") => (200, "text/html; charset=utf-8", DASHBOARD_HTML.to_string()),
@@ -2579,7 +2619,10 @@ pub fn route_req(
                 return (400, "application/json", err_json(&e));
             }
             match api_summary(conn, &date) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    add_ignored(&mut v, ignored_params(&["date"]));
+                    (200, "application/json", v.to_string())
+                }
                 // 库损坏/读取失败（db_error）映射 503：此前一律 200 全零或 400，
                 // 用户会误以为"今天什么都没干"（库损坏静默零值修复 2026-09）
                 Err(e) => (
@@ -2590,112 +2633,143 @@ pub fn route_req(
             }
         }
         ("GET", "/api/timeline") => {
-            // 负数会被 parse::<u32> 拒绝→回退 12（一致性：非法数值参数
-            // 不静默放行，日期类参数都是 400——统一为 400）
-            let hours = match qval("hours") {
-                None => 12,
-                Some(v) => match v.parse::<u32>() {
-                    Ok(h) => h.clamp(1, 744),
-                    Err(_) => {
-                        return (
-                            400,
-                            "application/json",
-                            // 回显用 Display + sanitize（{:?} 会把输入包上引号转义，
-                            // 像调试输出透传给中文界面；面向用户消息禁用 Debug 格式）
-                            err_json(&format!(
-                                "hours 应为正整数（收到 {}）",
-                                sanitize_date_echo(&v)
-                            )),
-                        );
-                    }
-                },
+            // hours 超 744 → 钳制 + 响应标注 hours_requested（不再无声）
+            let hours_req = match qnum("hours", 1, 744) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 12,
+                Ok(Some(h)) => h,
             };
+            let hours = hours_req.min(744);
             // 桥接阈值读 settings（与 overview presence 同一口径源）
             let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
             // 长窗口缓解（发现 ①-2）：744h 桶在年量级库上聚合数十秒。完整
             // 修复须把小时桶迁到带应用维度的预聚合（agg_minute 无 app 维度，
             // 属 core/tray 写侧职责，本域不可达）；此处仅常驻服务路径加 60s
-            // TTL 缓存（按 hours+bridge 区分），消除面板轮询重复聚合。纯函数
-            // api_timeline_at（tests.rs 直调）不受缓存影响。
+            // TTL 缓存（按 hours+bridge+query 区分），消除面板轮询重复聚合。
+            // 纯函数 api_timeline_at（tests.rs 直调）不受缓存影响。
             if TIMELINE_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
                 use std::sync::Mutex;
                 use std::time::{Duration, Instant};
-                // 缓存键含 db 路径：route_req 的 conn 与 db_path 在测试里可能
-                // 指向不同库，按参数四元组区分避免串台。
-                type TimelineCache = Option<(Instant, u32, u32, std::path::PathBuf, Value)>;
+                // 缓存键含 db 路径与原始 query：route_req 的 conn 与 db_path
+                // 在测试里可能指向不同库；ignored_params 随 query 变化，一并
+                // 入键避免串台。
+                type TimelineCache =
+                    Option<(Instant, u32, u32, std::path::PathBuf, String, Value)>;
                 static CACHE: Mutex<TimelineCache> = Mutex::new(None);
                 const TTL: Duration = Duration::from_secs(60);
                 let db_key = db_path.to_path_buf();
+                let query_key = query.to_string();
                 if let Ok(g) = CACHE.lock() {
-                    if let Some((at, h, b, p, v)) = g.as_ref() {
-                        if *h == hours && *b == bridge && *p == db_key && at.elapsed() < TTL {
+                    if let Some((at, h, b, p, q, v)) = g.as_ref() {
+                        if *h == hours
+                            && *b == bridge
+                            && *p == db_key
+                            && *q == query_key
+                            && at.elapsed() < TTL
+                        {
                             return (200, "application/json", v.to_string());
                         }
                     }
                 }
-                if let Ok(v) = api_timeline_at(conn, hours, Utc::now(), bridge) {
+                if let Ok(mut v) = api_timeline_at(conn, hours, Utc::now(), bridge) {
+                    if hours_req > 744 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "hours", hours_req, 744);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["hours"]));
                     if let Ok(mut g) = CACHE.lock() {
-                        *g = Some((Instant::now(), hours, bridge, db_key, v.clone()));
+                        *g = Some((
+                            Instant::now(),
+                            hours,
+                            bridge,
+                            db_key,
+                            query_key,
+                            v.clone(),
+                        ));
                     }
                     return (200, "application/json", v.to_string());
                 }
                 // 计算失败仍走下方正常路径回 400
             }
             match api_timeline_at(conn, hours, Utc::now(), bridge) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    if hours_req > 744 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "hours", hours_req, 744);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["hours"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/anomalies") => {
-            let days = match qval("days") {
-                None => 7,
-                Some(v) => match v.parse::<u32>() {
-                    // days=0 与负数一并拒绝（400），与 MCP get_anomalies
-                    // 「days 必须 >= 1」口径对齐，不再静默钳为 1 天窗口。
-                    Ok(d) if d >= 1 => d,
-                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
-                    Ok(_) => return (400, "application/json", err_json("days 应为正整数（>= 1）")),
-                },
+            // days=0/负数拒绝（400，与 MCP get_anomalies「days 必须 >= 1」
+            // 口径一致）；>30 → 钳制 + days_requested/truncated/note 标注。
+            let days = match qnum("days", 1, 30) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 7,
+                Ok(Some(d)) => d,
             };
-            (
-                200,
-                "application/json",
-                api_anomalies(conn, days, db_path).to_string(),
-            )
+            let mut v = api_anomalies(conn, days, db_path);
+            if days > 30 {
+                if let Some(obj) = v.as_object_mut() {
+                    cap_note(obj, "days", days, 30);
+                    // truncated 此前只在条数截断时置位；窗口被钳制同为截断，
+                    // 一并置 true，字段名与职责对齐。
+                    obj.insert("truncated".into(), json!(true));
+                }
+            }
+            add_ignored(&mut v, ignored_params(&["days"]));
+            (200, "application/json", v.to_string())
         }
-        ("GET", "/api/status") => (
-            200,
-            "application/json",
-            api_status(conn, db_path).to_string(),
-        ),
-        ("GET", "/api/overview") => (
-            200,
-            "application/json",
-            api_overview(conn, db_path).to_string(),
-        ),
+        ("GET", "/api/status") => {
+            let mut v = api_status(conn, db_path);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/overview") => {
+            let mut v = api_overview(conn, db_path);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
         ("GET", "/api/heatmap") => {
-            let weeks = match qval("weeks") {
-                None => 12,
-                Some(v) => match v.parse::<u32>() {
-                    Ok(w) => w.clamp(1, 52),
-                    Err(_) => return (400, "application/json", err_json("weeks 应为非负整数")),
-                },
+            let weeks_req = match qnum("weeks", 1, 52) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 12,
+                Ok(Some(w)) => w,
             };
-            match api_heatmap_at(conn, weeks, today_naive()) {
-                Ok(v) => (200, "application/json", v.to_string()),
+            match api_heatmap_at(conn, weeks_req.min(52), today_naive()) {
+                Ok(mut v) => {
+                    if weeks_req > 52 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "weeks", weeks_req, 52);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["weeks"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/apps") => {
-            let days = match qval("days") {
-                None => 7,
-                Some(v) => match v.parse::<u32>() {
-                    Ok(d) => d,
-                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
-                },
+            let days = match qnum("days", 1, 365) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 7,
+                Ok(Some(d)) => d,
             };
             match api_apps_at(conn, days, today_naive()) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    if days > 365 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "days", days, 365);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["days"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
@@ -2709,22 +2783,23 @@ pub fn route_req(
                 return (400, "application/json", err_json(&e));
             }
             match api_hours(conn, &date) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    add_ignored(&mut v, ignored_params(&["date"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/input") => {
-            let days = match qval("days") {
-                None => 7,
-                Some(v) => match v.parse::<u32>() {
-                    // 上限 90：聚合虽已在 SQL 端完成（SUM/json_each，不拉行），
-                    // 但窗口越大单请求扫描成本越高——限制回看跨度防慢查询。
-                    // 截断不再无声：响应补 days_requested + note（见下）。
-                    Ok(d) => d.clamp(1, 90),
-                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
-                },
+            // 上限 90：聚合虽已在 SQL 端完成（SUM/json_each，不拉行），
+            // 但窗口越大单请求扫描成本越高——限制回看跨度防慢查询。
+            // 截断不再无声：响应补 days_requested + note（见下）。
+            let days_requested = match qnum("days", 1, 90) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => None,
+                Ok(Some(d)) => Some(d),
             };
-            let days_requested = qval("days").and_then(|v| v.parse::<u32>().ok());
+            let days = days_requested.unwrap_or(7).min(90);
             // date= 指定逐时条形图统计哪一天（缺省今天；空值 400，与
             // hours/report 同族一致——此前传 date 会被静默忽略）
             let hourly = match qdate("date") {
@@ -2754,15 +2829,15 @@ pub fn route_req(
             match api_input_at(conn, days, today_naive(), hourly) {
                 Ok(mut v) => {
                     // 静默截断修复（审查）：请求跨度超上限时明示 days_requested
-                    // 与截断说明，风格与 timeline 的 local_offset_note 一致。
-                    if let (Some(req), Some(obj)) = (days_requested, v.as_object_mut()) {
-                        if req > days {
-                            obj.insert("days_requested".into(), json!(req));
-                            obj.insert(
-                                "note".into(),
-                                json!("days 上限为 90，已按 90 天返回 / days is capped at 90; 90 days returned"),
-                            );
+                    // 与截断说明（cap_note，与其他数值端点共用）。
+                    if let Some(obj) = v.as_object_mut() {
+                        if let Some(req) = days_requested {
+                            if req > days {
+                                cap_note(obj, "days", req, 90);
+                            }
                         }
+                        let ign = ignored_params(&["days", "date"]);
+                        add_ignored(&mut v, ign);
                     }
                     (200, "application/json", v.to_string())
                 }
@@ -2774,11 +2849,9 @@ pub fn route_req(
             // overview/report 的"连续性"口径全站一致
             let s = settings::load(db_path);
             let bridge = s.presence_bridge_minutes.min(15);
-            (
-                200,
-                "application/json",
-                api_insights(conn, bridge).to_string(),
-            )
+            let mut v = api_insights(conn, bridge);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
         }
         ("GET", "/api/report") => {
             let date = match qdate("date") {
@@ -2791,12 +2864,18 @@ pub fn route_req(
             }
             let s = settings::load(db_path);
             match api_report_at(conn, &date, &s) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    add_ignored(&mut v, ignored_params(&["date"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/trends") => match api_trends_at(conn, today_naive()) {
-            Ok(v) => (200, "application/json", v.to_string()),
+            Ok(mut v) => {
+                add_ignored(&mut v, ignored_params(&[]));
+                (200, "application/json", v.to_string())
+            }
             Err(e) => (400, "application/json", err_json(&e)),
         },
         ("GET", "/api/apps_grid") => {
@@ -2809,41 +2888,53 @@ pub fn route_req(
                 return (400, "application/json", err_json(&e));
             }
             match api_apps_grid_at(conn, &date) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    add_ignored(&mut v, ignored_params(&["date"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
         ("GET", "/api/daily_top") => {
-            let days = match qval("days") {
-                None => 14,
-                Some(v) => match v.parse::<u32>() {
-                    Ok(d) => d,
-                    Err(_) => return (400, "application/json", err_json("days 应为非负整数")),
-                },
+            let days = match qnum("days", 1, 90) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 14,
+                Ok(Some(d)) => d,
             };
             match api_daily_top_at(conn, days, today_naive()) {
-                Ok(v) => (200, "application/json", v.to_string()),
+                Ok(mut v) => {
+                    if days > 90 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "days", days, 90);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["days"]));
+                    (200, "application/json", v.to_string())
+                }
                 Err(e) => (400, "application/json", err_json(&e)),
             }
         }
-        ("GET", "/api/diagnostics") => (
-            200,
-            "application/json",
-            api_diagnostics(db_path).to_string(),
-        ),
-        ("GET", "/api/settings") => (200, "application/json", api_settings(db_path).to_string()),
+        ("GET", "/api/diagnostics") => {
+            let mut v = api_diagnostics(db_path);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/settings") => {
+            let mut v = api_settings(db_path);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
         // 自启同步读回（设置保存回执修复）：settings.json 已落盘，但注册表 Run 键
         // 由 tray 进程防抖后异步写入、失败只进 tray.log。面板保存后延迟读回比对，
         // 两者不一致时把"已保存"降级为"自启同步失败"。
-        ("GET", "/api/autostart-status") => (
-            200,
-            "application/json",
-            json!({
+        ("GET", "/api/autostart-status") => {
+            let mut v = json!({
                 "autostart": settings::load(db_path).autostart,
                 "registry_run_present": settings::autostart_registry_enabled_pub(),
-            })
-            .to_string(),
-        ),
+            });
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
         ("POST", "/api/settings") => {
             // 读-改-写整段串行化（审查 P1：并发 POST 会用旧快照覆盖对方字段）
             static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
