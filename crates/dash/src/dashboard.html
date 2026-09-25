@@ -257,6 +257,8 @@
        文本无变化时不重写（loadStatus 内），避免 30s 轮询反复触发播报 -->
   <div class="muted" id="status-line" aria-live="polite">loading…</div>
   <div id="update-banner" role="status" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#243040;font-size:13px"></div>
+  <!-- 看门狗告警横幅（修复：落库的 notification 系统事件此前无任何 UI 消费方） -->
+  <div id="watchdog-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #8a6d1f;border-radius:6px;background:#332a14;color:#f2ddaa;font-size:13px"></div>
   <div id="db-degraded-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #a33;border-radius:6px;background:#3a2020;color:#fdd;font-size:13px"></div>
   <!-- ARIA APG tabs 键盘契约：活动 tab tabindex=0 其余 -1，方向键/Home/End
        移动并激活（JS 末尾 tablist keydown）；aria-controls/aria-labelledby 双向关联 -->
@@ -288,7 +290,7 @@
     <div class="label"><span class="l en">automation today</span><span class="l zh">今日自动化</span></div>
     <div class="value xl" style="color:var(--dim);" id="c-automation">–</div>
     <div class="note">
-      <span class="l en">operations produced by automation tools or scripts</span><span class="l zh">自动化脚本或工具产生的操作</span>
+      <span class="l en">operations produced by automation tools or scripts — the keyboard/mouse hooks mark script-injected input (AutoHotkey, macro tools, etc.) as automation</span><span class="l zh">自动化脚本或工具产生的操作。识别方式：键盘/鼠标钩子把脚本注入的输入（AutoHotkey、按键精灵等）标记为自动化</span>
       · <span id="c-automation-delta"></span>
     </div>
   </div>
@@ -304,7 +306,7 @@
     <div class="label"><span class="l en">unattended today (foreground window active, no human, no automation)</span><span class="l zh">今日无人（前台有窗口，人不在场也不自动化）</span></div>
     <div class="value xl" style="color:var(--dim);" id="c-unattended">–</div>
     <div class="note">
-      <span class="l en">foreground app time − (presence ∪ automation); conservative approximation, negatives clamped to 0</span><span class="l zh">前台应用时长 −（在场 ∪ 自动化），保守近似，负值记 0</span>
+      <span class="l en">the part of foreground app time where neither you nor automation could be detected — counted here when you leave without locking the screen (e.g. an idle page keeps playing). Conservative estimate, never shown below zero</span><span class="l zh">前台应用时长中既检测不到人、也检测不到自动化的部分：人离开但没锁屏（如挂机网页还在播放）时计入此处。保守估算，不会夸大</span>
     </div>
   </div>
 </div>
@@ -314,7 +316,7 @@
 <div id="overview-note" class="muted" style="font-size:12px;margin:4px 0 0"></div>
 
 <section>
-  <h2><span class="l en">timeline — last 24 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 24 小时（在场 / 自动化 / 无人）</span></h2>
+  <h2><span class="l en">timeline — last 24 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 24 小时（在场 / 自动化 / 无输入）</span></h2>
   <div id="timeline" class="muted">loading…</div>
 </section>
 
@@ -376,7 +378,9 @@
     <span><span class="l en">less</span><span class="l zh">少</span></span>
     <!-- 色块与热力图同一色源（--hm-N 变量）：亮色/高对比主题整体换色；
          原内联 hex 在 forced-colors 下五个色块全被强制为 Canvas 同色 -->
-    <span class="sw" style="background:var(--hm-0);border:1px solid var(--border)"></span>
+    <!-- 零档用 --hm-idle（与 JS 端 loadHeatmap 的 HM_LEVELS[0] 同步）：
+         旧 --hm-0 与 --hm-1 对比度 1.14:1 肉眼不可分，"零"与"少"混淆 -->
+    <span class="sw" style="background:var(--hm-idle);border:1px solid var(--border)"></span>
     <span class="sw" style="background:var(--hm-1)"></span>
     <span class="sw" style="background:var(--hm-2)"></span>
     <span class="sw" style="background:var(--hm-3)"></span>
@@ -534,6 +538,9 @@
     <label for="set-port" style="white-space:nowrap"><span class="l en">dashboard port (1-65535):</span><span class="l zh">面板端口（1-65535）：</span></label>
     <input type="number" id="set-port" min="1" max="65535" style="width:88px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px">
     <span class="muted" style="font-size:11px"><span class="l en">local dashboard URL port (default 8422). takes effect after tray restart.</span><span class="l zh">本机面板访问端口（默认 8422）。重启托盘后生效。</span></span>
+    <!-- 实际监听端口（loadStatus/loadSettings 回填）：配置端口被占自动回退后，
+         用户可在浏览器地址栏与本页之间对照同一个数字 -->
+    <span class="muted" id="set-port-actual" style="font-size:11px"></span>
   </div>
   <div class="mon-row">
     <input type="checkbox" id="set-counts" checked>
@@ -570,9 +577,9 @@
 </div>
 <footer>
   <span class="l en">All data is local. This page reads your kynoptic.db on this machine only.<br>
-  Server binds 127.0.0.1 (localhost-only, not exposed to the network; no auth needed). Read-only: the dashboard never writes to your events. License: Apache-2.0.</span>
+  Server binds 127.0.0.1 (localhost-only, not exposed to the network; <span class="footer-auth">no auth needed</span>). Read-only: the dashboard never writes to your events. License: Apache-2.0.</span>
   <span class="l zh">所有数据均在本地。本页只读取本机的 kynoptic.db。<br>
-  服务仅绑定 127.0.0.1（只监听本机回环，不暴露到网络，无需鉴权）。只读：面板绝不写入事件数据。许可证：Apache-2.0。</span>
+  服务仅绑定 127.0.0.1（只监听本机回环，不暴露到网络，<span class="footer-auth">无需鉴权</span>）。只读：面板绝不写入事件数据。许可证：Apache-2.0。</span>
 </footer>
 
 <script nonce="__KYN_NONCE__">
@@ -596,7 +603,13 @@ function chartColors() {
   return { grid: cssVar("--chart-grid", "#232B38"), axis: cssVar("--chart-axis", "#93A1B3"),
            bar: cssVar("--chart-bar", "#3b82c4") };
 }
-/* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS） */
+/* 双语动态文案（静态文案走 .l.en/.l.zh + html[lang] CSS）
+   术语表（全页统一，勿混用）：
+   - presence = 在场（真实键鼠/滚轮操作）
+   - automation = 自动化（脚本注入的输入）
+   - away = 无输入（时间带标题/图例统一用"无输入"）
+   - unattended = 无人（总览卡专属指标：前台有窗口但既无在场也无自动化）
+   - "键"只用于按键次数；鼠标物理按键数用"个按键" */
 const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
         noSession: "not running", noData: "no data", saved: "saved. changes take effect in a few seconds.",
@@ -612,6 +625,15 @@ const T = {
         hourIdle: "idle (no events)",
         focusOmitted: "blocks over 4h omitted — they may include away/idle periods (see timeline)",
         disconnected: "disconnected — retrying…",
+        needToken: "access token required", enterToken: "enter token",
+        authNeeded: "access token required (data\\dashboard-token.txt)",
+        dbDirUser: "current user's app data directory", dbDirExe: "app directory",
+        actualPort: "actually listening on port {n}",
+        portFallback: "configured port {c} was busy — auto-fallback",
+        autostartSyncFail: "saved, but autostart sync failed — the Windows registry was not updated (see tray.log)",
+        baselineAccruing: "baseline still accruing: anomaly detection compares against your last 7 days of history — for the first days after install nothing can be judged here yet ({n} day(s) collected).",
+        watchdogAlert: "system alert (watchdog): {m} (within the last 24h)",
+        savedBtn: "✓ saved",
         weekInsufficient: "not enough data for a 7-day comparison ({n} day(s) collected)",
         retry: "retry", loadFailed: "load failed: ",
         hostFailed: "hardware info failed to load.",
@@ -621,7 +643,7 @@ const T = {
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
-        kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "键",
+        kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "个按键",
         withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",
         unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
         restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
@@ -632,6 +654,15 @@ const T = {
         hourIdle: "空闲（无事件）",
         focusOmitted: "存在超长块，可能包含离开/挂机时段（详见时间线）",
         disconnected: "连接断开，正在重试…",
+        needToken: "需要访问令牌", enterToken: "输入令牌",
+        authNeeded: "需要访问令牌（data\\dashboard-token.txt）",
+        dbDirUser: "当前用户的应用数据目录", dbDirExe: "程序目录",
+        actualPort: "实际监听端口：{n}",
+        portFallback: "配置端口 {c} 被占用，已自动回退",
+        autostartSyncFail: "已保存，但开机自启同步失败——注册表未更新（详见 tray.log）",
+        baselineAccruing: "基线积累中：异常检测需要你近 7 天同时段的历史数据，装好后几天内这里暂无法判断（已积累 {n} 天）。",
+        watchdogAlert: "系统告警（看门狗）：{m}（近 24 小时内）",
+        savedBtn: "✓ 已保存",
         weekInsufficient: "数据不足 7 天（已积累 {n} 天）",
         retry: "重试", loadFailed: "加载失败：",
         hostFailed: "硬件信息加载失败。",
@@ -670,31 +701,49 @@ const ERR_TEXT = {
   not_found: "API not found — the page may be stale, please refresh",
   method_not_allowed: "method not allowed",
   csrf_blocked: "write blocked: the request looks cross-site. Go back to the dashboard page and retry",
-  session_token_invalid: "invalid session token — the page may be stale, refresh and retry"
+  session_token_invalid: "invalid session token — the page may be stale, refresh and retry",
+  unauthorized: "access token required (data\\dashboard-token.txt)"
+};
+/* 中文界面的按码映射（ERR_TEXT 的中文对照）：服务端错误正文是英文/中文混排，
+   中文界面按 code 给中文文案，不再直出英文原文 */
+const ERR_TEXT_ZH = {
+  unauthorized: "需要访问令牌（data\\dashboard-token.txt）"
 };
 function apiErrText(e) {
   const en = document.documentElement.lang !== "zh";
-  if (en && e && e.code && ERR_TEXT[e.code]) return ERR_TEXT[e.code];
+  if (e && e.code) {
+    if (en && ERR_TEXT[e.code]) return ERR_TEXT[e.code];
+    if (ERR_TEXT_ZH[e.code]) return ERR_TEXT_ZH[e.code];
+  }
   return (e && e.error) || "";
+}
+/* 令牌输入共用入口：prompt → 存 sessionStorage。返回是否拿到非空令牌。 */
+function promptForToken() {
+  const tk = prompt(document.documentElement.lang === "zh"
+    ? "请输入访问令牌（data\\dashboard-token.txt 的内容）"
+    : "Enter access token (contents of data\\dashboard-token.txt)");
+  if (!tk) return false;
+  KYN_ACCESS_TOKEN = tk.trim();
+  try { sessionStorage.setItem("kyn-access-token", KYN_ACCESS_TOKEN); } catch (_) {}
+  return !!KYN_ACCESS_TOKEN;
 }
 async function jget(url, retried) {
   const r = await fetch(url, { headers: kynHeaders() });
   if (r.status === 401 && !retried) {
     // 访问令牌缺失/失效：给一次手工输入机会，而不是让整页 API 全部失败
-    const t = prompt(document.documentElement.lang === "zh"
-      ? "请输入访问令牌（data\\dashboard-token.txt 的内容）"
-      : "Enter access token (contents of data\\dashboard-token.txt)");
-    if (t) {
-      KYN_ACCESS_TOKEN = t.trim();
-      try { sessionStorage.setItem("kyn-access-token", KYN_ACCESS_TOKEN); } catch (_) {}
-      return jget(url, true);
-    }
+    if (promptForToken()) return jget(url, true);
   }
   if (!r.ok) {
     // 非 200 时后端正文为 {"error", "code"}（如未来日期校验）：
-    // 按 code 取本语言文案后交给 showViewError，不再只显示 "URL → HTTP 400"
+    // 按 code 取本语言文案后交给 showViewError，不再只显示 "URL → HTTP 400"。
+    // 401 单列：进入 markAuthRequired（状态行"需要访问令牌"+再输入入口），
+    // 不走 markDisconnected 的"连接断开"红字（服务实际在线）。
     const e = await r.json().catch(() => ({}));
-    throw new Error(apiErrText(e) || (url + " → HTTP " + r.status));
+    const err = new Error(apiErrText(e) || (url + " → HTTP " + r.status));
+    if (r.status === 401) { err.code = "unauthorized"; }
+    else if (e && e.code) { err.code = e.code; }
+    err.status = r.status;
+    throw err;
   }
   return r.json();
 }
@@ -741,6 +790,9 @@ function toggleLang() {
   // 但状态行不含勾选状态，必须立即按新语言重渲染（用缓存 last 数据），
   // 否则要等下一轮 30s 轮询才切换语言（P2 回归：状态行滞留旧语言）。
   if (currentView === "settings") { loadStatus().catch(() => {}); return; }
+  // 状态行在任何视图都要按新语言立即重绘（此前仅设置页补调，报告/apps/input/
+  // insights/anomalies 页要等 30s 轮询才切换，页面半中半英）
+  loadStatus().catch(() => {});
   // 启动即拉一次设置：Overview 目标环用真实目标而非硬编码；失败不影响首屏
   loadSettings().catch(() => {});
   refreshAll().catch(() => {});
@@ -752,9 +804,11 @@ function toggleLang() {
 async function loadStatus() {
   const s = await jget("/api/status");
   const el = document.getElementById("status-line");
-  // 审查 P1：markDisconnected 上过的红色必须在成功刷新时复位，
+  // 审查 P1：markDisconnected/markAuthRequired 上过的颜色必须在成功刷新时复位，
   // 否则一次瞬时断连后状态行永久红着"连接断开"。
   if (el) el.style.color = "";
+  // 页脚鉴权声明跟随服务端实际状态（令牌已启用时不宣称"无需鉴权"）
+  setFooterAuth(!!s.token_required);
   if (!s.last_event_ts) {
     const txt = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + dbStatusText(s);
     // aria-live 区：文本没变就不重写，30s 轮询不会反复触发读屏播报
@@ -781,6 +835,11 @@ async function loadStatus() {
     // 必须单列为异常态，避免采集器死亡被掩盖
     stateTxt = zh ? "时间戳异常（晚于本机时钟）" : "timestamp anomaly (ahead of local clock)";
   }
+  else if (s.paused) {
+    // 用户主动暂停（托盘 Pause 写 paused.flag）：不能报"停滞/未运行"，
+    // 那会把用户自己的选择当成故障
+    stateTxt = zh ? "已暂停（在托盘菜单里恢复采集）" : "paused (resume from the tray menu)";
+  }
   else if (age < 600) stateTxt = zh ? "采集中" : "collecting";
   else if (age < 86400) stateTxt = zh ? "停滞（最后事件 " + Math.round(age/60) + " 分钟前）" : "stale (last event " + Math.round(age/60) + " min ago)";
   else stateTxt = zh ? "无事件（采集器可能未运行）" : "no events (collector may be down)";
@@ -800,15 +859,31 @@ async function loadStatus() {
   }
   // 数据库降级横幅（库损坏静默零值修复 2026-09）：后端 quick_check / 数据
   // 回退对账发现问题时显示，避免用户把库损坏误读成"今天什么都没干"。
+  // 附托盘"打开数据目录"直达指引（面板不暴露完整路径，备份要靠这个入口）。
   const dg = document.getElementById("db-degraded-banner");
   if (dg) {
     if (s.db_degraded) {
       dg.style.display = "";
       dg.textContent = zh
-        ? "警告：数据库可能已损坏，部分数据暂时无法读取——" + s.db_degraded + "（建议先备份 data 目录，再尝试修复或恢复备份）。"
-        : "Warning: the database may be corrupted; some data cannot be read right now — " + s.db_degraded + " (back up the data folder first, then try repairing or restoring a backup).";
+        ? "警告：数据库可能已损坏，部分数据暂时无法读取——" + s.db_degraded + "（建议先通过 托盘菜单 → 打开数据目录 备份数据文件，再尝试修复或恢复备份）。"
+        : "Warning: the database may be corrupted; some data cannot be read right now — " + s.db_degraded + " (back up the data files first via tray menu → Open data folder, then try repairing or restoring a backup).";
     } else {
       dg.style.display = "none";
+    }
+  }
+  // 看门狗告警横幅（修复：cli watchdog_alert 落库的 notification 系统事件
+  // 此前全仓无消费方，采集空洞在 UI 零痕迹）。后端只回近 24h 内最新一条。
+  const wb = document.getElementById("watchdog-banner");
+  if (wb) {
+    const wa = s.watchdog_alert;
+    if (wa && wa.message) {
+      wb.style.display = "";
+      // 按界面语言选同义文案：落库的 message 是中文原文，英文界面用
+      // message_en（写入方同时落两语）；旧数据无 message_en 时回退原文
+      const wamsg = zh ? wa.message : (wa.message_en || wa.message);
+      wb.textContent = t("watchdogAlert").replace("{m}", wamsg);
+    } else {
+      wb.style.display = "none";
     }
   }
 }
@@ -816,7 +891,7 @@ async function loadStatus() {
    完整安装路径。状态行展示文件名并附目录性质提示（exe 同目录 / 其他）。 */
 function dbStatusText(s) {
   const kind = s.db_dir_kind
-    ? t("dbDirHint") + (s.db_dir_kind === "exe-relative data" ? "exe dir" : "user dir")
+    ? t("dbDirHint") + (s.db_dir_kind === "exe-relative data" ? t("dbDirExe") : t("dbDirUser"))
     : "";
   return kind ? s.db_path + " (" + kind + ")" : s.db_path;
 }
@@ -1101,6 +1176,9 @@ async function loadHeatmap() {
   const cols = Math.ceil(days.length / 7);
   const W = 40 + cols * (cell + gap) + 8, H = 7 * (cell + gap) + 16;
   const HM_LEVELS = hmLevels(); // 每次渲染现读 CSS 变量（主题切换后同步）
+  // 零档 = "无输入"，改用 --hm-idle（与图例色块同步）：旧 --hm-0 与 --hm-1
+  // 对比度仅 1.14:1，仅 1 天有数据时整张图肉眼完全均一，"零"与"少"分不清
+  HM_LEVELS[0] = cssVar("--hm-idle", "#0B0F16");
   const unit = document.documentElement.lang === "zh" ? " 分钟" : " min";
   // aria-label 与其余三图对齐（role=img 会剥离 <title> 后代，无名图对读屏不可达）
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" tabindex="0" aria-label="daily input heatmap, ' + cols + " weeks / 每日输入热力图，共 " + cols + ' 周">';
@@ -1197,6 +1275,22 @@ function kbColor(v, max) {
 }
 function renderKeyboard(freq) {
   const svg = document.getElementById("kb-heatmap");
+  // 空态（与 renderMouse 同口径）：装机第一天 key_freq 为空时不再渲染
+  // 104 键全暗键盘（每键悬浮"0"，看起来像功能坏了），明示"暂无数据"
+  const wrap = svg.parentElement;
+  let emptyHint = document.getElementById("kb-empty-hint");
+  if (!emptyHint) {
+    emptyHint = document.createElement("div");
+    emptyHint.id = "kb-empty-hint";
+    emptyHint.className = "muted";
+    emptyHint.style.display = "none";
+    wrap.parentElement.insertBefore(emptyHint, wrap);
+  }
+  const isEmpty = Object.keys(freq).length === 0;
+  emptyHint.style.display = isEmpty ? "" : "none";
+  emptyHint.textContent = isEmpty ? t("noData") : "";
+  wrap.style.display = isEmpty ? "none" : "";
+  if (isEmpty) { svg.innerHTML = ""; return; }
   const vals = Object.entries(freq).filter(([k]) => +k !== 32); // 空格独占上色会淹没全局
   const max = Math.max(1, ...vals.map(([, v]) => v));
   const ns = "http://www.w3.org/2000/svg";
@@ -1357,9 +1451,11 @@ async function loadReport() {
         presenceMin = ov.presence_minutes;
         const raw = dayRow ? (dayRow.active_minutes || 0) : 0;
         if (Math.abs(raw - presenceMin) >= 1) {
+          // 括号文案与历史日期同一措辞（口径标注不随所选日期变体）
           rawNote = " <span class='muted' style='font-size:12px'>(" +
             (document.documentElement.lang === "zh"
-              ? "原始输入分钟 " + fmtMin(raw) : "raw input minutes " + fmtMin(raw)) + ")</span>";
+              ? "原始输入分钟 " + fmtMin(raw) + "，非在场口径"
+              : "raw input minutes " + fmtMin(raw) + ", not presence") + ")</span>";
         }
       }
     } catch (e) { /* overview 失败时退回 raw，不打断整页渲染 */ }
@@ -1678,7 +1774,17 @@ async function loadAnomalies() {
     badge.textContent = alerts > 99 ? "99+" : String(alerts);
     badge.style.display = alerts > 0 ? "" : "none";
   }
-  if (!a.anomalies.length) { el.innerHTML = '<li class="muted">' + t("noAnomalies") + "</li>"; return; }
+  if (!a.anomalies.length) {
+    // 空态分流：基线未建立（近 7 天有数据的天数 < 3）≠ "已检查、一切正常"，
+    // 明示"基线积累中"，避免装机头几天被误读成一切正常
+    const bd = typeof a.baseline_days === "number" ? a.baseline_days : null;
+    if (bd !== null && bd < 3) {
+      el.innerHTML = '<li class="muted">' + t("baselineAccruing").replace("{n}", bd) + "</li>";
+      return;
+    }
+    el.innerHTML = '<li class="muted">' + t("noAnomalies") + "</li>";
+    return;
+  }
   // 严重级别排序：alert 最高，排最前；同级别内按时刻先后
   const SEV_ORDER = { alert: 0, critical: 1, warn: 2, info: 3 };
   const isEn = document.documentElement.lang === "en";
@@ -1712,11 +1818,12 @@ function settingsMsg(text, ok) {
   el.className = ok ? "ok" : "bad";
   el.style.opacity = "1";
   if (ok && text) {
-    // 保存成功 3 秒后淡出（仅透明过渡，不清空文本，读屏仍可感知）
+    // 保存成功 9 秒后淡出（原 3 秒：长设置页上视线不在消息区时确认已消失，
+    // 看起来像没保存而重复保存）。仅透明过渡，不清空文本，读屏仍可感知
     settingsFadeTimer = setTimeout(function () {
       el.style.opacity = "0";
       settingsFadeTimer = null;
-    }, 3000);
+    }, 9000);
   }
 }
 // 监控器双语名 + 新 loadSettings + restoreDefaults（替换原 loadSettings 整函数）
@@ -1808,10 +1915,16 @@ async function loadSettings() {
       ? '<span class="l en">' + n[0] + '</span><span class="l zh">' + n[1] + "</span>" +
         ' <span class="muted" style="font-size:10px">' + esc(m.id) + "</span>"
       : esc(m.id);
+    // 双语一句话说明：让用户勾选前知道到底记录什么
+    const desc = m.desc_en
+      ? '<div class="mon-desc" style="flex-basis:100%;margin-left:23px;font-size:11.5px;color:var(--dim)">' +
+        '<span class="l en">' + esc(m.desc_en) + '</span><span class="l zh">' + esc(m.desc_zh || m.desc_en) + "</span></div>"
+      : "";
     return '<div class="mon-row"><input type="checkbox" class="mon-toggle" data-id="' + esc(m.id) + '"' +
       (enabled.has(m.id) ? " checked" : "") + ' id="mon-' + esc(m.id) + '">' +
       '<label for="mon-' + esc(m.id) + '">' + label + "</label>" +
-      (m.default_enabled ? "" : '<span class="badge"><span class="l en">opt-in</span><span class="l zh">可选</span></span>') + "</div>";
+      (m.default_enabled ? "" : '<span class="badge"><span class="l en">opt-in</span><span class="l zh">可选</span></span>') +
+      desc + "</div>";
   };
   document.getElementById("mon-default").innerHTML =
     s.monitors.filter(m => m.default_enabled).map(row).join("");
@@ -1821,6 +1934,17 @@ async function loadSettings() {
   document.getElementById("set-bridge").value = (s.presence_bridge_minutes ?? 2);
   document.getElementById("set-goal").value = (s.daily_goal_minutes ?? 480);
   document.getElementById("set-port").value = (s.dashboard_port ?? 8422);
+  // 实际监听端口（修复：端口被占自动回退后，配置值与实际端口在 UI 上无从
+  // 对照）。actual_port 为 0/缺字段（旧后端）时静默留空。
+  jget("/api/status").then(function (st) {
+    const hint = document.getElementById("set-port-actual");
+    if (!hint) return;
+    const ap = st.actual_port;
+    if (!ap) { hint.textContent = ""; return; }
+    let txt = t("actualPort").replace("{n}", ap);
+    if (ap !== (s.dashboard_port ?? 8422)) txt += "（" + t("portFallback").replace("{c}", s.dashboard_port ?? 8422) + "）";
+    hint.textContent = txt;
+  }).catch(function () {});
   document.getElementById("set-counts").checked = s.input_counts_only;
   document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
   settingsMsg("", true);
@@ -1931,7 +2055,9 @@ async function saveSettings() {
     }
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      throw new Error(apiErrText(e) || ("HTTP " + r.status));
+      const err = new Error(apiErrText(e) || ("HTTP " + r.status));
+      if (e && e.code) err.code = e.code;
+      throw err;
     }
     let msg = t("saved");
     if (fellBack) msg += document.documentElement.lang === "zh"
@@ -1940,6 +2066,21 @@ async function saveSettings() {
     // 端口只在 serve() 启动时绑定一次，改端口需重启托盘才生效（portNote 文案）
     if (oldPort !== undefined && body.dashboard_port !== oldPort) msg += " " + t("portNote");
     settingsMsg(msg, true);
+    // 按钮本体短暂变"✓ 已保存"：成功反馈不依赖视线是否在消息区
+    const btn0 = btn.textContent;
+    btn.textContent = t("savedBtn");
+    setTimeout(function () { btn.textContent = btn0; }, 4000);
+    // autostart 读回校验（保存回执修复）：注册表 Run 键由 tray 进程防抖后
+    // 异步写入、失败只进 tray.log——此前 UI 只要 r.ok 就报"已保存"。
+    // 5 秒后读注册表现状，与设置不一致时把成功回执降级为失败提示。
+    const prevAuto = LAST_SETTINGS ? LAST_SETTINGS.autostart : undefined;
+    if (body.autostart !== prevAuto) {
+      setTimeout(function () {
+        jget("/api/autostart-status").then(function (st) {
+          if (st.autostart !== st.registry_run_present) settingsMsg(t("autostartSyncFail"), false);
+        }).catch(function () {});
+      }, 5000);
+    }
     // 同步缓存：目标环/确认弹窗立刻用新值，不再等刷新页面（Wave18 P1）
     if (!("error" in (body || {}))) LAST_SETTINGS = Object.assign({}, LAST_SETTINGS, body);
   } catch (e) {
@@ -2050,19 +2191,54 @@ setInterval(() => {
   if (document.hidden) return;
   if (currentView === "settings") {
     // 设置页仍要续跳状态行（不触碰表单勾选，轮询豁免只保护视图重渲染）
-    loadStatus().catch(() => markDisconnected());
+    loadStatus().catch(e => handleApiError(e));
     return;
   }
   if (currentView !== "overview") {
-    loadStatus().catch(() => markDisconnected());
+    loadStatus().catch(e => handleApiError(e));
     return;
   }
   refreshAll().catch(() => {
     // 轮询失败不能静默停在旧数据；但只有状态端点本身失联才算"断连"
     //（个别端点 500 时不该把好连接涂红——审查 P2）
-    loadStatus().then(() => {}).catch(() => markDisconnected());
+    loadStatus().then(() => {}).catch(e => handleApiError(e));
   });
 }, 30000);
+/* 页脚鉴权声明随令牌状态切换（修复：令牌已启用时页脚不再宣称"无需鉴权"） */
+function setFooterAuth(required) {
+  document.querySelectorAll(".footer-auth").forEach(el => {
+    el.textContent = required ? t("authNeeded") : (document.documentElement.lang === "zh" ? "无需鉴权" : "no auth needed");
+  });
+}
+/* 401（令牌缺失/失效）与断连分开叙述：服务实际在线，不能涂红成"连接断开"。
+   状态行显示"需要访问令牌"（警示色、非红），并附再输入入口按钮。 */
+function markAuthRequired() {
+  const el = document.getElementById("status-line");
+  setFooterAuth(true);
+  if (!el) return;
+  el.style.color = "var(--warn)";
+  el.textContent = t("needToken");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "save btn-ghost";
+  btn.style.cssText = "padding:1px 10px;font-size:12px;margin-left:8px";
+  btn.textContent = t("enterToken");
+  btn.onclick = function () {
+    if (promptForToken()) {
+      el.textContent = "";
+      RENDER_SIGS_CLEAR();
+      refreshAll().catch(e => handleApiError(e));
+    }
+  };
+  el.appendChild(btn);
+}
+/* 渲染签名清空（markAuthRequired 重试后强制整页重渲染） */
+function RENDER_SIGS_CLEAR() { for (const k of Object.keys(RENDER_SIGS)) delete RENDER_SIGS[k]; }
+/* 轮询/加载失败的统一分流：401 → 需要令牌状态；其余 → 断连红字 */
+function handleApiError(e) {
+  if (e && (e.code === "unauthorized" || e.status === 401)) { markAuthRequired(); return; }
+  markDisconnected();
+}
 function markDisconnected() {
   const el = document.getElementById("status-line");
   if (el) { el.textContent = t("disconnected"); el.style.color = "#e06c6c"; }
