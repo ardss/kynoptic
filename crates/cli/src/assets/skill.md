@@ -49,6 +49,13 @@ HTTP API（GET 全部只读）：
 查询参数统一语义（全 GET 端点）：重复参数取**首个**；显式空值（如 `?date=`、`?days=`）返回 400；数值参数非数字或低于下界返回 400，错误文案写明有效域（timeline `hours` 1–744、heatmap `weeks` 1–52、anomalies `days` 1–30、apps `days` 1–365、daily_top/input `days` 1–90）；超上限仍 200，但服务端钳制并在响应标注 `X_requested`+`note`（anomalies 同时置 `truncated=true`）；未识别或大小写错误的参数在响应 `ignored_params` 数组中回显。
 写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（Origin 必须与 dashboard-port.txt 里的实际端口一致）；**另有每会话 `X-Kynoptic-Token` 校验**——该令牌由服务端随机生成、仅注入面板页面，外部脚本拿不到，直连 POST 会被 403。外部脚本无法写设置，请引导用户在面板里改，或提示用户手动操作。
 
+## 退出码契约（脚本/AI 判断成败只看这里）
+
+- **0 = 成功，1 = 失败（参数错误/环境错误/操作未完成）**：所有子命令通用；错误说明走 stderr（`✗` 开头）。
+- `probe` 特有：**0 = 全部 PASS/EXPECTED-LIMITED，3 = 存在 FAIL（探针判定监控器坏），1 = 参数/环境错误**。门禁脚本看退出码即可，不必解析 verdict 文本。
+- `db checkpoint` 打印 `✓ 完成` 才是成功；WAL 因有活跃读取而未截断时报错（stderr，退出码 1），不是警告。
+- `update --check`：stdout 输出 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`，退出码 0；网络不可达或 Releases 上没有完整稳定版资产时退出码 1，stderr 写明原因。
+
 ## 口径铁律（引用数字前必读）
 
 - **人在场的唯一权威实现**在 `kynoptic-core::queries::presence::classify_minutes`，dashboard overview 与 CLI `presence` 共用。两者数字必须一致；不一致=bug，直接报告不要解释。
