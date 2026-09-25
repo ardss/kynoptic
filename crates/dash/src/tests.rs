@@ -192,6 +192,73 @@ fn status_reflects_last_event_ts() {
     );
 }
 
+// === watchdog 告警/恢复配对（修复：告警只有「发生」没有「解除」，采集
+// 恢复后横幅最长滞留 24h） ===
+
+/// 插入一条 notification 系统事件（与 cli watchdog_alert / tray 停滞告警
+/// 的落库表结构契约一致：events(timestamp,'system','notification',JSON)）。
+fn insert_notification(conn: &Connection, ts: &str, payload: &str) {
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data) VALUES (?1, 'system', 'notification', ?2)",
+        params![ts, payload],
+    )
+    .unwrap();
+}
+
+#[test]
+fn watchdog_alert_paired_with_recovery_event() {
+    let conn = mem_conn();
+    use chrono::TimeZone;
+    // 固定"现在"（测试不读真实时钟）：告警 23h 前、恢复 1h 前
+    let now = Utc.with_ymd_and_hms(2026, 9, 9, 12, 0, 0).unwrap();
+    let alert = (now - chrono::Duration::hours(23)).to_rfc3339();
+    insert_notification(
+        &conn,
+        &alert,
+        r#"{"source":"watchdog","kind":"collection_stalled","message":"挂死","message_en":"hung"}"#,
+    );
+    let v = latest_watchdog_alert_at(&conn, now).unwrap();
+    assert_eq!(v["recovered"], json!(false), "只有告警时照旧返回告警");
+    assert_eq!(v["message"], json!("挂死"));
+    let recovered = (now - chrono::Duration::hours(1)).to_rfc3339();
+    insert_notification(
+        &conn,
+        &recovered,
+        r#"{"source":"tray","kind":"collection_recovered","message":"已恢复","message_en":"recovered"}"#,
+    );
+    let v = latest_watchdog_alert_at(&conn, now).unwrap();
+    assert_eq!(
+        v["recovered"],
+        json!(true),
+        "恢复事件比告警新：横幅应翻转为已解除，不再滞留 24h"
+    );
+    assert_eq!(v["kind"], json!("collection_recovered"));
+    assert_eq!(v["message"], json!("已恢复"));
+    assert_eq!(v["message_en"], json!("recovered"));
+    assert_eq!(
+        v["at"],
+        json!(recovered),
+        "at = 恢复事件时刻，前端显示解除时间"
+    );
+}
+
+#[test]
+fn watchdog_alert_outside_24h_window_ignored() {
+    let conn = mem_conn();
+    use chrono::TimeZone;
+    let now = Utc.with_ymd_and_hms(2026, 9, 9, 12, 0, 0).unwrap();
+    let old = (now - chrono::Duration::hours(25)).to_rfc3339();
+    insert_notification(
+        &conn,
+        &old,
+        r#"{"kind":"collection_stalled","message":"旧告警"}"#,
+    );
+    assert!(
+        latest_watchdog_alert_at(&conn, now).is_none(),
+        "24h 窗口外的旧告警不返回"
+    );
+}
+
 // === overview ===
 
 #[test]

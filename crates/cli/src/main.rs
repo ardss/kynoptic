@@ -722,9 +722,13 @@ fn cmd_db(args: &[String]) -> Result<()> {
                 r.get::<_, i64>(0)
             }) {
                 Ok(0) => println!("✓ 完成"),
-                Ok(busy) => println!(
-                    "⚠ WAL 未截断（busy={busy}，存在活跃 reader）；关闭正在读取数据库的程序后重试"
-                ),
+                // busy = 请求的操作没完成，必须走错误通道（退出码非 0），
+                // 脚本才能用退出码判断成败；文案随之进 stderr。
+                Ok(busy) => {
+                    return Err(Error::InvalidData(format!(
+                        "WAL 未截断（busy={busy}，存在活跃 reader）；关闭正在读取数据库的程序后重试"
+                    )))
+                }
                 Err(e) => return Err(writable_db_error(&db_path, e)),
             }
         }
@@ -984,8 +988,14 @@ fn sync_settings_autostart(enable: bool) {
 
 fn cmd_autostart(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
-    // 始终指向 digital-pulse.exe（同目录或 src-tauri\target\debug）
-    let app_exe = locate_app_exe().unwrap_or_else(|| std::env::current_exe().unwrap_or_default());
+    // 始终指向托盘 exe（同目录）。找不到宁报错也绝不回退写 ctl 自身——
+    // 曾把 kynoptic-ctl.exe --minimized 写进 Run 键，开机自启拉起错误二进制。
+    let app_exe = locate_app_exe().ok_or_else(|| {
+        Error::InvalidData(
+            "同目录找不到 kynoptic-tray.exe，无法配置自启动（请将本工具与 kynoptic-tray.exe 放在同一目录）"
+                .into(),
+        )
+    })?;
     match sub {
         "enable" => {
             autostart::enable(&app_exe, &["--minimized"])?;
@@ -1013,11 +1023,17 @@ fn cmd_autostart(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 找到同目录下的 digital-pulse.exe（dev 模式）；找不到就用 ctl 自己
+/// 找到同目录下的托盘 exe（kynoptic-tray.exe；保留 digital-pulse.exe 仅作
+/// 旧目录兼容）。找不到返回 None——调用方必须报错，不得回退写自身。
 fn locate_app_exe() -> Option<std::path::PathBuf> {
     let ctl = std::env::current_exe().ok()?;
     let dir = ctl.parent()?;
-    for cand in ["digital-pulse.exe", "digital-pulse"] {
+    for cand in [
+        "kynoptic-tray.exe",
+        "kynoptic-tray",
+        "digital-pulse.exe",
+        "digital-pulse",
+    ] {
         let p = dir.join(cand);
         if p.exists() {
             return Some(p);
@@ -1102,7 +1118,19 @@ fn cmd_migrate(args: &[String]) -> Result<()> {
 
 /// `kynoptic now`：当前机器状态一行式视图（与 MCP get_current_status 同数据面）。
 fn cmd_now(args: &[String]) -> Result<()> {
-    let as_json = args.iter().any(|a| a == "--json");
+    // 显式解析：未知选项报错而非静默吞掉（与 stats/query/autostart 同政策；
+    // 旧实现 `--jsn` 被吞并悄悄降级为人话输出，下游 JSON 解析在别处炸）。
+    let mut as_json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => as_json = true,
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "未知选项: {other}（now 仅支持 --json）"
+                )))
+            }
+        }
+    }
     let conn = open_db_read(&resolve_db())?;
     let status = kynoptic_mcp::state::current_status(&conn, None).map_err(Error::InvalidData)?;
     if as_json {
@@ -1243,15 +1271,29 @@ fn parse_query_args(args: &[String]) -> Result<QueryArgs> {
         match args[i].as_str() {
             "--from" => {
                 i += 1;
-                q.from = args.get(i).cloned();
+                // 悬挂（缺值）显式报错：旧实现静默回落「今天」窗口且 exit 0，
+                // 查询窗口与意图不符（与 --limit/--days 同政策）
+                q.from = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidData("--from 需要值".into()))?,
+                );
             }
             "--to" => {
                 i += 1;
-                q.to = args.get(i).cloned();
+                q.to = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidData("--to 需要值".into()))?,
+                );
             }
             "--bucket" => {
                 i += 1;
-                q.bucket = args.get(i).cloned();
+                q.bucket = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidData("--bucket 需要值".into()))?,
+                );
             }
             "--limit" => {
                 i += 1;
@@ -1260,7 +1302,15 @@ fn parse_query_args(args: &[String]) -> Result<QueryArgs> {
                     .get(i)
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| Error::InvalidData("--limit 需要一个正整数".into()))?;
-                q.limit = v.clamp(1, 1000);
+                // 越界仍钳制到 1-1000（与 HTTP 端 X_requested 口径一致：照常
+                // 执行但回显实际生效值），不再完全静默。
+                if !(1..=1000).contains(&v) {
+                    let eff = v.clamp(1, 1000);
+                    eprintln!("提示: --limit {v} 超出 1-1000，已按 {eff} 执行");
+                    q.limit = eff;
+                } else {
+                    q.limit = v;
+                }
             }
             "--json" => q.json = true,
             other => {
@@ -1517,7 +1567,9 @@ fn cmd_skill_install() -> Result<()> {
 
 /// `kynoptic-ctl probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]`
 /// 实机探针：逐监控器启用、临时库采集 N 秒，报告事件数与 PASS/FAIL。
-fn cmd_probe(args: &[String]) -> Result<()> {
+/// 退出码契约：0=全部 PASS/EXPECTED-LIMITED；3=存在 FAIL（探针判定监控器
+/// 坏）；1=参数/环境错误。CI 可用退出码判断，不必解析 verdict 文本。
+fn cmd_probe(args: &[String]) -> Result<std::process::ExitCode> {
     let mut monitor = String::new();
     let mut secs: u64 = 15;
     let mut all = false;
@@ -1560,11 +1612,30 @@ fn cmd_probe(args: &[String]) -> Result<()> {
     if all {
         let outcomes = kynoptic_core::probe::probe_all(secs, fc_timeout);
         kynoptic_core::probe::print_matrix(&outcomes);
+        // verdict=FAIL 必须体现在退出码（3）：`probe --all && 上线` 这类
+        // 门禁旧实现恒 0 放行。
+        let fails = outcomes
+            .iter()
+            .filter(|o| o.verdict == kynoptic_core::probe::Verdict::Fail)
+            .count();
+        if fails > 0 {
+            eprintln!("probe: {fails} 个监控器判定 FAIL");
+            return Ok(std::process::ExitCode::from(3));
+        }
     } else {
         if monitor.is_empty() {
             return Err(Error::InvalidData(
                 "probe 需要 --monitor ID 或 --all".into(),
             ));
+        }
+        // 未知 id 在 CLI 侧报统一错误（exit 1），不进 core 的内部断言
+        //（probe_monitor 对未知 id panic 曾把参数错误实现成进程崩溃 exit 101）。
+        let ids = kynoptic_core::registry::all_monitor_ids();
+        if !ids.iter().any(|s| *s == monitor) {
+            return Err(Error::InvalidData(format!(
+                "未知监控器 id: {monitor}（可用: {}）",
+                ids.join(", ")
+            )));
         }
         let out = kynoptic_core::probe::probe_monitor(&monitor, secs, fc_timeout);
         println!(
@@ -1584,8 +1655,11 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                 format!(" ({})", out.note)
             }
         );
+        if out.verdict == kynoptic_core::probe::Verdict::Fail {
+            return Ok(std::process::ExitCode::from(3));
+        }
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// `collect` 子命令：前台运行采集器（默认 14 监控器；--all 启用全部 40 个），
@@ -1984,40 +2058,52 @@ fn watchdog_log(msg: &str) {
     }
 }
 
-/// 同类告警去重窗口：常驻模式每 15s 一轮，窗口内同一 kind 只升级一次
-/// （落库+系统通知），防长时间故障期把 events 表刷爆。
+/// 同类告警去重窗口：窗口内同一 kind 只升级一次（落库+系统通知），防长
+/// 时间故障期把 events 表刷爆。去重时刻持久化在 watchdog-state.json——
+/// 生产形态是计划任务每分钟跑一次 `watchdog --once`（全新进程），进程内
+/// static 去重完全失效（持续故障每分钟弹框+插库）。
 const WATCHDOG_ALERT_DEDUP_SECS: i64 = 1800;
-/// 告警升级是否触发过的原子旗标（--once 模式退出前据此短暂等待，给
-/// 异步系统通知一个渲染窗口）
+/// 告警升级是否触发过的原子旗标（--once 模式退出前据此等待模态框线程）
 static WATCHDOG_ALERT_FIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// --once 退出前需等待的告警模态框线程（windows 块内发射，跨函数交给退出
+/// 路径）。--once 进程退出会随进程销毁窗口，进程内的固定 1500ms 睡眠既等
+/// 不到用户、窗口也可能来不及画出。
+#[cfg(target_os = "windows")]
+static ALERT_BOX_THREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+/// 模态框存活上限：等用户关闭，但没人理时不能让计划任务进程被一个对话框
+/// 长期占住（互斥锁防并发 --once，但每分钟一个 60s 进程仍属浪费）。
+#[cfg(target_os = "windows")]
+const ALERT_BOX_MAX_LIFETIME_SECS: u64 = 60;
 
 /// 看门狗告警升级通道：异常不再只写 watchdog.log（复核发现生产库 29 分钟
 /// 采集空洞在库/UI 层面零痕迹），同时
 /// 1) 落库为 `notification` 系统事件（event_data 带 source=watchdog/kind/
 ///    message），UI 与分析侧可读；沿用既有 action 枚举，不改 schema。
-/// 2) 尽力而为弹一次系统通知（独立线程，不阻塞检查循环）。
+/// 2) 尽力而为弹一次系统通知（独立线程，不阻塞检查循环；--once 退出路径
+///    会等它关闭或到存活上限）。
 ///
 /// 全程尽力而为：库打不开/写失败只留 stderr，不影响看门狗主流程。
-/// 按 kind 去重（进程内存级；常驻进程内窗口 30 分钟）。
-fn watchdog_alert(kind: &str, message: &str, message_en: &str) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static LAST: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+/// 按 kind 去重（上次告警时刻持久化在 state.last_alert_epochs，跨进程
+/// 窗口 30 分钟；心跳恢复正常时 state 清零，去重历史随之一并清空）。
+fn watchdog_alert(state: &mut WatchdogState, kind: &str, message: &str, message_en: &str) {
     let now_epoch = Utc::now().timestamp();
-    let deduped = {
-        let Ok(mut g) = LAST.lock() else { return };
-        let map = g.get_or_insert_with(HashMap::new);
-        if now_epoch - *map.get(kind).unwrap_or(&0) < WATCHDOG_ALERT_DEDUP_SECS {
-            true
-        } else {
-            map.insert(kind.to_string(), now_epoch);
-            false
-        }
-    };
-    if deduped {
+    // 跨进程去重：读持久化表，满窗口才升级并回写
+    let last = state.last_alert_epochs.get(kind).copied().unwrap_or(0);
+    if now_epoch.saturating_sub(last) < WATCHDOG_ALERT_DEDUP_SECS {
         return;
     }
+    state.last_alert_epochs.insert(kind.to_string(), now_epoch);
+    // 恢复门（跨进程持久化）：停摆类告警升级时记下 kind，心跳恢复的那一轮
+    // 据此落解除事件。进程内 WATCHDOG_ALERT_FIRED 旗标只保留「--once 退出前
+    // 等模态框线程」的用途，不能作恢复门——生产形态每分钟一个全新进程，
+    // 旗标在进程 N 置位后随进程退出丢弃，进程 N+1 读到的恒为 false。
+    if kind_implies_collection_stall(kind) {
+        state.pending_recovery_kind = Some(kind.to_string());
+    }
+    save_watchdog_state(state);
     WATCHDOG_ALERT_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
     watchdog_log(&format!("告警[{kind}] {message}"));
     // 落库：复用 open_db（SCHEMA+迁移），库缺失时也能建全 schema 再插入
@@ -2041,7 +2127,9 @@ fn watchdog_alert(kind: &str, message: &str, message_en: &str) {
         }
         Err(e) => eprintln!("watchdog: 告警事件落库失败(库打不开): {e}"),
     }
-    // 系统通知（Windows）：MB_ICONWARNING | MB_TOPMOST，独立线程发射
+    // 系统通知（Windows）：MB_ICONWARNING | MB_TOPMOST，独立线程发射；
+    // 线程句柄交给 ALERT_BOX_THREADS，--once 退出路径等待其关闭（上限
+    // ALERT_BOX_MAX_LIFETIME_SECS），不再依赖固定 1500ms 睡眠的渲染窗口。
     #[cfg(target_os = "windows")]
     {
         let text: Vec<u16> = format!("kynoptic 告警: {message}")
@@ -2049,7 +2137,7 @@ fn watchdog_alert(kind: &str, message: &str, message_en: &str) {
             .chain([0])
             .collect();
         let title: Vec<u16> = "kynoptic watchdog\0".encode_utf16().collect();
-        std::thread::spawn(move || unsafe {
+        let h = std::thread::spawn(move || unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 std::ptr::null_mut(),
                 text.as_ptr(),
@@ -2057,6 +2145,54 @@ fn watchdog_alert(kind: &str, message: &str, message_en: &str) {
                 0x0000_0030 | 0x0004_0000,
             );
         });
+        if let Ok(mut q) = ALERT_BOX_THREADS.lock() {
+            q.push(h);
+        }
+    }
+}
+
+/// 停摆类告警判定（纯函数，单测覆盖）：这类告警描述的是采集停摆/挂死，
+/// 解除后落 collection_recovered 才说得通。exit_flag（用户主动退出托盘）
+/// 与 updating_flag（更新进行中）不属于停摆，不设恢复门——否则横幅会出现
+/// 「此前的挂死/停摆告警已解除」而此前根本不是停摆告警的矛盾文案。
+fn kind_implies_collection_stall(kind: &str) -> bool {
+    !matches!(kind, "exit_flag" | "updating_flag")
+}
+
+/// 采集恢复通知（dash 域横幅滞留修复的 cli 侧配合）：此前升级过停摆类
+/// 告警（门持久化在 state.pending_recovery_kind——生产形态是计划任务每
+/// 分钟跑一次 `watchdog --once` 全新进程，进程内 static 旗标随进程退出
+/// 丢弃，恢复门必须落盘才能跨轮存活）且心跳恢复正常后，落一条
+/// kind=collection_recovered 的 notification 事件，面板横幅据此从
+/// 「告警中」翻转为「已解除」，不再滞留 24h。调用方取出待解除 kind 并
+/// 清空回写做幂等门（仅告警后首次恢复落库）。全程尽力而为，失败只留
+/// stderr。
+fn watchdog_recovered_notice() {
+    watchdog_log("采集已恢复正常");
+    let db_path = resolve_db();
+    match open_db(&db_path) {
+        Ok(conn) => {
+            let sql = "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                       VALUES (?1, 'system', 'notification', ?2)";
+            if let Err(e) = conn.execute(
+                sql,
+                params![
+                    Utc::now().to_rfc3339(),
+                    // rusqlite 未开 serde_json 特性口径，落库为 JSON 文本（与
+                    // watchdog_alert 同契约），message_en 与 message 同义
+                    json!({
+                        "source": "watchdog",
+                        "kind": "collection_recovered",
+                        "message": "采集已恢复正常（此前的挂死/停摆告警自动解除）",
+                        "message_en": "Collection has recovered (the earlier stall alert is now cleared)"
+                    })
+                    .to_string(),
+                ],
+            ) {
+                eprintln!("watchdog: 恢复事件落库失败: {e}");
+            }
+        }
+        Err(e) => eprintln!("watchdog: 恢复事件落库失败(库打不开): {e}"),
     }
 }
 
@@ -2133,6 +2269,16 @@ struct WatchdogState {
     /// 观察窗内跳过的重复拉起轮数（P1 状态机防重拉;仅诊断用,不参与判定）
     #[serde(default)]
     observation_skips: u64,
+    /// 同 kind 最近一次告警升级的 unix 秒（kind → epoch）。--once 形态下
+    /// 每分钟是全新进程，告警去重必须持久化（见 WATCHDOG_ALERT_DEDUP_SECS）。
+    #[serde(default)]
+    last_alert_epochs: std::collections::BTreeMap<String, i64>,
+    /// 待解除的停摆类告警 kind（跨进程恢复门）。进程内 static 旗标随
+    /// --once 进程退出丢弃，恢复判定必须落盘：升级停摆类告警时置位；
+    /// 心跳恢复正常时取出并落 kind=collection_recovered 解除事件后清空
+    ///（取出即清,兼作幂等门）。None = 当前没有待解除的告警。
+    #[serde(default)]
+    pending_recovery_kind: Option<String>,
 }
 
 fn watchdog_state_path() -> PathBuf {
@@ -2205,6 +2351,12 @@ fn load_watchdog_state() -> WatchdogState {
             *e = 0;
         }
     }
+    // 告警去重表：无效/未来时刻剔除，超过 7 天的旧条目清掉防表无限增长
+    //（30 分钟窗口用不到 7 天前的记录）
+    const ALERT_MAP_RETENTION_SECS: i64 = 7 * 24 * 3600;
+    st.last_alert_epochs.retain(|_, v| {
+        *v > 0 && *v - now <= MAX_EPOCH_SKEW_SECS && now - *v <= ALERT_MAP_RETENTION_SECS
+    });
     st
 }
 
@@ -2696,6 +2848,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         );
                         // 升级告警：环境故障期间采集大概率停摆，只写 log 用户看不见
                         watchdog_alert(
+                            &mut state,
                             "heartbeat_unwritable",
                             "托盘自报心跳文件写失败（磁盘满/目录只读/权限），采集可能已停摆，请检查磁盘与目录权限",
                             "Tray heartbeat file write failed (disk full, read-only directory, or permission problem); collection may have stalled — check disk space and directory permissions",
@@ -2750,6 +2903,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     "复查仍未恢复且心跳写权限探测失败(磁盘满/目录只读/ACL 锁死): 判定环境故障, 仅告警不 kill",
                                 );
                                 watchdog_alert(
+                                    &mut state,
                                     "env_unwritable",
                                     "采集未恢复且磁盘/目录不可写（磁盘满或权限问题），无法自动重启托盘，请人工排查",
                                     "Collection has not recovered and the disk/directory is not writable (disk full or permission problem); the tray cannot be restarted automatically — manual investigation required",
@@ -2760,6 +2914,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                 ));
                                 // 升级告警：采集挂死即数据空洞开始，库/UI 层须留痕
                                 watchdog_alert(
+                                    &mut state,
                                     "collection_stalled",
                                     "采集挂死（心跳超龄），看门狗正在重启托盘；期间的数据会有空洞",
                                     "Collection is hung (heartbeat overdue); the watchdog is restarting the tray — data collected during this window will have gaps",
@@ -2774,6 +2929,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                         "kill kynoptic-tray 失败(taskkill 非零)：心跳 pid 可能已失效或进程受保护，下一轮重试",
                                     );
                                     watchdog_alert(
+                                        &mut state,
                                         "kill_failed",
                                         "看门狗无法结束挂死的托盘进程（记录的 pid 可能已失效，或被安全软件拦截），采集持续停摆，请人工处理",
                                         "The watchdog could not terminate the hung tray process (the recorded pid may be stale, or security software interfered); collection remains stalled — manual handling required",
@@ -2791,6 +2947,12 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 } else if !matches!(hb_first, HeartbeatRead::Unwritable) {
                     // 心跳健康：熔断计数清零（P1：手动启动托盘成功即恢复拉起）。
                     // Unwritable（环境故障,上方已告警）不算健康,不清零。
+                    // 恢复解除（横幅滞留修复）：此前升级过停摆类告警且心跳
+                    // 恢复健康，落一条 kind=collection_recovered 解除事件，
+                    // 面板横幅翻转为「已解除」，不再滞留 24h。门是持久化的
+                    // state.pending_recovery_kind（取出即清,兼作幂等门）——
+                    // 进程内旗标在每分钟全新进程的 --once 形态下不可达。
+                    let pending_recovery = state.pending_recovery_kind.take();
                     if state.consecutive_failures != 0
                         || state.last_spawn_epoch != 0
                         || state.backoff_until_epoch != 0
@@ -2798,6 +2960,12 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         state = WatchdogState::default();
                         save_watchdog_state(&state);
                         watchdog_log("心跳恢复正常, 连续失败计数与退避已清零");
+                    } else if pending_recovery.is_some() {
+                        // 无需清零也要回写「门已取走」，否则下一轮重复落解除事件
+                        save_watchdog_state(&state);
+                    }
+                    if pending_recovery.is_some() {
+                        watchdog_recovered_notice();
                     }
                 }
             } else if !exit_flag.exists() {
@@ -2853,6 +3021,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                         "updating.flag 在位（更新进行中），本轮跳过托盘拉起与 .bak 恢复",
                                     );
                                     watchdog_alert(
+                                        &mut state,
                                         "updating_flag",
                                         "检测到更新进行中旗标，看门狗暂不恢复托盘；若长时间不见托盘，请删除 exe 同目录的 updating.flag 或重跑安装",
                                         "Update-in-progress flag detected; the watchdog will not restore the tray for now — if the tray stays missing, delete updating.flag next to the exe or rerun the installer",
@@ -2893,6 +3062,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                                 eprintln!("{msg}");
                                                 watchdog_log(&msg);
                                                 watchdog_alert(
+                                                    &mut state,
                                                     "spawn_failed",
                                                     &format!("看门狗拉起托盘失败: {e}，采集停摆中"),
                                                     &format!("The watchdog failed to start the tray: {e}; collection is stalled"),
@@ -2900,23 +3070,23 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                                 state.consecutive_failures =
                                                     state.consecutive_failures.saturating_add(1);
                                                 if state.consecutive_failures >= FAILURE_THRESHOLD {
-                                                    let backoff = backoff_delay_secs(
-                                                        state.consecutive_failures,
-                                                    );
+                                                    // 先取快照再拼告警文案：&mut state 与
+                                                    // 文案里的 state 字段借用冲突
+                                                    let fails = state.consecutive_failures;
+                                                    let backoff = backoff_delay_secs(fails);
                                                     state.backoff_until_epoch = now_epoch + backoff;
                                                     watchdog_log(&format!(
                                                         "连续失败 {} 次，进入 {}s 退避",
-                                                        state.consecutive_failures, backoff
+                                                        fails, backoff
                                                     ));
                                                     watchdog_alert(
+                                                        &mut state,
                                                         "backoff",
                                                         &format!(
-                                                            "托盘连续 {} 次拉起失败，看门狗退避 {}s，期间无采集",
-                                                            state.consecutive_failures, backoff
+                                                            "托盘连续 {fails} 次拉起失败，看门狗退避 {backoff}s，期间无采集"
                                                         ),
                                                         &format!(
-                                                            "The tray failed to start {} times in a row; the watchdog backs off for {}s with no collection",
-                                                            state.consecutive_failures, backoff
+                                                            "The tray failed to start {fails} times in a row; the watchdog backs off for {backoff}s with no collection"
                                                         ),
                                                     );
                                                 }
@@ -2930,6 +3100,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                             // 空转，不留任何痕迹。
                                             watchdog_log("kynoptic-tray.exe 缺失，无法拉起");
                                             watchdog_alert(
+                                                &mut state,
                                                 "tray_missing",
                                                 "kynoptic-tray.exe 缺失，看门狗无法拉起托盘，采集停摆中",
                                                 "kynoptic-tray.exe is missing; the watchdog cannot start the tray and collection is stalled",
@@ -2959,6 +3130,7 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     age
                 ));
                 watchdog_alert(
+                    &mut state,
                     "exit_flag",
                     "检测到托盘退出旗标，看门狗已停止拉起托盘；若非本人主动退出，请删除 exe 同目录的 tray-exit.flag",
                     "Tray exit flag detected; the watchdog has stopped starting the tray — if you did not quit the tray yourself, delete tray-exit.flag next to the exe",
@@ -2966,9 +3138,24 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             }
             if once {
                 release_watchdog_lock(&lock_path);
-                // 给异步系统通知留渲染窗口（--once 进程退出会杀死通知线程）
+                // 告警模态框由独立线程发射、随进程销毁。旧的固定 1500ms 睡眠
+                // 既等不到用户（框一闪而没），窗口甚至可能来不及画出。改为
+                // 等待对话框线程本身：用户关闭（或框被系统收掉）即返回，无
+                // 人理时按 ALERT_BOX_MAX_LIFETIME_SECS 上限退出，不长期占住
+                // 计划任务进程。
+                #[cfg(target_os = "windows")]
                 if WATCHDOG_ALERT_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let handles: Vec<_> = match ALERT_BOX_THREADS.lock() {
+                        Ok(mut q) => q.drain(..).collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(ALERT_BOX_MAX_LIFETIME_SECS);
+                    for h in handles {
+                        while !h.is_finished() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -3069,7 +3256,16 @@ fn main() -> ExitCode {
             "query" => cmd_query(&rest),
             "mcp" => cmd_mcp(),
             "skill" => cmd_skill(&rest),
-            "probe" => cmd_probe(&rest),
+            // probe 返回自己的退出码（FAIL=3），错误仍走统一「✗」通道
+            "probe" => {
+                return match cmd_probe(&rest) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("✗ {}", enrich_open_failure(&e));
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "dashboard" => dashboard::cmd_dashboard(&rest),
             "update" => {
                 if rest.iter().any(|a| a == "--check") {
@@ -3758,18 +3954,58 @@ mod tests {
             heartbeat_at_spawn_epoch: 100,
             backoff_until_epoch: 9999,
             observation_skips: 7,
+            last_alert_epochs: std::collections::BTreeMap::from([(
+                "collection_stalled".to_string(),
+                555,
+            )]),
+            pending_recovery_kind: Some("collection_stalled".to_string()),
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: WatchdogState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.consecutive_failures, 4);
         assert_eq!(back.backoff_until_epoch, 9999);
         assert_eq!(back.observation_skips, 7);
+        assert_eq!(
+            back.last_alert_epochs.get("collection_stalled"),
+            Some(&555),
+            "告警去重表须随 state 往返"
+        );
         // 损坏/缺字段：serde default 兜底 + 顶层回退缺省
         let partial: WatchdogState = serde_json::from_str(r#"{"consecutive_failures":2}"#).unwrap();
         assert_eq!(partial.consecutive_failures, 2);
         assert_eq!(partial.last_spawn_epoch, 0);
         assert_eq!(partial.observation_skips, 0, "新增字段缺省 0");
+        assert!(partial.last_alert_epochs.is_empty(), "告警去重表缺省为空");
+        assert_eq!(
+            back.pending_recovery_kind.as_deref(),
+            Some("collection_stalled"),
+            "恢复门须随 state 往返"
+        );
+        assert!(
+            partial.pending_recovery_kind.is_none(),
+            "恢复门缺省为无待解除告警"
+        );
         assert!(serde_json::from_str::<WatchdogState>("garbage").is_err());
+    }
+
+    // === 恢复门 kind 判定（文案一致性：解除文案只对停摆类告警成立） ===
+
+    #[test]
+    fn recovery_gate_applies_to_stall_kinds_only() {
+        for kind in [
+            "collection_stalled",
+            "kill_failed",
+            "tray_missing",
+            "spawn_failed",
+            "backoff",
+            "heartbeat_unwritable",
+            "env_unwritable",
+        ] {
+            assert!(kind_implies_collection_stall(kind), "{kind} 属停摆类");
+        }
+        // 用户主动退出托盘 / 更新进行中：非停摆，解除门不置位
+        assert!(!kind_implies_collection_stall("exit_flag"));
+        assert!(!kind_implies_collection_stall("updating_flag"));
     }
 
     // === watchdog 状态机（P1：观察窗内禁止重拉,秒退 3 次必入退避） ===
@@ -3820,6 +4056,8 @@ mod tests {
             heartbeat_at_spawn_epoch: 90,
             backoff_until_epoch: 0,
             observation_skips: 5,
+            last_alert_epochs: std::collections::BTreeMap::new(),
+            pending_recovery_kind: None,
         };
         // t=100+90=190 > 观察窗, hb_mtime=120 > 90 → Recovered → 允许再拉起
         assert!(matches!(

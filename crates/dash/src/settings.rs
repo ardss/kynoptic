@@ -347,7 +347,7 @@ fn autostart_registry_enabled() -> bool {
     // Wave40 挂账：Run 值按安装目录指纹命名（与安装器同算法，见 core::naming）
     let value_name = match kynoptic_core::naming::install_dir() {
         Some(d) => kynoptic_core::naming::run_value_name(&d),
-        None => kynoptic_core::naming::LEGACY_RUN_VALUE_NAME.to_string(),
+        None => kynoptic_core::naming::legacy_run_value_name(),
     };
     // 多实例/沙箱旁路（与 core/singleton.rs 的 KYNOPTIC_MUTEX_SUFFIX 同一
     // 开关）：副本实例的 settings.json 缺失时绝不继承宿主的注册表自启动

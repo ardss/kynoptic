@@ -579,30 +579,46 @@ pub fn actual_port() -> u16 {
     ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 最近 24h 内的看门狗告警事件（event_type='system', event_action='notification'，
-/// 由 cli watchdog_alert 落库）。此前该事件是死数据——注释承诺「UI 可读」但
-/// 全仓无消费方；面板顶部横幅消费它，采集空洞在 UI 层面不再零痕迹。
-fn latest_watchdog_alert(conn: &Connection) -> Option<Value> {
-    let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-    let raw = conn
+/// 最近 24h 内的看门狗告警/恢复事件（event_type='system', event_action='notification'，
+/// 由 cli watchdog_alert / tray insert_stalled_notice 落库）。此前该事件是死数据
+/// ——注释承诺「UI 可读」但全仓无消费方；面板顶部横幅消费它，采集空洞在
+/// UI 层面不再零痕迹。
+///
+/// 修复（告警只有「发生」没有「解除」）：此前只取 24h 内最新一条告警，采集
+/// 恢复后没有任何解除通道，横幅最长滞留 24h 与托盘绿标自相矛盾。现改为
+/// 取 24h 内最新一条通知事件：若为恢复事件（kind=collection_recovered，
+/// cli 心跳恢复路径 / tray 停滞下降沿各落一条）则回 recovered=true，前端
+/// 显示「已解除」而非持续告警；仍为告警则照旧。时间参数化（_at）供测试
+/// 注入固定时刻，测试不读真实时钟。
+fn latest_watchdog_alert_at(conn: &Connection, now: chrono::DateTime<Utc>) -> Option<Value> {
+    let since = (now - chrono::Duration::hours(24)).to_rfc3339();
+    let (data, ts): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT event_data FROM events \
+            "SELECT event_data, timestamp FROM events \
              WHERE event_type = 'system' AND event_action = 'notification' \
                AND timestamp >= ?1 ORDER BY id DESC LIMIT 1",
             params![&since],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .ok()
-        .flatten()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
-    // 只透出 kind/message/message_en 三个字段（与写入方 watchdog_alert 的
-    // 载荷一致，message_en 为同义英文版，供英文界面选用），不回显完整
-    // event_data，避免未来字段变化把内部结构漏进 UI。
+        .ok()?;
+    let v: Value = serde_json::from_str(&data?).ok()?;
+    let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+    let recovered = kind == "collection_recovered";
+    // 只透出 kind/message/message_en/recovered/at 五个字段（与写入方
+    // watchdog_alert 的载荷一致，message_en 为同义英文版，供英文界面选用；
+    // at 为事件 UTC 时刻，前端据此显示解除时间），不回显完整 event_data，
+    // 避免未来字段变化把内部结构漏进 UI。
     Some(json!({
-        "kind": v.get("kind").and_then(|x| x.as_str()).unwrap_or(""),
+        "kind": kind,
         "message": v.get("message").and_then(|x| x.as_str()).unwrap_or(""),
         "message_en": v.get("message_en").and_then(|x| x.as_str()).unwrap_or(""),
+        "recovered": recovered,
+        "at": ts.unwrap_or_default(),
     }))
+}
+
+fn latest_watchdog_alert(conn: &Connection) -> Option<Value> {
+    latest_watchdog_alert_at(conn, Utc::now())
 }
 
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {

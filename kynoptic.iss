@@ -169,37 +169,48 @@ end;
 // 都会夺走已装实例的任务指向。改为按安装目录指纹派生专属名字，运行时侧
 // （crates/core/src/naming.rs）以同一算法独立实现，两侧必须逐字节一致。
 
-// Int64 → 8 位大写十六进制（Inno PascalScript 无 IntToHex，也不支持函数内
-// const 段，手写等价实现，与 Rust 侧 format!("{:08X}") 对齐）
-function FingerprintToHex(const H: Int64): String;
+// Integer → 4 位大写十六进制（Inno PascalScript 无 IntToHex，也不支持函数内
+// const 段，手写等价实现，与 Rust 侧 format!("{:04X}") 对齐）
+function FingerprintHalfToHex(const V: Integer): String;
 var
-  V, I: Integer;
+  T, I: Integer;
 begin
   Result := '';
-  V := H;
-  for I := 1 to 8 do begin
-    Result := Copy('0123456789ABCDEF', (V mod 16) + 1, 1) + Result;
-    V := V div 16;
+  T := V;
+  for I := 1 to 4 do begin
+    Result := Copy('0123456789ABCDEF', (T mod 16) + 1, 1) + Result;
+    T := T div 16;
   end;
 end;
 
 // 安装目录指纹：小写化、去结尾分隔符后，对 UTF-16 码元做 h=5381 起
 // h=(h*33+码元) mod 2^32 的 djb 变体，输出 8 位大写十六进制。用 UTF-16 码元
-// 是为了与 Rust 侧 encode_utf16() 对齐；乘法走 Int64 防溢出，勿改算法。
+// 是为了与 Rust 侧 encode_utf16() 对齐。算法勿改；实现刻意不用 Int64——
+// 0.3.1 发布门禁实测：部分 Inno PascalScript 编译产物对 Int64 乘法与
+// mod 4294967296 字面量求值错误，把指纹算成 00000000（本机 6.7.3 复测正常，
+// 缺陷随 runner 预装版本漂移）。改为 h 拆高低 16 位（HiW*65536+LoW），全程
+// Integer 运算且中间值 < 2^22，任何版本下数值行为一致（真机 ISCC 探针
+// 双向量与 Rust/脚本参考实现比对一致，2026-09-25）。
 function InstallFingerprint(): String;
 var
   AppDir: String;
-  H: Int64;
-  I: Integer;
+  HiW, LoW, ProdLo, NewLo, NewHi, I: Integer;
 begin
   AppDir := Lowercase(ExpandConstant('{app}'));
   while (Length(AppDir) > 0) and
         ((AppDir[Length(AppDir)] = '\') or (AppDir[Length(AppDir)] = '/')) do
     SetLength(AppDir, Length(AppDir) - 1);
-  H := 5381;
-  for I := 1 to Length(AppDir) do
-    H := (H * 33 + Ord(AppDir[I])) mod 4294967296;
-  Result := FingerprintToHex(H);
+  HiW := 0;
+  LoW := 5381;
+  for I := 1 to Length(AppDir) do begin
+    // h*33 = HiW*33*65536 + LoW*33；LoW*33+码元 < 2^22，进位并入高半字
+    ProdLo := LoW * 33 + Ord(AppDir[I]);
+    NewLo := ProdLo mod 65536;
+    NewHi := (HiW * 33 + (ProdLo div 65536)) mod 65536;
+    HiW := NewHi;
+    LoW := NewLo;
+  end;
+  Result := FingerprintHalfToHex(HiW) + FingerprintHalfToHex(LoW);
 end;
 
 // 本次安装的看门狗计划任务名：Kynoptic Watchdog [ -后缀] <指纹>
@@ -252,7 +263,7 @@ begin
 #endif
 end;
 
-// 旧版无指纹全局名的升级清扫在 RunHidden 定义之后（CleanupLegacyAutostart），
+// 旧版无指纹全局名的升级清扫在 RunHidden 定义之后（CleanupAutostartEntries），
 // 避免前向引用。
 
 // 按分号切分 PATH 为条目数组（手写切分，兼容全部 Inno 6.x；跳过空条目）
@@ -435,13 +446,185 @@ begin
     Result := (CmdResult = 0);
 end;
 
-// 旧版无指纹全局名的升级清扫（Wave40 挂账）：生产构建清「Kynoptic Watchdog」
-// 任务与「Kynoptic」Run 值；TestSuffix 构建绝不碰生产名字，只清自己旧后缀
-// 形态的无指纹名。调用点：ssDone（新名终态收敛完之后）与卸载收尾。
-procedure CleanupLegacyAutostart();
+// ===================== 自启动清扫（按指向归属） =====================
+// 0.3.1 审查修复（卸载清扫双向缺口，同根因合并）：旧的「两个精确名无条件
+// 删」①对同后缀异目录的另一份沙箱安装无归属校验，任意一方卸载都会误删
+// 对方的 legacy 任务与 Run 值；②对畸名/更旧指纹名（如「… 00000000」）无
+// 枚举兜底，永久残留并反复触发调度报错。统一改为：读任务 TR / Run 值数据
+// 里的 exe 路径，仅当指向本次 {app}（升级残留）或指向已不存在的目录（孤儿）
+// 时才删，指向本机其它仍在的安装目录一律保留；并按前缀枚举兜底，覆盖当前
+// 算法产不出的名字。每个删除/保留决定都留日志。
+//
+// 清扫前缀即 Legacy* 名：生产构建覆盖全部「Kynoptic Watchdog」/「Kynoptic」
+// 开头名字（归属校验兜住不误删活安装）；TestSuffix 构建只认自己后缀形态，
+// 绝不触碰生产名字（与旧 CleanupLegacyAutostart 同规则）。
+
+// 去掉字符串结尾的路径分隔符
+function TrimTrailingSeparators(const S: String): String;
 begin
-  RunHidden('schtasks', '/Delete /F /TN "' + LegacyWatchdogTaskName() + '"');
-  RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, LegacyRunValueName());
+  Result := S;
+  while (Length(Result) > 0) and
+        ((Result[Length(Result)] = '\') or (Result[Length(Result)] = '/')) do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+// exe 路径是否位于 Dir 之下（大小写不敏感，不含 Dir 本身）
+function PathUnderDir(const ExePath, Dir: String): Boolean;
+var
+  D, P: String;
+begin
+  D := Uppercase(TrimTrailingSeparators(Dir));
+  P := Uppercase(Trim(ExePath));
+  Result := (Length(P) > Length(D)) and (Copy(P, 1, Length(D)) = D) and
+    (P[Length(D) + 1] = '\');
+end;
+
+// 从命令行/值数据里提取 exe 路径：优先取引号（单/双）内的内容，无引号取
+// 首个空格前的段；解析不出返回空串（调用方安全侧不删）
+function ExtractExePath(const CmdLine: String): String;
+var
+  Q: Char;
+  Start, I: Integer;
+begin
+  Result := '';
+  Q := #0;
+  Start := 0;
+  for I := 1 to Length(CmdLine) do begin
+    if (Q = #0) and ((CmdLine[I] = '"') or (CmdLine[I] = Chr(39))) then begin
+      Q := CmdLine[I];
+      Start := I + 1;
+    end else if (Q <> #0) and (CmdLine[I] = Q) then begin
+      Result := Copy(CmdLine, Start, I - Start);
+      Exit;
+    end else if (Q = #0) and (CmdLine[I] = ' ') then begin
+      Result := Copy(CmdLine, 1, I - 1);
+      Exit;
+    end;
+  end;
+  if Q = #0 then
+    Result := Trim(CmdLine);
+end;
+
+// 读指定任务「要运行的任务」字段的原始命令行（LIST /V 输出，中英系统都认；
+// 勿用 CSV 的该列——同状态列的版本相关解析问题，统一走 LIST 字段）
+function GetTaskActionCmd(const TaskName: String): String;
+var
+  TmpFile: String;
+  CmdResult: Integer;
+  Lines: TArrayOfString;
+  I, P: Integer;
+  S: String;
+begin
+  Result := '';
+  TmpFile := ExpandConstant('{tmp}') + '\kyn-task-tr.txt';
+  Exec('cmd.exe', '/C schtasks /Query /TN "' + TaskName + '" /FO LIST /V > "' + TmpFile + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+  if LoadStringsFromFile(TmpFile, Lines) then
+    for I := 0 to GetArrayLength(Lines) - 1 do begin
+      S := TrimRight(Lines[I]);
+      if (Pos('Task To Run', S) > 0) or (Pos('要运行的任务', S) > 0) then begin
+        P := Pos(':', S);
+        if P > 0 then
+          Result := Trim(Copy(S, P + 1, MaxInt));
+      end;
+    end;
+  DeleteFile(TmpFile);
+end;
+
+// 枚举名字以 Prefix 开头的用户任务（schtasks /Query /FO CSV /NH 全列表，
+// 取每行首个引号字段为任务名；查不到任何任务时返回空数组）
+function ListTaskNamesByPrefix(const Prefix: String): TArrayOfString;
+var
+  TmpFile: String;
+  CmdResult: Integer;
+  Lines: TArrayOfString;
+  I, Q1, Q2, N: Integer;
+  S, Name: String;
+begin
+  SetArrayLength(Result, 0);
+  TmpFile := ExpandConstant('{tmp}') + '\kyn-task-list.txt';
+  Exec('cmd.exe', '/C schtasks /Query /FO CSV /NH > "' + TmpFile + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+  if not LoadStringsFromFile(TmpFile, Lines) then begin
+    DeleteFile(TmpFile);
+    Exit;
+  end;
+  N := 0;
+  for I := 0 to GetArrayLength(Lines) - 1 do begin
+    S := Lines[I];
+    Q1 := Pos('"', S);
+    if Q1 = 0 then
+      Continue;
+    Q2 := Pos('"', Copy(S, Q1 + 1, MaxInt));
+    if Q2 = 0 then
+      Continue;
+    Name := Copy(S, Q1 + 1, Q2 - 1);
+    // 任务名可能带根文件夹前导「\」，剥掉再比前缀
+    while (Length(Name) > 0) and (Name[1] = '\') do
+      Name := Copy(Name, 2, MaxInt);
+    if (Name <> '') and
+       (Uppercase(Copy(Name, 1, Length(Prefix))) = Uppercase(Prefix)) then begin
+      SetArrayLength(Result, N + 1);
+      Result[N] := Name;
+      N := N + 1;
+    end;
+  end;
+  DeleteFile(TmpFile);
+end;
+
+// 指向是否可清：指向本次 {app}（本目录升级残留）或指向已不存在的目录
+//（孤儿，如手工删除目录没走卸载器的演练残留）；解析不出指向的安全侧不删
+function ShouldSweepDeleteTarget(const ExePath: String): Boolean;
+begin
+  Result := False;
+  if Trim(ExePath) = '' then
+    Exit;
+  if PathUnderDir(ExePath, ExpandConstant('{app}')) then begin
+    Result := True;
+    Exit;
+  end;
+  Result := not DirExists(ExtractFileDir(Trim(ExePath)));
+end;
+
+// 自启动统一清扫（调用点：ssDone 新名终态收敛完之后与卸载收尾）。本名
+//（本次安装刚收敛/已精确删除的终态）跳过，其余按指向归属删留。
+procedure CleanupAutostartEntries();
+var
+  Names: TArrayOfString;
+  I: Integer;
+  Name, Data, Exe: String;
+begin
+  // 计划任务侧
+  Names := ListTaskNamesByPrefix(LegacyWatchdogTaskName());
+  for I := 0 to GetArrayLength(Names) - 1 do begin
+    Name := Names[I];
+    if Uppercase(Name) = Uppercase(WatchdogTaskName()) then
+      Continue;
+    Exe := ExtractExePath(GetTaskActionCmd(Name));
+    if ShouldSweepDeleteTarget(Exe) then begin
+      Log('sweep: delete task (this install or orphan), TR=' + Exe + ', name=' + Name);
+      RunHidden('schtasks', '/Delete /F /TN "' + Name + '"');
+    end else
+      Log('sweep: keep task (another live install or unreadable TR), name=' + Name);
+  end;
+  // Run 值侧
+  if RegGetValueNames(HKEY_CURRENT_USER, RunKeyPath, Names) then
+    for I := 0 to GetArrayLength(Names) - 1 do begin
+      Name := Names[I];
+      if Uppercase(Copy(Name, 1, Length(LegacyRunValueName()))) <>
+         Uppercase(LegacyRunValueName()) then
+        Continue;
+      if Uppercase(Name) = Uppercase(RunValueName()) then
+        Continue;
+      if not RegQueryStringValue(HKEY_CURRENT_USER, RunKeyPath, Name, Data) then
+        Continue;
+      Exe := ExtractExePath(Data);
+      if ShouldSweepDeleteTarget(Exe) then begin
+        Log('sweep: delete Run value (this install or orphan), data=' + Exe + ', name=' + Name);
+        RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, Name);
+      end else
+        Log('sweep: keep Run value (another live install), name=' + Name);
+    end;
 end;
 
 // 指定任务名的计划任务是否存在（升级识别）
@@ -527,9 +710,34 @@ begin
   DeleteFile(TmpFile);
 end;
 
-// 回读看门狗任务的状态/指向并写安装日志（状态文案随系统语言变化，
-// 英文 Disabled / 中文 已禁用，仅记录不判失败）
-procedure LogWatchdogTaskState();
+// 读指定任务的「计划任务状态」字段值（schtasks /FO LIST /V 输出中标签含
+// Status/状态 的行；勿用 CSV 模式的状态列——实测其对「已禁用但仍在运行」
+// 的任务会误显示为「正在运行」）。状态文案随系统语言变化（英文 Disabled /
+// 中文 已禁用），只认这两种字面量；查不到任务或解析不出时返回 False。
+function TaskStateDisabled(const TaskName: String): Boolean;
+var
+  TmpFile: String;
+  CmdResult: Integer;
+  Lines: TArrayOfString;
+  I: Integer;
+  S: String;
+begin
+  Result := False;
+  TmpFile := ExpandConstant('{tmp}') + '\kyn-task-state.txt';
+  Exec('cmd.exe', '/C schtasks /Query /TN "' + TaskName + '" /FO LIST /V > "' + TmpFile + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
+  if LoadStringsFromFile(TmpFile, Lines) then
+    for I := 0 to GetArrayLength(Lines) - 1 do begin
+      S := TrimRight(Lines[I]);
+      if (Pos('Status', S) > 0) or (Pos('状态', S) > 0) then
+        if (Pos('Disabled', S) > 0) or (Pos('已禁用', S) > 0) then
+          Result := True;
+    end;
+  DeleteFile(TmpFile);
+end;
+
+// 回读指定任务的状态/指向并写安装日志（仅记录不判失败）
+procedure LogWatchdogTaskStateFor(const TaskName: String);
 var
   TmpFile: String;
   CmdResult: Integer;
@@ -538,7 +746,7 @@ var
   S: String;
 begin
   TmpFile := ExpandConstant('{tmp}') + '\kyn-task-query.txt';
-  Exec('cmd.exe', '/C schtasks /Query /TN "' + WatchdogTaskName() + '" /FO LIST /V > "' + TmpFile + '" 2>&1',
+  Exec('cmd.exe', '/C schtasks /Query /TN "' + TaskName + '" /FO LIST /V > "' + TmpFile + '" 2>&1',
     '', SW_HIDE, ewWaitUntilTerminated, CmdResult);
   if LoadStringsFromFile(TmpFile, Lines) then
     for I := 0 to GetArrayLength(Lines) - 1 do begin
@@ -548,6 +756,32 @@ begin
         Log('watchdog task> ' + S);
     end;
   DeleteFile(TmpFile);
+end;
+
+// 回读看门狗任务的状态/指向并写安装日志（仅记录不判失败）
+procedure LogWatchdogTaskState();
+begin
+  LogWatchdogTaskStateFor(WatchdogTaskName());
+end;
+
+// DISABLE 指定任务并回读「计划任务状态」字段校验（勿用 CSV 模式列，见
+// TaskStateDisabled 注释），失败重试一次；返回终态是否确为已禁用。
+// 只记日志不判失败：DISABLE 回读异常不应阻断安装主流程。
+function DisableTaskVerified(const TaskName: String): Boolean;
+begin
+  Result := False;
+  if not RunHidden('schtasks', '/Change /TN "' + TaskName + '" /DISABLE') then
+    Log('task DISABLE command failed: ' + TaskName);
+  Result := TaskStateDisabled(TaskName);
+  if not Result then begin
+    Sleep(300);
+    RunHidden('schtasks', '/Change /TN "' + TaskName + '" /DISABLE');
+    Result := TaskStateDisabled(TaskName);
+  end;
+  if Result then
+    Log('task DISABLE verified: ' + TaskName)
+  else
+    Log('task DISABLE NOT verified after retry: ' + TaskName);
 end;
 
 // 重建指向本次安装目录的看门狗任务：先删旧任务再建（/Create 一旦执行必刷新
@@ -675,10 +909,11 @@ begin
       HKEY_CURRENT_USER, RunKeyPath, LegacyRunValueName())));
   // DISABLE 本名之外还要 DISABLE 旧名（回归复审修复）：legacy 升级的整个
   // 文件复制阶段旧任务仍指向旧目录的托盘，不禁用会被 watchdog 每分钟拉起
-  // 撞"文件被占用"（审查 P1）；新指纹任务此时尚不存在，/Change 失败仅记日志
-  if not RunHidden('schtasks', '/Change /TN "' + WatchdogTaskName() + '" /DISABLE') then
-    Log('Watchdog task DISABLE skipped/failed');
-  if not RunHidden('schtasks', '/Change /TN "' + LegacyWatchdogTaskName() + '" /DISABLE') then
+  // 撞"文件被占用"（审查 P1）；新指纹任务此时尚不存在，DISABLE 失败仅记日志。
+  // 两者都回读「计划任务状态」字段校验（0.3.1 教训：/Change 退出码为 0 不代表
+  // 终态生效；勿用 CSV 模式列——其对已禁用运行中任务误显示「正在运行」）。
+  DisableTaskVerified(WatchdogTaskName());
+  if not DisableTaskVerified(LegacyWatchdogTaskName()) then
     Log('Legacy watchdog task DISABLE skipped/failed (not upgraded or already removed)');
   KillLockedApps();
 end;
@@ -712,8 +947,8 @@ begin
     // 审查 P1-4：双写，避免升级场景半开半关——计划任务与 Run 值在这里统一
     // 收敛终态（此前散在 [Run] 段与 [Registry] 段，退出码被吞、失败不清理）
     FinalizeAutostart();
-    // 旧版无指纹全局名清扫（新名终态收敛完之后再清，防升级窗口空档）
-    CleanupLegacyAutostart();
+    // 旧名/畸名按指向归属清扫（新名终态收敛完之后再清，防升级窗口空档）
+    CleanupAutostartEntries();
     // 安装目录写入用户 PATH（README/官网 MCP 配置假设裸命令 kynoptic 可用）
     AddInstallDirToUserPath();
     // 顺带清理指向已消失 Temp 目录的孤儿 PATH 项（见函数注释）
@@ -743,6 +978,17 @@ begin
       Log('compensation: watchdog task ENABLE failed');
     // 回读校验，DISABLE 未恢复会在日志留下痕迹
     LogWatchdogTaskState();
+  end;
+  // legacy 任务的补偿与 G_AutostartWasDisabled 的双名判断对称（回归复审修复：
+  // legacy→新指纹升级失败回退后，legacy 看门狗任务停留 DISABLE 每分钟脱岗）。
+  // legacy 任务存在且升级前用户未显式关闭自启动时一并 /ENABLE 并回读；此前
+  // 已显式关闭（快照 True）则保持 DISABLE，不违背用户选择。
+  if LegacyWatchdogTaskExists() and (not G_AutostartWasDisabled) then begin
+    if RunHidden('schtasks', '/Change /TN "' + LegacyWatchdogTaskName() + '" /ENABLE') then
+      Log('compensation: legacy watchdog task re-enabled')
+    else
+      Log('compensation: legacy watchdog task ENABLE failed');
+    LogWatchdogTaskStateFor(LegacyWatchdogTaskName());
   end;
   // 旧托盘仍在 {app}（复制未完成的残留也以存在性为准）且未在运行时拉回
   // 后台运行；先探测避免与仍在跑的托盘并存
@@ -815,13 +1061,13 @@ begin
     AppDir := ExpandConstant('{app}');
     DataDir := AppDir + '\data';
     // Run 自启动值已从 [Registry] 段移除，卸载时由这里对称删除
-    //（原 uninsdeletevalue 的等价物）
+    //（原 uninsdeletevalue 的等价物）；看门狗任务对称删除同理（任务名含
+    // 运行期指纹，须用 [Code] 函数现算，不能在 [UninstallRun] 静态展开）。
+    // 本名精确删之后，其余历史名（legacy/畸名/更旧指纹名）按指向归属清扫：
+    // 指向本次 {app} 或孤儿才删，本机其它活安装（含同后缀异目录沙箱）不误删。
     RegDeleteValue(HKEY_CURRENT_USER, RunKeyPath, RunValueName());
-    // 看门狗计划任务对称删除（原 [UninstallRun] 段移到这里：任务名含运行期
-    // 指纹，须用 [Code] 函数现算，不能在 [UninstallRun] 静态展开）+ 旧版
-    // 无指纹全局名清扫（生产）/旧 TestSuffix 名清扫（沙箱）
     RunHidden('schtasks', '/Delete /F /TN "' + WatchdogTaskName() + '"');
-    CleanupLegacyAutostart();
+    CleanupAutostartEntries();
     // 安装时写入用户 PATH 的安装目录项，卸载时对称移除（整项全等才剔除，
     // 不动用户自配条目）；顺带清理已消失 Temp 目录的孤儿项
     RemoveInstallDirFromUserPath();

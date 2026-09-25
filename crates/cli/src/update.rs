@@ -513,9 +513,7 @@ pub fn is_stable_release(version: &str) -> bool {
 
 pub fn cmd_check_only() -> crate::Result<()> {
     let cur = self_update::cargo_crate_version!();
-    match latest_stable_version().ok_or_else(|| {
-        crate::Error::InvalidData("GitHub Releases 上找不到完整的稳定版资产".to_string())
-    })? {
+    match latest_stable_version()? {
         Some(v) => {
             println!("UPDATE {v}");
         }
@@ -526,16 +524,22 @@ pub fn cmd_check_only() -> crate::Result<()> {
     Ok(())
 }
 
-/// 查询最新稳定版版本号；无更新（<= 当前）返回 None。网络/资产错误返回
-/// None 并打日志——检查失败必须静默降级，不能打扰用户。
-pub fn latest_stable_version() -> Option<Option<String>> {
+/// 查询最新稳定版版本号；无更新（<= 当前）返回 Some(None)。
+/// 错误两态区分（审查 low）：「网络不可达/接口异常」与「Releases 上没有
+/// 完整稳定版资产」必须可分——旧实现把两者压扁成同一个 None，
+/// `update --check` 在死代理下误报「找不到稳定的资产」。
+pub fn latest_stable_version() -> crate::Result<Option<String>> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .build()
-        .ok()?
+        .map_err(|e| crate::Error::InvalidData(format!("GitHub Releases 客户端构建失败: {e}")))?
         .fetch()
-        .ok()?;
+        .map_err(|e| {
+            crate::Error::InvalidData(format!(
+                "无法访问 GitHub Releases（网络不可达或代理问题）: {e}"
+            ))
+        })?;
     let cur = self_update::cargo_crate_version!();
     let release = releases.into_iter().find(|r| {
         is_stable_release(&r.version)
@@ -543,12 +547,17 @@ pub fn latest_stable_version() -> Option<Option<String>> {
                 .iter()
                 .all(|n| r.assets.iter().any(|a| &a.name == n))
             && r.assets.iter().any(|a| a.name == SUMS_NAME)
-    })?;
+    });
+    let Some(release) = release else {
+        return Err(crate::Error::InvalidData(
+            "GitHub Releases 上找不到完整的稳定版资产".to_string(),
+        ));
+    };
     let new_ver = release.version.trim_start_matches('v').to_string();
     if version_cmp(&new_ver, cur) == std::cmp::Ordering::Greater {
-        Some(Some(new_ver))
+        Ok(Some(new_ver))
     } else {
-        Some(None)
+        Ok(None)
     }
 }
 
