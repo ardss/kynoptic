@@ -48,6 +48,10 @@ jobs:
           if (!(Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
             choco install innosetup -y --no-progress
           }
+          # 版本留痕：指纹/命名相关缺陷随 PascalScript 版本漂移（0.3.1 教训：
+          # 部分 runner 版本把 Int64 指纹算法求值成 00000000），排查时先比对
+          # 本日志的 ISCC 版本与已验证版本
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /? | Select-Object -First 4 | Write-Host
       - name: Fetch Chinese language file for Inno Setup
         shell: pwsh
         run: |
@@ -118,8 +122,27 @@ jobs:
           $vout = (& "$tmp/kynoptic.exe" --version) -join " "
           Write-Host "kynoptic.exe --version -> '$vout' (package version $ver)"
           if ($vout -notlike "*$ver*") { throw "version mismatch: package $ver, binary reports '$vout'" }
-          # 清理一次性 runner 上的安装副作用（不清理也会随 runner 销毁，这里显式做）
+          # 安装器写入名 == 运行时计算名的真机一致性门禁（0.3.1 事故：部分
+          # runner 的 Inno PascalScript 把指纹算成 00000000，安装器写出的
+          # 看门狗任务名与运行时同算法算出的名永久失配，自启保护闭环断裂；
+          # 此前单测只验 Rust 侧，名字形态从未在真机上验过两侧相等）。
+          # scripts/fingerprint.mjs 与 crates/core/src/naming.rs 同算法，
+          # 其输出已由 naming.rs 单测向量锚定。
+          $fp = node scripts/fingerprint.mjs $tmp
+          $wantTask = "Kynoptic Watchdog $fp"
+          $wantRun = "Kynoptic-$fp"
+          Write-Host "expected fingerprint: $fp; task: '$wantTask'; run value: '$wantRun'"
+          schtasks /Query /TN "$wantTask" | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "installer/runtime name mismatch: task '$wantTask' not found (installer wrote a different watchdog task name)" }
+          $runHit = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $wantRun -ErrorAction SilentlyContinue
+          if (!$runHit) { throw "installer/runtime name mismatch: Run value '$wantRun' not found" }
+          Write-Host "installer-written names match runtime-computed names"
+          # 清理一次性 runner 上的安装副作用（不清理也会随 runner 销毁，这里显式做：
+          # 指纹名 + 旧版无指纹名都清一遍）
+          schtasks /Delete /F /TN "$wantTask" 2>$null | Out-Null
           schtasks /Delete /F /TN "Kynoptic Watchdog" 2>$null | Out-Null
+          Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+            -Name $wantRun -ErrorAction SilentlyContinue
           Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
             -Name "Kynoptic" -ErrorAction SilentlyContinue
       - name: Write release notes
