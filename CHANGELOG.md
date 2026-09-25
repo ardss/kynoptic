@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard: `/api/status` now returns `token_required` (opt-in access
+  token enabled), `actual_port` (the port `serve` actually bound, so a
+  busy-port auto-fallback is visible), and `watchdog_alert` (the most
+  recent `event_action='notification'` watchdog event within 24h —
+  previously these events had no UI consumer at all). The dashboard
+  renders the watchdog alert as a top banner, and the footer auth note
+  now follows the real token state instead of always claiming "no auth
+  needed".
+- Dashboard: new `GET /api/autostart-status` returns the saved
+  `autostart` value together with the current registry Run-key state, so
+  the settings page can verify the tray-side registry sync after saving
+  and downgrade its confirmation when the sync failed.
+- Dashboard: `/api/anomalies` responses now include `baseline_days`
+  (days with data in the last 7 local days), letting the anomalies page
+  tell "baseline still accruing" apart from a genuine "no anomalies".
+- Dashboard: `/api/status` now returns `paused` (the tray-written
+  `paused.flag` marker), and the status line shows "paused by user"
+  instead of "stale"/"collector may be down" while collection is paused
+  from the tray menu.
+- Tray: on first launch the tray now opens the dashboard in the default
+  browser automatically (tracked by a `ran-first-open.txt` marker in the
+  data folder), so a fresh install reaches its UI without hunting for
+  the port.
+- Tray: the tray menu gains a dynamic "update failed to start" entry
+  (backed by `update-error.txt` in the data folder) when a one-click
+  update could not launch, with the recorded error details.
+
+### Fixed
+
+- Dashboard: an HTTP 401 from the API is no longer narrated as
+  "disconnected — retrying…" — the status line now shows "access token
+  required" with a re-entry button, the unauthorized error gets a stable
+  `code` plus Chinese mapping, and parameter-validation echoes no longer
+  use Rust Debug formatting (`{:?}`).
+- Dashboard: the daily heatmap zero level now uses the idle color
+  (contrast vs level 1 was 1.14:1), the keyboard heatmap gains the same
+  empty state as the mouse chart, language switching immediately redraws
+  the status line on every tab, the settings save confirmation fades
+  after 9s with a brief "✓ saved" on the button, the report page uses
+  one consistent raw-input annotation on all dates, and the
+  unattended/automation card notes are rewritten in plain language with
+  a shared glossary (away = 无输入, mouse buttons = 个按键).
+
 - Tray: the watchdog scheduled task now self-checks and self-heals — on
   tray startup the scheduled task is verified and re-registered if it is
   missing or broken, so stall alerts keep working without manual repair.
@@ -69,6 +112,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `report`, `export`, `analyze`, …) no longer create a database file
   when none exists, reject future dates instead of silently returning
   empty results, and cap WAL growth on long read sessions.
+- Tray: a second instance's start attempt is no longer blocked on a
+  modal message box — the rejection notice now pops on an independent
+  thread, closes itself after 3.5 s, and the rejected instance exits
+  with status 1 about 4 s later.
+- CLI (migrate): `kynoptic migrate` now runs
+  `scripts/migrate_legacy_db.py` itself and writes the target database,
+  instead of only printing the python command for the user to run. This
+  adds a Python interpreter dependency for that subcommand; calling it
+  without `--legacy` surfaces the script's own error and the CLI only
+  echoes its exit code.
+- Tray: tray menu labels are now consistently Chinese-first in both
+  languages (the bilingual "中文 / English" ordering is unified).
 
 ### Fixed
 
