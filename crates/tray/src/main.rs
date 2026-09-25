@@ -595,17 +595,27 @@ fn main() {
                     match query_watchdog_task_health() {
                         WatchdogTaskHealth::Ok => {}
                         WatchdogTaskHealth::Disabled => {
+                            let task = kynoptic_core::naming::install_dir()
+                                .map(|d| kynoptic_core::naming::watchdog_task_name(&d))
+                                .unwrap_or_else(|| {
+                                    kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string()
+                                });
                             alert_watchdog_task_problem(
                                 &db_for_upd,
-                                "计划任务 \"Kynoptic Watchdog\" 处于禁用状态",
-                                "the scheduled task \"Kynoptic Watchdog\" is disabled",
+                                &format!("计划任务 \"{task}\" 处于禁用状态"),
+                                &format!("the scheduled task \"{task}\" is disabled"),
                             );
                         }
                         WatchdogTaskHealth::Unavailable => {
+                            let task = kynoptic_core::naming::install_dir()
+                                .map(|d| kynoptic_core::naming::watchdog_task_name(&d))
+                                .unwrap_or_else(|| {
+                                    kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string()
+                                });
                             alert_watchdog_task_problem(
                                 &db_for_upd,
-                                "无法查询计划任务 \"Kynoptic Watchdog\"（任务可能被删除，或计划任务服务被停用）",
-                                "the scheduled task \"Kynoptic Watchdog\" could not be queried (the task may have been deleted, or the Task Scheduler service is disabled)",
+                                &format!("无法查询计划任务 \"{task}\"（任务可能被删除，或计划任务服务被停用）"),
+                                &format!("the scheduled task \"{task}\" could not be queried (the task may have been deleted, or the Task Scheduler service is disabled)"),
                             );
                         }
                     }
@@ -1005,7 +1015,20 @@ fn apply_autostart(enable: bool) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-    const VALUE_NAME: &str = "Kynoptic";
+    // Wave40 挂账（安装器全局命名空间隔离）：Run 值与看门狗任务按安装目录
+    // 指纹命名（与安装器 kynoptic.iss 同一算法，见 kynoptic_core::naming），
+    // 异目录安装/沙箱试装不再夺走彼此的自启动与任务指向。
+    let (value_name, task_name) = match kynoptic_core::naming::install_dir() {
+        Some(d) => (
+            kynoptic_core::naming::run_value_name(&d),
+            kynoptic_core::naming::watchdog_task_name(&d),
+        ),
+        // 取不到 exe 路径的极端情况退回旧全局名（至少保持旧行为可用）
+        None => (
+            kynoptic_core::naming::LEGACY_RUN_VALUE_NAME.to_string(),
+            kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string(),
+        ),
+    };
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let Ok(key) = hkcu.open_subkey_with_flags(
         RUN_KEY_PATH,
@@ -1024,7 +1047,7 @@ fn apply_autostart(enable: bool) {
                 // 会把宿主的开机自启动劫持到自己的路径。共享的看门狗计划
                 // 任务同样不动（提前返回，跳过末尾 schtasks 块）。
                 if std::env::var_os("KYNOPTIC_MUTEX_SUFFIX").is_some() {
-                    if let Ok(cur) = key.get_value::<String, _>(VALUE_NAME) {
+                    if let Ok(cur) = key.get_value::<String, _>(&value_name) {
                         if !cur.is_empty() && cur != path {
                             log::warn!(
                                 "多实例旁路激活：检测到既有自启动项指向其他程序，保留不动（{cur}）"
@@ -1033,8 +1056,18 @@ fn apply_autostart(enable: bool) {
                         }
                     }
                 }
-                if let Err(e) = key.set_value(VALUE_NAME, &path) {
+                if let Err(e) = key.set_value(&value_name, &path) {
                     eprintln!("autostart: 写入失败 {e}");
+                } else {
+                    // 升级清扫：旧版无指纹全局值名指向本 exe 时删掉，避免新旧双自启动
+                    if let Ok(legacy) =
+                        key.get_value::<String, _>(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
+                    {
+                        if legacy.contains(&path) {
+                            let _ = key.delete_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME);
+                            log::info!("已清理旧版全局自启动值 Kynoptic（升级到按目录指纹命名）");
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("autostart: 取 exe 路径失败 {e}"),
@@ -1042,7 +1075,7 @@ fn apply_autostart(enable: bool) {
     } else {
         // 旁路激活时同样不删宿主的自启动项（副本退出不该撤销宿主的开机自启）
         if std::env::var_os("KYNOPTIC_MUTEX_SUFFIX").is_some() {
-            if let Ok(cur) = key.get_value::<String, _>(VALUE_NAME) {
+            if let Ok(cur) = key.get_value::<String, _>(&value_name) {
                 let mine = std::env::current_exe()
                     .ok()
                     .map(|e| format!("\"{}\" --minimized", e.display()))
@@ -1053,7 +1086,21 @@ fn apply_autostart(enable: bool) {
                 }
             }
         }
-        let _ = key.delete_value(VALUE_NAME);
+        let _ = key.delete_value(&value_name);
+        // 升级清扫（免安装器升级，如绿色替换二进制）：旧版无指纹全局值名指向
+        // 本 exe 时一并删掉，否则用户关自启动后旧名残留项继续生效（与 enable
+        // 分支同判定：只清指向自己的，不动其他安装的值）
+        if let Ok(exe) = std::env::current_exe() {
+            let mine = format!("\"{}\" --minimized", exe.display());
+            if let Ok(legacy) =
+                key.get_value::<String, _>(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME)
+            {
+                if legacy.contains(&mine) {
+                    let _ = key.delete_value(kynoptic_core::naming::LEGACY_RUN_VALUE_NAME);
+                    log::info!("已清理旧版全局自启动值 Kynoptic（指向本 exe 的残留项）");
+                }
+            }
+        }
     }
     // Wave20 P0：autostart 双写源统一——看门狗计划任务随开关一起
     // ENABLE/DISABLE，否则设置页关了 autostart 后计划任务仍每分钟把
@@ -1065,7 +1112,7 @@ fn apply_autostart(enable: bool) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let flag = if enable { "/ENABLE" } else { "/DISABLE" };
         match std::process::Command::new("schtasks")
-            .args(["/Change", "/TN", "Kynoptic Watchdog", flag])
+            .args(["/Change", "/TN", &task_name, flag])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
@@ -1073,8 +1120,9 @@ fn apply_autostart(enable: bool) {
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 log::warn!(
-                    "schtasks /Change {} Kynoptic Watchdog 失败(退出码 {:?}) {}。看门狗计划任务的启停可能未生效（任务被禁用/删除/组策略拦截）",
+                    "schtasks /Change {} {} 失败(退出码 {:?}) {}。看门狗计划任务的启停可能未生效（任务被禁用/删除/组策略拦截）",
                     flag,
+                    task_name,
                     out.status.code(),
                     stderr.trim()
                 );
@@ -1176,7 +1224,7 @@ fn xml_task_disabled(xml: &str) -> bool {
     flat.contains("<enabled>false</enabled>")
 }
 
-/// 查询看门狗计划任务（"Kynoptic Watchdog"）当前状态。
+/// 查询看门狗计划任务（按安装目录指纹命名，见 kynoptic_core::naming）当前状态。
 ///
 /// 解析用 `schtasks /Query /TN … /XML` 输出里的 `<Enabled>` 元素——
 /// 真机探针实测（2026-09-24）：禁用任务输出 `<Enabled>false</Enabled>`、
@@ -1186,8 +1234,14 @@ fn xml_task_disabled(xml: &str) -> bool {
 fn query_watchdog_task_health() -> WatchdogTaskHealth {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // 按本安装目录的指纹名查询（与安装器同算法，见 kynoptic_core::naming；
+    // Wave40 挂账：旧全局名 "Kynoptic Watchdog" 只在取不到 exe 路径时兜底）
+    let task_name = match kynoptic_core::naming::install_dir() {
+        Some(d) => kynoptic_core::naming::watchdog_task_name(&d),
+        None => kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME.to_string(),
+    };
     let out = match std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", "Kynoptic Watchdog", "/XML"])
+        .args(["/Query", "/TN", &task_name, "/XML"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
@@ -1198,6 +1252,20 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
         }
     };
     if !out.status.success() {
+        // 免安装器升级兜底（绿色替换二进制）：指纹任务尚不存在时探旧全局名
+        // 任务，仅当其 XML 指向本 exe 才采信（认任务不认名字，避免误读其他
+        // 安装或陌生遗留任务）；沙箱旁路不探生产 legacy 名。正常安装器升级
+        // 会在 ssDone 清掉旧任务，此兜底只在升级窗口/免安装器场景生效。
+        if !kynoptic_core::singleton::mutex_suffix_active() {
+            if let Some(health) = legacy_task_health_if_ours(&task_name) {
+                return health;
+            }
+        }
+        // 自检找不到自己的任务：按日志告警，不静默（Wave40 挂账）
+        log::warn!(
+            "看门狗计划任务自检: 未找到本安装的任务 \"{task_name}\"（退出码 {:?}），自启动保护可能失效",
+            out.status.code()
+        );
         return WatchdogTaskHealth::Unavailable;
     }
     // 去空白 + 小写后找 <enabled>false</enabled>（容忍属性/换行/大小写差异）
@@ -1206,6 +1274,41 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
     } else {
         WatchdogTaskHealth::Ok
     }
+}
+
+/// 免安装器升级兜底：旧全局名 `Kynoptic Watchdog` 任务存在且 XML 指向本
+/// exe 时，按其状态返回健康态；否则 None（调用方继续走 Unavailable 告警）。
+/// 只查询，不改任务。
+fn legacy_task_health_if_ours(missing_task_name: &str) -> Option<WatchdogTaskHealth> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe().ok()?;
+    let exe_lower = exe.to_string_lossy().to_lowercase();
+    let out = std::process::Command::new("schtasks")
+        .args([
+            "/Query",
+            "/TN",
+            kynoptic_core::naming::LEGACY_WATCHDOG_TASK_NAME,
+            "/XML",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !stdout.to_lowercase().contains(&exe_lower) {
+        return None;
+    }
+    log::info!(
+        "看门狗自检：指纹任务 \"{missing_task_name}\" 不存在，旧全局名任务指向本 exe，按其状态报告（免安装器升级窗口）"
+    );
+    Some(if xml_task_disabled(&stdout) {
+        WatchdogTaskHealth::Disabled
+    } else {
+        WatchdogTaskHealth::Ok
+    })
 }
 
 /// 组策略限制提示（尽力而为）：读任务计划程序策略键（平台审查指认的
@@ -1312,7 +1415,7 @@ fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem
     }
     let text: Vec<u16> = format!(
         "Kynoptic 的自动保护（看门狗）当前没有生效，程序异常退出时可能不会被自动恢复，数据可能出现空洞。\n\
-         请在计划任务程序里检查名为 \"Kynoptic Watchdog\" 的任务，或重新安装 Kynoptic。\n\
+         请在计划任务程序里检查本安装目录对应的看门狗计划任务（任务名含安装路径指纹），或重新安装 Kynoptic。\n\
          （{message}）\0"
     )
     .encode_utf16()

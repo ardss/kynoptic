@@ -2035,3 +2035,149 @@ fn loopback_host_strips_trailing_dot_in_browser_forms() {
     // 非回环仍拒绝
     assert!(!loopback_host_ok("evil.example.com:8422", 8422));
 }
+
+// === 查询参数解析统一（审查修复：qval/qdate 语义分裂收口） ===
+#[test]
+fn duplicate_query_params_take_first_everywhere() {
+    let conn = mem_conn();
+    let db = Path::new("kyn.db");
+    // 重复日期：一律取首个（此前取末个）。两个方向一个合法（2000 年，远
+    // 过去）一个非法，首末取向不同则结果必不同。
+    let (code, _, body) = route_req(
+        &conn,
+        "GET",
+        "/api/summary?date=bad&date=2000-01-01",
+        "",
+        db,
+    );
+    assert_eq!(code, 400, "取首个 date=bad（格式错）须 400: {body}");
+    let (code, _, body) = route_req(
+        &conn,
+        "GET",
+        "/api/summary?date=2000-01-01&date=bad",
+        "",
+        db,
+    );
+    assert_eq!(code, 200, "取首个 date=2000-01-01 合法须 200: {body}");
+    // 重复数值：一律取首个（此前取首个，保持方向一致）
+    let (code, _, body) = route_req(&conn, "GET", "/api/apps?days=abc&days=2", "", db);
+    assert_eq!(code, 400, "首个 days=abc 非法须 400: {body}");
+    // 数值参数显式空串 → 400（此前静默回缺省）
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?hours=", "", db);
+    assert_eq!(code, 400, "hours= 空串须 400: {body}");
+    assert!(body.contains("不应为空"), "got: {body}");
+    let (code, _, _) = route_req(&conn, "GET", "/api/apps?days=", "", db);
+    assert_eq!(code, 400, "days= 空串与日期族同口径 400");
+}
+
+#[test]
+fn numeric_params_below_range_rejected_with_domain_in_message() {
+    let conn = mem_conn();
+    let db = Path::new("kyn.db");
+    // 六个数值端点 days/weeks/hours=0 统一 400，文案写明有效域
+    for (path, domain) in [
+        ("/api/anomalies?days=0", "1-30"),
+        ("/api/apps?days=0", "1-365"),
+        ("/api/daily_top?days=0", "1-90"),
+        ("/api/input?days=0", "1-90"),
+        ("/api/heatmap?weeks=0", "1-52"),
+        ("/api/timeline?hours=0", "1-744"),
+    ] {
+        let (code, _, body) = route_req(&conn, "GET", path, "", db);
+        assert_eq!(code, 400, "{path} 的 0 须 400: {body}");
+        assert!(
+            body.contains(domain),
+            "{path} 错误文案须写明有效域 {domain}: {body}"
+        );
+    }
+    // anomalies：负数与 0 同一条文案（此前分裂为两条）
+    let (_, _, body) = route_req(&conn, "GET", "/api/anomalies?days=-1", "", db);
+    assert!(body.contains("1-30"), "got: {body}");
+    // 非数字文案同样含有效域
+    let (_, _, body) = route_req(&conn, "GET", "/api/heatmap?weeks=abc", "", db);
+    assert!(body.contains("1-52"), "got: {body}");
+}
+
+#[test]
+fn over_max_numeric_params_are_clamped_with_annotation() {
+    let conn = mem_conn();
+    let db = Path::new("kyn.db");
+    // 各数值端点超上限：仍 200，但响应标注 X_requested + note（不再无声）
+    let cases = [
+        ("/api/timeline?hours=999999", "hours_requested"),
+        ("/api/heatmap?weeks=999999", "weeks_requested"),
+        ("/api/apps?days=999999", "days_requested"),
+        ("/api/daily_top?days=999999", "days_requested"),
+        ("/api/anomalies?days=999999", "days_requested"),
+    ];
+    for (path, field) in cases {
+        let (code, _, body) = route_req(&conn, "GET", path, "", db);
+        assert_eq!(code, 200, "{path}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get(field).is_some(), "{path} 须标注 {field}: {body}");
+        assert!(
+            v["note"].as_str().unwrap().contains("上限"),
+            "{path} 须带截断说明: {body}"
+        );
+    }
+    // anomalies 窗口钳制时 truncated 置 true（字段名与职责对齐）
+    let (_, _, body) = route_req(&conn, "GET", "/api/anomalies?days=999999", "", db);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["truncated"],
+        json!(true),
+        "窗口钳制须 truncated=true: {body}"
+    );
+    // 未超上限不带标注
+    let (_, _, body) = route_req(&conn, "GET", "/api/heatmap?weeks=4", "", db);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("weeks_requested").is_none(), "got: {body}");
+}
+
+#[test]
+fn unknown_query_params_are_echoed_as_ignored_params() {
+    let conn = mem_conn();
+    let db = Path::new("kyn.db");
+    // 未知参数回显（与 POST /api/settings 的 ignored 对称）
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?foo=1&hours=6", "", db);
+    assert_eq!(code, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ignored_params"], json!(["foo"]), "got: {body}");
+    // 大小写错误键名此前被静默丢弃，现在回显
+    let (_, _, body) = route_req(&conn, "GET", "/api/summary?DATE=2026-09-01", "", db);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ignored_params"], json!(["DATE"]), "got: {body}");
+    // 已知参数不出现在 ignored_params
+    let (_, _, body) = route_req(&conn, "GET", "/api/summary?date=2026-09-01", "", db);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("ignored_params").is_none(), "got: {body}");
+}
+
+#[test]
+fn ignored_params_cover_all_get_endpoints_and_bare_params() {
+    let conn = mem_conn();
+    let db = Path::new("kyn.db");
+    // 此前不接收参数的 GET 端点同样回显（文档口径：全 GET 端点统一语义）
+    for path in [
+        "/api/status?Days=5",
+        "/api/overview?Days=5",
+        "/api/insights?Days=5",
+        "/api/trends?Days=5",
+        "/api/diagnostics?Days=5",
+        "/api/settings?Days=5",
+        "/api/autostart-status?Days=5",
+    ] {
+        let (code, _, body) = route_req(&conn, "GET", path, "", db);
+        assert_eq!(code, 200, "{path}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ignored_params"], json!(["Days"]), "{path}: {body}");
+    }
+    // 裸参数（无 '='）整段视为键名，同样回显；已知参数 + 裸参数混排去重
+    let (_, _, body) = route_req(&conn, "GET", "/api/trends?flag&Days=5&flag", "", db);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ignored_params"], json!(["flag", "Days"]), "got: {body}");
+    // 无参数时不出现该字段
+    let (_, _, body) = route_req(&conn, "GET", "/api/trends", "", db);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("ignored_params").is_none(), "got: {body}");
+}
