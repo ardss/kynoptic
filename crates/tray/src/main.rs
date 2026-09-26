@@ -296,29 +296,46 @@ fn main() {
                 args::candidate_ports(dash_port_requested)
             };
             let mut last_err: Option<String> = None;
-            for &cand in &candidates {
+            // 随机端口（cand=0）的 serve 失败允许一次性重探测（见循环内注释）
+            let mut random_reprobed = false;
+            let mut ci = 0usize;
+            while ci < candidates.len() {
+                let cand = candidates[ci];
                 // 探测 bind 紧贴 serve:成功即写 port.txt 并回传端口,再交 serve
                 // 正式 bind（探测 listener 立即 drop,毫秒级窗口;单实例互斥体
                 // 已排除第二个 kynoptic 抢端口）。serve 失败（含罕见 TOCTOU
                 // 撞车）按候选序列继续重试。
-                match std::net::TcpListener::bind(("127.0.0.1", cand)) {
-                    Ok(probe) => drop(probe),
+                // cand=0（随机端口）:探测 listener 的 local_addr 即 OS 实际
+                // 分配的端口,serve 改绑这个具体端口（与候选回退同一形态:
+                // 探测→drop→serve 具体端口）。此前 cand=0 跳过写 port.txt、
+                // serve(0) 另行取随机端口:文件永不落,首启引导 60s 轮询必超
+                // 时、菜单「打开面板」回退 parsed.port=0 恒死链（2026-09 复
+                // 核双实例 A/B 实测:面板 bind 8667 成功但数据目录无
+                // dashboard-port.txt,唯一变量是端口参数）。
+                // 探测端口在毫秒窗口内被抢占导致 serve 失败时,cand=0 允许再
+                // 重探测一次、由 OS 重新取随机端口（恢复旧 serve(0) 的当场
+                // 重取语义）;固定端口候选不重试同端口,行为不变。
+                let bind_port = match probe_bind_serve_port(cand) {
+                    Ok(p) => p,
                     Err(e) => {
-                        last_err = Some(format!("bind 127.0.0.1:{cand}: {e}"));
+                        last_err = Some(e);
+                        ci += 1;
                         continue;
                     }
-                }
-                if cand != 0 {
+                };
+                // 实际端口已知才写 port.txt（local_addr 失败的极端情形退回
+                // 旧行为:不写文件、回传 0）
+                if bind_port != 0 {
                     if let Some(dir) = dash_db.parent() {
-                        write_port_file(dir, &format!("{cand}\n"));
+                        write_port_file(dir, &format!("{bind_port}\n"));
                     }
                 }
                 DASH_FAILED.store(2, std::sync::atomic::Ordering::Relaxed);
-                let _ = port_tx.send(Some(cand));
+                let _ = port_tx.send(Some(bind_port));
                 // catch_unwind：serve panic 不许让线程静默死亡还挂着绿色
                 // Running 图标（审查 P2：活着但残废）——转成 Err 走候选重试
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    kynoptic_dash::serve(&dash_db, cand, true)
+                    kynoptic_dash::serve(&dash_db, bind_port, true)
                 }));
                 let result = match attempt {
                     Ok(r) => r,
@@ -329,8 +346,13 @@ fn main() {
                 match result {
                     Ok(()) => return, // 正常退出路径（进程结束）
                     Err(e) => {
-                        last_err = Some(format!("serve 127.0.0.1:{cand}: {e}"));
-                        continue;
+                        last_err = Some(format!("serve 127.0.0.1:{bind_port}: {e}"));
+                        if cand == 0 && !random_reprobed {
+                            // 重探测：OS 重新分配随机端口，重试（仅一次）
+                            random_reprobed = true;
+                        } else {
+                            ci += 1;
+                        }
                     }
                 }
             }
@@ -1008,6 +1030,27 @@ impl Debounce {
     }
 }
 
+/// 探测 bind 决定 serve 实际端口（纯 127.0.0.1 I/O,单测覆盖）：
+/// - cand≠0:探测成功即原样透传 cand（探测→drop→serve 同一端口,毫秒级
+///   TOCTOU 窗口,单实例互斥体已排除第二个 kynoptic 抢端口）;
+/// - cand=0:OS 随机空闲端口,透传探测 listener 的 local_addr 实际端口——
+///   调用方据此写 dashboard-port.txt 与回传托盘,首启引导/菜单不再死链。
+///   Err（bind 失败,如端口被占）由调用方记 last_err 走候选序列重试。
+fn probe_bind_serve_port(cand: u16) -> Result<u16, String> {
+    match std::net::TcpListener::bind(("127.0.0.1", cand)) {
+        Ok(probe) => {
+            let p = if cand == 0 {
+                probe.local_addr().map(|a| a.port()).unwrap_or(0)
+            } else {
+                cand
+            };
+            drop(probe);
+            Ok(p)
+        }
+        Err(e) => Err(format!("bind 127.0.0.1:{cand}: {e}")),
+    }
+}
+
 /// dashboard-port.txt 原子写：先写 .tmp 再 rename 替换（rename 失败兜底
 /// 直接写,尽力而为）。单次 fs::write 先建文件后写内容,读取方（托盘首启
 /// 引导/菜单）在毫秒级窗口内会读到空串或半截内容,与心跳文件同一修法。
@@ -1635,6 +1678,35 @@ mod tests {
         let mut last: Option<bool> = Some(true);
         assert!(!apply_autostart_if_changed(true, &mut last));
         assert_eq!(last, Some(true));
+    }
+
+    // === 随机端口（--port 0）serve 端口决定（探针铁律:真机 127.0.0.1 实测） ===
+
+    #[test]
+    fn probe_bind_serve_port_zero_returns_real_port() {
+        // port 0 = OS 随机空闲端口:必须返回 1..=65535 的真实端口
+        //（这是写 dashboard-port.txt / 回传托盘的依据;0 会重新变成死链）
+        let p = probe_bind_serve_port(0).expect("bind 127.0.0.1:0 不应失败");
+        assert!((1..=65535).contains(&p), "随机端口不得为 0, got {p}");
+    }
+
+    #[test]
+    fn probe_bind_serve_port_fixed_passthrough_and_occupied_err() {
+        // 取一个空闲端口:释放后探测必须原样透传（被他人抢走则 Err 可接受,
+        // 但绝不能返回错端口）
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("127.0.0.1 bind 失败");
+        let p = held.local_addr().unwrap().port();
+        drop(held);
+        if let Ok(got) = probe_bind_serve_port(p) {
+            assert_eq!(got, p, "固定端口必须原样透传");
+        } // 罕见竞态:端口被抢,走候选重试分支
+          // 被占端口必须走 Err（候选序列重试的驱动信号）
+        let held2 = std::net::TcpListener::bind("127.0.0.1:0").expect("127.0.0.1 bind 失败");
+        let p2 = held2.local_addr().unwrap().port();
+        assert!(
+            probe_bind_serve_port(p2).is_err(),
+            "被占端口必须返回 Err（驱动候选重试）"
+        );
     }
 
     // === 看门狗计划任务 XML 状态解析（真机探针实测的输出形态） ===
