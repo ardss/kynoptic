@@ -179,6 +179,10 @@ impl Database {
         for e in events {
             rowids.push(execute_event(&tx, e)?);
         }
+        // 与事件写入同事务推进 events 水位（WAL 静默蒸发防护，见
+        // db::persist_events_watermark）：本批提交后把 max(rowid) 一并刷新，
+        // 回滚时水位随之回滚，不会留下「水位超前数据」。
+        super::persist_events_watermark(&tx);
         tx.commit()?;
         Ok(rowids)
     }
@@ -196,6 +200,10 @@ impl Database {
             super::agg::apply_event(&tx, e, rowid)?;
             rowids.push(rowid);
         }
+        // 同事务推进 events 水位（WAL 静默蒸发防护，见 db::persist_events_
+        // watermark）：events+agg+水位同生共死，回滚时一并回滚。纯 input_agg
+        // 批 max(rowid) 不变，重写同值无害。
+        super::persist_events_watermark(&tx);
         tx.commit()?;
         Ok(rowids)
     }
@@ -245,6 +253,14 @@ impl Database {
                 }
             }
         }
+        // 降级逐条路径收尾：整批处理完（无论逐条成败）统一推进一次 events
+        // 水位，覆盖本批已提交行；写连接不可用时 with_writer 自动跳过。
+        self.with_writer(
+            |conn| {
+                super::persist_events_watermark(conn);
+            },
+            || (),
+        );
         rowids
     }
 
@@ -433,6 +449,79 @@ mod tests {
         let (rowids, all_failed) = bad_db.insert_events_with_agg(&[e.clone(), e]);
         assert!(all_failed, "纯 input_agg 批整批失败必须显式返回 true");
         assert_eq!(rowids, vec![0, 0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 结构性修复（WAL 静默蒸发防护 2026-09）：每次批量事件落库后把 events
+    /// 水位（max(rowid)）与写入同事务推进持久化——此前水位只在正常停机
+    /// 写一次，「停机后写入再丢失」整段不可检测。此测试锚定新行为：
+    /// 批量提交后 metadata 水位即等于当前 MAX(rowid)，input_agg 批不改
+    /// MAX 时水位原样重写。
+    #[test]
+    fn batch_write_persists_events_watermark() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-wm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wm.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+
+        // 新库 open 时 reconcile 已把水位播种为 0（对账刷新为当前 max(rowid)）
+        assert_eq!(
+            db.get_metadata("events_watermark_max_rowid"),
+            Some("0".to_string()),
+            "新库开库对账后水位应为 0"
+        );
+
+        let ev = Event::new(EventAction::Press, EventType::Keyboard);
+        let events = vec![ev.clone(), ev.clone(), ev];
+        let (rowids, all_failed) = db.insert_events_with_agg(&events);
+        assert!(!all_failed, "正常批量写不得报全败");
+        assert_eq!(rowids, vec![1, 2, 3], "3 条普通事件 rowid 应为 1..3");
+
+        // 批量提交后水位推进到当前 MAX(rowid)=3
+        let wm: i64 = db
+            .get_metadata("events_watermark_max_rowid")
+            .expect("批量落库后必须已写入水位")
+            .parse()
+            .unwrap();
+        let max: i64 = db
+            .reader()
+            .query_row("SELECT MAX(rowid) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(wm, 3, "水位应等于当前 MAX(rowid)");
+        assert_eq!(wm, max, "水位与 MAX(rowid) 必须一致");
+
+        // 纯 input_agg 批：UPSERT 行本身是 events 表新行（同分钟同类型首写
+        // 即插入新 rowid），故 MAX(rowid) 同样推进、水位随之刷新（调用方
+        // 拿到的 rowid 记 0 只表示"无稳定新 rowid"，不代表表无新行）。
+        let agg_ev = Event::new(EventAction::InputAgg, EventType::Keyboard);
+        let (agg_rowids, agg_failed) = db.insert_events_with_agg(std::slice::from_ref(&agg_ev));
+        assert!(!agg_failed, "纯 input_agg 批合法成功");
+        assert_eq!(
+            agg_rowids,
+            vec![0],
+            "input_agg 行调用方记 0（无稳定新 rowid）"
+        );
+        let wm2: i64 = db
+            .get_metadata("events_watermark_max_rowid")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let max2: i64 = db
+            .reader()
+            .query_row("SELECT MAX(rowid) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            wm2, max2,
+            "水位必须始终跟随当前 MAX(rowid)（input_agg 行也计入）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

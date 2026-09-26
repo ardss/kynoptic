@@ -14,7 +14,7 @@
 - Raw events are stored untouched in SQLite. Aggregate tables are
   derived read caches only; the raw layer is append-only and is never
   truncated or cleaned up automatically.
-- Status: v0.3.0, active development. Language: Rust. License:
+- Status: v0.3.1, active development. Language: Rust. License:
   Apache-2.0.
 
 ## Privacy boundary
@@ -38,7 +38,9 @@
   subcommands: `now`, `query`, `stats`, `collect`, `dashboard`, `probe`,
   `mcp`, `export`, `report`, `db`, `analyze`, `ghost`, `autostart`,
   `migrate`, `skill`, `update`, `watchdog`, `presence`. Includes a
-  local-only read-only web dashboard. Full command reference: APP.md.
+  local-only read-only web dashboard. Full command reference: APP.md
+  (a version snapshot - it reflects the released CLI; run
+  `kynoptic --help` for the current option set).
 - `crates/dash` - dashboard service and pages (shared by CLI and tray).
 - `crates/mcp` - MCP server over stdio JSON-RPC 2.0.
 - `crates/tray` - pure Win32 tray shell hosting the collector and

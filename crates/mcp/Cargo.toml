@@ -2,7 +2,7 @@
 name = "kynoptic-mcp"
 version.workspace = true
 edition = "2021"
-description = "MCP server（stdio JSON-RPC 2.0，五工具，见 mcp-tool-spec-v1）"
+description = "MCP server（stdio JSON-RPC 2.0，六工具，见 mcp-tool-spec-v1）"
 
 [dependencies]
 kynoptic-core = { path = "../core" }

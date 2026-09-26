@@ -71,7 +71,7 @@ Subcommands:
   probe     [--monitor ID] [--secs N] [--all] [--first-collect-timeout N] Live per-monitor hardware probe
   dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
   update [--check]                          Self-update from GitHub releases (--check: report only)
-  watchdog [--once]                         Ensure tray is alive (for Task Scheduler)
+  watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary
 
 Global options (all subcommands unless noted):
@@ -153,6 +153,25 @@ fn open_db_read(path: &Path) -> Result<Connection> {
         )));
     }
     open_db(path)
+}
+
+/// 与 core `Database::open` 相同的 quick_check 门禁（core 侧对非 ok/执行失败
+/// 都会 mark_db_degraded 留档）：CLI 的 db 命令走自建连接（open_db_read，
+/// 不经 Database::open），主文件数据页损坏时 schema/迁移仍可读、各计数走
+/// count_or_log 全部静默回落 0——旧实现对损坏库输出「事件数: 0 / 会话数: 0」
+/// 且退出码 0，用户/脚本会把「库坏了」读成「没有活动」。统计类 db 子命令
+/// 打印数字前先过本门禁：降级时返回原因文案，由调用方显著告警 + 非零退出。
+/// 返回 Err(String) 而非 Err(Error)：stdout 告警文案与 stderr 错误文案分开写。
+fn db_quick_check(conn: &Connection) -> std::result::Result<(), String> {
+    match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+        Ok(s) if s == "ok" => Ok(()),
+        Ok(s) => Err(format!(
+            "quick_check = {s}（数据库可能已损坏，计数不可信。请先备份再修复；零计数不代表「没有活动」）"
+        )),
+        Err(e) => Err(format!(
+            "quick_check 无法完成: {e}（数据库可能已损坏，请先备份）"
+        )),
+    }
 }
 
 fn parse_date(s: &str) -> Result<String> {
@@ -338,7 +357,14 @@ fn cmd_export(args: &[String]) -> Result<()> {
     }
     let out_path = PathBuf::from(&out);
 
-    // window_title 默认输出原文（本地数据完整优先）；--redact 显式开启才剥查询串
+    // 原子写（三格式统一）：先写同目录 tmp，成功后原子改名到最终路径——最终
+    // 路径上永不出现半截文件。写盘中途失败（磁盘满等）时把 tmp 留作
+    // .partial 失败留痕并以非零退出；旧实现直接写最终路径且逐次写失败全被
+    // 丢弃（.ok()/let _ =），落盘残缺文件仍宣称「✓ 导出 N 行」成功。
+    let tmp_path = out_path.with_extension(format!("{}.tmp", ext(&format)));
+
+    // window_title 字符串形式（CSV 用）：NULL 与空串在 CSV 里同为 ''（CSV 固有
+    // 形态，保持不变）；默认输出原文（本地数据完整优先），--redact 显式开启才剥查询串
     let title_out = |t: &Option<String>| -> String {
         let t = t.clone().unwrap_or_default();
         if redact {
@@ -347,11 +373,18 @@ fn cmd_export(args: &[String]) -> Result<()> {
             t
         }
     };
+    // window_title 的 JSON 形式：NULL→json null，与同文档其余字段一致（旧实现
+    // 把 NULL 落成 ""，与 event_data/app_name 的 null 并存，程序化消费方无法
+    // 区分「没有标题」与「空标题」）
+    let title_json = |t: &Option<String>| -> Option<String> {
+        t.clone()
+            .map(|t| if redact { sanitize_window_title(&t) } else { t })
+    };
 
     match format.as_str() {
         "csv" => {
             use std::io::Write;
-            let f = open_export_file(&out_path)?;
+            let f = open_export_file(&tmp_path, &out_path)?;
             let mut buf = std::io::BufWriter::new(f);
             // P2：写 UTF-8 BOM（EF BB BF），Excel 双击打开才不会把 UTF-8 中文
             // 当 ANSI 读出乱码。仅 CSV——jsonl/json 是程序间交换格式,加 BOM
@@ -384,51 +417,81 @@ fn cmd_export(args: &[String]) -> Result<()> {
                     r.session_id.map(|x| x.to_string()).unwrap_or_default(),
                 ]);
             });
-            w.flush()?;
+            // 结尾 flush 冒泡中途写失败（磁盘满等）：BufWriter 会保留首个错误
+            // 供 flush 吐出；失败时把 tmp 留作 .partial 留痕，非零退出
+            if let Err(e) = w.flush() {
+                drop(w); // Windows 上改名前必须先释放底层文件句柄
+                return Err(export_write_failed(&tmp_path, &out_path, &e));
+            }
+            atomic_replace(&tmp_path, &out_path)?;
         }
         "json" => {
             use std::io::Write;
-            let mut f = open_export_file(&out_path)?;
+            let f = open_export_file(&tmp_path, &out_path)?;
+            // 流式回调签名返回 unit（core 共享，不改跨域），写错误无法 ? 冒泡：
+            // 用 AbsorbWriter 吸收并记下首个错误，流结束后检查留痕 + 非零退出
+            let mut w = AbsorbWriter::new(std::io::BufWriter::new(f));
             let rc = row_count.clone();
-            let mut first = true;
-            writeln!(f, "[")?;
+            let _ = w.write_all("[\n".as_bytes());
             skipped += queries::export_events_since_stream(&conn, &cutoff, |r| {
                 let n = rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_out(&r.window_title), "session_id": r.session_id
+                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_json(&r.window_title), "session_id": r.session_id
                 });
                 let line = serde_json::to_string_pretty(&obj).unwrap_or_default();
                 if n > 0 {
-                    writeln!(f, ",").ok();
+                    let _ = writeln!(w, ",");
                 }
                 // 缩进对齐首行
                 for (i2, l) in line.lines().enumerate() {
                     if i2 == 0 {
-                        write!(f, "  {l}").ok();
+                        let _ = write!(w, "  {l}");
                     } else {
-                        writeln!(f).ok();
-                        write!(f, "  {l}").ok();
+                        let _ = writeln!(w);
+                        let _ = write!(w, "  {l}");
                     }
                 }
-                first = false;
-                let _ = first;
             });
-            writeln!(f).ok();
-            write!(f, "]").ok();
+            let _ = w.write_all("\n]".as_bytes());
+            // 残块写失败显式冒泡：std BufWriter 的 Drop 静默吞掉 flush 错误，
+            // 不显式 flush 时最后一块（<8KB 残块）写失败会漏过 error_text
+            // 检查、被当完整文件改名
+            if let Err(e) = w.flush() {
+                drop(w); // Windows 上改名前必须先释放底层文件句柄
+                return Err(export_write_failed(&tmp_path, &out_path, &e));
+            }
+            let failed = w.error_text();
+            drop(w);
+            if let Some(msg) = failed {
+                return Err(export_write_failed(&tmp_path, &out_path, &msg));
+            }
+            atomic_replace(&tmp_path, &out_path)?;
         }
         "jsonl" => {
             use std::io::Write;
-            let mut f = open_export_file(&out_path)?;
+            let f = open_export_file(&tmp_path, &out_path)?;
+            let mut w = AbsorbWriter::new(std::io::BufWriter::new(f));
             let rc = row_count.clone();
             skipped += queries::export_events_since_stream(&conn, &cutoff, |r| {
                 rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_out(&r.window_title), "session_id": r.session_id
+                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_json(&r.window_title), "session_id": r.session_id
                 });
-                let _ = writeln!(f, "{}", serde_json::to_string(&obj).unwrap_or_default());
+                let _ = writeln!(w, "{}", serde_json::to_string(&obj).unwrap_or_default());
             });
+            // 残块写失败显式冒泡（理由同 json 分支：Drop 静默吞掉 flush 错误）
+            if let Err(e) = w.flush() {
+                drop(w); // Windows 上改名前必须先释放底层文件句柄
+                return Err(export_write_failed(&tmp_path, &out_path, &e));
+            }
+            let failed = w.error_text();
+            drop(w);
+            if let Some(msg) = failed {
+                return Err(export_write_failed(&tmp_path, &out_path, &msg));
+            }
+            atomic_replace(&tmp_path, &out_path)?;
         }
         other => {
             return Err(Error::InvalidData(format!(
@@ -495,6 +558,86 @@ fn ext(f: &str) -> &'static str {
     }
 }
 
+/// 导出流式写吸收器：导出流的回调签名是返回 unit 的 `FnMut(ExportRow)`
+/// （core 共享实现，cli 域不改），回调内无法 `?` 冒泡写错误。本包装器把
+/// 首个写失败记下、后续写变 no-op，调用方在流结束后先显式 flush（残块写
+/// 失败冒泡——std BufWriter 的 Drop 静默吞掉 flush 错误）再检查
+/// `error_text()` 决定是否留 .partial 留痕并以非零退出（json/jsonl 旧实现
+/// 逐次写失败被丢弃，半截文件直接落在最终路径仍宣称成功）。
+struct AbsorbWriter<W: std::io::Write> {
+    inner: W,
+    err: Option<std::io::Error>,
+}
+
+impl<W: std::io::Write> AbsorbWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, err: None }
+    }
+    /// 记下的首个写错误文本（None = 全程写成功）。
+    fn error_text(&self) -> Option<String> {
+        self.err.as_ref().map(|e| e.to_string())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for AbsorbWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.err.is_some() {
+            return Ok(0); // 已失败：写变 no-op，不再浪费盘空间
+        }
+        match self.inner.write(buf) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.err = Some(e);
+                Ok(0)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // io::Error 不可 Clone，失败时用文本重建错误冒泡
+        if let Some(e) = &self.err {
+            return Err(std::io::Error::other(e.to_string()));
+        }
+        self.inner.flush()
+    }
+}
+
+/// 原子改名 tmp → 最终路径：成功时整个写好的文件才进最终路径。Unix 上
+/// fs::rename 直接原子覆盖已存在目标；Windows 上目标已存在会失败，先删旧
+/// 文件再改名（CLI 导出可接受这一小窗口）。
+fn atomic_replace(tmp: &Path, dest: &Path) -> Result<()> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if dest.exists() {
+                std::fs::remove_file(dest)?;
+                std::fs::rename(tmp, dest)?;
+            } else {
+                return Err(e.into());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 导出中途写失败统一收口（三格式）：把半截 tmp 改名为 .partial 失败留痕
+/// （改名也失败则删掉半截文件——最终路径上永不留半截文件），调用方据返回
+/// 的错误以非零退出。
+fn export_write_failed(tmp: &Path, out_path: &Path, e: &impl std::fmt::Display) -> Error {
+    let partial = PathBuf::from(format!("{}.partial", out_path.display()));
+    let note = match std::fs::rename(tmp, &partial) {
+        Ok(()) => format!(
+            "已生成不完整文件: {}（磁盘问题解决后请重新导出）",
+            partial.display()
+        ),
+        Err(_) => {
+            let _ = std::fs::remove_file(tmp);
+            "半截文件已删除（磁盘问题解决后请重新导出）".to_string()
+        }
+    };
+    Error::InvalidData(format!("导出中途写失败: {e}；{note}"))
+}
+
 /// Markdown 表格单元格转义：`|` 会破坏列结构，换行会破坏行结构。
 fn md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
@@ -557,7 +700,7 @@ fn cmd_report(args: &[String]) -> Result<()> {
     let anomalies = anomaly::detect_all(&conn, &date).unwrap_or_default();
 
     let mut md = String::new();
-    md.push_str(&format!("# 数字脉搏 · {} 报告\n\n", date));
+    md.push_str(&format!("# Kynoptic · {} 报告\n\n", date));
     md.push_str(&format!("- 按键: **{}**\n", analysis.total_keys));
     md.push_str(&format!("- 点击: **{}**\n", analysis.total_clicks));
     md.push_str(&format!(
@@ -631,6 +774,14 @@ fn cmd_db(args: &[String]) -> Result<()> {
     let conn = open_db_read(&db_path)?;
     match sub {
         "stats" => {
+            // 降级门禁（2026-09）：损坏库上先显著告警并非零退出，不再打印
+            // 全零统计（详见 db_quick_check 注释）
+            if let Err(reason) = db_quick_check(&conn) {
+                println!("⚠ 数据库完整性检查未通过: {reason}");
+                return Err(Error::InvalidData(format!(
+                    "数据库完整性检查未通过，统计结果不可信: {reason}"
+                )));
+            }
             let n_events = queries::count_all_events(&conn);
             let n_sessions = queries::count_all_sessions(&conn);
             let n_ghost = queries::count_ghost_sessions(&conn);
@@ -694,18 +845,60 @@ fn cmd_db(args: &[String]) -> Result<()> {
             // 极限注入审查：同 export——极大 days 曾 panic（TimeDelta::days
             // out of bounds）。钳到 20 万天，cutoff 落到远古，语义不变（全删）。
             let days = days.min(200_000);
-            let cutoff = (Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000)))
-                .to_rfc3339();
+            // cutoff 时刻算一次、两处口径：events 用 UTC RFC3339 瞬间（原行为），
+            // 三张 agg 表的 date 是本地日历日（写入路径用 Local），边界取该
+            // 时刻对应的本地日——删事件联动删聚合，两口径对齐（与 core
+            // cleanup_old_events 同一口径）
+            let cutoff_instant =
+                Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000));
+            let cutoff = cutoff_instant.to_rfc3339();
+            let cutoff_date = cutoff_instant
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string();
             let ns = queries::delete_closed_sessions_before(&conn, &cutoff)?;
             let n = if with_events {
-                queries::delete_events_before(&conn, &cutoff)?
+                // 四表同事务（与 core db/events.rs cleanup_old_events 同一口径）：
+                // 只删 events 不删派生 agg，孤儿行会让仪表盘分钟级/聚合视图
+                // 继续展示原始数据已删的日期。事务失败回滚，不半删。
+                let deleted = (|| -> rusqlite::Result<usize> {
+                    conn.execute_batch("BEGIN IMMEDIATE")?;
+                    let ev =
+                        conn.execute("DELETE FROM events WHERE timestamp < ?1", params![&cutoff])?;
+                    let _daily = conn.execute(
+                        "DELETE FROM daily_agg WHERE date < ?1",
+                        params![&cutoff_date],
+                    )?;
+                    let _minute = conn.execute(
+                        "DELETE FROM agg_minute WHERE date < ?1",
+                        params![&cutoff_date],
+                    )?;
+                    let _app = conn.execute(
+                        "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
+                        params![&cutoff_date],
+                    )?;
+                    conn.execute_batch("COMMIT")?;
+                    Ok(ev)
+                })();
+                match deleted {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(writable_db_error(&db_path, e));
+                    }
+                }
             } else {
                 0
             };
-            println!(
-                "✓ 清理: 删除 {} 事件, {} sessions（保留 {} 天；原始事件默认保留）",
-                n, ns, days
-            );
+            if with_events {
+                println!(
+                    "✓ 清理: 删除 {n} 事件, {ns} sessions（过期日期的统计汇总同步删除；保留 {days} 天）"
+                );
+            } else {
+                println!(
+                    "✓ 清理: 删除 {n} 事件, {ns} sessions（保留 {days} 天；原始事件默认保留）"
+                );
+            }
         }
         "vacuum" => {
             println!("正在整理数据库空间（VACUUM）...");
@@ -3296,8 +3489,10 @@ fn main() -> ExitCode {
 
 /// 导出文件创建失败增强（审查条目）：File::create 直接 `?` 透传 os error
 /// 不带目标路径，CFA/ACL 拒写场景下用户无从知道被拒的是哪个导出路径。
-fn open_export_file(out_path: &Path) -> Result<std::fs::File> {
-    std::fs::File::create(out_path).map_err(|e| {
+/// 实际创建的是同目录 tmp（原子写中间文件），错误文案仍指向用户指定的
+/// 最终路径——tmp 是实现细节，不该暴露给用户。
+fn open_export_file(tmp: &Path, out_path: &Path) -> Result<std::fs::File> {
+    std::fs::File::create(tmp).map_err(|e| {
         let mut msg = format!("无法创建导出文件 {}: {e}", out_path.display());
         if e.raw_os_error() == Some(5) {
             msg.push_str(

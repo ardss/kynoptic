@@ -100,7 +100,7 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 
 数据库路径解析：环境变量 `KYNOPTIC_DB` > exe 同级 `data/kynoptic.db` > cwd 候选。
 
-## CLI（实际可用面，截至 v0.3.0）
+## CLI（实际可用面，截至 v0.3.1）
 
 两个 bin 同源：`kynoptic`（网站 MCP 配置示例的 command）与 `kynoptic-ctl`（别名）。
 
@@ -108,13 +108,13 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 |--------|------|------|
 | `stats` / `export` / `report` / `db` / `analyze` / `ghost` / `autostart` / `migrate` | ✅ | 同上一版（v0.1 起可用） |
 | `now [--json]` | ✅ | 当前机器状态紧凑视图（cpu/mem/前台应用/idle/APM/电量），与 MCP `get_current_status` 同数据面 |
-| `query --from T --to T --bucket B --limit N --json` | ✅（营销口径的子集） | 时间范围事件查询。`--from/--to` 接受 `today`/`yesterday`/`YYYY-MM-DD`/RFC3339；`--bucket` 接受 bucket id（`activity/keys`、`activity/mouse`、`app/window`、`system/*`、`network/*`、`session/*`、`device/*`）或裸 event_type。网站的 `--metric gpu` / `--join window` 依赖 GPU/窗口聚合层，**至今未落地**（截至 v0.3.0 仍报"未知选项"；`current_state`/`agg_*` 表已建，采集器未写入） |
+| `query --from T --to T --bucket B --limit N --json` | ✅（营销口径的子集） | 时间范围事件查询。`--from/--to` 接受 `today`/`yesterday`/`YYYY-MM-DD`/RFC3339；`--bucket` 接受 bucket id（`activity/keys`、`activity/mouse`、`app/window`、`system/*`、`network/*`、`session/*`、`device/*`）或裸 event_type。网站的 `--metric gpu` / `--join window` 依赖 GPU/窗口聚合层，**至今未落地**（截至 v0.3.1 仍报"未知选项"；`current_state`/`agg_*` 表已建，采集器未写入） |
 | `mcp` | ✅ | 启动 MCP server（stdio，阻塞到 stdin 关闭） |
 | `collect` | ✅ | 前台运行采集器，Ctrl+C 优雅停止（`--db PATH` / `--all` 覆盖 settings） |
 | `dashboard [--port N] [--db PATH]` | ✅ | 仅本机可访问的只读网页面板（127.0.0.1） |
 | `presence [--days N]` | ✅ | 三指标日报（presence/automation/foreground + mixed），与 dashboard overview 同一权威实现 |
 | `skill install` | ✅ | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
-| `probe [--monitor ID] [--secs N] [--all]` | ✅ | 逐监控器硬件实测探针 |
+| `probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]` | ✅ | 逐监控器硬件实测探针（0 = 自动推导首次采集等待上限，仍受 420s 上限约束） |
 | `watchdog [--db PATH] [--once]` | ✅ | 看门狗心跳（供计划任务调用，确保托盘存活） |
 | `update` | ✅ | 自更新（GitHub releases，SHA256 校验 + 三件套备份 + 失败回滚） |
 

@@ -78,15 +78,49 @@ pub fn clear_degraded_flag(db_file: &Path) {
     }
 }
 
-/// metadata 表里持久化的 events 水位键名（最近一次正常关闭时的 max(rowid)）。
+/// metadata 表里持久化的 events 水位键名（最近一次确认的 events max(rowid)）。
+///
+/// 刷新时机不止正常停机——三处推进（见 [`persist_events_watermark`]）：
+/// 1. 每次批量事件落库（`insert_events` / `insert_events_with_agg`，与写入同事务）；
+/// 2. 每次成功的 WAL checkpoint（`maintenance` 的 `wal_checkpoint_truncate`）；
+/// 3. 正常停机（[`Database::mark_stopping`]）。
 const EVENTS_WATERMARK_KEY: &str = "events_watermark_max_rowid";
 
-/// WAL 水位对账（WAL 静默蒸发防护 2026-09）：连接存活期间 WAL 被外部截断/
-/// 删除（云同步冲突、手动清理）时，SQLite 恢复把截断后的尾部当无效帧丢弃——
-/// quick_check=ok、正常启动、已提交事务静默蒸发且零告警。对策：正常停机
-/// （[`Database::mark_stopping`]）把 events max(rowid) 持久化到 metadata 作
-/// 水位；open 时若当前 max(rowid) **回退**到水位之下，说明持久化数据蒸发，
-/// 走 [`mark_db_degraded`] 留档并暴露。同时把水位刷新为当前值（对账一次性）。
+/// 把当前 events max(rowid) 刷新持久化到 metadata（水位写入的唯一落库点，
+/// 收敛原 `mark_stopping` 的内联 SQL，供批量落库 / checkpoint / 停机共用）。
+/// 查询失败（events 表不可用/已损坏）时**不写**——避免把水位误刷成 0 而丢失
+/// 后续回退检测能力；写入失败仅留日志，不阻塞调用方。
+pub(crate) fn persist_events_watermark(conn: &Connection) {
+    let n: i64 = match conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
+        r.get(0)
+    }) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    if let Err(e) = conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![EVENTS_WATERMARK_KEY, n.to_string()],
+    ) {
+        log::warn!("events 水位持久化失败: {e}");
+    }
+}
+
+/// WAL 水位对账（WAL 静默蒸发防护 2026-09，覆盖面如实描述 2026-09 修订）：
+///
+/// 机制：把 events max(rowid) 持久化到 metadata 作水位 W；open 时若当前
+/// max(rowid) **回退**到 W 之下（`persisted > current`），说明已提交数据蒸发
+/// （如 WAL 被外部截断/删除、云同步冲突、手动清理），走 [`mark_db_degraded`]
+/// 留档并暴露。对账同时把水位刷新为当前值（一次性，避免每次 open 重复告警）。
+///
+/// **残余盲区（如实）**：水位本身也走 WAL，其持久性滞后一次 checkpoint。
+/// 凡「上一次成功 checkpoint（TRUNCATE）之后才提交、且对应的水位推进也未能
+/// 随之落进主文件」的事件（例如写完即被强杀、没等到下一次 maintenance 的
+/// checkpoint，或经外部进程绕开本库写路径直接落 WAL 后 WAL 被截断/删除），
+/// 事件与水位一起丢失，当前 max(rowid) 恰等于主文件水位、严格回退条件不触发，
+/// **不可检测**。本修复把盲区从「上一次正常停机以来」收窄到「上一次成功
+/// checkpoint 以来」：每次批量写 + 每次成功 checkpoint 都推进水位，窗口大幅
+/// 缩小；上述剩余窄带在不做带外独立水位文件的前提下不可消除，属已知局限。
 /// 返回回退告警文本（无回退返回 None）。
 fn reconcile_events_watermark(conn: &Connection) -> Option<String> {
     let current: i64 = conn
@@ -604,18 +638,7 @@ impl Database {
         // reconcile_events_watermark）。失败仅留日志，不阻塞关停。
         self.with_writer(
             |conn| {
-                let n: i64 = conn
-                    .query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
-                        r.get(0)
-                    })
-                    .unwrap_or(0);
-                if let Err(e) = conn.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
-                     ON CONFLICT(key) DO UPDATE SET value = ?2",
-                    params![EVENTS_WATERMARK_KEY, n.to_string()],
-                ) {
-                    log::warn!("停机水位持久化失败: {e}");
-                }
+                persist_events_watermark(conn);
             },
             || log::warn!("停机水位持久化跳过：写连接不可用"),
         );
@@ -765,7 +788,13 @@ impl Database {
             return;
         }
         log::info!("正在执行 WAL 检查点...");
-        wal_checkpoint_truncate(&conn);
+        // 检查点成功后推进 events 水位：已提交数据此刻已确认落进主文件，
+        // 把水位刷到当前 max(rowid) 安全——其后 WAL 丢失不会误报回退（残余
+        // 盲区说明见 reconcile_events_watermark）。busy 跳过时不推进，保持
+        // 「水位 ≤ 主文件已持久化 max(rowid)」不变量。
+        if wal_checkpoint_truncate(&conn) {
+            persist_events_watermark(&conn);
+        }
         // Wave19 性能审查：retention=0 下库是 append-only，空闲页极少，
         // 每日 VACUUM 收益≈0 却要重写整库（1 年 4.5GB = 每天 ~13GB 白烧
         // IO + 等量瞬时磁盘峰值）。空闲页占比 < 10% 直接跳过。
@@ -787,7 +816,10 @@ impl Database {
         }
         // VACUUM 全程经 WAL 重写（把 WAL 再次撑大），故检查点必须放在 VACUUM 之后，
         // 否则"维护后库大小"被未截断的 WAL 虚增近一倍（perf-write 2026-09 实测）。
-        wal_checkpoint_truncate(&conn);
+        // 检查点成功后同样推进水位（理由同上）。
+        if wal_checkpoint_truncate(&conn) {
+            persist_events_watermark(&conn);
+        }
     }
 
     /// 等待后台聚合回填完成（最多 `timeout`）。供测试与需要在回填结束后
@@ -863,15 +895,25 @@ impl Database {
 /// TRUNCATE 检查点（审查 33-F8）：存在活跃 reader（dashboard 常驻只读池 /
 /// core 读池持未结束读事务）时 busy=1，WAL 无法截断——旧实现 execute_batch
 /// 丢弃返回值，「检查点完成」与实际不符。这里读出 busy 状态留痕日志。
-fn wal_checkpoint_truncate(conn: &Connection) {
+///
+/// 返回检查点是否真正完成（非 busy、非查询失败）：调用方据此决定是否推进
+/// events 水位——只有数据确已落进主文件后，把水位刷到当前 max(rowid) 才安全
+/// （WAL 后续丢失不会误报回退，见 reconcile_events_watermark 的残余盲区说明）。
+fn wal_checkpoint_truncate(conn: &Connection) -> bool {
     match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
         r.get::<_, i64>(0)
     }) {
-        Ok(0) => {}
-        Ok(busy) => log::info!(
-            "WAL 检查点未能截断（busy={busy}，存在活跃 reader）；journal_size_limit 会在其后下一笔写入把 WAL 回落到 16MB 封顶"
-        ),
-        Err(e) => log::debug!("WAL 检查点查询失败（跳过）: {e}"),
+        Ok(0) => true,
+        Ok(busy) => {
+            log::info!(
+                "WAL 检查点未能截断（busy={busy}，存在活跃 reader）；journal_size_limit 会在其后下一笔写入把 WAL 回落到 16MB 封顶"
+            );
+            false
+        }
+        Err(e) => {
+            log::debug!("WAL 检查点查询失败（跳过）: {e}");
+            false
+        }
     }
 }
 

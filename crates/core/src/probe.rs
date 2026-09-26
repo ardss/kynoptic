@@ -159,6 +159,14 @@ type LogBuf = Arc<Mutex<Vec<(log::Level, String)>>>;
 /// 一次——若每个探针自建缓冲，第二个探针起拿不到句柄，"等待首次采集完成"
 /// 会退化为纯窗口等待，慢采集监控器（如 windows_update 在线搜索）会被误判
 /// 为零事件。所有探针共享同一缓冲，用起始下标区分各自窗口。
+/// 内存边界：probe_monitor 收尾经 collect_warnings 截断到本探针窗口起点
+/// （truncate(log_start)）——否则全进程日志只增不清（--all 40 探针顺序跑,
+/// 总行数常驻至 capacity 高水位,镜像实测 40 探针 ×2000 行常驻 ~5MB）。
+/// truncate 只缩短 len、不释放 capacity（Vec 语义）——真实收益是 len 不再
+/// 跨探针累积：后续探针复用已分配的高水位内存，capacity 封顶为「迄今单
+/// 探针窗口最大值」而非 40 窗口之和。不改变任何探针的窗口判定（各探针
+/// log_start 在启动时取当前 len,截断只回收本探针已读走的行,迟到行落在
+/// 下一窗口起点之前）。
 static LOG_BUF: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
 
 impl log::Log for CaptureLogger {
@@ -196,6 +204,21 @@ fn install_capture_logger() -> LogBuf {
             buf
         })
         .clone()
+}
+
+/// 读本探针日志窗口的 WARN/ERROR 行，随后把窗口截断到 log_start（内存
+/// 边界，见 LOG_BUF 注释）：截断与读取在同一临界区内完成，迟到推入的行
+/// 落在下一探针窗口起点之前，不会被下一探针误读；已取走的 warnings
+/// 不受影响。
+fn collect_warnings(log_buf: &LogBuf, log_start: usize) -> Vec<String> {
+    let mut buf = log_buf.lock().unwrap();
+    let warnings: Vec<String> = buf[log_start..]
+        .iter()
+        .filter(|(lvl, _)| *lvl <= log::Level::Warn)
+        .map(|(_, m)| m.clone())
+        .collect();
+    buf.truncate(log_start);
+    warnings
 }
 
 // ─── 探针核心 ─────────────────────────────────────────────────────────────────
@@ -273,11 +296,7 @@ pub fn probe_monitor(id: &str, secs: u64, first_collect_timeout: u64) -> ProbeOu
         // 留下僵尸 hook 持续向已关闭通道投递，污染后续探针的丢弃计数）
         std::thread::sleep(std::time::Duration::from_secs(secs.max(3)));
         let (events, sample) = count_and_sample(&collector.db);
-        let warnings: Vec<String> = log_buf.lock().unwrap()[log_start..]
-            .iter()
-            .filter(|(lvl, _)| *lvl <= log::Level::Warn)
-            .map(|(_, m)| m.clone())
-            .collect();
+        let warnings = collect_warnings(&log_buf, log_start);
         collector.shutdown();
         if let Some(dir) = db_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
@@ -335,11 +354,7 @@ pub fn probe_monitor(id: &str, secs: u64, first_collect_timeout: u64) -> ProbeOu
     // shutdown 只停 writer；monitor 线程看到 SHUTDOWN 后自行退出，不影响读库
 
     let (events, sample) = count_and_sample(&collector.db);
-    let warnings: Vec<String> = log_buf.lock().unwrap()[log_start..]
-        .iter()
-        .filter(|(lvl, _)| *lvl <= log::Level::Warn)
-        .map(|(_, m)| m.clone())
-        .collect();
+    let warnings = collect_warnings(&log_buf, log_start);
 
     let (mut verdict, mut note) = classify(events, &warnings, is_hook);
     if events == 0 && warnings.is_empty() && first_collect_ok {
@@ -533,4 +548,77 @@ pub fn print_matrix(outcomes: &[ProbeOutcome]) {
         "total: {} PASS / {} EXPECTED-LIMITED / {} FAIL",
         pass, limited, fail
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 截断契约：窗口 WARN/ERROR 行取走 + 缓冲回收至 log_start 前缀（len 语义；
+    /// capacity 为历史高水位、truncate 不释放，见 LOG_BUF 注释）。
+    /// 模拟 --all 顺序探针：探针 N 收尾截断后,探针 N+1 的 log_start（=
+    /// 当时 len）不含探针 N 的行,迟到推入的行也落在 N+1 窗口起点之前。
+    #[test]
+    fn collect_warnings_truncates_window() {
+        let buf: LogBuf = Arc::new(Mutex::new(Vec::new()));
+        buf.lock()
+            .unwrap()
+            .push((log::Level::Info, "探针前早期行".into()));
+        buf.lock()
+            .unwrap()
+            .push((log::Level::Info, "本探针 INFO 行".into()));
+        buf.lock()
+            .unwrap()
+            .push((log::Level::Warn, "本探针 WARN 行".into()));
+        let log_start = 1usize; // 早期行属于上一窗口
+        let w = collect_warnings(&buf, log_start);
+        assert_eq!(
+            w,
+            vec!["本探针 WARN 行".to_string()],
+            "只取本窗口 WARN/ERROR"
+        );
+        assert_eq!(
+            buf.lock().unwrap().len(),
+            log_start,
+            "收尾必须截断到 log_start（len 不再全进程累积）"
+        );
+        // 下一探针:上一探针的迟到行（shutdown 后 monitor 线程尾巴日志）先
+        // 推入,本探针启动时才取 log_start（=当前 len）,迟到行落在窗口外
+        buf.lock()
+            .unwrap()
+            .push((log::Level::Error, "上一探针迟到 ERROR".into()));
+        let log_start2 = buf.lock().unwrap().len();
+        let w2 = collect_warnings(&buf, log_start2);
+        assert!(w2.is_empty(), "迟到行不得污染下一探针窗口: {w2:?}");
+        buf.lock()
+            .unwrap()
+            .push((log::Level::Error, "下一探针 ERROR".into()));
+        let w3 = collect_warnings(&buf, log_start2);
+        assert_eq!(w3, vec!["下一探针 ERROR".to_string()]);
+        // len 语义：收尾截断把 len 放回窗口起点（不随探针数累积）
+        assert_eq!(
+            buf.lock().unwrap().len(),
+            log_start2,
+            "截断后 len 恰好回到窗口起点"
+        );
+        // 模拟 --all 顺序探针（生产 40 探针）：每探针推入一个满窗口再
+        // collect 截断，验证 capacity 封顶在单窗口高水位、不达 40×50 的
+        // 全累积量级（不截断时此处 capacity≈2000+，断言即失败）
+        for probe in 0..40 {
+            // 窗口起点在本探针日志开始前取（生产语义：log_start = 当时 len）
+            let start = buf.lock().unwrap().len();
+            for row in 0..50u32 {
+                buf.lock()
+                    .unwrap()
+                    .push((log::Level::Info, format!("probe {probe} row {row}")));
+            }
+            let _w = collect_warnings(&buf, start);
+            assert_eq!(buf.lock().unwrap().len(), start, "收尾截断回窗口起点");
+        }
+        let cap = buf.lock().unwrap().capacity();
+        assert!(
+            cap < 40 * 50,
+            "capacity 封顶在单窗口高水位，不随探针数累积: {cap}"
+        );
+    }
 }
