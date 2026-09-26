@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---|---|
-| 0.1.x   | Yes       |
+| 0.3.x   | Yes       |
 
-Kynoptic is pre-1.0; only the latest 0.1.x release receives security
+Kynoptic is pre-1.0; only the latest 0.3.x release receives security
 fixes. Please update to the latest version before reporting.
 
 ## Reporting a vulnerability
