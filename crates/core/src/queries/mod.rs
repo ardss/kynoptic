@@ -281,6 +281,10 @@ pub use summary::*;
 // 此处 re-export 保持 `queries::longest_active_streak` 调用路径稳定。
 pub use crate::time::longest_active_streak;
 
+// minutes_complete_for_dates 物理上住在 db::agg（聚合层），
+// 此处 re-export 保持 anomaly 侧 `queries::` 调用路径稳定。
+pub use crate::db::agg::minutes_complete_for_dates;
+
 #[cfg(test)]
 mod tests {
     use super::*;

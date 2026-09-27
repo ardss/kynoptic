@@ -538,10 +538,28 @@ pub fn top_app_window_in_range(
 /// 区间谓词；`substr(timestamp,1,10)=?` 对整列求值无法走索引，1M 行时每次
 /// 调用退化为全表扫描（~300ms+），get_anomalies(7d) 会累计到秒级。
 pub fn late_night_key_count(conn: &Connection, date: &str, hour_start: i64, hour_end: i64) -> i64 {
+    late_night_key_count_marked(conn, date, hour_start, hour_end, None)
+}
+
+/// [`late_night_key_count`] 的预置 agg 完备标记版：`agg_complete` 为
+/// `Some(true/false)` 时直接按标记取数（跳过该日逐点探测），`None` 为原
+/// 逐点探测行为。异常多日检测路径以 [`crate::db::agg::minutes_complete_for_dates`]
+/// 整窗批量算出标记后注入，把逐日 3 次探测（深夜/APM/注入）收敛为 2 条整窗查询。
+pub fn late_night_key_count_marked(
+    conn: &Connection,
+    date: &str,
+    hour_start: i64,
+    hour_end: i64,
+    agg_complete: Option<bool>,
+) -> i64 {
     // 优先读 agg_minute 读缓存（O(当日聚合行数)），缺失回退 events 现算。
     // 人侧口径（审查修复 2026-09）：扣减注入拆桶 `input_keys_injected`，
     // 纯注入分钟不得计成"深夜按键"；旧缓存无该桶时按 0 注入处理（等价旧行为）。
-    if agg::has_minute_for_date(conn, date) {
+    let use_agg = match agg_complete {
+        Some(m) => m,
+        None => agg::has_minute_for_date(conn, date),
+    };
+    if use_agg {
         return conn
             .query_row(
                 "SELECT CAST(COALESCE(SUM(MAX(COALESCE(k,0) - COALESCE(j,0), 0)), 0) AS INTEGER) FROM (\
@@ -624,9 +642,25 @@ pub fn daily_agg_avg_apm_before(conn: &Connection, date: &str) -> f64 {
 /// 人侧口径（审查修复 2026-09）：扣减注入（自动化）输入——纯注入分钟
 /// （{"keys":500,"injected_keys":500}）不再被当成行为突增报警。
 pub fn top_burst_minutes(conn: &Connection, date: &str, min_count: i64) -> Vec<(String, i64)> {
+    top_burst_minutes_marked(conn, date, min_count, None)
+}
+
+/// [`top_burst_minutes`] 的预置 agg 完备标记版：`agg_complete` 为
+/// `Some(true/false)` 时直接按标记取数（跳过该日逐点探测），`None` 为原
+/// 逐点探测行为（语义同 [`late_night_key_count_marked`]）。
+pub fn top_burst_minutes_marked(
+    conn: &Connection,
+    date: &str,
+    min_count: i64,
+    agg_complete: Option<bool>,
+) -> Vec<(String, i64)> {
     let mut out = Vec::new();
     // 优先读 agg_minute 读缓存：每分钟人侧 keys+clicks 合计（扣注入拆桶）
-    if agg::has_minute_for_date(conn, date) {
+    let use_agg = match agg_complete {
+        Some(m) => m,
+        None => agg::has_minute_for_date(conn, date),
+    };
+    if use_agg {
         let Ok(mut stmt) = conn.prepare(
             "SELECT hour, minute, CAST(MAX(COALESCE(k,0) - COALESCE(j,0), 0) \
                  + MAX(COALESCE(c,0) - COALESCE(ic,0), 0) AS INTEGER) AS n \
@@ -716,10 +750,25 @@ pub fn injected_input_minutes_by_date(
     conn: &Connection,
     date: &str,
 ) -> std::collections::HashSet<String> {
+    injected_input_minutes_by_date_marked(conn, date, None)
+}
+
+/// [`injected_input_minutes_by_date`] 的预置 agg 完备标记版：`agg_complete`
+/// 为 `Some(true/false)` 时直接按标记取数（跳过该日逐点探测），`None` 为原
+/// 逐点探测行为（语义同 [`late_night_key_count_marked`]）。
+pub fn injected_input_minutes_by_date_marked(
+    conn: &Connection,
+    date: &str,
+    agg_complete: Option<bool>,
+) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let off = super::LOCAL_MODIFIER_AT_EVENT;
     // agg 缓存路径：注入拆桶行即注入分钟
-    if agg::has_minute_for_date(conn, date) {
+    let use_agg = match agg_complete {
+        Some(m) => m,
+        None => agg::has_minute_for_date(conn, date),
+    };
+    if use_agg {
         let Ok(mut stmt) = conn.prepare(
             "SELECT hour, minute FROM agg_minute \
              WHERE date = ?1 \

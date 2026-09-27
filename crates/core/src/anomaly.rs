@@ -276,20 +276,44 @@ where
 
 /// 深夜活动检测（编排入口）。
 pub fn detect_late_night(conn: &Connection, date: &str) -> Result<Vec<Anomaly>> {
-    let n = queries::late_night_key_count(
+    detect_late_night_marked(conn, date, None)
+}
+
+/// [`detect_late_night`] 的预置 agg 完备标记版：`agg_complete` 为
+/// `Some(true/false)` 时直接按标记取数（跳过该日逐点探测），`None` 为原
+/// 逐点探测行为。多日检测以 [`queries::minutes_complete_for_dates`] 整窗
+/// 批量算出的标记注入（逐日 3 次探测收敛为 2 条整窗查询，见该函数文档）。
+fn detect_late_night_marked(
+    conn: &Connection,
+    date: &str,
+    agg_complete: Option<bool>,
+) -> Result<Vec<Anomaly>> {
+    let n = queries::late_night_key_count_marked(
         conn,
         date,
         LATE_NIGHT_HOUR_START as i64,
         LATE_NIGHT_END_HOUR as i64,
+        agg_complete,
     );
     Ok(late_night_from_count(n, date))
 }
 
 /// APM 突增检测（编排入口）。
 pub fn detect_apm_burst(conn: &Connection, date: &str) -> Result<Vec<Anomaly>> {
+    detect_apm_burst_marked(conn, date, None)
+}
+
+/// [`detect_apm_burst`] 的预置 agg 完备标记版（语义同
+/// [`detect_late_night_marked`]；APM 突增的注入标注与突增分钟两条读取
+/// 共用同一标记，不再各自探测）。
+fn detect_apm_burst_marked(
+    conn: &Connection,
+    date: &str,
+    agg_complete: Option<bool>,
+) -> Result<Vec<Anomaly>> {
     let hist_avg = queries::daily_agg_avg_apm_before(conn, date);
-    let burst = queries::top_burst_minutes(conn, date, APM_BURST_MIN_KEYS);
-    let injected = queries::injected_input_minutes_by_date(conn, date);
+    let burst = queries::top_burst_minutes_marked(conn, date, APM_BURST_MIN_KEYS, agg_complete);
+    let injected = queries::injected_input_minutes_by_date_marked(conn, date, agg_complete);
     Ok(apm_burst_from_data_with_injected(
         &burst, hist_avg, &injected,
     ))
@@ -366,13 +390,20 @@ pub fn detect_all_days_with_bridge(
     bridge_minutes: u32,
 ) -> Result<Vec<(String, Vec<Anomaly>)>> {
     let marathons = detect_marathon_days(conn, dates, bridge_minutes)?;
+    // 性能（dash 发现 ①-2 ③）：逐日检测器此前各调 has_minute_for_date
+    // （深夜 / APM 突增 / 注入标注共 3 次/日，每次对当日 events input_agg 行
+    // COUNT DISTINCT）。此处整窗批量算「该日 agg 完备」标记（2 条整窗查询）
+    // 注入检测器，逐日语义与旧逐日探测严格等价（见批量函数文档）。
+    let markers = queries::minutes_complete_for_dates(conn, dates);
     dates
         .iter()
+        .enumerate()
         .zip(marathons)
-        .map(|(date, marathon)| {
+        .map(|((i, date), marathon)| {
+            let marker = Some(markers[i]);
             let mut all = Vec::new();
-            all.extend(detect_late_night(conn, date)?);
-            all.extend(detect_apm_burst(conn, date)?);
+            all.extend(detect_late_night_marked(conn, date, marker)?);
+            all.extend(detect_apm_burst_marked(conn, date, marker)?);
             all.extend(marathon);
             all.extend(detect_new_app_surge(conn, date)?);
             Ok((date.clone(), all))
