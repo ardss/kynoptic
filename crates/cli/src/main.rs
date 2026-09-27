@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use chrono::{Duration, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::json;
 
 use kynoptic_core::analyzer;
@@ -139,11 +139,38 @@ fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// db 写维护子命令（cleanup/vacuum/checkpoint/recompute-agg）开库门禁：
+/// 与 HEAD 同一契约——库文件不存在时报 db_missing、退出码 1，不静默新建
+/// 空库。HEAD 里这些子命令与 stats 共用 open_db_read（首句即存在性门禁）；
+/// Wave45 把共享的 open_db_read 改成真只读连接后，写子命令改走 open_db
+/// （Connection::open 不存在即建库），门禁被悄悄放宽——脚本/计划任务在
+/// 拼错路径时会在错误位置建出空库并「✓ 清理 0 事件」假成功。回归复审
+/// 后恢复门禁：先查文件存在，再走 open_db 的 RW 建库/迁移行为。
+fn open_db_gated(path: &Path) -> Result<Connection> {
+    if !path.exists() {
+        return Err(Error::InvalidData(output::db_missing(
+            path,
+            "维护命令",
+            "maintenance command",
+        )));
+    }
+    open_db(path)
+}
+
 /// 读命令专用打开：库不存在时拒绝并报错（与 dashboard 入口同口径），不静默
-/// 新建空库。旧实现读路径共用 open_db（Connection::open + SCHEMA 会建库），
-/// `stats --db 不存在路径` 会凭空创建空库并输出全零统计、退出码 0——用户把
-/// 「采集从未运行/库被移走」误读成「今天没有活动」。写路径（采集/告警落库）
-/// 仍走 open_db 保留既有建库行为。
+/// 新建空库。
+///
+/// Wave45（败者语义/零写口径统一）：底层由 open_db（RW 连接 + SCHEMA/迁移/库头
+/// 写）改为**真只读连接**（SQLITE_OPEN_READ_ONLY + apply_pragmas_readonly，
+/// 与 MCP open_reader 同口径）：
+/// 1. 旧实现在非 WAL 遗留库上让只读命令持久化变更日志模式、创建 -wal/-shm
+///    侧车，与 dash 侧「零写入」口径不一致（实测复现）；
+/// 2. 写锁竞争下开库写步骤的 5s busy 税强加给纯读（实测 locker 窗口内
+///    db stats 7.2s，纯只读对照 0.005s）；
+/// 3. 不再跑 run_migrations / sync_user_version 库头写。
+///
+/// 库未初始化或 schema 不全时返回可读错误（引导先跑采集器或任一写命令
+/// 完成建库/迁移），不静默自动迁移。
 fn open_db_read(path: &Path) -> Result<Connection> {
     if !path.exists() {
         return Err(Error::InvalidData(output::db_missing(
@@ -152,7 +179,43 @@ fn open_db_read(path: &Path) -> Result<Connection> {
             "read-only commands",
         )));
     }
-    open_db(path)
+    // 与写路径同口径：超长路径先过 core 收口的 verbatim 规范化
+    let normalized = kynoptic_core::db::normalize_sqlite_path(&path.to_string_lossy());
+    let conn = Connection::open_with_flags(normalized.as_str(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| open_readonly_failure(path, e))?;
+    // 只读 PRAGMA 子集（MCP 口径）：不含 journal_mode=WAL 等写 PRAGMA，
+    // 不改变库当前日志模式
+    kynoptic_core::db::apply_pragmas_readonly(&conn)?;
+    // schema 可用性门禁：读命令不建库不迁移。events 表缺失时给可读指引，
+    // 不让「no such table」原样渗到各命令里
+    let has_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_events == 0 {
+        return Err(Error::InvalidData(format!(
+            "数据库 {} 没有 events 表（未初始化或 schema 不完整）。读命令不建库不迁移——请先运行一次采集器（或托盘/任一写命令）把 schema 建全，再重试",
+            path.display()
+        )));
+    }
+    Ok(conn)
+}
+
+/// 只读开库失败文案：文件头不是 SQLite（损坏/非库文件）给恢复指引；其余
+/// 开放失败保持原错误通道（退出码 1，经 main 统一打印）。
+fn open_readonly_failure(path: &Path, e: rusqlite::Error) -> Error {
+    let raw = e.to_string();
+    if raw.contains("not a database") {
+        return Error::InvalidData(format!(
+            "无法以只读方式打开数据库 {}: {}。数据库文件可能已损坏或不是 SQLite 库；请先停止托盘/采集器，再用已有的备份文件覆盖回原路径恢复",
+            path.display(),
+            raw
+        ));
+    }
+    Error::from(e)
 }
 
 /// 与 core `Database::open` 相同的 quick_check 门禁（core 侧对非 ok/执行失败
@@ -768,176 +831,236 @@ fn cmd_report(args: &[String]) -> Result<()> {
 }
 
 // === db ===
+/// db 子命令选项说明（`db help` 输出；USAGE 里的 db 行保持单行，详情在此）
+const DB_USAGE: &str = "db 子命令:
+  stats                       数据库统计（事件/会话计数、文件体积、完整性门禁）
+  cleanup [N] [--days N] [--yes]
+                              清理过期会话（保留 N 天，默认 90；原始事件默认保留，
+                              显式 --yes 且 N>=30 才删事件）
+  vacuum                      整理空间（VACUUM）
+  checkpoint                  合并 WAL
+  recompute-agg               重算日统计
+";
+
 fn cmd_db(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("stats");
+    let rest: &[String] = &args[1..];
     let db_path = resolve_db();
-    let conn = open_db_read(&db_path)?;
     match sub {
-        "stats" => {
-            // 降级门禁（2026-09）：损坏库上先显著告警并非零退出，不再打印
-            // 全零统计（详见 db_quick_check 注释）
-            if let Err(reason) = db_quick_check(&conn) {
-                println!("⚠ 数据库完整性检查未通过: {reason}");
-                return Err(Error::InvalidData(format!(
-                    "数据库完整性检查未通过，统计结果不可信: {reason}"
-                )));
-            }
-            let n_events = queries::count_all_events(&conn);
-            let n_sessions = queries::count_all_sessions(&conn);
-            let n_ghost = queries::count_ghost_sessions(&conn);
-            let (size_wal, size_main) = (
-                file_size(&db_path.with_extension("db-wal")),
-                file_size(&db_path),
-            );
-            println!("=== 数据库统计 ===");
-            println!("路径:        {}", db_path.display());
-            println!("事件数:      {}", n_events);
-            println!("会话数:      {}（其中空转 {}）", n_sessions, n_ghost);
-            println!("主文件:      {} 字节", size_main);
-            println!("WAL 文件:    {} 字节", size_wal);
+        "stats" => db_stats(&db_path)?,
+        "cleanup" => db_cleanup(&db_path, rest)?,
+        "vacuum" => db_vacuum(&db_path)?,
+        "checkpoint" => db_checkpoint(&db_path)?,
+        "recompute-agg" => db_recompute_agg(&db_path, rest)?,
+        // Wave45 曾在本轮加入 backup/restore/verify/integrity/repair/
+        // backfill-timestamps 六个子命令的分发，但实现缺失（整 crate 无函数
+        // 定义），分发会报 E0425 且帮助/错误文案承诺了不存在的命令；回归
+        // 复审后收口：本轮只保留有完整实现的 5 个子命令。
+        "help" | "-h" | "--help" => {
+            println!("{DB_USAGE}");
         }
-        "cleanup" => {
-            // 铁律（审查 P0）：原始 events 永不删——默认只清 sessions；
-            // 确要删事件必须显式 `cleanup <days> --yes` 且 days>=30。
-            // 参数解析失败一律报错，不再静默落 90（曾致 cleanup 0 / -1 /
-            // abc 全部变成危险的全量删除）。
-            let mut with_events = false;
-            let mut days_arg: Option<i64> = None;
-            // Wave24：兼容 `--days N` flag 写法（此前 positional-only，
-            // 写 --days 会把 flag 本身当天数报误导性错误）
-            let mut it = args[1..].iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--yes" => with_events = true,
-                    "--days" => {
-                        let v = it.next().ok_or_else(|| {
-                            Error::InvalidData("cleanup: --days 需要一个天数".into())
-                        })?;
-                        days_arg =
-                            Some(v.parse().map_err(|_| {
-                                Error::InvalidData(format!("cleanup: 无效天数 {v:?}"))
-                            })?);
-                    }
-                    v => {
-                        days_arg =
-                            Some(v.parse().map_err(|_| {
-                                Error::InvalidData(format!("cleanup: 无效天数 {v:?}"))
-                            })?);
-                    }
-                }
-            }
-            let days = days_arg.unwrap_or(90);
-            // 铁律（e2e C1）：cleanup 0 不得删除任何东西。retention = 0 的语义是
-            // "永不清理"，与 core 侧 DEFAULT_RETENTION_DAYS=0 及 Database::maintenance()
-            // 的日常路径同源（见 crates/core/tests/cleanup_law_test.rs：retention 0
-            // 时 maintenance 后各表行数不变）。旧实现 days=0 仍会执行
-            // delete_closed_sessions_before(now)，把全部已关闭 sessions 删光
-            // （实测 57 → 2）。days<=0（含负数，cutoff 会落到未来更危险）一律 no-op。
-            if days <= 0 {
-                println!("✓ cleanup {days}: 保留天数 0 表示永不清理, 未删除任何数据");
-                return Ok(());
-            }
-            if with_events && days < 30 {
-                return Err(Error::InvalidData(
-                    "删除原始事件被拒绝: 天数必须 >= 30 且显式带 --yes".into(),
-                ));
-            }
-            // 极限注入审查：同 export——极大 days 曾 panic（TimeDelta::days
-            // out of bounds）。钳到 20 万天，cutoff 落到远古，语义不变（全删）。
-            let days = days.min(200_000);
-            // cutoff 时刻算一次、两处口径：events 用 UTC RFC3339 瞬间（原行为），
-            // 三张 agg 表的 date 是本地日历日（写入路径用 Local），边界取该
-            // 时刻对应的本地日——删事件联动删聚合，两口径对齐（与 core
-            // cleanup_old_events 同一口径）
-            let cutoff_instant =
-                Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000));
-            let cutoff = cutoff_instant.to_rfc3339();
-            let cutoff_date = cutoff_instant
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
-                .to_string();
-            let ns = queries::delete_closed_sessions_before(&conn, &cutoff)?;
-            let n = if with_events {
-                // 四表同事务（与 core db/events.rs cleanup_old_events 同一口径）：
-                // 只删 events 不删派生 agg，孤儿行会让仪表盘分钟级/聚合视图
-                // 继续展示原始数据已删的日期。事务失败回滚，不半删。
-                let deleted = (|| -> rusqlite::Result<usize> {
-                    conn.execute_batch("BEGIN IMMEDIATE")?;
-                    let ev =
-                        conn.execute("DELETE FROM events WHERE timestamp < ?1", params![&cutoff])?;
-                    let _daily = conn.execute(
-                        "DELETE FROM daily_agg WHERE date < ?1",
-                        params![&cutoff_date],
-                    )?;
-                    let _minute = conn.execute(
-                        "DELETE FROM agg_minute WHERE date < ?1",
-                        params![&cutoff_date],
-                    )?;
-                    let _app = conn.execute(
-                        "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
-                        params![&cutoff_date],
-                    )?;
-                    conn.execute_batch("COMMIT")?;
-                    Ok(ev)
-                })();
-                match deleted {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        return Err(writable_db_error(&db_path, e));
-                    }
-                }
-            } else {
-                0
-            };
-            if with_events {
-                println!(
-                    "✓ 清理: 删除 {n} 事件, {ns} sessions（过期日期的统计汇总同步删除；保留 {days} 天）"
-                );
-            } else {
-                println!(
-                    "✓ 清理: 删除 {n} 事件, {ns} sessions（保留 {days} 天；原始事件默认保留）"
-                );
-            }
-        }
-        "vacuum" => {
-            println!("正在整理数据库空间（VACUUM）...");
-            conn.execute_batch("VACUUM")
-                .map_err(|e| writable_db_error(&db_path, e))?;
-            println!("✓ 完成");
-        }
-        "checkpoint" => {
-            println!("正在合并 WAL 日志（checkpoint）...");
-            // 与 core 侧 wal_checkpoint_truncate（db/mod.rs）同口径：读出返回
-            // 行的 busy 列。有活跃 reader 时 WAL 实际未截断，须如实上报，
-            // 不能无条件「✓ 完成」。
-            match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
-                r.get::<_, i64>(0)
-            }) {
-                Ok(0) => println!("✓ 完成"),
-                // busy = 请求的操作没完成，必须走错误通道（退出码非 0），
-                // 脚本才能用退出码判断成败；文案随之进 stderr。
-                Ok(busy) => {
-                    return Err(Error::InvalidData(format!(
-                        "WAL 未截断（busy={busy}，存在活跃 reader）；关闭正在读取数据库的程序后重试"
-                    )))
-                }
-                Err(e) => return Err(writable_db_error(&db_path, e)),
-            }
-        }
-        "recompute-agg" => {
-            // 脱敏出口：raw 错误只进日志（审查整改），错误仍以非零退出码上报
-            let n = daily_agg::recompute_all(&conn)
-                .map_err(|e| Error::InvalidData(output::db_failure("重新汇总失败", &e)))?;
-            // 用户词汇：不直出内部表名 daily_agg（审查整改）
-            println!("✓ 重新汇总完成，已更新 {n} 天的统计数据");
-        }
-        other => {
+        _ => {
             return Err(Error::InvalidData(format!(
-                "未知子命令: {other}（stats/cleanup/vacuum/checkpoint/recompute-agg）"
-            )))
+                "未知子命令: {sub}（stats/cleanup/vacuum/checkpoint/recompute-agg，选项见 `db help`）"
+            )));
         }
     }
+    Ok(())
+}
+
+/// db stats：只读连接（Wave45：零写、不迁移、不被写锁拖 5s）+ 降级门禁 +
+/// 基础计数/体积。
+/// 注：本轮曾新增「聚合水位 + 一致性四行快查」两节，但其依赖的
+/// agg_table_exists/agg_watermark/integrity_counts 在 crate 内无定义
+/// （半成品重构），且指引文案指向同样不存在的 `db integrity` 子命令；
+/// 回归复审后收口到既有实现，两节随实现补齐后再恢复。
+fn db_stats(db_path: &Path) -> Result<()> {
+    let conn = open_db_read(db_path)?;
+    // 降级门禁（2026-09）：损坏库上先显著告警并非零退出，不再打印
+    // 全零统计（详见 db_quick_check 注释）
+    if let Err(reason) = db_quick_check(&conn) {
+        println!("⚠ 数据库完整性检查未通过: {reason}");
+        return Err(Error::InvalidData(format!(
+            "数据库完整性检查未通过，统计结果不可信: {reason}"
+        )));
+    }
+    let n_events = queries::count_all_events(&conn);
+    let n_sessions = queries::count_all_sessions(&conn);
+    let n_ghost = queries::count_ghost_sessions(&conn);
+    let (size_wal, size_main) = (
+        file_size(&db_path.with_extension("db-wal")),
+        file_size(db_path),
+    );
+    println!("=== 数据库统计 ===");
+    println!("路径:        {}", db_path.display());
+    println!("事件数:      {}", n_events);
+    println!("会话数:      {}（其中空转 {}）", n_sessions, n_ghost);
+    println!("主文件:      {} 字节", size_main);
+    println!("WAL 文件:    {} 字节", size_wal);
+    Ok(())
+}
+/// db cleanup：写命令（RW 连接 + 迁移）。铁律与参数语义同旧版；Wave45 起
+/// 败者面 busy 错误统一附「谁持锁 + 停托盘重试」指引（三路败者语义统一）。
+fn db_cleanup(db_path: &Path, rest: &[String]) -> Result<()> {
+    // 铁律（审查 P0）：原始 events 永不删——默认只清 sessions；
+    // 确要删事件必须显式 `cleanup <days> --yes` 且 days>=30。
+    // 参数解析失败一律报错，不再静默落 90（曾致 cleanup 0 / -1 /
+    // abc 全部变成危险的全量删除）。
+    let mut with_events = false;
+    let mut days_arg: Option<i64> = None;
+    // Wave24：兼容 `--days N` flag 写法（此前 positional-only，
+    // 写 --days 会把 flag 本身当天数报误导性错误）
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--yes" => with_events = true,
+            "--days" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::InvalidData("cleanup: --days 需要一个天数".into()))?;
+                days_arg = Some(
+                    v.parse()
+                        .map_err(|_| Error::InvalidData(format!("cleanup: 无效天数 {v:?}")))?,
+                );
+            }
+            v => {
+                days_arg = Some(
+                    v.parse()
+                        .map_err(|_| Error::InvalidData(format!("cleanup: 无效天数 {v:?}")))?,
+                );
+            }
+        }
+    }
+    let days = days_arg.unwrap_or(90);
+    // 铁律（e2e C1）：cleanup 0 不得删除任何东西。retention = 0 的语义是
+    // "永不清理"，与 core 侧 DEFAULT_RETENTION_DAYS=0 及 Database::maintenance()
+    // 的日常路径同源（见 crates/core/tests/cleanup_law_test.rs：retention 0
+    // 时 maintenance 后各表行数不变）。旧实现 days=0 仍会执行
+    // delete_closed_sessions_before(now)，把全部已关闭 sessions 删光
+    // （实测 57 → 2）。days<=0（含负数，cutoff 会落到未来更危险）一律 no-op。
+    if days <= 0 {
+        println!("✓ cleanup {days}: 保留天数 0 表示永不清理, 未删除任何数据");
+        return Ok(());
+    }
+    if with_events && days < 30 {
+        return Err(Error::InvalidData(
+            "删除原始事件被拒绝: 天数必须 >= 30 且显式带 --yes".into(),
+        ));
+    }
+    // 极限注入审查：同 export——极大 days 曾 panic（TimeDelta::days
+    // out of bounds）。钳到 20 万天，cutoff 落到远古，语义不变（全删）。
+    let days = days.min(200_000);
+    let conn = open_db_gated(db_path)?;
+    // cutoff 时刻算一次、两处口径：events 用 UTC RFC3339 瞬间（原行为），
+    // 三张 agg 表的 date 是本地日历日（写入路径用 Local），边界取该
+    // 时刻对应的本地日——删事件联动删聚合，两口径对齐（与 core
+    // cleanup_old_events 同一口径）
+    let cutoff_instant = Utc::now() - Duration::try_days(days).unwrap_or(Duration::days(200_000));
+    let cutoff = cutoff_instant.to_rfc3339();
+    let cutoff_date = cutoff_instant
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    // Wave45：删 sessions 语句的 busy 同样走写锁败者文案（原来裸
+    // "数据库错误: database is locked"，无原因无重试指引）
+    let ns = queries::delete_closed_sessions_before(&conn, &cutoff).map_err(|e| match e {
+        Error::Db(re) => writable_db_error(db_path, &re),
+        other => other,
+    })?;
+    let n = if with_events {
+        // 四表同事务（与 core db/events.rs cleanup_old_events 同一口径）：
+        // 只删 events 不删派生 agg，孤儿行会让仪表盘分钟级/聚合视图
+        // 继续展示原始数据已删的日期。事务失败回滚，不半删。
+        let deleted = (|| -> rusqlite::Result<usize> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let ev = conn.execute("DELETE FROM events WHERE timestamp < ?1", params![&cutoff])?;
+            let _daily = conn.execute(
+                "DELETE FROM daily_agg WHERE date < ?1",
+                params![&cutoff_date],
+            )?;
+            let _minute = conn.execute(
+                "DELETE FROM agg_minute WHERE date < ?1",
+                params![&cutoff_date],
+            )?;
+            let _app = conn.execute(
+                "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
+                params![&cutoff_date],
+            )?;
+            conn.execute_batch("COMMIT")?;
+            Ok(ev)
+        })();
+        match deleted {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(writable_db_error(db_path, &e));
+            }
+        }
+    } else {
+        0
+    };
+    if with_events {
+        println!(
+            "✓ 清理: 删除 {n} 事件, {ns} sessions（过期日期的统计汇总同步删除；保留 {days} 天）"
+        );
+    } else {
+        println!("✓ 清理: 删除 {n} 事件, {ns} sessions（保留 {days} 天；原始事件默认保留）");
+    }
+    Ok(())
+}
+/// db vacuum：写命令（RW 连接）。busy 败者面附停托盘指引（Wave45）。
+fn db_vacuum(db_path: &Path) -> Result<()> {
+    let conn = open_db_gated(db_path)?;
+    println!("正在整理数据库空间（VACUUM）...");
+    conn.execute_batch("VACUUM")
+        .map_err(|e| writable_db_error(db_path, &e))?;
+    println!("✓ 完成");
+    Ok(())
+}
+/// db checkpoint：写命令（RW 连接）。
+///
+/// Wave45 文案修正：busy=1 不再归因为「存在活跃 reader」——实测写锁竞争
+/// （零 reader，第三方持写锁）同样返回 busy=1；活跃 reader、托盘写锁、
+/// 其他检查点三种败因文案一并覆盖，只保留非零退出码语义。
+fn db_checkpoint(db_path: &Path) -> Result<()> {
+    let conn = open_db_gated(db_path)?;
+    println!("正在合并 WAL 日志（checkpoint）...");
+    // 与 core 侧 wal_checkpoint_truncate（db/mod.rs）同口径：读出返回
+    // 行的 busy 列。有活跃 reader 时 WAL 实际未截断，须如实上报，
+    // 不能无条件「✓ 完成」。
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        Ok(0) => println!("✓ 完成"),
+        // busy = 请求的操作没完成，必须走错误通道（退出码非 0），
+        // 脚本才能用退出码判断成败；文案随之进 stderr。
+        Ok(busy) => {
+            return Err(Error::InvalidData(format!(
+                "WAL 未截断（busy={busy}）：存在无法放下的读事务或写事务（活跃 reader / 托盘写锁 / 其他检查点），待其结束后重试"
+            )));
+        }
+        Err(e) => return Err(writable_db_error(db_path, &e)),
+    }
+    Ok(())
+}
+/// db recompute-agg：重算日统计（旧行为，脱敏出口同旧版）。
+///
+/// 注：Wave45 的 `--full` 全桶对账在本轮只落了分发与 `unimplemented!()`
+/// 桩（reconcile_on_copy 无实现、签名与调用点类型不符），`--check-only`
+/// 同走桩路径——跑起来必 panic（退出码 101）。回归复审后连同
+/// --from/--to 一并收回；全桶对账能力目前由独立一次性 bin
+/// `kynoptic-aggrepair`（同「复制 + rebuild_all」口径）提供。
+fn db_recompute_agg(db_path: &Path, rest: &[String]) -> Result<()> {
+    if let Some(a) = rest.first() {
+        return Err(Error::InvalidData(format!(
+            "recompute-agg 不支持选项: {a}（该子命令无选项）"
+        )));
+    }
+    let conn = open_db_gated(db_path)?;
+    let n = daily_agg::recompute_all(&conn)
+        .map_err(|e| Error::InvalidData(output::db_failure("重新汇总失败", &e)))?;
+    // 用户词汇：不直出内部表名 daily_agg（审查整改）
+    println!("✓ 重新汇总完成，已更新 {n} 天的统计数据");
     Ok(())
 }
 
@@ -3503,15 +3626,40 @@ fn open_export_file(tmp: &Path, out_path: &Path) -> Result<std::fs::File> {
     })
 }
 
-/// db 写维护命令（vacuum/checkpoint）错误增强：SQLite 只读/拒写时直出英文
-/// 原文（如 attempt to write a readonly database）且不含 db 路径。附上路径，
-/// 对只读/os error 5 追加可行动建议。
-fn writable_db_error(db_path: &Path, e: rusqlite::Error) -> Error {
+/// busy 判定（三路败者统一，Wave45）：写锁竞争（SQLITE_BUSY=5 /
+/// SQLITE_LOCKED=6）。cleanup/vacuum/checkpoint 与 aggrepair 败者面文案
+/// 共用此判定——锁在谁手上只有一种可操作解释：先停托盘再重试。
+fn is_db_busy(e: &rusqlite::Error) -> bool {
+    match e {
+        // SqliteFailure 的载荷是 ffi::Error：code 为枚举（libsqlite3-sys
+        // ErrorCode，SQLITE_BUSY→DatabaseBusy / SQLITE_LOCKED→DatabaseLocked），
+        // 不能与整数字面量比较（E0308）
+        rusqlite::Error::SqliteFailure(ffi_err, _) => {
+            ffi_err.code == rusqlite::ffi::ErrorCode::DatabaseBusy
+                || ffi_err.code == rusqlite::ffi::ErrorCode::DatabaseLocked
+        }
+        _ => {
+            let s = e.to_string();
+            s.contains("locked") || s.contains("busy")
+        }
+    }
+}
+
+/// db 写维护命令（vacuum/checkpoint/cleanup 等）错误增强：SQLite
+/// 只读/拒写时直出英文原文（如 attempt to write a readonly database）且不含
+/// db 路径。附上路径；只读/os error 5 追加可行动建议；写锁竞争（busy）
+/// 追加「停托盘再重试」指引（Wave45：败者面不裸报 "database is locked"）。
+fn writable_db_error(db_path: &Path, e: &rusqlite::Error) -> Error {
     let raw = e.to_string();
     let readonly = raw.contains("readonly") || raw.contains("os error 5");
     let mut msg = format!("数据库操作失败 ({}): {raw}", db_path.display());
     if readonly {
         msg.push_str("\n  → 数据库或其所在目录只读/被保护，请检查只读属性、ACL 或受控文件夹访问");
+    }
+    if is_db_busy(e) {
+        msg.push_str(
+            "\n  → 其他进程正持写锁（通常是托盘/采集在写）：请停止托盘进程（确认没有其他程序在用数据库），或等采集空闲后重试；本次未改动数据库",
+        );
     }
     Error::InvalidData(msg)
 }

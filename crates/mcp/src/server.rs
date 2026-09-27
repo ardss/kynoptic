@@ -110,11 +110,36 @@ impl McpServer {
     /// tools/call 分发。工具内部错误走 MCP 约定的 `isError: true` 结果
     /// （而非 JSON-RPC error——工具参数错误对客户端应是可读的工具结果）。
     fn tools_call(&self, params: &Value) -> Result<Value, Value> {
-        let name = params
-            .get("name")
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| json!({"code": -32602, "message": "missing tool name"}))?;
-        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        // 审查 P2：缺参 / 错型 name / 错型 arguments 三种情形分开报错，
+        // 文案不得误导排障（旧逻辑：name 非字符串也报 "missing tool name"；
+        // arguments 非对象被静默当空参执行工具）。
+        let name = match params.get("name") {
+            None | Some(Value::Null) => {
+                return Err(json!({"code": -32602, "message": "missing tool name"}));
+            }
+            Some(n) => n.as_str().ok_or_else(|| {
+                json!({
+                    "code": -32602,
+                    "message": format!(
+                        "tool name must be a string, got {}（name 必须是字符串）",
+                        trunc_echo(&n.to_string(), 64)
+                    ),
+                })
+            })?,
+        };
+        let args = match params.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(v) => {
+                return Err(json!({
+                    "code": -32602,
+                    "message": format!(
+                        "tools/call arguments must be an object, got {}（arguments 必须是对象）",
+                        trunc_echo(&v.to_string(), 64)
+                    ),
+                }));
+            }
+        };
         match self.call_tool(name, &args) {
             Ok(v) => Ok(tool_text(&v, false)),
             Err(e) => Ok(tool_text(&json!({ "error": e }), true)),
@@ -132,6 +157,14 @@ impl McpServer {
                 let groups = match args.get("groups") {
                     None | Some(Value::Null) => None,
                     Some(Value::Array(a)) => {
+                        // 审查 P2：空数组不得静默当「默认分组」（与未知分组名/
+                        // 非字符串元素的硬错误保持一致）
+                        if a.is_empty() {
+                            return Err(
+                                "groups must not be an empty array; omit it or pass at least one group（groups 不能是空数组，请省略或至少传一个分组）"
+                                    .to_string(),
+                            );
+                        }
                         let mut list = Vec::with_capacity(a.len());
                         for v in a {
                             let s = v.as_str().ok_or_else(|| {
@@ -151,38 +184,29 @@ impl McpServer {
                 state::current_status(&conn, groups.as_deref())
             }
             "get_summary" => {
-                let date = args
-                    .get("date")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&kynoptic_core::queries::today_local_str())
-                    .to_string();
-                let metric = args
-                    .get("metric")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("keys");
+                let date = match str_arg(args, "date")? {
+                    Some(d) => d.to_string(),
+                    None => kynoptic_core::queries::today_local_str(),
+                };
+                let metric = str_arg(args, "metric")?.unwrap_or("keys");
                 state::summary(&conn, &date, metric)
             }
             "get_timeline" => {
                 let now = chrono::Utc::now().to_rfc3339();
-                let from = args
-                    .get("from")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| {
+                let from = match str_arg(args, "from")? {
+                    Some(f) => f.to_string(),
+                    None => {
                         let today = kynoptic_core::queries::today_local_str();
                         kynoptic_core::queries::local_day_range(&today)
                             .map(|(s, _)| s)
                             .unwrap_or(today)
-                    });
-                let to = args
-                    .get("to")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or(now);
-                let granularity = args
-                    .get("granularity")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("minute");
+                    }
+                };
+                let to = match str_arg(args, "to")? {
+                    Some(t) => t.to_string(),
+                    None => now,
+                };
+                let granularity = str_arg(args, "granularity")?.unwrap_or("minute");
                 let (limit, clamped_to) = parse_limit(args)?;
                 let mut v = state::timeline(&conn, &from, &to, granularity, limit)?;
                 if let Some(n) = clamped_to {
@@ -191,13 +215,13 @@ impl McpServer {
                 Ok(v)
             }
             "get_top_apps" => {
-                let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
-                let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
-                let (from, to) = match (from, to) {
-                    (Some(f), Some(t)) => (f, t),
-                    (None, Some(t)) => (default_from(), t),
-                    (Some(f), None) => (f, chrono::Utc::now().to_rfc3339()),
-                    (None, None) => (default_from(), chrono::Utc::now().to_rfc3339()),
+                let from = match str_arg(args, "from")? {
+                    Some(f) => f.to_string(),
+                    None => default_from(),
+                };
+                let to = match str_arg(args, "to")? {
+                    Some(t) => t.to_string(),
+                    None => chrono::Utc::now().to_rfc3339(),
                 };
                 let (limit, clamped_to) = parse_limit(args)?;
                 let mut v = state::top_apps(&conn, &from, &to, limit)?;
@@ -244,15 +268,14 @@ impl McpServer {
                 let signal = args.get("signal").and_then(|v| v.as_str()).ok_or_else(|| {
                     "Missing required argument: signal（缺少必填参数 signal）".to_string()
                 })?;
-                // Wave19：非法值报错而非静默回落（与 limit/days 政策一致）
-                let timeout = match args.get("timeout_sec") {
-                    None => 300,
-                    Some(v) => v.as_u64().ok_or_else(|| {
-                        "Invalid timeout_sec: must be a non-negative integer（timeout_sec 须为非负整数）"
-                            .to_string()
-                    })?,
-                };
-                state::wait_for(&conn, signal, timeout, &self.shutdown)
+                // 审查 P2：0 为硬错误（与 limit/days 同政策，对齐 schema minimum:1）；
+                // 超 1800 钳到 1800 并以 clamped_to 回显（与 limit/days 钳制约定一致）
+                let (timeout, clamped_to) = parse_wait_timeout(args)?;
+                let mut v = state::wait_for(&conn, signal, timeout, &self.shutdown)?;
+                if let Some(n) = clamped_to {
+                    v["clamped_to"] = json!(n);
+                }
+                Ok(v)
             }
             other => Err(format!(
                 "Unknown tool: {other} (available: {})（未知工具，可用: {}）",
@@ -305,6 +328,49 @@ fn parse_limit(args: &Value) -> Result<(usize, Option<usize>), String> {
     }
 }
 
+/// 解析 wait_for 的 timeout_sec 参数：缺省 300；0 为硬错误（与 limit/days 同政策，
+/// 对齐 schema minimum:1，错误文案不再暗示 0 合法）；>1800 钳到 1800 并返回
+/// clamped_to 标记（与 limit/days 钳制约定一致）。
+fn parse_wait_timeout(args: &Value) -> Result<(u64, Option<u64>), String> {
+    match args.get("timeout_sec") {
+        None => Ok((300, None)),
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                "Invalid timeout_sec: must be an integer >= 1（timeout_sec 必须是 >= 1 的整数）"
+                    .to_string()
+            })?;
+            if n == 0 {
+                return Err(
+                    "timeout_sec must be >= 1, got 0（timeout_sec 必须 >= 1，不接受 0）"
+                        .to_string(),
+                );
+            }
+            if n > 1800 {
+                Ok((1800, Some(1800)))
+            } else {
+                Ok((n, None))
+            }
+        }
+    }
+}
+
+/// 解析字符串参数：缺省/null 由调用方用默认值；存在但类型不是字符串 → 工具错误，
+/// 文案写明期望类型与被丢弃的值（P2 政策，与 limit/days 一致，不再静默回落默认）。
+fn str_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                format!(
+                    "{key} must be a string, got {}（{key} 必须是字符串）",
+                    trunc_echo(&v.to_string(), 64)
+                )
+            })?;
+            Ok(Some(s))
+        }
+    }
+}
+
 /// 工具结果 → MCP content 包装（text content，payload 为紧凑 JSON 字符串，
 /// 保持响应小且可解析）。
 fn tool_text(v: &Value, is_error: bool) -> Value {
@@ -317,18 +383,21 @@ fn tool_text(v: &Value, is_error: bool) -> Value {
 /// tools/list 的工具定义（name + description + inputSchema）。
 fn tool_definitions() -> Vec<Value> {
     let limit_schema = |desc: &str| json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": desc });
+    // 审查 P2：六工具 inputSchema 一律拒绝未知参数名（拼写错参数不再静默忽略），
+    // 由 LLM 客户端 schema 校验层硬报错。
     vec![
         json!({
             "name": "get_current_status",
             "description": "本机当前状态标量视图：cpu_pct/mem_pct/max_temp_c/battery_pct/foreground_app/idle_seconds/apm_5min/net_up_kbps/net_down_kbps",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "groups": {
                         "type": "array",
                         "items": { "type": "string", "enum": state::GROUPS },
                         "default": ["system", "activity"],
-                        "description": "返回哪些分组",
+                        "description": "返回哪些分组；空数组不接受，省略则按默认分组",
                     }
                 }
             },
@@ -338,6 +407,7 @@ fn tool_definitions() -> Vec<Value> {
             "description": "单指标日聚合 + 与前一日对比百分比。响应含 baseline_semantic 标注对比口径：date=今天时为 same_time（前一日至当前同时刻），date 为过去日期时为 full_day（前一日全天总数）",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "date": { "type": "string", "format": "date", "description": "YYYY-MM-DD，默认今天" },
                     "metric": { "type": "string", "enum": state::METRICS, "default": "keys" },
@@ -349,6 +419,7 @@ fn tool_definitions() -> Vec<Value> {
             "description": "应用/窗口时间线段（前台应用占用段，应用名为空时回退窗口标题，皆空记 (unknown)）。裸日期 from/to 按本地日界解析；to 为日期时含当天全天。响应含 total_segments；超限时保留最新 limit 段（truncation=oldest-dropped，丢弃最旧段）并带 next_from（保留段最早 start）。分页推进规则：下一页以同一 from、to=next_from 再查，循环直到 truncated=false，各页拼接不重不漏；段 start 严格递增（同 timestamp 重复 switch 已去重）",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "from": { "type": "string", "description": "起始时间（RFC3339 或 YYYY-MM-DD，裸日期按本地时区 00:00），默认今日起点" },
                     "to": { "type": "string", "description": "结束时间（RFC3339 或 YYYY-MM-DD，裸日期含该本地日全天到 24:00），默认现在" },
@@ -362,6 +433,7 @@ fn tool_definitions() -> Vec<Value> {
             "description": "窗口 [from,to) 内各前台应用的驻留秒数排行（降序）。驻留 = 相邻 window/switch 事件间隔，末段计到 to。适合『上周二我用的哪个工具/应用』这类问题。裸日期按本地日界解析",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "from": { "type": "string", "description": "起始（RFC3339 或 YYYY-MM-DD，裸日期按本地时区 00:00），默认今日起点" },
                     "to": { "type": "string", "description": "结束（RFC3339 或 YYYY-MM-DD，裸日期含该本地日全天），默认现在" },
@@ -374,6 +446,7 @@ fn tool_definitions() -> Vec<Value> {
             "description": "最近 N 天异常事件（深夜活动/马拉松会话/APM 突增等），每条带时间戳+severity",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "days": { "type": "integer", "minimum": 1, "maximum": 30, "default": 1 },
                     "limit": limit_schema("最多返回条数"),
@@ -385,9 +458,16 @@ fn tool_definitions() -> Vec<Value> {
             "description": "阻塞等待语义信号触发（订阅兜底，MCP Tool 无推送语义）；超时返回 timeout 标记。注意：wait_for 在后台线程执行，其响应可能乱序返回，客户端必须按 JSON-RPC id 关联响应",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "signal": { "type": "string", "enum": state::SIGNALS },
-                    "timeout_sec": { "type": "integer", "minimum": 1, "maximum": 1800, "default": 300 },
+                    "timeout_sec": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1800,
+                        "default": 300,
+                        "description": "等待秒数；0 不接受；超过 1800 钳到 1800 并带 clamped_to 回显",
+                    },
                 },
                 "required": ["signal"],
             },
@@ -437,6 +517,16 @@ fn read_line_capped<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<O
             }
         }
     }
+}
+
+/// 判断一条 JSON-RPC 消息是否 wait_for 的 tools/call（不看 id——
+/// 无 id 的畸形/通知形态同样会在同步路径上跑满长轮询）。
+fn is_wait_for_call(m: &Value) -> bool {
+    m.get("method").and_then(|v| v.as_str()) == Some("tools/call")
+        && m.get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("wait_for")
 }
 
 /// 逐行读取 JSON-RPC 消息并写出响应（换行分隔）。EOF 即退出。
@@ -580,11 +670,28 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
             // 审查 P1：JSON-RPC 2.0 批量请求（顶层数组）必须以数组回应——
             // 旧逻辑 get("id") 为 None 走通知路径整体吞掉，规范客户端会挂等。
             Ok(Value::Array(batch)) => {
-                let responses: Vec<Value> = batch.iter().filter_map(|m| server.handle(m)).collect();
-                if responses.is_empty() {
-                    None
+                // 审查 P2：批量内的 wait_for 会在主读循环同步执行（每条最长
+                // 1800s）——阻塞其后所有请求、绕过 16 并发上限、客户端断连后
+                // EOF 关停旗标无法置位（进程僵住 N×1800s）。整批拒收并回单一
+                // -32602（JSON-RPC 允许对无法处理的批量回一条错误响应），
+                // 客户端把 wait_for 拆成独立请求即走正常的后台线程+上限路径。
+                if batch.iter().any(is_wait_for_call) {
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params: wait_for cannot be part of a batch request; send it as a standalone request（wait_for 不能出现在批量请求中，请作为独立请求调用）",
+                        },
+                    }))
                 } else {
-                    Some(Value::Array(responses))
+                    let responses: Vec<Value> =
+                        batch.iter().filter_map(|m| server.handle(m)).collect();
+                    if responses.is_empty() {
+                        None
+                    } else {
+                        Some(Value::Array(responses))
+                    }
                 }
             }
             Ok(msg) => server.handle(&msg),
@@ -814,6 +921,8 @@ mod tests {
         // 在写入侧（采集器/此处）先转成 WAL，与生产库一致
         kynoptic_core::db::apply_pragmas(&conn).unwrap();
         conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+        // 与 state 侧测试同约定：跑迁移补全 current_state 等表（生产库经采集器/ctl 建好）
+        let _ = kynoptic_core::db::run_migrations(&conn);
         (path.display().to_string(), dir)
     }
 
@@ -963,5 +1072,227 @@ mod tests {
             "cmd_mcp 必须通过 KYNOPTIC_DB 传递 --db"
         );
         std::env::remove_var("KYNOPTIC_DB");
+    }
+
+    // ─── 审查 P2 回归：批量拒绝 / 参数类型一致性 / wait_for 边界 ─────────
+
+    #[test]
+    fn batch_containing_wait_for_is_rejected_as_a_whole() {
+        // 批量里的 wait_for 曾同步跑在主读循环（阻塞+绕过上限+断连僵住）——
+        // 现在整批拒收，回单一 -32602
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let batch = json!([
+            {"jsonrpc":"2.0","id":10,"method":"ping"},
+            {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wait_for","arguments":{"signal":"late_night","timeout_sec":1}}}
+        ]);
+        serve(
+            std::io::BufReader::new(format!("{batch}\n").as_bytes()),
+            out.clone(),
+            McpServer::new(":memory:"),
+        );
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "含 wait_for 的批量必须回且仅回一条整批拒绝: {text}"
+        );
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+        assert_eq!(v["id"], Value::Null, "批量无 id，单一错误回 null: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("wait_for"));
+    }
+
+    #[test]
+    fn batch_without_wait_for_still_responds_per_message() {
+        // 回归：不含 wait_for 的批量仍按 JSON 数组成组应答（逐元素回包）
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let batch = json!([
+            {"jsonrpc":"2.0","id":10,"method":"ping"},
+            {"jsonrpc":"2.0","id":11,"method":"ping"}
+        ]);
+        serve(
+            std::io::BufReader::new(format!("{batch}\n").as_bytes()),
+            out.clone(),
+            McpServer::new(":memory:"),
+        );
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let batch_resp: Value = serde_json::from_str(lines[0]).unwrap();
+        let arr = batch_resp.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "{arr:?}");
+        assert_eq!(arr[0]["id"], json!(10));
+        assert_eq!(arr[1]["id"], json!(11));
+    }
+
+    #[test]
+    fn string_args_wrong_type_are_tool_errors() {
+        // 值存在但非字符串 → 工具错误（写明期望类型与被丢弃值），不再静默回落默认
+        let (db, _guard) = mem_db_guarded();
+        let srv = McpServer::new(&db);
+        let r = call(&srv, 1, "get_summary", json!({ "date": 20260101 }));
+        let msg = r["content"][0]["text"].as_str().unwrap();
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+        assert!(msg.contains("date must be a string"), "{msg}");
+        assert!(msg.contains("20260101"), "错误文案需回显被丢弃值: {msg}");
+        let r = call(&srv, 2, "get_summary", json!({ "metric": 7 }));
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+        let r = call(&srv, 3, "get_timeline", json!({ "from": 123, "to": 456 }));
+        let msg = r["content"][0]["text"].as_str().unwrap();
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+        assert!(msg.contains("from must be a string"), "{msg}");
+        let r = call(&srv, 4, "get_top_apps", json!({ "to": 456 }));
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+        let r = call(&srv, 5, "get_timeline", json!({ "granularity": 3 }));
+        assert!(
+            r["isError"].as_bool().unwrap(),
+            "granularity 错型不得静默回落: {r}"
+        );
+        // 缺参/null 仍走默认值成功执行（政策不变）
+        let r = call(
+            &srv,
+            6,
+            "get_summary",
+            json!({ "date": null, "metric": null }),
+        );
+        assert!(!r["isError"].as_bool().unwrap(), "{r}");
+        let r = call(&srv, 7, "get_top_apps", json!({ "from": null, "to": null }));
+        assert!(!r["isError"].as_bool().unwrap(), "{r}");
+    }
+
+    #[test]
+    fn wait_for_timeout_sec_zero_rejected() {
+        // 0 与 limit/days=0 同政策硬错误（对齐 schema minimum:1）
+        let (db, _guard) = mem_db_guarded();
+        let srv = McpServer::new(&db);
+        let r = call(
+            &srv,
+            1,
+            "wait_for",
+            json!({ "signal": "thermal_hot", "timeout_sec": 0 }),
+        );
+        let msg = r["content"][0]["text"].as_str().unwrap();
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+        assert!(msg.contains(">= 1"), "0 必须硬错误: {msg}");
+        let r = call(
+            &srv,
+            2,
+            "wait_for",
+            json!({ "signal": "thermal_hot", "timeout_sec": -5 }),
+        );
+        assert!(r["isError"].as_bool().unwrap(), "{r}");
+    }
+
+    fn insert_thermal_snapshot(db: &str) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) \
+             VALUES (?1,'system','thermal_snapshot',?2,NULL,NULL,NULL)",
+            rusqlite::params!["2026-09-09T10:00:00+00:00", json!({"max_temp_celsius": 85.0}).to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn wait_for_over_max_clamps_with_marker() {
+        // >1800 钳到 1800 并带 clamped_to（预置热数据，首轮即触发不阻塞）
+        let (db, _guard) = mem_db_guarded();
+        insert_thermal_snapshot(&db);
+        let srv = McpServer::new(&db);
+        let r = call(
+            &srv,
+            1,
+            "wait_for",
+            json!({ "signal": "thermal_hot", "timeout_sec": 3600 }),
+        );
+        let v = serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(!r["isError"].as_bool().unwrap(), "{r}");
+        assert_eq!(v["status"], json!("triggered"), "{v}");
+        assert_eq!(v["clamped_to"], json!(1800), "超限必须带钳制标记: {v}");
+        assert!(v.get("elapsed_sec").is_some(), "{v}");
+        // 未超限不带标记
+        let r = call(
+            &srv,
+            2,
+            "wait_for",
+            json!({ "signal": "thermal_hot", "timeout_sec": 100 }),
+        );
+        let v = serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(v.get("clamped_to").is_none(), "未钳制不得带标记: {v}");
+    }
+
+    #[test]
+    fn groups_empty_array_is_rejected() {
+        let (db, _guard) = mem_db_guarded();
+        let srv = McpServer::new(&db);
+        let r = call(&srv, 1, "get_current_status", json!({ "groups": [] }));
+        let msg = r["content"][0]["text"].as_str().unwrap();
+        assert!(
+            r["isError"].as_bool().unwrap(),
+            "空数组不得静默回落默认分组: {r}"
+        );
+        assert!(msg.contains("empty"), "{msg}");
+        // 非空数组回归：正常执行
+        let r = call(
+            &srv,
+            2,
+            "get_current_status",
+            json!({ "groups": ["network"] }),
+        );
+        assert!(!r["isError"].as_bool().unwrap(), "{r}");
+    }
+
+    #[test]
+    fn tools_call_shape_errors_distinguish_missing_and_mistyped() {
+        let srv = McpServer::new(":memory:");
+        // name 错型 → 文案写明「必须是字符串」而非 misleading 的 missing
+        let resp = srv
+            .handle(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": 123, "arguments": {} }
+            }))
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("must be a string"), "{msg}");
+        assert!(msg.contains("123"), "需回显错型值: {msg}");
+        // arguments 非对象 → 硬错误（旧行为：静默按空参真实执行工具）
+        let resp = srv
+            .handle(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "get_timeline", "arguments": [1, 2] }
+            }))
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("object"));
+        // 缺 name → 保持原有 missing 文案（回归）
+        let resp = srv
+            .handle(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "arguments": {} }
+            }))
+            .unwrap();
+        assert_eq!(resp["error"]["message"], json!("missing tool name"));
+    }
+
+    #[test]
+    fn tool_schemas_forbid_unknown_properties() {
+        // 六工具 inputSchema 一律拒绝未知参数名（拼写错参数由客户端 schema 层硬报错）
+        let srv = McpServer::new(":memory:");
+        let resp = srv
+            .handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .unwrap();
+        for t in resp["result"]["tools"].as_array().unwrap() {
+            assert_eq!(
+                t["inputSchema"]["additionalProperties"],
+                json!(false),
+                "每个工具 inputSchema 必须拒绝未知参数: {}",
+                t["name"]
+            );
+        }
     }
 }

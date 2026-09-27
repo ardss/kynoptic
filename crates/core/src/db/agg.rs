@@ -801,6 +801,108 @@ pub fn has_minute_for_date(conn: &Connection, date: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// [`has_minute_for_date`] 的批量版：逐本地日「agg_minute 缓存完备」标记。
+///
+/// 异常多日检测路径（`detect_all_days_with_bridge`）此前逐日检测器各调
+/// [`has_minute_for_date`]（深夜 / APM 突增 / 注入标注共 3 次/日），每次都对
+/// 当日 events input_agg 行做 COUNT DISTINCT。本函数把 N 日 × 3 次探测换成
+/// 两条整窗查询：agg_minute 逐日去重分钟数（GROUP BY date）+ events 输入分钟
+/// 全窗按本地日分组（单次区间扫描），逐日语义与单点探测严格等价
+///（「该日有 agg 行」且「当日输入分钟数 ≤ agg 去重分钟数」）。
+///
+/// 失败口径与单点探测一致：agg_minute 表缺失 / 查询失败 → 全 false（调用方
+/// 回退 events 现算慢路径）。`dates` 取有效本地日期（调用方传
+/// `date_offset_str` 结果）；日界不可解析的日期沿用单点探测的纯 EXISTS
+/// 口径（不做完整性校验）。返回与 `dates` 同序。
+pub fn minutes_complete_for_dates(conn: &Connection, dates: &[String]) -> Vec<bool> {
+    let n = dates.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // agg_minute 侧：逐日去重分钟数（主键含 bucket_id，同一分钟至多 4 行，
+    // 与单点探测同口径按 hour*60+minute 去重）
+    let placeholders: Vec<String> = (1..=n).map(|i| format!("?{i}")).collect();
+    let sql_agg = format!(
+        "SELECT date, COUNT(DISTINCT hour * 60 + minute) \
+         FROM agg_minute WHERE date IN ({}) GROUP BY date",
+        placeholders.join(", ")
+    );
+    let mut agg_min: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(&sql_agg) {
+        if let Ok(rows) = stmt.query_map(
+            rusqlite::params_from_iter(dates.iter().map(|d| d.as_str())),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            for (d, c) in rows.flatten() {
+                agg_min.insert(d, c);
+            }
+        }
+    }
+    // 表缺失 / 无 agg 行 / 查询失败 → 全 false（回退 events 现算，同单点口径）
+    if agg_min.is_empty() {
+        return vec![false; n];
+    }
+    // events 侧：整窗输入分钟按本地日去重计数（输入分钟口径与单点探测的
+    // 完整性校验一致：keys/clicks/moves/move_distance_px 任一 > 0）
+    let mut lo: Option<String> = None;
+    let mut hi: Option<String> = None;
+    let mut parseable = vec![false; n];
+    for (i, d) in dates.iter().enumerate() {
+        if let Some((s, e)) = crate::queries::local_day_range(d) {
+            parseable[i] = true;
+            lo = Some(match lo {
+                Some(l) if l <= s => l,
+                _ => s,
+            });
+            hi = Some(match hi {
+                Some(h) if h >= e => h,
+                _ => e,
+            });
+        }
+    }
+    let mut events_min: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    if let (Some(lo), Some(hi)) = (lo, hi) {
+        let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
+        let sql_events = format!(
+            "SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d, \
+             COUNT(DISTINCT substr(datetime(timestamp, '{off}'), 1, 16)) \
+             FROM events \
+             WHERE event_action = 'input_agg' \
+               AND json_valid(event_data) \
+               AND (COALESCE(json_extract(event_data, '$.keys'), 0) > 0 \
+                 OR COALESCE(json_extract(event_data, '$.clicks'), 0) > 0 \
+                 OR COALESCE(json_extract(event_data, '$.moves'), 0) > 0 \
+                 OR COALESCE(json_extract(event_data, '$.move_distance_px'), 0) > 0) \
+               AND timestamp >= ?1 AND timestamp < ?2 \
+             GROUP BY d",
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql_events) {
+            if let Ok(rows) = stmt.query_map(params![&lo, &hi], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (d, c) in rows.flatten() {
+                    events_min.insert(d, c);
+                }
+            }
+        }
+    }
+    dates
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if !parseable[i] {
+                // 日界不可解析：单点探测回退纯 EXISTS——只看该日有无 agg 行
+                agg_min.contains_key(d)
+            } else {
+                match agg_min.get(d) {
+                    Some(agg_c) => events_min.get(d).copied().unwrap_or(0) <= *agg_c,
+                    None => false,
+                }
+            }
+        })
+        .collect()
+}
+
 /// agg_daily 是否有 per-app 缓存行（可选限定某本地日期）。
 pub fn has_app_daily(conn: &Connection, date: Option<&str>) -> bool {
     match date {
