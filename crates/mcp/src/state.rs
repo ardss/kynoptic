@@ -774,6 +774,8 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
 /// 见 CODE_NOTES §5）。返回触发 payload 或 timeout 标记。
 /// `shutdown` 为 stdin EOF 关停信号（serve 退出读循环时置位）：轮询循环每次
 /// 醒来检查一次，让后台线程数秒内退出而非阻塞满 1800s 拖住 join。
+/// 入参 timeout_sec 由工具层保证 1..=1800（0 硬错误，>1800 钳到 1800 并带
+/// clamped_to 回显）；此处 clamp 仅作底层兜底。
 pub fn wait_for(
     conn: &Connection,
     signal: &str,
@@ -798,15 +800,18 @@ pub fn wait_for(
                 "elapsed_sec": start.elapsed().as_secs(),
             }));
         }
-        if start.elapsed().as_secs() >= timeout {
+        let elapsed = start.elapsed().as_secs();
+        if elapsed >= timeout {
+            // 审查 P2：timeout 与 triggered/shutdown 同 shape，补 elapsed_sec
             return Ok(json!({
                 "signal": signal,
                 "status": "timeout",
                 "timeout_sec": timeout,
+                "elapsed_sec": elapsed,
             }));
         }
         std::thread::sleep(poll.min(std::time::Duration::from_secs(
-            timeout.saturating_sub(start.elapsed().as_secs()).max(1),
+            timeout.saturating_sub(elapsed).max(1),
         )));
     }
 }
@@ -1492,6 +1497,11 @@ mod tests {
         let v = wait_for(&conn, "thermal_hot", 1, &stop).unwrap();
         assert_eq!(v["status"], json!("timeout"));
         assert_eq!(v["timeout_sec"], json!(1));
+        // 审查 P2：三种 status（triggered/timeout/shutdown）payload 同 shape
+        assert!(
+            v.get("elapsed_sec").is_some(),
+            "timeout 须带 elapsed_sec: {v}"
+        );
     }
 
     /// 审查 P2：EOF 关停信号置位后，wait_for 必须在下一轮询点立即退出
