@@ -12,6 +12,13 @@ use windows_sys::Win32::System::ProcessStatus::*;
 use windows_sys::Win32::System::Threading::*;
 
 /// 系统进程名（小写），采集时跳过
+///
+/// 匹配口径（发现 platform medium 修复）：名单条目与 TH32 进程名都归一化为
+/// 「小写、去 .exe」基名后比较——旧精确匹配依赖条目自带/不带 .exe 的书写
+/// 形态，新条目不再受此影响。
+/// 增补：UWP/内置 XAML 宿主与搜索/输入法基础设施（与 monitors/host.rs 的
+/// HOST_EXES 同族）——这些是窗口承载/系统服务而非用户应用，进 top 榜只会
+/// 制造「宿主假应用」（同 window 宿主感知解析的数据口径）。
 const SKIP_PROCESSES: &[&str] = &[
     "system",
     "registry",
@@ -33,7 +40,20 @@ const SKIP_PROCESSES: &[&str] = &[
     "runtimebroker.exe",
     "securityhealthsystray.exe",
     "shellexperiencehost.exe",
+    // UWP/内置 XAML 宿主与搜索/输入法基础设施（宿主名单同族，见 host.rs）
+    "applicationframehost.exe",
+    "textinputhost.exe",
+    "searchhost.exe",
+    "searchui.exe",
+    "searchprotocolhost.exe",
+    "searchfilterhost.exe",
+    "unbrokeredapphost.exe",
+    "eudcedit.exe",
 ];
+
+fn process_base(name: &str) -> String {
+    name.to_lowercase().trim_end_matches(".exe").to_string()
+}
 
 pub struct ProcessMonitor {
     prev_fingerprint: Cell<Option<String>>,
@@ -228,9 +248,15 @@ fn collect_processes() -> Option<ProcessSnapshot> {
     })
 }
 
+/// 是否系统/基础设施进程（宿主感知解析过滤子窗属主时共用，单一口径）。
+pub(crate) fn is_system_process(name: &str) -> bool {
+    let base = process_base(name);
+    SKIP_PROCESSES.iter().any(|s| process_base(s) == base)
+}
+
+/// 采集快照是否跳过该进程名。
 fn should_skip(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    SKIP_PROCESSES.iter().any(|s| lower == *s)
+    is_system_process(name)
 }
 
 /// 查询单个进程的内存 (MB)。CPU 不再逐个查（改用批量 WMI）。
@@ -350,6 +376,19 @@ fn query_cpu_percent_map(pids: &[u32]) -> HashMap<u32, f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 归一化匹配口径（发现 platform medium）：大小写/带不带 .exe 均命中，
+    /// 宿主同族条目进名单，真实应用绝不误伤。
+    #[test]
+    fn should_skip_normalizes_and_includes_hosts() {
+        assert!(should_skip("System"));
+        assert!(should_skip("svchost.exe"));
+        assert!(should_skip("ApplicationFrameHost.EXE"));
+        assert!(should_skip("textinputhost.exe"));
+        assert!(should_skip("SEARCHUI.EXE"));
+        assert!(!should_skip("chrome.exe"));
+        assert!(!should_skip("kynoptic.exe"));
+    }
 
     #[test]
     fn process_snapshot_fingerprint_tolerance() {

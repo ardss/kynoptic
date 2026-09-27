@@ -37,7 +37,12 @@ impl Monitor for WifiMonitor {
     }
     fn interval(&self) -> Duration {
         // 原生 API 调用开销极低（无子进程），保持 15s 变化检测延迟
-        Duration::from_secs(15)
+        if super::low_power_mode() {
+            // 低配模式（perf 发现）：放档 15s→45s（Wi-Fi 变化本就低频）
+            Duration::from_secs(45)
+        } else {
+            Duration::from_secs(15)
+        }
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {

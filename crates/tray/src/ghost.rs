@@ -83,14 +83,37 @@ pub fn close_all_open_sessions(db_path: &Path) -> Result<usize, String> {
 mod tests {
     use super::*;
 
+    /// 测试库目录 + 历史残留清扫（发现 platform low 修复）。
+    ///
+    /// 旧问题：目录名带测试进程 pid，跑完（或被强杀）后 %TEMP% 下的
+    /// kynoptic-tray-ghost-test-* 目录永久残留，且末尾的
+    /// `let _ = remove_dir_all` 在连接未 drop（SQLite 锁目录）时静默失败。
+    /// 现：每次建目录前清扫**其他进程**遗留的同前缀目录（带本 pid 后缀的
+    /// 目录 = 本进程并发测试在用的，绝不碰——Windows 下打开的 SQLite 文件
+    /// 也移除不了，双保险）；测试结束时先 drop 连接再移除并断言清空。
     fn temp_db(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kynoptic-tray-ghost-test-{tag}-{}",
-            std::process::id()
-        ));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("kynoptic-tray-ghost-test-{tag}-{pid}"));
+        let my_suffix = format!("-{pid}");
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for e in entries.flatten() {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                if n.starts_with("kynoptic-tray-ghost-test-") && !n.ends_with(&my_suffix) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("kynoptic.db")
+    }
+
+    /// 测试目录收尾：先 drop 所有活动连接（SQLite 锁目录则 Windows 移除
+    /// 失败），移除后断言无残留——残留会进下一轮测试视野，必须可见失败。
+    fn cleanup_dir(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!dir.exists(), "测试残留未清干净: {}", dir.display());
     }
 
     fn open_count(conn: &rusqlite::Connection) -> i64 {
@@ -131,9 +154,12 @@ mod tests {
             d.close_ghost_sessions();
             d.start_session();
         }
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        assert!(open_count(&conn) <= 1, "重启后 sessions 表最多 1 个 open");
-        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            assert!(open_count(&conn) <= 1, "重启后 sessions 表最多 1 个 open");
+            drop(conn);
+        }
+        cleanup_dir(db.parent().unwrap());
     }
 
     /// 多个幽灵（历史 bug 已积累双 open）一次全清。
@@ -182,7 +208,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n1, 1);
-        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+        drop(conn);
+        cleanup_dir(db.parent().unwrap());
     }
 
     /// db 不存在（全新首装）：Ok(0)，不建库不报错。
@@ -191,6 +218,6 @@ mod tests {
         let db = temp_db("missing");
         assert_eq!(close_all_open_sessions(&db).unwrap(), 0);
         assert!(!db.exists(), "清扫不得建库（建库是采集器职责）");
-        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+        cleanup_dir(db.parent().unwrap());
     }
 }

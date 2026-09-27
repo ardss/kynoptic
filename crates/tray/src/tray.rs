@@ -614,7 +614,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // 时区等无关设置也会广播，不能无脑重建）。
         0x001A | 0x02A0 => {
             // 0x001A = WM_SETTINGCHANGE, 0x02A0 = WM_DPICHANGED
-            let new_size = win::GetSystemMetrics(win::SM_CXSMICON).max(16);
+            // 与 create() 同口径（任务栏显示器 DPI，见 icons::taskbar_icon_size）：
+            // 旧实现按系统默认 DPI 比较，多显示器缩放下永远判「变了」反复重绘。
+            let new_size = crate::icons::taskbar_icon_size();
             if let Some(c) = ctx.as_mut() {
                 if c.icons.size() != new_size {
                     if let Some(fresh) = TrayIcons::create() {

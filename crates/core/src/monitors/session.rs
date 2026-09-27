@@ -265,7 +265,13 @@ impl Monitor for SessionMonitor {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(5)
+        // 低配模式（perf 发现）：轮询兜底放档 5s→15s（WTS 通知线程仍为
+        // 事件驱动主力，不受影响）
+        if super::low_power_mode() {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(5)
+        }
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {

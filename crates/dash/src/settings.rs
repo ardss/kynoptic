@@ -26,8 +26,16 @@ pub fn default_categories() -> Vec<CategoryRule> {
         CategoryRule::rule("浏览", "chrome msedge edge firefox browser safari opera vivaldi brave"),
         CategoryRule::rule("通讯", "wechat weixin qq telegram discord slack dingtalk feishu outlook mail thunderbird"),
         CategoryRule::rule("娱乐", "steam bilibili youtube spotify music netease douyin tiktok game epic"),
-        CategoryRule::rule("文档", "word excel powerpoint notepad pdf office wps typura obsidian notion"),
+        // winword/powerpnt 为 Word/PowerPoint 的真实进程基名（整词匹配后
+        // "word" 不再命中 "winword"、"powerpoint" 不再命中 "powerpnt"，
+        // 补上进程名 token 以免文档类空标题窗口被误归「其他」）
+        CategoryRule::rule("文档", "word excel winword powerpoint powerpnt notepad pdf office wps typura obsidian notion"),
         CategoryRule::rule("设计", "photoshop figma blender gimp inkscape premiere davinci affinity canva"),
+        // 远程/虚拟机（发现 platform medium）：宿主侧只能看到远控/虚拟机
+        // 宿主进程本身（真实活动发生在客户机/远端，结构性漏报），单独分类
+        // 让 Top 应用榜不把它们当普通本地应用。token 与采集侧宿主名单
+        // （core monitors/host.rs REMOTE_HOST_EXES）同族。
+        CategoryRule::rule("远程/虚拟机", "mstsc xfreerdp mremote vmware-vmx vboxheadless todesk rustdesk anydesk sunloginclient vncviewer"),
     ]
 }
 
@@ -35,12 +43,18 @@ pub fn default_categories() -> Vec<CategoryRule> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CategoryRule {
     pub name: String,
-    /// 不区分大小写的子串/正则模式（简化：按空格拆 token，任一 token 命中即归类）
+    /// 不区分大小写的子串/正则模式（简化：按空格拆 token，任一 token 命中即归类）。
+    /// 纯 ASCII 字母数字 token 按「整词」匹配（词边界），含 CJK/特殊字符的
+    /// token 保持子串语义（中文无词边界，子串才正确）。
     pub pattern: String,
     /// pattern 预编译（小写 token 化一次，加载时生成；序列化跳过）。
     /// 匹配热路径（每 dwell 段 × 每规则）不再重复 split/to_lowercase。
     #[serde(skip)]
     pub lc_tokens: Vec<String>,
+    /// 与 [`lc_tokens`] 同序预编译：该 token 是否为「整词」token（纯 ASCII
+    /// 字母数字）。true → 需词边界匹配；false → 子串匹配。序列化跳过。
+    #[serde(skip)]
+    pub tok_word: Vec<bool>,
 }
 
 impl CategoryRule {
@@ -50,6 +64,7 @@ impl CategoryRule {
             name: name.into(),
             pattern: pattern.into(),
             lc_tokens: Vec::new(),
+            tok_word: Vec::new(),
         };
         r.recompile();
         r
@@ -63,24 +78,60 @@ impl CategoryRule {
             .split_whitespace()
             .map(String::from)
             .collect();
+        self.tok_word = self.lc_tokens.iter().map(|t| is_word_token(t)).collect();
     }
 
     pub(crate) fn rule(name: &str, pattern: &str) -> Self {
         Self::new(name, pattern)
     }
 
-    /// app/title 是否命中该规则（token 子串匹配，大小写不敏感）。
+    /// app/title 是否命中该规则（大小写不敏感；ASCII token 整词、CJK 子串）。
     pub fn matches(&self, app: &str, title: &str) -> bool {
         // 每段只小写一次（与规则数无关），token 命中判定走预编译表
         let hay = format!("{} {}", app, title).to_lowercase();
         self.matches_lc(&hay)
     }
 
-    /// [`matches`] 的小写预 映射版：调用方（如 report 的 classify 循环）对
+    /// [`matches`] 的小写预映射版：调用方（如 report 的 classify 循环）对
     /// 同一段落逐一试规则时，可先 lowercase 一次再复用。
+    ///
+    /// 整词/子串双语义：纯 ASCII 字母数字 token（如 "edge"、"qq"）要求词边界
+    /// 命中，杜绝 "ledges" 误中 "edge"、"qquick" 误中 "qq"；含 CJK 或特殊
+    /// 字符的 token 保持子串语义（中文无词边界，子串才正确）。
     pub fn matches_lc(&self, hay_lower: &str) -> bool {
-        self.lc_tokens.iter().any(|tok| hay_lower.contains(tok))
+        self.lc_tokens
+            .iter()
+            .zip(self.tok_word.iter())
+            .any(|(tok, word)| {
+                if *word {
+                    token_word_match(hay_lower, tok)
+                } else {
+                    hay_lower.contains(tok.as_str())
+                }
+            })
     }
+}
+
+/// token 是否按「整词」匹配：非空且全为 ASCII 字母数字。
+fn is_word_token(tok: &str) -> bool {
+    !tok.is_empty() && tok.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// 整词命中（`hay_lower` 须已小写，`tok` 为纯 ASCII）：token 的某一处出现，
+/// 其紧邻的前后字节（或串边界）都不得是 ASCII 字母数字，才算命中。
+/// 前后是 CJK/标点/空白/串边界都视为词界（UTF-8 下 CJK 字节 ≥0x80，天然
+/// 非 ASCII 字母数字，故按字节判定安全；token 为 ASCII，命中起点必在字符界上）。
+fn token_word_match(hay_lower: &str, tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    let hay = hay_lower.as_bytes();
+    hay_lower.match_indices(tok).any(|(start, _)| {
+        let end = start + tok.len();
+        let before_ok = start == 0 || !hay[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == hay.len() || !hay[end].is_ascii_alphanumeric();
+        before_ok && after_ok
+    })
 }
 
 /// 加载后的钳制：categories 条数 ≤100、单条 pattern ≤200 字符（字符级截断），
@@ -127,6 +178,18 @@ pub struct AppSettings {
     /// 窗口分类规则（正则 token，匹配顺序即优先级，未命中 → 其他）。
     #[serde(default = "default_categories")]
     pub categories: Vec<CategoryRule>,
+    /// 自动检查更新开关（默认开启；关闭后托盘不再做 24h 一次的新版本检查。
+    /// 托盘进程另有 --no-update-check 命令行开关，二者任一关闭即不检查）。
+    #[serde(default = "default_update_check")]
+    pub update_check: bool,
+    /// 低配模式（默认关）：开启后采集轮询间隔整体放档、线程降优先级，
+    /// 适合低配设备。只降采集频率，不改变落库数据口径。
+    #[serde(default)]
+    pub low_power: bool,
+}
+
+fn default_update_check() -> bool {
+    true
 }
 
 fn default_daily_goal_minutes() -> u32 {
@@ -167,6 +230,8 @@ impl Default for AppSettings {
             presence_bridge_minutes: 2,
             vk_frequency_enabled: true,
             categories: default_categories(),
+            update_check: true,
+            low_power: false,
         }
     }
 }
@@ -425,6 +490,7 @@ mod tests {
             presence_bridge_minutes: 2,
             vk_frequency_enabled: false,
             categories: default_categories(),
+            ..AppSettings::default()
         };
         save(&db, &s).unwrap();
         assert_eq!(try_load(&db), Some(s));

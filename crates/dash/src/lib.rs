@@ -37,6 +37,7 @@
 //! 之一且匹配，否则 401；`/`（静态页）不受限。令牌在 serve 启动时读取一次，
 //! 修改后需重启 dashboard（托盘菜单重启或重开 `kynoptic-ctl dashboard`）。
 
+pub mod display;
 pub mod settings;
 
 use std::io::{Read, Write};
@@ -141,7 +142,9 @@ pub fn api_summary(conn: &Connection, date: &str) -> std::result::Result<Value, 
     let top_app = queries::top_apps_today(conn, &start, &end, 1)
         .into_iter()
         .next()
-        .map(|(app, _)| app);
+        // 展示层归一：宿主进程/常见应用映射为友好名（display 单一事实源），
+        // 计数与 Top 口径不变（映射单射、幂等）。
+        .map(|(app, _)| display::display_app(&app));
     Ok(json!({
         "date": date,
         "active_minutes": totals.active_minutes,
@@ -342,8 +345,9 @@ pub fn api_timeline_at(
         let apps = by_bucket.remove(&hour).unwrap_or_default();
         let list: Vec<Value> = top5_with_other(apps)
             .into_iter()
-            // 与 insights 卡一致：展示名剔除 ".exe" 后缀（如 "ZCode.exe" -> "ZCode"）
-            .map(|(app, n)| json!({"app": app.trim_end_matches(".exe"), "events": n}))
+            // 展示层归一（display 单一事实源）：宿主→友好标签、.exe 剔除、
+            // 常见应用→友好名（如 "msedge.exe" -> "Microsoft Edge"）
+            .map(|(app, n)| json!({"app": display::display_app(&app), "events": n}))
             .collect();
         let (human, auto) = minute_kind.get(&hour).copied().unwrap_or((0, 0));
         // 未桥接人侧分钟 = input_agg 人侧分钟 + raw 人侧分钟（去重后，见上）
@@ -920,6 +924,13 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         .flatten();
     let has_full_day = earliest_ts.map(|e| e < start).unwrap_or(false);
 
+    // 展示层归一（display 单一事实源）：当前前台应用也经 display_app，
+    // 与 Top 榜/时间线同一命名口径；非字符串（如 null）原样透传。
+    let foreground_app = match sys.get("foreground_app").cloned().unwrap_or(Value::Null) {
+        Value::String(s) => Value::String(display::display_app(&s)),
+        other => other,
+    };
+
     json!({
         "host": host,
         "today": today,
@@ -935,7 +946,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "has_full_day": has_full_day,
         "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,
-        "fg_top": fg_top.map(|(a, _)| Value::from(a)).unwrap_or(Value::Null),
+        "fg_top": fg_top
+            .map(|(a, _)| Value::from(display::display_app(&a)))
+            .unwrap_or(Value::Null),
         "first_activity": first_presence,
         "last_activity": last_presence,
         "monitors_enabled": s.enabled_monitors.len(),
@@ -948,7 +961,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "uptime_seconds": uptime_seconds,
         "cpu_pct": sys.get("cpu_pct").cloned().unwrap_or(Value::Null),
         "mem_pct": sys.get("mem_pct").cloned().unwrap_or(Value::Null),
-        "foreground_app": sys.get("foreground_app").cloned().unwrap_or(Value::Null),
+        "foreground_app": foreground_app,
     })
 }
 
@@ -1034,7 +1047,7 @@ pub fn api_apps_at(
         })
         .map_err(|e| e.to_string())?
         .flatten()
-        .map(|(app, cnt)| json!({"app": app, "count": cnt}))
+        .map(|(app, cnt)| json!({"app": display::display_app(&app), "count": cnt}))
         .collect();
     Ok(json!({"days": days, "apps": apps}))
 }
@@ -1755,7 +1768,7 @@ fn insights_compute(
         let names: Vec<String> = top
             .iter()
             .take(3)
-            .map(|(a, h)| format!("{} {:.1}h", a.trim_end_matches(".exe"), h / 3600.0))
+            .map(|(a, h)| format!("{} {:.1}h", display::display_app(a), h / 3600.0))
             .collect();
         insights.push(json!({
             "title_zh": "前台应用时长 Top3",
@@ -1959,10 +1972,12 @@ pub fn api_report_at(
         }
         "其他".to_string()
     };
+    // 展示层归一（display 单一事实源）：app 名经 display_app（宿主→友好标签、
+    // .exe 剔除、常见应用→友好名）。classify 仍吃原始 app+title，口径不变。
     let segments: Vec<Value> = segs
         .iter()
         .map(|(app, title, a, b)| {
-            json!({"app": app, "category": classify(app, title), "start_min": a, "end_min": b})
+            json!({"app": display::display_app(app), "category": classify(app, title), "start_min": a, "end_min": b})
         })
         .collect();
 
@@ -2198,14 +2213,16 @@ pub fn api_apps_grid_at(conn: &Connection, date: &str) -> std::result::Result<Va
             }
         }
     }
+    // 展示层归一（display 单一事实源）：网格/榜名的 app 键经 display_app，
+    // 宿主进程→友好标签、.exe 剔除、常见应用→友好名。"(other)" 哨兵原样。
     let grid_out: Vec<Value> = grid
         .into_iter()
-        .map(|(app, hours)| json!({"app": app, "hours": hours}))
+        .map(|(app, hours)| json!({"app": display::display_app(&app), "hours": hours}))
         .collect();
     let totals: Vec<Value> = ranked
         .iter()
         .take(6)
-        .map(|(a, n)| json!({"app": a, "count": n}))
+        .map(|(a, n)| json!({"app": display::display_app(a), "count": n}))
         .collect();
     Ok(json!({"date": date, "grid": grid_out, "totals": totals, "hourly_total": hourly_total}))
 }
@@ -2248,7 +2265,7 @@ pub fn api_daily_top_at(
             apps.truncate(3);
             let top: Vec<Value> = apps
                 .into_iter()
-                .map(|(app, n)| json!({"app": app, "count": n}))
+                .map(|(app, n)| json!({"app": display::display_app(&app), "count": n}))
                 .collect();
             json!({"date": d, "top": top})
         })
@@ -2284,6 +2301,8 @@ fn settings_payload(s: &AppSettings) -> Value {
         "daily_goal_minutes": s.daily_goal_minutes,
         "presence_bridge_minutes": s.presence_bridge_minutes,
         "vk_frequency_enabled": s.vk_frequency_enabled,
+        "update_check": s.update_check,
+        "low_power": s.low_power,
         "categories": s.categories,
         "monitors": monitors,
     })
@@ -2340,6 +2359,12 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     if let Some(v) = req.get("vk_frequency_enabled") {
         next.vk_frequency_enabled = v.as_bool().ok_or("vk_frequency_enabled 应为布尔值")?;
+    }
+    if let Some(v) = req.get("update_check") {
+        next.update_check = v.as_bool().ok_or("update_check 应为布尔值")?;
+    }
+    if let Some(v) = req.get("low_power") {
+        next.low_power = v.as_bool().ok_or("low_power 应为布尔值")?;
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;
@@ -2506,6 +2531,8 @@ fn settings_audit_summary(old: &AppSettings, new: &AppSettings) -> String {
             old.vk_frequency_enabled,
             new.vk_frequency_enabled,
         ),
+        ("update_check", old.update_check, new.update_check),
+        ("low_power", old.low_power, new.low_power),
     ] {
         if a != b {
             d.insert(k.into(), json!([a, b]));

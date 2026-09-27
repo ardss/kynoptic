@@ -9,7 +9,7 @@ use kynoptic_core::Error;
 /// dashboard 默认端口(与 `kynoptic-ctl dashboard` 一致)
 pub const DEFAULT_PORT: u16 = 8422;
 
-const USAGE: &str = "usage: kynoptic-tray [--db PATH] [--port N] [--all] [--flag PATH]\n  --db PATH    database path (default: kynoptic_core::db::resolve_db_path)\n  --port N     dashboard TCP port on 127.0.0.1 (default 8422)\n  --all        enable the full monitor set instead of the default 14\n  --flag PATH  override tray-exit.flag path (default: exe dir; also KYNOPTIC_EXIT_FLAG env)\n";
+const USAGE: &str = "usage: kynoptic-tray [--db PATH] [--port N] [--all] [--no-update-check] [--flag PATH]\n  --db PATH    database path (default: kynoptic_core::db::resolve_db_path)\n  --port N     dashboard TCP port on 127.0.0.1 (default 8422)\n  --all        enable the full monitor set instead of the default 14\n  --no-update-check  disable the periodic new-version check (same switch as the settings page, CLI wins)\n  --flag PATH  override tray-exit.flag path (default: exe dir; also KYNOPTIC_EXIT_FLAG env)\n";
 
 /// 托盘壳启动配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,9 @@ pub struct Args {
     pub port: u16,
     /// 透传采集器:启用全集监控器(registry::all_monitor_ids)
     pub all: bool,
+    /// 命令行禁用周期性更新检查(发现 platform:更新检查必须可关;
+    /// 与设置页 update_check 开关语义相同,命令行优先)
+    pub no_update_check: bool,
     /// "用户主动退出"旗标路径覆盖(测试用;缺省走 exe 同目录,见 paths.rs)
     pub exit_flag: Option<PathBuf>,
 }
@@ -52,6 +55,7 @@ pub fn parse(args: &[String]) -> Result<Args, Error> {
     let mut port = DEFAULT_PORT;
     let mut db: Option<PathBuf> = None;
     let mut all = false;
+    let mut no_update_check = false;
     let mut exit_flag: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -72,6 +76,9 @@ pub fn parse(args: &[String]) -> Result<Args, Error> {
                     .map_err(|_| Error::InvalidData(format!("端口非法: {raw}(0-65535)")))?;
             }
             "--all" => all = true,
+            // 周期性更新检查的命令行开关(与设置页 update_check 同语义;
+            // 仅能强制关,不能强制开——开仍由设置页决定)
+            "--no-update-check" => no_update_check = true,
             // 退出旗标路径覆盖(与 watchdog 契约测试用;缺省 exe 同目录)
             "--flag" => {
                 i += 1;
@@ -92,6 +99,7 @@ pub fn parse(args: &[String]) -> Result<Args, Error> {
         db: db.unwrap_or_else(kynoptic_core::db::resolve_db_path),
         port,
         all,
+        no_update_check,
         exit_flag,
     })
 }
@@ -218,6 +226,16 @@ mod tests {
         assert_eq!(a.port, DEFAULT_PORT);
         assert_eq!(a.db, kynoptic_core::db::resolve_db_path());
         assert!(!a.all);
+        assert!(!a.no_update_check);
+    }
+
+    #[test]
+    fn no_update_check_flag_parses() {
+        let a = sv(&["--no-update-check"]).unwrap();
+        assert!(a.no_update_check);
+        // 与其他开关可叠加
+        let a = sv(&["--no-update-check", "--all"]).unwrap();
+        assert!(a.no_update_check && a.all);
     }
 
     #[test]
