@@ -759,6 +759,43 @@ impl Database {
         std::fs::metadata(&p).ok().map(|m| m.len())
     }
 
+    /// 库所在卷的剩余空间（字节）——写路径磁盘将满预检（ENOSPC 主动防护）
+    /// 的唯一探测点，供 collector::write_batch 每次落库前读取：低于
+    /// constants::DB_FREE_SPACE_PAUSE_BYTES 即暂停写入（本批保留待重试）。
+    ///
+    /// 实现：GetDiskFreeSpaceExW（与 monitors/device.rs 生产调用同一 API、
+    /// 同一参数形，见该处实机验证；候选路径依次为库文件自身 → 父目录
+    /// （首次运行库文件尚未创建时，父目录由 open 的 create_dir_all 保证
+    /// 存在））。返回 None = 无法判定（API 失败/路径非本地卷）：调用方
+    /// 按「不暂停」处理（fail-open 保持旧行为，绝不因探测失败误停写）。
+    pub fn db_free_space_bytes(&self) -> Option<u64> {
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let mut candidates: Vec<&str> = vec![self.db_path.as_str()];
+        if let Some(parent) = std::path::Path::new(&self.db_path).parent() {
+            candidates.push(parent.to_str()?);
+        }
+        for cand in candidates {
+            // 宽字符 + 结尾 0（LPCWSTR）；库路径可能带 \\?\ 前缀（长路径
+            // 规范化），该形式同为合法卷路径。
+            let wide: Vec<u16> = cand.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut free_avail: u64 = 0;
+            let mut total: u64 = 0;
+            let mut free_unrestricted: u64 = 0;
+            let ok = unsafe {
+                GetDiskFreeSpaceExW(
+                    wide.as_ptr(),
+                    &mut free_avail,
+                    &mut total,
+                    &mut free_unrestricted,
+                )
+            };
+            if ok != 0 {
+                return Some(free_avail);
+            }
+        }
+        None
+    }
+
     /// 完整的维护操作：清理 + 欠聚合核对自愈 + WAL 检查点 + VACUUM 压缩
     pub fn maintenance(&self) {
         // 审查 MEDIUM：停机旗标置位即整体跳过——checkpoint/VACUUM 持写互斥体
@@ -1089,5 +1126,28 @@ mod tests {
         conn.execute("DELETE FROM events WHERE x > 2", []).unwrap();
         let msg = reconcile_events_watermark(&conn).expect("回退必须被发现");
         assert!(msg.contains("回退"), "告警文本须含回退: {msg}");
+    }
+
+    /// 真机探针（Win32 API 参数结构铁律）：db_free_space_bytes 的
+    /// GetDiskFreeSpaceExW 调用形与 monitors/device.rs 生产路径一致
+    /// （同一 API、同一三指针参数组，device monitor 30s 周期已实机验证）；
+    /// 此处对真实临时卷走一遍真调用，验证参数结构未漂移（指针/返回值口径
+    /// 错时返回 0 或崩溃，字符串形状检查抓不到）。断言剩余空间有限且
+    /// 不超过 100TB（防 0/未初始化值）。
+    #[test]
+    fn db_free_space_probe_on_real_volume() {
+        let dir = std::env::temp_dir().join(format!("kyn-dfsp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("fsp.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        let free = db
+            .db_free_space_bytes()
+            .expect("Windows 真实卷必须能读出剩余空间");
+        assert!(
+            free > 0 && free < 100 * 1024 * 1024 * 1024 * 1024,
+            "剩余空间必须有限且量级正常: {free}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

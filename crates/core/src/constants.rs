@@ -18,14 +18,15 @@ pub const MAINTENANCE_INTERVAL_SECS: u64 = 24 * 3600;
 /// daily_agg 缓存刷新间隔。缓存读方（charts/insights）与实时读方（summary 卡片）
 /// 并存，若随 24h 维护才刷新，两个面板最长差一整天的数。1h 上限保证交叉一致。
 pub const DAILY_AGG_REFRESH_SECS: u64 = 600;
-pub const TRAY_UPDATE_INTERVAL_SECS: u64 = 5;
-/// SnapshotCache 后台重算间隔。前端 3s 轮询时读此缓存（0 SQL），
-/// 2s 重算保证缓存新鲜度足够，同时比每次轮询都 collect（9 SQL）省 ~85% 查询。
-pub const SNAPSHOT_CACHE_INTERVAL_SECS: u64 = 2;
 
 // === 数据库 ===
 /// 数据保留天数。0 = 永不删除（铁律：原始数据一字节不动；清理必须显式 opt-in）。
 pub const DEFAULT_RETENTION_DAYS: i64 = 0;
+/// 写路径磁盘将满预检阈值（ENOSPC 主动防护）：库所在卷剩余空间低于此值时
+/// write_batch 主动暂停写入（本批保留、空间恢复自动续写，见
+/// db::Database::db_free_space_bytes 与 collector 的暂停状态）。
+/// 256MB ≈ WAL 16MB journal_size_limit 封顶 + 批次余量。
+pub const DB_FREE_SPACE_PAUSE_BYTES: u64 = 256 * 1024 * 1024;
 pub const READER_POOL_SIZE: usize = 8;
 /// 数据库文件名（不含目录）。路径解析见 db::resolve_db_path。
 pub const DB_FILENAME: &str = "kynoptic.db";
