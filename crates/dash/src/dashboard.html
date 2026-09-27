@@ -552,6 +552,16 @@
     <label for="set-vkfreq"><span class="l en">per-key frequency (keyboard distribution detail)</span>
     <span class="l zh">逐键频次（键盘分布明细）</span></label>
   </div>
+  <div class="mon-row">
+    <input type="checkbox" id="set-updatecheck" checked>
+    <label for="set-updatecheck"><span class="l en">check for new versions once a day. off = no periodic check (an already-found "new version" hint stays as-is).</span>
+    <span class="l zh">每天检查一次新版本。关闭 = 不再定期检查（已发现的新版本提示保持原样）。</span></label>
+  </div>
+  <div class="mon-row">
+    <input type="checkbox" id="set-lowpower">
+    <label for="set-lowpower"><span class="l en">low-spec mode: sample less often, for weaker machines (applies at the next collector restart, which happens automatically after saving)</span>
+    <span class="l zh">低配模式：降低采样频率，适合配置较低的电脑（保存后下一次采集重启自动生效）</span></label>
+  </div>
   <div class="muted"><span class="l en">takes effect automatically after save.</span><span class="l zh">保存后自动生效。</span></div>
 </section>
 <section>
@@ -1262,7 +1272,7 @@ async function loadTopApps() {
     '<span class="app-count">' + t("colEvents") + "</span></div>" +
     a.apps.map(x =>
     '<div class="app-row">' +
-    '<span class="app-label" title="' + esc(x.app) + '">' + esc(prettyApp(x.app)) + "</span>" +
+    '<span class="app-label" title="' + esc(prettyApp(x.app)) + '">' + esc(prettyApp(x.app)) + "</span>" +
     '<span class="app-track"><span class="app-bar" style="width:' + (x.count / max * 100).toFixed(2) + '%"></span></span>' +
     '<span class="app-count">' + x.count.toLocaleString() + "</span></div>").join("");
 }
@@ -1459,7 +1469,7 @@ async function loadReport() {
     const hm = m => Math.floor(m / 60) + ":" + String(m % 60).padStart(2, "0");
     svg += '<rect x="' + px(seg.start_min) + '" y="' + (y + rowH - 13) + '" width="' +
       Math.max(px(seg.end_min) - px(seg.start_min), 1.5) + '" height="12" rx="3" fill="' +
-      catColor(seg.category) + '"><title>' + esc(seg.app) + " · " + esc(catLabel(seg.category)) +
+      catColor(seg.category) + '"><title>' + esc(prettyApp(seg.app)) + " · " + esc(catLabel(seg.category)) +
       " · " + hm(seg.start_min) + "–" + hm(seg.end_min) + '</title></rect>';
   }
   svg += "</svg>";
@@ -1623,7 +1633,7 @@ async function loadApps() {
       // 与趋势图同口径：零值不画柱（此处 v>0 已被 continue 保证，写法保持一致）
       svg += '<rect x="' + (padL + hr * bw + 2) + '" y="' + yCur + '" width="' + (bw - 4) +
         '" height="' + Math.max(bh, v > 0 ? 2 : 0) + '" rx="1.5" fill="' + (colorOf[g.app] || "#888") +
-        '"><title>' + hr + ":00 — " + esc(g.app) + " (" + v.toLocaleString() + ')</title></rect>';
+        '"><title>' + hr + ":00 — " + esc(prettyApp(g.app)) + " (" + v.toLocaleString() + ')</title></rect>';
     }
     if (hr % 3 === 0) {
       svg += '<text x="' + (padL + hr * bw + bw / 2) + '" y="' + (H - 6) +
@@ -1645,7 +1655,7 @@ async function loadApps() {
         '<span class="app-track" style="flex:1"><span class="app-bar" style="width:' +
         (t.count / cmax * 100).toFixed(2) + "%;background:" + appColor(t.app) + '"></span></span>' +
         '<span style="width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
-        esc(t.app) + '">' + esc(prettyApp(t.app)) + ' <span class="muted">(' + t.count.toLocaleString() + ")</span></span>").join("") +
+        esc(prettyApp(t.app)) + '">' + esc(prettyApp(t.app)) + ' <span class="muted">(' + t.count.toLocaleString() + ")</span></span>").join("") +
       "</div>").join("")
     : '<span class="muted">' + t("noData") + "</span>";
 }
@@ -2015,6 +2025,9 @@ async function loadSettings() {
   }).catch(function () {});
   document.getElementById("set-counts").checked = s.input_counts_only;
   document.getElementById("set-vkfreq").checked = !!s.vk_frequency_enabled;
+  // 旧后端/旧文件缺字段时按默认回填（update_check 默认开、low_power 默认关）
+  document.getElementById("set-updatecheck").checked = s.update_check !== false;
+  document.getElementById("set-lowpower").checked = !!s.low_power;
   settingsMsg("", true);
 }
 /* 诊断信息（发现 ①-4）：首次展开时拉 /api/diagnostics，展示各留档日志的
@@ -2099,7 +2112,9 @@ async function saveSettings() {
       presence_bridge_minutes: Math.max(0, Math.min(15, num("set-bridge", LAST_SETTINGS && LAST_SETTINGS.presence_bridge_minutes, 2))),
       daily_goal_minutes: Math.max(0, Math.min(1440, num("set-goal", LAST_SETTINGS && LAST_SETTINGS.daily_goal_minutes, 480))),
       // 审查：端口 0 会落库出"面板打不开"的设置，前端先夹到 1-65535（后端同样校验）
-      dashboard_port: Math.max(1, Math.min(65535, num("set-port", oldPort, 8422)))
+      dashboard_port: Math.max(1, Math.min(65535, num("set-port", oldPort, 8422))),
+      update_check: document.getElementById("set-updatecheck").checked,
+      low_power: document.getElementById("set-lowpower").checked
     };
     const r = await fetch("/api/settings", {
       method: "POST",

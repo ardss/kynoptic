@@ -164,8 +164,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
     ),
     spec(
         "process",
-        "Records names of running applications",
-        "记录正在运行的应用程序名称",
+        "Records periodic snapshots of the processes using the most CPU and memory",
+        "周期性记录占用 CPU 和内存最高的进程快照",
         true,
         Sensitivity::Low,
         Dep::Native,
@@ -442,7 +442,7 @@ pub fn create_monitors_for(
 
     // 注意：分支顺序即注册表顺序，新增监控器时同步维护 MONITOR_REGISTRY。
     if want("window") {
-        out.push(Box::new(monitors::window::WindowMonitor::default()));
+        out.push(Box::new(monitors::window::WindowMonitor));
     }
     if want("idle") {
         out.push(Box::new(monitors::idle::IdleMonitor::default()));

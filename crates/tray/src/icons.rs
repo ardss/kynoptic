@@ -13,16 +13,51 @@
 
 #![allow(non_snake_case)]
 
-use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateDIBSection, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse, GetDC, Polygon,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, PS_SOLID,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DestroyIcon, GetSystemMetrics, ICONINFO, SM_CXSMICON,
+    CreateIconIndirect, DestroyIcon, GetShellWindow, GetSystemMetrics, ICONINFO, SM_CXSMICON,
 };
 
 use crate::state::TrayState;
+
+/// 任务栏所在显示器的 DPI（shell 窗口所属显示器；探针实测该显示器
+/// DPI≠系统默认时旧口径取到的是默认显示器的 16）。取不到 → 0（调用方兜底）。
+fn taskbar_dpi() -> u32 {
+    unsafe {
+        // Win32_UI_HiDpi 未进 tray 依赖表（探针先例：真机 GetDpiForWindow 可用）
+        extern "system" {
+            fn GetDpiForWindow(hwnd: HWND) -> u32;
+        }
+        let shell = GetShellWindow();
+        if shell.is_null() {
+            return 0;
+        }
+        GetDpiForWindow(shell)
+    }
+}
+
+/// 图标边长（发现 platform medium 修复）：按任务栏显示器的 DPI 取
+/// SM_CXSMICON（多显示器缩放不一致时 16px 小图标在 120 DPI 任务栏上被
+/// 放大有损；探针实测 shell 窗口 DPI=120 → 正确尺寸 20）。DPI 取不到时
+/// 回退系统默认口径（与旧行为一致）。
+pub fn taskbar_icon_size() -> i32 {
+    unsafe {
+        extern "system" {
+            fn GetSystemMetricsForDpi(ui_index: i32, dpi: u32) -> i32;
+        }
+        let dpi = taskbar_dpi();
+        let size = if dpi != 0 {
+            GetSystemMetricsForDpi(SM_CXSMICON, dpi)
+        } else {
+            GetSystemMetrics(SM_CXSMICON)
+        };
+        size.max(16)
+    }
+}
 
 /// 三态图标句柄([Running, Paused, Error])。
 pub struct TrayIcons {
@@ -35,7 +70,7 @@ pub struct TrayIcons {
 impl TrayIcons {
     /// 启动时绘制全部三态。任一绘制失败返回 None(调用方降级处理)。
     pub fn create() -> Option<Self> {
-        let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+        let size = taskbar_icon_size();
         // Wave20 P2：逐个 draw 失败时先销毁已成功的 HICON（原 `?` 提前
         // 返回会让 Self 不构造、Drop 不跑，已建图标泄漏）
         #[allow(clippy::upper_case_acronyms)]
@@ -157,9 +192,19 @@ fn draw(shape: IconShape, size: i32) -> Option<windows_sys::Win32::UI::WindowsAn
             DeleteDC(mem);
             return None;
         }
-        // 1bpp 掩码:全 0 = 不透明(alpha 通道才是真正的透明面)
-        let mask_bm =
-            windows_sys::Win32::Graphics::Gdi::CreateBitmap(size, size, 1, 1, std::ptr::null());
+        // 1bpp 掩码：显式全 0（不透明；alpha 通道才是真正的透明面）。
+        // 发现 platform low 修复：此前末参传 null——掩码像素是 GDI 池里未定义
+        // 的复用内存，CreateIconIndirect 的 OR 掩码带上垃圾位，任务栏偶发
+        // 花纹毛边。传显式清零缓冲（1bpp 行宽 = ceil(size/8) 字节，行不额外
+        // 填充）：
+        let mut mask_bits = vec![0u8; ((size + 7) / 8) as usize * size as usize];
+        let mask_bm = windows_sys::Win32::Graphics::Gdi::CreateBitmap(
+            size,
+            size,
+            1,
+            1,
+            mask_bits.as_mut_ptr() as *mut core::ffi::c_void,
+        );
         if mask_bm.is_null() {
             DeleteObject(color_bm);
             DeleteDC(mem);

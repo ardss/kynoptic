@@ -218,9 +218,21 @@ harness in this repo (full methodology and raw numbers in
 ## Privacy
 
 - Recorded data never leaves your machine by default. There is no account, no
-  telemetry, no analytics, no network calls except a once-daily version check
-  (a few hundred bytes to GitHub; found versions are shown in the tray menu —
-  never auto-installed).
+  telemetry, no analytics, and no network calls except a once-daily version
+  check. That check is one GET of GitHub's **entire Releases list** — on the
+  order of ~100 KB today, and it grows with the number of releases and
+  assets (the API can also paginate) — not a lightweight single-field
+  lookup. A version the check finds is shown in the tray menu and is
+  **never auto-installed**.
+- **Fully offline deployments:** the version check is the only outbound call
+  and it honors the standard proxy environment variables. Point
+  `HTTPS_PROXY` at an unreachable proxy to stop the check with no outbound
+  traffic at all (an `https://` URL only consults `HTTPS_PROXY` /
+  `https_proxy`, not `HTTP_PROXY`). The tray runs the check in the
+  background and fails silently, so a dead proxy just means no
+  "update available" prompt ever appears. Running `kynoptic update
+  --check` by hand is **not** silent: it exits non-zero and prints the
+  failed URL — that is the expected "no network" signal, not a fault.
 - **Keyboard and mouse are stored as per-minute counts only — never key
   contents, key order, or timing.** The dashboard keyboard heatmap uses
   per-key frequency counts (how many times each key was pressed), which are

@@ -39,6 +39,9 @@ pub mod window;
 pub mod keyboard_hook;
 pub mod mouse_hook;
 
+// ── 窗口属主宿主感知解析（宿主名单与展示层共享，见 host.rs 头注）──
+pub mod host;
+
 // ── 已恢复、默认关闭：纯 windows-sys（原生，无子进程）──
 pub mod bluetooth;
 pub mod browser;
@@ -92,4 +95,19 @@ pub static MONITOR_DEGRADED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub fn note_degraded(what: &str) {
     log::error!("监控器降级: {what}");
     MONITOR_DEGRADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── 低功耗模式（发现 perf medium）：低配机器把轮询监控器间隔各放一档、
+// 线程降到 BELOW_NORMAL（见各 monitor 的 interval()）。单一开关，
+// 由 collector 依设置注册，monitor 侧只读。
+static LOW_POWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 注册低功耗开关（collector 设置同步入口）。
+pub fn set_low_power_mode(on: bool) {
+    LOW_POWER.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 低功耗模式是否开启（monitor interval() 判定用）。
+pub fn low_power_mode() -> bool {
+    LOW_POWER.load(std::sync::atomic::Ordering::Relaxed)
 }

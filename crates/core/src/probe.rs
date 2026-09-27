@@ -224,6 +224,12 @@ fn collect_warnings(log_buf: &LogBuf, log_start: usize) -> Vec<String> {
 // ─── 探针核心 ─────────────────────────────────────────────────────────────────
 
 fn temp_db_path(id: &str) -> std::path::PathBuf {
+    // 先清扫历史探针残留（发现 platform low）：进程被强杀/崩溃时收尾的
+    // remove_dir_all 没跑到，kynoptic-probe-*/probe.db 会累积在 %TEMP%。
+    // best-effort：在用目录（并发探针的 DB 有锁）移不掉会原样留下，由
+    // 该次探针自己的收尾清理；历史残留无锁可移。清扫必须早于建本目录
+    // （否则会把自己刚建的空目录扫掉，后续建库报「目录不存在」）。
+    sweep_stale_probe_dirs();
     let dir = std::env::temp_dir().join(format!(
         "kynoptic-probe-{}-{}",
         id,
@@ -231,6 +237,24 @@ fn temp_db_path(id: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&dir).ok();
     dir.join("probe.db")
+}
+
+/// 一次性清扫 %TEMP% 下的历史探针目录（每进程一次，40 个监控器连跑只扫首拍）。
+fn sweep_stale_probe_dirs() {
+    use std::sync::Once;
+    static SWEEPED: Once = Once::new();
+    SWEEPED.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            if n.starts_with("kynoptic-probe-") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
 }
 
 fn count_and_sample(db: &crate::db::Database) -> (usize, String) {
@@ -433,22 +457,29 @@ impl Inducers {
             stop: Arc::new(AtomicBool::new(false)),
         };
         if id == "network" {
-            // 持续制造出站流量，保证 30s 增量窗口内有 delta
+            // 环回刺激（发现 platform high + 契约「采集只绑 127.0.0.1」）：
+            // 旧实现绑 0.0.0.0 向外网黑洞发 UDP——既违反只绑 127.0.0.1 的
+            // 契约（出站外网），增量又依赖外部可达性。改为绑 127.0.0.1 自回环
+            // （发给自己）：真实回环伪接口（Type 24）计入 iftable2 增量
+            // （探针实测：网络监控只跳 Type 31 软件回环），本机即有 delta，
+            // 全程不出本机。
             let stop = out.stop.clone();
             let spawned = std::thread::Builder::new()
                 .name("probe-net-inducer".into())
                 .spawn(move || {
-                    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                        let payload = [0u8; 512];
-                        while !stop.load(Ordering::Relaxed) {
-                            // 探针流量：突发发往公共黑洞端口（UDP 不等回应），
-                            // 保证 30s 增量窗口内 netstat 计数有明显 delta
-                            for _ in 0..32 {
-                                let _ = sock.send_to(&payload, "1.1.1.1:9");
-                                let _ = sock.send_to(&payload, "8.8.8.8:9");
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                    let Ok(sock) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+                        return;
+                    };
+                    let Ok(local) = sock.local_addr() else {
+                        return;
+                    };
+                    let payload = [0u8; 512];
+                    while !stop.load(Ordering::Relaxed) {
+                        // 32 发 × 512B 自回环突发，50ms 一拍
+                        for _ in 0..32 {
+                            let _ = sock.send_to(&payload, local);
                         }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 })
                 .ok();

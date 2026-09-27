@@ -790,23 +790,62 @@ mod tests {
 
     // ─── 参数校验回归（P1：非法参数曾静默回落/静默钳制） ───────────────
 
-    fn mem_db() -> String {
-        // 每测试一个独立临时库文件（:memory: 连接不跨 call_tool 存活——每请求重开）
-        let dir = std::env::temp_dir().join(format!("kynoptic-mcp-test-{}", std::process::id()));
+    /// 带 Drop 守卫的测试库（发现 platform low 修复）：每次调用独立目录，
+    /// 测试结束（含 panic）移除；:memory: 连接不跨 call_tool 存活——每请求重开。
+    fn mem_db_guarded() -> (String, TempDirGuard) {
+        let (path, dir) = new_mem_db();
+        (path, TempDirGuard(dir))
+    }
+
+    fn new_mem_db() -> (String, std::path::PathBuf) {
+        // 每次调用一个独立目录（:memory: 连接不跨 call_tool 存活——每请求
+        // 重开；历史实现全测试共享一个 {pid} 目录，跑完不清即 165+ 残留）
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("kynoptic-mcp-test-{pid}-{nanos}"));
+        sweep_stale_mcp_test_dirs();
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!(
-            "db-{}.sqlite",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = dir.join(format!("db-{nanos}.sqlite"));
         let conn = rusqlite::Connection::open(&path).unwrap();
         // 预设 WAL：open_reader 只读连接上 journal_mode=WAL 是写操作，库必须
         // 在写入侧（采集器/此处）先转成 WAL，与生产库一致
         kynoptic_core::db::apply_pragmas(&conn).unwrap();
         conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
-        path.display().to_string()
+        (path.display().to_string(), dir)
+    }
+
+    /// 清扫历史测试运行遗留的 `kynoptic-mcp-test-*` 目录（发现 platform low）：
+    /// 只清**非本进程 pid** 的目录（别的测试进程/上次运行遗留；本进程
+    /// 并发在用的目录有文件锁移不掉，双保险留待其 Drop 守卫清理）。
+    /// 每进程一次。
+    fn sweep_stale_mcp_test_dirs() {
+        use std::sync::Once;
+        static SWEEPED: Once = Once::new();
+        SWEEPED.call_once(|| {
+            let pid = std::process::id();
+            let my_suffix = format!("-{pid}-");
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                if n.starts_with("kynoptic-mcp-test-") && !n.contains(&my_suffix) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        });
+    }
+
+    /// 测试目录 Drop 守卫：作用域结束（正常或 panic）移除整个临时目录。
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn insert_window_switch(db: &str, ts: &str, app: &str) {
@@ -829,7 +868,8 @@ mod tests {
 
     #[test]
     fn limit_zero_and_negative_are_rejected_not_silently_fallback() {
-        let srv = McpServer::new(mem_db());
+        let (db, _guard) = mem_db_guarded();
+        let srv = McpServer::new(db);
         let r = call(&srv, 1, "get_timeline", json!({ "limit": 0 }));
         assert!(r["isError"].as_bool().unwrap(), "{r}");
         assert!(r["content"][0]["text"].as_str().unwrap().contains(">= 1"));
@@ -843,7 +883,8 @@ mod tests {
 
     #[test]
     fn over_max_limit_and_days_report_clamped_to() {
-        let srv = McpServer::new(mem_db());
+        let (db, _guard) = mem_db_guarded();
+        let srv = McpServer::new(db);
         let r = call(&srv, 1, "get_timeline", json!({ "limit": 500 }));
         assert!(!r["isError"].as_bool().unwrap());
         assert_eq!(
@@ -874,7 +915,7 @@ mod tests {
 
     #[test]
     fn get_top_apps_basic() {
-        let db = mem_db();
+        let (db, _guard) = mem_db_guarded();
         insert_window_switch(&db, "2026-09-09T01:00:00+00:00", "code");
         insert_window_switch(&db, "2026-09-09T01:40:00+00:00", "web");
         insert_window_switch(&db, "2026-09-09T01:50:00+00:00", "code");
@@ -902,7 +943,7 @@ mod tests {
     /// cmd_mcp 转成该变量；这里验证 serve_stdio 的读取端契约）。
     #[test]
     fn serve_stdio_honors_kynoptic_db_env() {
-        let db = mem_db();
+        let (db, _guard) = mem_db_guarded();
         insert_window_switch(&db, "2026-09-09T01:00:00+00:00", "envmarker");
         // 直接验证 call_tool 层用 db_path 打开对应库（env → db_path 的映射在 serve_stdio）
         let srv = McpServer::new(&db);

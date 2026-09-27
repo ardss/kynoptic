@@ -533,6 +533,10 @@ fn main() {
     // 状态栏同步提示。检查失败静默（网络差不该变成用户的负担）。
     {
         let db_for_upd = parsed.db.clone();
+        // 更新检查开关（发现 platform：必须可关）：--no-update-check 命令行
+        // 与设置页 update_check 同语义，任一为关即不检查；设置页可运行中
+        // 改（每 24h 循环读一次），命令行只能强制关。
+        let upd_cli_off = parsed.no_update_check;
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| p.to_path_buf()));
@@ -615,17 +619,25 @@ fn main() {
                     .unwrap_or_else(|| std::path::PathBuf::from("update-available.txt"));
                 loop {
                     thread::sleep(std::time::Duration::from_secs(120)); // 启动缓冲，避开开机网络未就绪
-                    match run_check() {
-                        CheckOutcome::Update(v) => {
-                            let _ = std::fs::write(&upd_path, &v);
-                        }
-                        CheckOutcome::UpToDate => {
-                            let _ = std::fs::remove_file(&upd_path);
-                        }
-                        CheckOutcome::Failed => {
-                            // 查询失败：保留已有提示文件不动
+                    // 每轮读一次设置（缓存层已按 mtime 失效，读盘开销可忽略）：
+                    // 用户在设置页关掉 update_check 后无需重启托盘即生效。
+                    let upd_on = !upd_cli_off
+                        && kynoptic_dash::settings::load(&db_for_upd).update_check;
+                    if upd_on {
+                        match run_check() {
+                            CheckOutcome::Update(v) => {
+                                let _ = std::fs::write(&upd_path, &v);
+                            }
+                            CheckOutcome::UpToDate => {
+                                let _ = std::fs::remove_file(&upd_path);
+                            }
+                            CheckOutcome::Failed => {
+                                // 查询失败：保留已有提示文件不动
+                            }
                         }
                     }
+                    // 更新检查已关时：本轮不查（已发现的新版本提示文件保持
+                    // 原样——不清除、也不再刷新，与设置页文案一致）
                     // 平台审查：搭每日子进程通路的便车自检看门狗计划任务——
                     // 任务被禁用/删除后 watchdog_alert（唯一告警通道）本身就是
                     // 停摆的组件，托盘是唯一还能说话的进程。每日一次，随本循环。
@@ -737,6 +749,9 @@ fn main() {
                             // （serde 默认 false）→ CollectorSettings → core 的
                             // input_agg::set_vk_enabled（collector 内部接线）。
                             vk_frequency_enabled: app_settings.vk_frequency_enabled,
+                            // 低配模式（perf 发现）：设置页开关 → collector 的
+                            // 轮询间隔放档 + BELOW_NORMAL 线程优先级
+                            low_power: app_settings.low_power,
                             ..kynoptic_core::collector::CollectorSettings::default()
                         };
                         let db_str = owner_db.to_string_lossy().into_owned();

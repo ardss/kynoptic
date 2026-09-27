@@ -54,8 +54,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tray menu's "open panel" entry uses that real port; previously the
   file was never written and the menu entry was a dead link on a fresh
   install.
+- Dashboard: host/infrastructure process names (e.g. `applicationframehost.exe`,
+  `textinputhost.exe`, `conhost.exe`) no longer appear verbatim in the top-app
+  ranking, timeline, report, or the "top app" KPI. They are now mapped to
+  short, readable labels ("UWP", "IME", "Console"), so a UWP-host process
+  can no longer head the ranking as an opaque raw name.
+- Dashboard: category-rule matching now matches ASCII tokens as whole
+  words (word boundaries) instead of bare substrings. A token like
+  `edge` no longer matches inside `ledges`, and `qq` no longer matches
+  inside `qquick`/`quick`-style titles; Chinese (CJK) tokens keep their
+  substring semantics (no word boundaries in Chinese). The `文档`
+  default rule gained `winword`/`powerpnt` so Word/PowerPoint still
+  classify by process name under the tighter matching.
 
 ### Changed
+
+- Dashboard: every `/api/*` app name is now normalized by a single
+  display-layer mapping (`.exe` stripped, host → friendly label, common
+  apps → friendly name), so `msedge.exe` shows as "Microsoft Edge",
+  `qq.exe` as "QQ", `notepad.exe` as "Notepad", etc. The `Top apps`,
+  `report`, `apps grid`, `daily top`, and `insights` endpoints and the
+  page tooltips all use the same normalized names (previously the raw
+  process name was shown in some tooltips). Counting and ranking are
+  unchanged — the mapping is one-to-one and idempotent.
+- Docs: the version-check byte-volume description is corrected. The
+  once-daily check performs a single `GET` of GitHub's entire
+  **Releases list** (on the order of ~100 KB, growing with release/asset
+  count and paginable), not "a few hundred bytes". A fully-offline
+  escape hatch is now documented: point `HTTPS_PROXY` at an unreachable
+  proxy to make the check fail with no outbound traffic (the tray fails
+  silently; `kynoptic update --check` run by hand exits non-zero).
+  Synced across `README.md`, `README.zh-CN.md`, and `SECURITY.md`.
 
 - CLI (`db cleanup N --yes`): deleting expired raw events now also
   cascade-deletes the derived aggregate rows for the expired dates

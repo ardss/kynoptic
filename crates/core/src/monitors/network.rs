@@ -33,7 +33,13 @@ impl Monitor for NetworkMonitor {
         "network"
     }
     fn interval(&self) -> Duration {
-        Duration::from_secs(30)
+        if super::low_power_mode() {
+            // 低配模式（perf 发现）：放档 30s→90s（流量增量窗口按比例拉长，
+            // 计数口径不变，只是采样更疏）
+            Duration::from_secs(90)
+        } else {
+            Duration::from_secs(30)
+        }
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {

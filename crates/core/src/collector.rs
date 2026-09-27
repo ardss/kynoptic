@@ -21,9 +21,23 @@ static FUTURE_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 /// 数据库写失败累计（P0）：磁盘写满/写失败时旧实现只在 db 层 log（"降级逐条
 /// → 跳过"后无任何观测），而 DropWatchdog 只看 DROPPED_EVENTS（通道满载），
-/// 写失败完全静默。db/events.rs 的所有最终失败写路径（整批失败、单条降级
-/// 失败、提交失败）都累加此计数，由看门狗周期性读取并告警。
+/// 写失败完全静默。db 层的整批失败点（整批尝试/重试失败）各按「批」口径累加
+/// 一次，由看门狗周期性读取并告警。
+///
+/// 口径（2026-09 修复）：db 层降级逐条路径的**行级**失败数不再进此计数
+/// （一批 ~300 行全败会把「批」口径虚高 ~300 倍，看门狗 60s 汇总与
+/// collector-error.log 留档跟着失真）——行级数进独立的 [`WRITE_FAILED_ROWS`]。
 pub(crate) static WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// 降级逐条路径的失败**行**级计数（观测口径，独立于「批」口径的
+/// [`WRITE_FAILURES`]）：写失败日志洪水限流后（一批一条汇总日志），行级细节
+/// 由本计数器承接，看门狗汇总写失败时与批数并列展示。
+pub(crate) static WRITE_FAILED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// 记录降级路径的失败行数（db 层批末一次调用，非逐条累加）。
+pub(crate) fn note_failed_rows(n: u64) {
+    WRITE_FAILED_ROWS.fetch_add(n, Ordering::Relaxed);
+}
 
 /// 看门狗连续观察到写失败的周期数（>=3 升级 log::error）。
 static CONSECUTIVE_WRITE_FAILURE_PERIODS: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +56,47 @@ static LAST_FLUSH_EPOCH: AtomicU64 = AtomicU64::new(0);
 pub fn last_flush_epoch() -> u64 {
     LAST_FLUSH_EPOCH.load(Ordering::Relaxed)
 }
+
+// === 磁盘空间不足暂停写入（ENOSPC 主动防护，2026-09） ===
+//
+// 写路径此前零剩余空间检测：磁盘将满时硬撑到 ENOSPC 才进「整批保留重试 +
+// 通道丢弃」，stalled 判据 1800s 期间事件静默丢失（上界约 19 分钟）。现在
+// write_batch 每次落库前读库所在卷剩余空间（db::Database::db_free_space_bytes），
+// 低于 constants::DB_FREE_SPACE_PAUSE_BYTES 即主动暂停写入：本批保留待重试
+// （空间恢复后自动续写），期间新事件在通道填满后按既有背压计 CHANNEL_DROPPED，
+// 丢数窗口不再无信号地拖满 1800s。用户可见面：看门狗周期日志（本模块）+
+// 下方公开访问器（托盘/状态接口跨域消费，见 disk_write_paused 文档）。
+static DISK_LOW_SPACE: AtomicBool = AtomicBool::new(false);
+/// 暂停期间被跳过落库的事件累计（按批累加，仅观测）。
+static DISK_PAUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// 磁盘空间不足导致的写入暂停当前是否生效（托盘/状态接口可查询，用于黄标/
+/// 横幅展示；与 db 层启动期损坏旗标 DB_DEGRADED 相互独立）。
+pub fn disk_write_paused() -> bool {
+    DISK_LOW_SPACE.load(Ordering::Relaxed)
+}
+
+/// 暂停期间被跳过落库的事件累计数。
+pub fn disk_paused_events() -> u64 {
+    DISK_PAUSED_EVENTS.load(Ordering::Relaxed)
+}
+
+/// 采集线程优先级降至 BELOW_NORMAL（perf 发现：采集线程属后台工作，默认
+/// 优先级会与前台应用抢 CPU；Windows 前台提升机制下尤甚）。采集器各线程
+/// （writer/聚合/监控/维护/看门狗）启动即调用。仅 Windows 有效，其余平台
+/// 无-op。
+#[cfg(target_os = "windows")]
+fn set_thread_priority_below_normal() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_thread_priority_below_normal() {}
 
 pub(crate) fn send_event(tx: &crossbeam_channel::Sender<Event>, event: Event) -> bool {
     match tx.try_send(event) {
@@ -112,6 +167,7 @@ fn watchdog_tick(
     chan_dropped: u64,
     future_rejected: u64,
     write_failures: u64,
+    failed_rows: u64,
     consecutive_wf: &mut u64,
 ) -> u64 {
     // 审查 33-F4：两类丢弃分别告警，不再统一打成「通道已满」
@@ -126,8 +182,14 @@ fn watchdog_tick(
     }
     if write_failures > 0 {
         *consecutive_wf += 1;
+        // 「批」口径 + 行级数并列（行级数来自独立观测计数器，不混入批计数）
+        let rows_part = if failed_rows > 0 {
+            format!("，涉及 {failed_rows} 行")
+        } else {
+            String::new()
+        };
         let msg = format!(
-            "数据库写失败，过去 60 秒新增 {} 次（连续 {} 个周期）",
+            "数据库写失败，过去 60 秒新增 {} 批（连续 {} 个周期）{rows_part}",
             write_failures, *consecutive_wf
         );
         if *consecutive_wf >= 3 {
@@ -147,14 +209,23 @@ fn log_dropped_events_watchdog() {
     let chan_dropped = CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
     let future_rejected = FUTURE_REJECTED.swap(0, Ordering::Relaxed);
     let write_failures = WRITE_FAILURES.swap(0, Ordering::Relaxed);
+    let failed_rows = WRITE_FAILED_ROWS.swap(0, Ordering::Relaxed);
     let mut consecutive = CONSECUTIVE_WRITE_FAILURE_PERIODS.load(Ordering::Relaxed);
     watchdog_tick(
         chan_dropped,
         future_rejected,
         write_failures,
+        failed_rows,
         &mut consecutive,
     );
     CONSECUTIVE_WRITE_FAILURE_PERIODS.store(consecutive, Ordering::Relaxed);
+    // 磁盘空间不足暂停态周期提醒（ENOSPC 主动防护）：暂停期每 60s 一条日志
+    // 保证用户有持续信号；托盘侧经 disk_write_paused / disk_paused_events
+    // 消费（跨域接线见函数文档）。
+    if DISK_LOW_SPACE.load(Ordering::Relaxed) {
+        let skipped = DISK_PAUSED_EVENTS.load(Ordering::Relaxed);
+        log::warn!("磁盘空间不足，采集已暂停（累计 {skipped} 条事件未落库，请清理磁盘空间）");
+    }
 }
 
 /// flush 决策（纯函数，便于测试）。
@@ -216,6 +287,11 @@ pub struct CollectorSettings {
     /// 字段名 `vk_frequency_enabled`，经 `CollectorSettings` 传入
     /// `start_collection_with` / `start_collection_custom` 即生效。
     pub vk_frequency_enabled: bool,
+    /// 低配模式（默认关）：开启后轮询监控器间隔放档（如 window 200ms→1s，
+    /// 见各 monitor 的 interval()），并配合 BELOW_NORMAL 线程优先级降 CPU。
+    /// 数据口径不变，只降采样密度。开关在设置页「低配模式」（settings.json
+    /// 的 low_power），tray 每次启动采集器时透传本字段。
+    pub low_power: bool,
     /// 窗口/标签页标题脱敏开关（默认 false：标题原文落库，本地数据完整优先；
     /// 开启后采集侧把标题中 URL 的查询串剥掉，见 monitors::title_privacy）。
     ///
@@ -234,6 +310,7 @@ impl Default for CollectorSettings {
             write_flush_interval_secs: constants::WRITE_FLUSH_INTERVAL_SECS,
             vk_frequency_enabled: true,
             redact_titles: false,
+            low_power: false,
         }
     }
 }
@@ -278,11 +355,40 @@ fn reject_future_events(batch: &mut Vec<Event>) {
 ///    （CHANNEL_DROPPED，看门狗可见），batch 本身不无界增长，符合
 ///    「绝不丢已确认数据」与有界内存两条铁律；重试按指数退避（500ms 起,
 ///    上限 8s）避免对整批反复做事务尝试。
+///
+/// 磁盘空间预检（ENOSPC 主动防护）：落库前读库所在卷剩余空间，低于
+/// constants::DB_FREE_SPACE_PAUSE_BYTES 即暂停写入（返回 false、本批保留、
+/// 状态见 disk_write_paused / disk_paused_events，空间恢复后调用方下一轮
+/// 重试自动续写）——把「磁盘将满」从 ENOSPC 后的静默丢数变成有信号的
+/// 主动暂停。
 fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsize) -> bool {
     // 未来时间戳防线：先于 session 补盖与落库执行（见 reject_future_events）
     reject_future_events(batch);
     if batch.is_empty() {
         return true;
+    }
+    // 磁盘空间预检（ENOSPC 主动防护）：库所在卷剩余空间低于阈值即主动暂停
+    // 写入——不尝试落库（避免硬撑到 ENOSPC 后逐条降级刷屏/静默丢数），
+    // 返回 false 让调用方保留 batch 按指数退避重试，空间恢复后自动续写；
+    // 暂停期间通道填满后新事件走既有 CHANNEL_DROPPED 背压计数（有信号，非静默）。
+    if let Some(free) = db.db_free_space_bytes() {
+        let low = free < constants::DB_FREE_SPACE_PAUSE_BYTES;
+        let was_low = DISK_LOW_SPACE.swap(low, Ordering::Relaxed);
+        if low {
+            DISK_PAUSED_EVENTS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            if !was_low {
+                let msg = format!(
+                    "磁盘空间不足（库所在卷剩余 {free} 字节 < 阈值 {} 字节），采集已暂停，请清理磁盘空间",
+                    constants::DB_FREE_SPACE_PAUSE_BYTES
+                );
+                log::warn!("{msg}");
+                archive_write_failure(&msg);
+            }
+            return false;
+        }
+        if was_low {
+            log::info!("磁盘空间已恢复，采集续写");
+        }
     }
     // 审查 P0：Event::new 硬编码 session_id=None 且全链路无人回填，导致
     // events.session_id 全库为 NULL、sessions.total_events/ghost 清扫失效。
@@ -506,6 +612,7 @@ fn run_monitor(
     tx: crossbeam_channel::Sender<Event>,
     shutdown: Arc<AtomicBool>,
 ) {
+    set_thread_priority_below_normal();
     let name = m.name().to_string();
     let interval = m.interval();
 
@@ -616,6 +723,13 @@ impl Collector {
         for h in &self.hooks {
             h.stop();
         }
+        // 窗口监控器的事件通道（EVENT_SYSTEM_FOREGROUND 出上下文钩子）是
+        // 进程级常驻线程，首拍 collect 时惰性拉起。必须在本实例关停时
+        // 显式 stop：取走并 drop 静态 Sender 槽（否则通道永不 Disconnected，
+        // writer join 挂死——与 keyboard_hook 的 P0 口径一致）+ Post WM_QUIT。
+        // 放在 join 监控线程之前：监控线程退出后不再有生产者，顺序与
+        // hook stop 对称。
+        monitors::window::stop_event_channel();
 
         // 审查 33-F7：先 join 全部监控线程（旗标已置位，睡眠 1 秒切片 → join
         // 有界），再进聚合/writer 的关停链——保证排空 rx_tail 兜底时所有
@@ -768,6 +882,11 @@ pub fn start_collection_custom(
         .try_init()
         .ok();
 
+    // 低配模式注册（perf 发现）：monitor 线程的 interval() 在 spawn 后首拍
+    // 读取该全局开关，故必须在监控线程启动前设置（settings.low_power 由
+    // tray 从设置页透传）。
+    monitors::set_low_power_mode(settings.low_power);
+
     // 本实例独立的停机旗标（见 Collector.shutdown 字段文档）。
     let shutdown = Arc::new(AtomicBool::new(false));
     // 审查 33-F4：丢弃计数改 swap 取复位前余数（与下方 WRITE_FAILURES 同款）——
@@ -856,6 +975,7 @@ pub fn start_collection_custom(
     let writer_handle = match thread::Builder::new()
         .name("EventWriter".into())
         .spawn(move || {
+            set_thread_priority_below_normal();
             writer_loop(
                 rx,
                 db_w,
@@ -933,6 +1053,7 @@ pub fn start_collection_custom(
             match thread::Builder::new()
                 .name("InputAgg".into())
                 .spawn(move || {
+                    set_thread_priority_below_normal();
                     // panic 防护（审查 P2）：drain/flush panic 不允许终结聚合
                     // 线程——catch_unwind 包住单轮工作，Err 则延迟后重启循环。
                     loop {
@@ -1021,6 +1142,7 @@ pub fn start_collection_custom(
     let maint_handle = thread::Builder::new()
         .name("Maintenance".into())
         .spawn(move || {
+            set_thread_priority_below_normal();
             // 每 DAILY_AGG_REFRESH_SECS（600s = 10 分钟）刷新一次 daily_agg
             // 派生缓存（图表与实时卡片不能互相矛盾）；
             // 每 MAINTENANCE_INTERVAL_SECS 做一次全量维护（清理/回填等重活）。
@@ -1070,15 +1192,18 @@ pub fn start_collection_custom(
     let sd_watch = shutdown.clone();
     let watch_handle = thread::Builder::new()
         .name("DropWatchdog".into())
-        .spawn(move || loop {
-            // 睡眠 1 秒切片：shutdown join 本线程时最多 ~1 秒退出（审查 LOW）
-            for _ in 0..60 {
-                if sd_watch.load(Ordering::Acquire) {
-                    return;
+        .spawn(move || {
+            set_thread_priority_below_normal();
+            loop {
+                // 睡眠 1 秒切片：shutdown join 本线程时最多 ~1 秒退出（审查 LOW）
+                for _ in 0..60 {
+                    if sd_watch.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
                 }
-                thread::sleep(Duration::from_secs(1));
+                log_dropped_events_watchdog();
             }
-            log_dropped_events_watchdog();
         });
     if let Err(e) = watch_handle {
         spawn_fail_collector!(
@@ -1157,17 +1282,17 @@ mod tests {
     fn watchdog_escalates_after_three_consecutive_write_failure_periods() {
         let mut consecutive = 0u64;
         // 无失败：不推进
-        assert_eq!(watchdog_tick(0, 0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 0, 0, 0, &mut consecutive), 0);
         // 连续三个周期有写失败：1 → 2 → 3（第 3 周期起 error）
-        assert_eq!(watchdog_tick(0, 0, 5, &mut consecutive), 1);
-        assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 2);
-        assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 3);
-        assert_eq!(watchdog_tick(0, 0, 2, &mut consecutive), 4);
+        assert_eq!(watchdog_tick(0, 0, 5, 300, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(0, 0, 1, 0, &mut consecutive), 2);
+        assert_eq!(watchdog_tick(0, 0, 1, 0, &mut consecutive), 3);
+        assert_eq!(watchdog_tick(0, 0, 2, 0, &mut consecutive), 4);
         // 一个干净周期即清零
-        assert_eq!(watchdog_tick(7, 0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(7, 0, 0, 0, &mut consecutive), 0);
         // 通道丢弃/未来时间戳拒绝独立于写失败计数推进（33-F4 拆分口径）
-        assert_eq!(watchdog_tick(9, 3, 0, &mut consecutive), 0);
-        assert_eq!(watchdog_tick(0, 0, 1, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(9, 3, 0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 0, 1, 12, &mut consecutive), 1);
     }
 
     /// 回归：持久写失败（磁盘满/库锁）时 batch 必须有界、send 端背压必须生效。

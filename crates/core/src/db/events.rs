@@ -1,6 +1,9 @@
 //! `events` 表的写入与清理
 //!
-//! 批量插入带三级降级（整批事务 → 单条重试 → 单条独立事务），确保成功行不丢失。
+//! 批量插入带多级降级（整批事务 → 子批事务（50 条/事务）→ 单条独立事务），
+//! 确保成功行不丢失。子批化（WAL 写放大修复）：外部写者持锁竞争下整批失败
+//! 后，逐条降级原本把 300 条批拆成 ~300 个独立事务（WAL 增长实测 ~15-20x）；
+//! 每 50 条一个事务（~6 提交/批，实测 ~3x），子批内真正出现行级冲突才退回逐条。
 //!
 //! 聚合一致性（审查 P1）：[`Database::insert_events_with_agg`] 把 events 落库与
 //! agg_minute/agg_daily 增量维护包进**同一个事务**——旧实现两者是独立事务，
@@ -28,12 +31,19 @@ ON CONFLICT(timestamp, event_type) WHERE event_action = 'input_agg'
 DO UPDATE SET event_data = excluded.event_data
 ";
 
-/// 写失败计数（P0）：磁盘写满/写失败时旧实现只 log::warn（且"降级逐条→跳过"
-/// 后无任何聚合观测），告警看门狗只看通道满载计数，写失败完全静默。所有
-/// 最终失败的写路径（整批失败、单条降级失败、提交失败）都累加此计数，由
-/// collector 的 DropWatchdog 周期性读取并告警。
+/// 写失败计数（P0，「批」口径）：磁盘写满/写失败时旧实现只 log::warn（且"降级逐条→跳过"
+/// 后无任何聚合观测），告警看门狗只看通道满载计数，写失败完全静默。各整批失败点
+/// （整批尝试失败、重试失败）每批只累加一次；降级逐条路径的**行级**失败数不进此
+/// 计数（一批 ~300 行全败会让「批」口径虚高 ~300 倍，看门狗 60s 汇总与
+/// collector-error.log 留档跟着失真）——行级数由 collector::WRITE_FAILED_ROWS
+/// 独立观测（见 note_failed_rows），看门狗汇总时并列展示。
 fn note_write_failure(n: u64) {
     crate::collector::WRITE_FAILURES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 降级路径行级失败行计数（观测口径，独立于「批」口径的 WRITE_FAILURES，见上）。
+fn note_failed_rows(n: u64) {
+    crate::collector::note_failed_rows(n);
 }
 
 /// 降级逐条后判断"整批全败"（rowid 全 0 即无一成功落库），供整批兜底重试。
@@ -85,10 +95,10 @@ impl Database {
     /// 批量插入事件（只插 events，不做聚合维护）。
     ///
     /// 健壮性：单条失败不会让整批丢失——
-    /// 1. 第一次尝试：事务内逐条 INSERT
-    /// 2. 任意一条失败 → ROLLBACK 整个事务
-    /// 3. 重试一次（去掉失败行 + 可能不冲突的 schema 漂移）
-    /// 4. 仍失败则降级为逐条单独事务，确保成功行不丢
+    /// 1. 第一次尝试：事务内逐条 INSERT（整批一个事务）
+    /// 2. 失败 → 降级为子批提交（每 50 条一个独立事务，WAL 写放大小一个量级）
+    /// 3. 子批内出现行级冲突 → 该子批回滚后逐条独立事务重试（逐条语义不变：
+    ///    成功行 rowid 照常返回，失败行记 0）
     ///
     /// 返回与 `events` 一一对应的 rowid（写入失败的行记 0，供 agg 增量维护
     /// 的 max_event_rowid 幂等防护使用）。
@@ -136,9 +146,9 @@ impl Database {
                     Ok(rowids) => (rowids, false),
                     Err(e) => {
                         note_write_failure(1);
-                        log::error!("批量插入（含聚合维护）重试仍失败，降级为逐条: {e}");
+                        log::error!("批量插入（含聚合维护）重试仍失败，降级为子批提交: {e}");
                         let rowids = self.insert_events_with_agg_one_by_one(events);
-                        // 审查 P1：逐条也全败（busy 风暴未退，整批已 pop 出通道）
+                        // 审查 P1：降级路径也全败（busy 风暴未退，整批已 pop 出通道）
                         // → 最后再整批兜底重试一次，避免整块事件永久丢失。
                         // （纯 input_agg 批成功时 rowid 也全为 0，会多一次幂等
                         // UPSERT 重试，无害。）
@@ -147,7 +157,7 @@ impl Database {
                             match self.insert_events_with_agg_tx(events) {
                                 Ok(rowids2) => {
                                     log::info!(
-                                        "逐条降级全败后整批兜底重试成功（{} 条）",
+                                        "子批降级全败后整批兜底重试成功（{} 条）",
                                         events.len()
                                     );
                                     return (rowids2, false);
@@ -208,53 +218,63 @@ impl Database {
         Ok(rowids)
     }
 
-    /// 降级路径公共体：单条独立事务（可选附带聚合维护），失败计数并跳过。
+    /// 降级路径每个子批的事件数（WAL 写放大修复）：外部写者持写锁竞争时
+    /// （后台回填/欠聚合自愈的 BEGIN IMMEDIATE 分块事务），纯逐条降级会把
+    /// 300 条批拆成 ~300 个独立事务提交，WAL 增长实测 ~15-20x。子批 = 每 50
+    /// 条一个事务（300 条约 6 次提交，实测 ~3x 放大）；子批内**真正**出现行级
+    /// 冲突（单条 execute/commit 失败）才回滚退回逐条独立事务（子批回滚把已做
+    /// 的 agg 更新一并回滚，逐条重放时 max_event_rowid 守卫与 input_agg 的
+    /// MAX 覆盖语义保证不重复累计）。「rowid 与 events 一一对应、失败行 push
+    /// 0」契约不变。
+    const FALLBACK_CHUNK_SIZE: usize = 50;
+
+    /// 降级路径公共体：子批提交（每 [`FALLBACK_CHUNK_SIZE`] 条一个独立事务），
+    /// 子批级失败时退回逐条（可选附带聚合维护）。
     ///
     /// 契约：返回 Vec 与 `events` **一一对应**——失败的行 push 0（rowid 0 在
     /// agg 增量维护中被 max_event_rowid 守卫跳过，不会重复累计）。交叉审查
     /// P4 修复：此前 lock_writer / 事务创建失败的 continue 路径不 push，返回
     /// Vec 短于 events，违反 doc 契约（调用方按索引 zip 会错位）。
+    /// 限流：禁止逐条 warn 洪水与逐条 WRITE_FAILURES 累加（「批」口径虚高
+    /// ~300 倍）——批末一条汇总日志，行级计数进 collector::WRITE_FAILED_ROWS
+    /// 观测计数器（见 note_write_failure 文档）。
     fn insert_one_by_one_impl(&self, events: &[Event], with_agg: bool) -> Vec<i64> {
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
-        for e in events {
-            let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
-                note_write_failure(1);
-                rowids.push(0);
-                continue;
-            };
-            let Ok(tx) = conn.unchecked_transaction() else {
-                note_write_failure(1);
-                rowids.push(0);
-                continue;
-            };
-            // 降级路径 input_agg 行同样必须走 UPSERT（裸 INSERT 撞部分唯一
-            // 索引会静默丢行，且关停 flush 无自愈）
-            let result = (|| -> rusqlite::Result<i64> {
-                let rowid = execute_event(&tx, e)?;
-                if with_agg {
-                    super::agg::apply_event(&tx, e, rowid)?;
-                }
-                Ok(rowid)
-            })();
-            match result {
-                Ok(rowid) => {
-                    if let Err(c) = tx.commit() {
-                        log::warn!("单条提交失败: {c}");
-                        note_write_failure(1);
-                        rowids.push(0);
-                    } else {
-                        rowids.push(rowid);
+        let mut failed_rows = 0usize;
+        let mut first_error: Option<String> = None;
+
+        for chunk in events.chunks(Self::FALLBACK_CHUNK_SIZE) {
+            match self.write_chunk_tx(chunk, with_agg) {
+                Some(ids) => rowids.extend(ids),
+                // 子批级失败（写连接/事务创建失败，或行级冲突触发回滚）：退回
+                // 逐条重试（保持旧「每条独立取锁」语义），短暂锁竞争不会整
+                // 子批跳过。
+                None => {
+                    for e in chunk {
+                        let id = self.write_row_degraded(
+                            e,
+                            with_agg,
+                            &mut failed_rows,
+                            &mut first_error,
+                        );
+                        rowids.push(id);
                     }
-                }
-                Err(err) => {
-                    log::warn!("单条事件写入失败（已跳过）: {err}");
-                    note_write_failure(1);
-                    rowids.push(0);
                 }
             }
         }
-        // 降级逐条路径收尾：整批处理完（无论逐条成败）统一推进一次 events
-        // 水位，覆盖本批已提交行；写连接不可用时 with_writer 自动跳过。
+
+        // 批末限流（写失败计数口径）：一批一条汇总日志 + 一次行级观测计数。
+        if failed_rows > 0 {
+            note_failed_rows(failed_rows as u64);
+            log::warn!(
+                "{failed_rows}/{} 条单条写入失败（已跳过，记 0）: {}",
+                events.len(),
+                first_error.unwrap_or_default()
+            );
+        }
+
+        // 降级路径收尾：整批处理完（无论逐条成败）统一推进一次 events 水位，
+        // 覆盖本批已提交行；写连接不可用时 with_writer 自动跳过。
         self.with_writer(
             |conn| {
                 super::persist_events_watermark(conn);
@@ -262,6 +282,73 @@ impl Database {
             || (),
         );
         rowids
+    }
+
+    /// 子批事务：单事务写一个子批（with_agg 时聚合维护同事务，与整批路径
+    /// 同语义），全行成功才提交；任一行级冲突或提交失败即回滚返回 None
+    /// （事务随 tx 丢弃而回滚），由调用方把该子批退回逐条。
+    fn write_chunk_tx(&self, chunk: &[Event], with_agg: bool) -> Option<Vec<i64>> {
+        let conn = lock_writer(&self.writer, &self.db_path)?;
+        let tx = conn.unchecked_transaction().ok()?;
+        let mut ids = Vec::with_capacity(chunk.len());
+        for e in chunk {
+            let rowid = execute_event(&tx, e).ok()?;
+            if with_agg {
+                super::agg::apply_event(&tx, e, rowid).ok()?;
+            }
+            ids.push(rowid);
+        }
+        tx.commit().ok()?;
+        Some(ids)
+    }
+
+    /// 逐条降级写（子批级失败后的兜底，即旧逐条路径主体）：独立取锁 + 独立
+    /// 事务。失败记一行计数并返回 0（rowid 0 被 agg 维护的 max_event_rowid
+    /// 守卫跳过，不重复累计）；只保留首条错误供批末汇总日志——逐条日志/
+    /// 计数禁止（洪水 + 虚高，见 insert_one_by_one_impl 限流说明）。
+    fn write_row_degraded(
+        &self,
+        e: &Event,
+        with_agg: bool,
+        failed_rows: &mut usize,
+        first_error: &mut Option<String>,
+    ) -> i64 {
+        let mut record_fail = |err: String| {
+            *failed_rows += 1;
+            if first_error.is_none() {
+                *first_error = Some(err);
+            }
+        };
+        let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
+            record_fail("写连接不可用".to_string());
+            return 0;
+        };
+        let Ok(tx) = conn.unchecked_transaction() else {
+            record_fail("事务创建失败".to_string());
+            return 0;
+        };
+        // 降级路径 input_agg 行同样必须走 UPSERT（裸 INSERT 撞部分唯一
+        // 索引会静默丢行，且关停 flush 无自愈）
+        let result = (|| -> rusqlite::Result<i64> {
+            let rowid = execute_event(&tx, e)?;
+            if with_agg {
+                super::agg::apply_event(&tx, e, rowid)?;
+            }
+            Ok(rowid)
+        })();
+        match result {
+            Ok(rowid) => match tx.commit() {
+                Ok(()) => rowid,
+                Err(c) => {
+                    record_fail(format!("单条提交失败: {c}"));
+                    0
+                }
+            },
+            Err(err) => {
+                record_fail(format!("单条事件写入失败: {err}"));
+                0
+            }
+        }
     }
 
     fn insert_events_one_by_one(&self, events: &[Event]) -> Vec<i64> {
@@ -334,18 +421,25 @@ mod tests {
     use super::*;
     use crate::types::{EventAction, EventType};
 
+    /// 临时库目录（红线：测试不读真实时钟）：纯 pid+seq（AtomicUsize 计数），
+    /// 上次运行遗留同名目录（panic 跳过清理/删库时连接未关闭）则递增 seq 取空名。
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let dir = std::env::temp_dir().join(format!("kyn-{tag}-{}-{seq}", std::process::id()));
+            if !dir.exists() {
+                return dir;
+            }
+            seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// P0 注入测试：删除 events 表使一切写入必然失败（等效磁盘故障/只读），
     /// 断言 WRITE_FAILURES 计数增长且所有 rowid 落 0。
     #[test]
     fn write_failures_are_counted() {
-        let dir = std::env::temp_dir().join(format!(
-            "kyn-wf-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tmp_dir("wf");
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("wf.db");
         let db = Database::open(db_path.to_str().unwrap()).unwrap();
@@ -379,14 +473,7 @@ mod tests {
     /// （失败行 push 0），任何失败路径都不得使返回值短于输入。
     #[test]
     fn one_by_one_rowids_len_always_matches_events() {
-        let dir = std::env::temp_dir().join(format!(
-            "kyn-wflen-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tmp_dir("wflen");
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("wf.db");
         let db = Database::open(db_path.to_str().unwrap()).unwrap();
@@ -419,14 +506,7 @@ mod tests {
     /// rowid，write_batch 误判已落库、心跳照常推进。
     #[test]
     fn all_failed_flag_is_explicit_for_pure_input_agg_batch() {
-        let dir = std::env::temp_dir().join(format!(
-            "kyn-aggfail-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tmp_dir("aggfail");
         std::fs::create_dir_all(&dir).unwrap();
 
         // 对照组：正常写纯 input_agg 批 → all_failed=false（rowid 合法为 0）
@@ -460,14 +540,7 @@ mod tests {
     /// MAX 时水位原样重写。
     #[test]
     fn batch_write_persists_events_watermark() {
-        let dir = std::env::temp_dir().join(format!(
-            "kyn-wm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tmp_dir("wm");
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("wm.db");
         let db = Database::open(db_path.to_str().unwrap()).unwrap();
@@ -524,5 +597,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 子批降级 + 批/行口径分离回归（WAL 写放大修复，2026-09）：
+    /// 1) 正常库 300 条走子批提交（每 50 条一个事务），rowid 仍与输入 1:1；
+    /// 2) DROP TABLE 强制整批失败 → 降级路径：rowids 全 0（一一对应契约），
+    ///    WRITE_FAILURES 只按「批」口径增长（不再随 300 行虚高），行级失败
+    ///    数完整记入 WRITE_FAILED_ROWS 观测计数器。
+    #[test]
+    fn subbatch_degraded_keeps_rowid_contract_and_row_caliber() {
+        // 对照组：正常库 300 条子批路径 rowid 一一对应
+        let ok_dir = tmp_dir("subbatch");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        let ok_db = Database::open(ok_dir.join("ok.db").to_str().unwrap()).unwrap();
+        let events: Vec<Event> = (0..300)
+            .map(|_| Event::new(EventAction::Press, EventType::Keyboard))
+            .collect();
+        let rowids = ok_db.insert_events(&events);
+        assert_eq!(
+            rowids,
+            (1..=300i64).collect::<Vec<i64>>(),
+            "子批提交 rowid 必须一一对应且连续"
+        );
+        drop(ok_db);
+
+        // 故障组：DROP events 表 → 整批失败 → 子批降级全败
+        let bad_dir = tmp_dir("subbatch");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let bad_db = Database::open(bad_dir.join("bad.db").to_str().unwrap()).unwrap();
+        bad_db.with_writer(
+            |c| {
+                let _ = c.execute("DROP TABLE events", []);
+            },
+            || (),
+        );
+        let wf_before = crate::collector::WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        let rows_before =
+            crate::collector::WRITE_FAILED_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        let rowids = bad_db.insert_events(&events);
+        let wf =
+            crate::collector::WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed) - wf_before;
+        let rows = crate::collector::WRITE_FAILED_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+            - rows_before;
+        assert_eq!(rowids, vec![0i64; 300], "失败行必须 push 0 保持一一对应");
+        // 同进程其他写失败测试可能并发累加（只增不减）：本测试自身贡献
+        // rows=300 / wf=1，故下限 300、上限取「批」口径远小于行数即可证。
+        assert!(
+            rows >= 300,
+            "行级失败数必须记入观测计数器（本测试贡献 300 行，实测增量 {rows}）"
+        );
+        assert!(
+            wf < 50,
+            "WRITE_FAILURES 应保持「批」口径（增量 {wf}，不得随行数放大）"
+        );
+
+        let _ = std::fs::remove_dir_all(&ok_dir);
+        let _ = std::fs::remove_dir_all(&bad_dir);
     }
 }

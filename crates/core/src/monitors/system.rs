@@ -23,7 +23,12 @@ impl Monitor for SystemMonitor {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(10)
+        // 低配模式（perf 发现）：轮询放档 10s→30s，数据口径不变
+        if super::low_power_mode() {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(10)
+        }
     }
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
