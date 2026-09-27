@@ -144,6 +144,57 @@ fn timeline_hours_clamped_and_range_excludes_old_events() {
     assert!(v["local_offset_note"].as_str().unwrap().contains("DST"));
 }
 
+// 展示层归一（发现 dashdocs）：宿主进程在时间线 Top 榜映射为友好标签，
+// 不再以裸进程名（applicationframehost.exe）原样进榜；.exe 剔除 + 别名同理。
+#[test]
+fn timeline_maps_host_and_alias_apps_to_friendly_names() {
+    let conn = mem_conn();
+    let t = local_ts(0, 10, 0);
+    for _ in 0..6 {
+        insert(
+            &conn,
+            &t,
+            "window",
+            "switch",
+            Some("applicationframehost.exe"),
+        );
+    }
+    insert(&conn, &t, "window", "switch", Some("msedge.exe"));
+    insert(&conn, &t, "window", "switch", Some("notepad.exe"));
+    let now = chrono::DateTime::parse_from_rfc3339(&local_ts(0, 12, 0))
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let v = api_timeline_at(&conn, 12, now, 2).unwrap();
+    let buckets = v["buckets"].as_array().unwrap();
+    let b10 = buckets
+        .iter()
+        .find(|b| b["hour"].as_str().unwrap().ends_with("T10"))
+        .unwrap();
+    let apps = b10["apps"].as_array().unwrap();
+    let by_name: std::collections::HashMap<&str, i64> = apps
+        .iter()
+        .filter_map(|x| {
+            let n = x["app"].as_str()?;
+            Some((n, x["events"].as_i64().unwrap_or(0)))
+        })
+        .collect();
+    // 宿主 → "UWP"（6 事件），msedge → "Microsoft Edge"，notepad → "Notepad"；
+    // 裸进程名不得原样出现
+    assert_eq!(
+        by_name.get("UWP").copied(),
+        Some(6),
+        "宿主应映射为 UWP: {apps:?}"
+    );
+    assert_eq!(by_name.get("Microsoft Edge").copied(), Some(1));
+    assert_eq!(by_name.get("Notepad").copied(), Some(1));
+    assert!(!apps
+        .iter()
+        .any(|x| x["app"].as_str() == Some("applicationframehost.exe")));
+    assert!(!apps
+        .iter()
+        .any(|x| x["app"].as_str() == Some("applicationframehost")));
+}
+
 // === anomalies（与 MCP 同入口；marathon 桥接阈值读 settings） ===
 
 #[test]
@@ -1871,11 +1922,36 @@ fn try_load_clamps_categories_and_precompiles_tokens() {
             "预编译 token 必须已小写"
         );
     }
-    // 匹配语义不变：小写 token 子串命中
+    // 匹配语义（大小写不敏感 + ASCII 整词/词边界）：小写 token 在词边界命中
     let r = settings::CategoryRule::rule("x", "GitHub CODE");
-    assert!(r.matches("github.com", "Pull Requests"));
+    assert!(r.matches("github.com", "Pull Requests")); // "github" 整词（.com 前是词界）
     assert!(!r.matches("gitee.com", "Pull Requests"));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 整词匹配收紧（发现 dashdocs）：ASCII token 不再子串误命中——
+/// "edge" 不命中 "ledges"、"qq" 不命中 "qquick"；而真实进程基名/标题词仍整词命中，
+/// CJK token 保持子串语义。
+#[test]
+fn category_ascii_tokens_match_word_boundaries_only() {
+    let browse = settings::CategoryRule::rule("浏览", "edge chrome msedge");
+    // 真实 Edge 进程（msedge.exe）与独立 "edge" 仍整词命中
+    assert!(browse.matches("msedge.exe", ""));
+    assert!(browse.matches("edge", "New Tab"));
+    // "ledges"（notepad 标题）里的 "edge" 不得误命中「浏览」
+    assert!(!browse.matches("notepad.exe", "Ledgers - open"));
+    let comm = settings::CategoryRule::rule("通讯", "qq wechat");
+    // QQ 独立整词命中；"qquick" 里的 "qq" 不得误命中「通讯」
+    assert!(comm.matches("qq.exe", ""));
+    assert!(!comm.matches("obs64.exe", "Recording - QQuick Scene"));
+    // "code" 整词命中开发；"code" 嵌在 "encode" 里不命中
+    let dev = settings::CategoryRule::rule("开发", "code");
+    assert!(dev.matches("code.exe", "main.rs"));
+    assert!(!dev.matches("ffmpeg", "encode video"));
+    // CJK token 保持子串语义（中文无词边界）
+    let cjk = settings::CategoryRule::rule("聊天", "微信");
+    assert!(cjk.matches("wechat.exe", "微信 - 张三"));
+    assert!(cjk.matches("anything", "正在使用微信"));
 }
 
 /// 发现 ①-3：读端点 DB 级失败统一 400（不再 200 + 静默空数据）。
