@@ -60,8 +60,9 @@ use settings::AppSettings;
 /// 自动用新设置重启采集器（保存即生效，无需手动重启）。
 pub static SETTINGS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// timeline 60s TTL 缓存开关：仅常驻 serve 路径开启（tests.rs 直调
-/// route_req / api_timeline_at 的用例不受缓存串台影响）。
+/// 60s TTL 缓存开关（timeline，发现 ① 起含 report / anomalies）：
+/// 仅常驻 serve 路径开启（tests.rs 直调 route_req / api_*_at 的用例
+/// 不受缓存串台影响）。
 static TIMELINE_CACHE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -521,20 +522,41 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
     let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
     let days = days.clamp(1, 30) as usize;
     let mut out: Vec<Value> = Vec::new();
-    // 基线数据量（近 7 个本地日里有事件的天数）：空结果 ≠ "已检查、一切正常"
-    // ——装机头几天基线一条都没有，检测根本无从发生。前端据此区分"基线积累中"
-    // 与真正的"未检测到异常"。
-    let baseline_days: i64 = queries::local_day_range(&queries::date_offset_str(-6))
-        .map(|(start, _)| {
-            conn.query_row(
-                "SELECT COUNT(DISTINCT substr(datetime(timestamp, 'localtime'), 1, 10)) \
-                 FROM events WHERE timestamp >= ?1",
-                params![&start],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-        })
-        .unwrap_or(0);
+    // 基线数据量（近 7 个本地日里有使用记录的天数）：空结果 ≠ "已检查、
+    // 一切正常"——装机头几天基线一条都没有，检测根本无从发生。前端据此
+    // 区分"基线积累中"与真正的"未检测到异常"。
+    // 数据源（发现 ②）：改读 daily_agg 派生缓存——旧式对近 7 天 events 全窗
+    // COUNT DISTINCT 逐行套函数（520k 行 118ms，成本中心），daily_agg 同义
+    // 计数 0.02ms 级。口径差（前端 baselineAccruing 文案已标注）：
+    // ① daily_agg 只保留有键鼠输入的天（零输入日不产行，见
+    //    daily_agg::recompute_day 幽灵零行守卫），纯滚轮日不再计入；
+    // ② 上界封顶本地今天（旧式无上界，时钟拨快残留的未来事件会计入）；
+    // ③ 当日行由维护线程刷新（24h 节奏），装机头一天可能晚一天计入。
+    // 缺表兜底（回归复审）：daily_agg 表从未建过（旧库未跑到该建表迁移，
+    // CLI 读路径不自动迁移、无补迁移入口）时查询失败——旧实现的
+    // .unwrap_or(0) 静默落 0，前端 baselineAccruing 门禁（bd < 3）会把这类
+    // 「有数年事件、但缺派生表」的库永远卡在「基线积累中（0 天）」、
+    // 挡住「未检测到异常」空态。失败时回落旧式口径（events 近 7 个本地日
+    // COUNT DISTINCT，与 HEAD 同一 SQL），只兜「表缺失/查询失败」，
+    // 表存在时仍走 daily_agg 快路径。
+    let baseline_days: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM daily_agg WHERE date >= ?1 AND date <= ?2",
+        params![&queries::date_offset_str(-6), &queries::today_local_str()],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(n) => n,
+        Err(_) => queries::local_day_range(&queries::date_offset_str(-6))
+            .map(|(start, _)| {
+                conn.query_row(
+                    "SELECT COUNT(DISTINCT substr(datetime(timestamp, 'localtime'), 1, 10)) \
+                     FROM events WHERE timestamp >= ?1",
+                    params![&start],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+            })
+            .unwrap_or(0),
+    };
     // 长跨度性能：逐日循环改为一次整窗调用（core detect_all_days_with_bridge，
     // marathon 的人在场分钟整窗取数一次），逐日结果与旧循环完全一致。
     let dates: Vec<String> = (0..days)
@@ -2038,6 +2060,19 @@ pub fn api_report_at(
     // 口径修复（发现 ①-7）：旧实现截 UTC 日期前缀，UTC+8 下每日本地 0-8 点
     // 事件归 UTC 前一日，日历多放开一天空白日；与全站"某天=本地自然日"契约
     // 对齐（queries::today_local_str 同一口径）。
+    // Wave45 曾改为「字符串 MIN(timestamp) 后再换算单值」的性能写法，回归
+    // 复审发现两处口径退化，回落到逐行口径：
+    // 1. 本产品旧库存在混合时间戳编码（Z/±HH:MM/无时区，DB_USAGE 与
+    //    旧库数据均如此）——混合编码下字典序最小 ≠ 时间最早，字符串 MIN
+    //    取到的值换算出的本地日偏晚，前端空态提示会把有数据的最早 1~N 天
+    //    误判为「无数据」；逐行口径（先 datetime 换算再取 MIN）对编码
+    //    不敏感，恒等于「最早可解析事件的本地日」。
+    // 2. 库内存在使 datetime() 返回 NULL 的坏值（空串/乱码形；注意越界
+    //    日期如 '2024-02-30' 会被 SQLite 宽容解释而非 NULL）且其字符串
+    //    序最前时，单值换算得到 NULL、data_since 整体缺失；逐行口径跳过
+    //    坏行，仍给出最早可解析的本地日。
+    // 性能代价（全表逐行套函数）由本轮 report 页 60s TTL 缓存摊薄；
+    // 旧库时间戳归一后编码统一，可再重新评估快路径。
     let data_since: Option<String> = conn
         .query_row(
             "SELECT MIN(substr(datetime(timestamp, 'localtime'), 1, 10)) FROM events",
@@ -2756,6 +2791,45 @@ pub fn route_req(
                 Ok(None) => 7,
                 Ok(Some(d)) => d,
             };
+            // 60s TTL 缓存（发现 ②）：异常页每次进页全窗重算且前端零反馈
+            // （p95/p99 超 500ms）；对照 timeline 同模式补缓存。键 = db +
+            // 原始 query（含 days）+ 设置纪元（marathon 桥接阈值读
+            // settings），保存设置后立即失效。api_anomalies 恒返回 Value
+            // （无 Result），缓存块内算完标注即入库；仅常驻 serve 路径
+            // 开启（tests.rs 直调不受影响）。
+            if TIMELINE_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                use std::sync::Mutex;
+                use std::time::{Duration, Instant};
+                type AnomaliesCache = Option<(Instant, std::path::PathBuf, String, u64, Value)>;
+                static CACHE: Mutex<AnomaliesCache> = Mutex::new(None);
+                const TTL: Duration = Duration::from_secs(60);
+                let db_key = db_path.to_path_buf();
+                let query_key = query.to_string();
+                let epoch = SETTINGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+                if let Ok(g) = CACHE.lock() {
+                    if let Some((at, p, q, e, v)) = g.as_ref() {
+                        if *p == db_key
+                            && *q == query_key
+                            && *e == epoch
+                            && at.elapsed() < TTL
+                        {
+                            return (200, "application/json", v.to_string());
+                        }
+                    }
+                }
+                let mut v = api_anomalies(conn, days, db_path);
+                if days > 30 {
+                    if let Some(obj) = v.as_object_mut() {
+                        cap_note(obj, "days", days, 30);
+                        obj.insert("truncated".into(), json!(true));
+                    }
+                }
+                add_ignored(&mut v, ignored_params(&["days"]));
+                if let Ok(mut g) = CACHE.lock() {
+                    *g = Some((Instant::now(), db_key, query_key, epoch, v.clone()));
+                }
+                return (200, "application/json", v.to_string());
+            }
             let mut v = api_anomalies(conn, days, db_path);
             if days > 30 {
                 if let Some(obj) = v.as_object_mut() {
@@ -2904,6 +2978,41 @@ pub fn route_req(
             };
             if let Err(e) = reject_future_date(&date) {
                 return (400, "application/json", err_json(&e));
+            }
+            // 60s TTL 缓存（发现 ①）：report 页此前每次访问都逐日重扫、无
+            // 缓存（对照 timeline/insights 首慢后快），随库龄线性恶化。键 =
+            // db + 原始 query（含 date 与 ignored 参数）+ 设置纪元：report 的
+            // 分类/专注块依赖 settings（categories/bridge），SETTINGS_EPOCH
+            // 入键使保存设置后立即失效。纯函数 api_report_at（tests.rs 直调）
+            // 不受缓存影响（缓存仅常驻 serve 路径开启，同 timeline）。
+            if TIMELINE_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                use std::sync::Mutex;
+                use std::time::{Duration, Instant};
+                type ReportCache = Option<(Instant, std::path::PathBuf, String, u64, Value)>;
+                static CACHE: Mutex<ReportCache> = Mutex::new(None);
+                const TTL: Duration = Duration::from_secs(60);
+                let db_key = db_path.to_path_buf();
+                let query_key = query.to_string();
+                let epoch = SETTINGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+                if let Ok(g) = CACHE.lock() {
+                    if let Some((at, p, q, e, v)) = g.as_ref() {
+                        if *p == db_key
+                            && *q == query_key
+                            && *e == epoch
+                            && at.elapsed() < TTL
+                        {
+                            return (200, "application/json", v.to_string());
+                        }
+                    }
+                }
+                if let Ok(mut v) = api_report_at(conn, &date, &settings::load(db_path)) {
+                    add_ignored(&mut v, ignored_params(&["date"]));
+                    if let Ok(mut g) = CACHE.lock() {
+                        *g = Some((Instant::now(), db_key, query_key, epoch, v.clone()));
+                    }
+                    return (200, "application/json", v.to_string());
+                }
+                // 计算失败仍走下方正常路径回 400
             }
             let s = settings::load(db_path);
             match api_report_at(conn, &date, &s) {

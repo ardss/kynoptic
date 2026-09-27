@@ -641,11 +641,11 @@ const T = {
         actualPort: "actually listening on port {n}",
         portFallback: "configured port {c} was busy — auto-fallback",
         autostartSyncFail: "saved, but autostart sync failed — the Windows registry was not updated (see tray.log)",
-        baselineAccruing: "baseline still accruing: anomaly detection compares against your last 7 days of history — for the first days after install nothing can be judged here yet ({n} day(s) collected).",
+        baselineAccruing: "baseline still accruing: anomaly detection compares you against your own last 7 days — it needs a few days of history before it can judge here (days with usage in the last 7 days: {n}).",
         watchdogAlert: "system alert (watchdog): {m} (within the last 24h)",
         savedBtn: "✓ saved",
         weekInsufficient: "not enough data for a 7-day comparison ({n} day(s) collected)",
-        retry: "retry", loadFailed: "load failed: ",
+        retry: "retry", loadFailed: "load failed: ", loading: "loading…",
         hostFailed: "hardware info failed to load.",
         colApp: "app", colEvents: "events (window switches, not duration)",
         goalOff: "off (no goal set)", dbDirHint: "data: ",
@@ -670,11 +670,11 @@ const T = {
         actualPort: "实际监听端口：{n}",
         portFallback: "配置端口 {c} 被占用，已自动回退",
         autostartSyncFail: "已保存，但开机自启同步失败——注册表未更新（详见 tray.log）",
-        baselineAccruing: "基线积累中：异常检测需要你近 7 天同时段的历史数据，装好后几天内这里暂无法判断（已积累 {n} 天）。",
+        baselineAccruing: "基线积累中：异常检测和你自己近 7 天的数据做对比，攒够几天数据才能判断（近 7 天里有使用记录的天数：{n}）。",
         watchdogAlert: "系统告警（看门狗）：{m}（近 24 小时内）",
         savedBtn: "✓ 已保存",
         weekInsufficient: "数据不足 7 天（已积累 {n} 天）",
-        retry: "重试", loadFailed: "加载失败：",
+        retry: "重试", loadFailed: "加载失败：", loading: "加载中…",
         hostFailed: "硬件信息加载失败。",
         colApp: "应用", colEvents: "按窗口切换事件数（非时长）",
         goalOff: "关闭（未设目标）", dbDirHint: "数据：",
@@ -1045,10 +1045,14 @@ async function loadOverview() {
   if (on) on.textContent = o.metrics_note || o.note || "";
 }
 /* ─── 洞察页：从原始数据挖掘出的叙事式发现 ─── */
+let INS_SEQ = 0;
 async function loadInsights() {
-  const d = await jget("/api/insights");
+  const seq = ++INS_SEQ;
   const zh = document.documentElement.lang === "zh";
   const el = document.getElementById("insights-list");
+  el.innerHTML = '<div class="muted" style="font-size:12px">' + t("loading") + "</div>";
+  const d = await jget("/api/insights");
+  if (seq !== INS_SEQ) return; // 同 loadReport：乱序防护（连点页签旧响应不覆盖新数据）
   if (!d.insights || !d.insights.length) {
     // 真实门槛（后端 gate 字段）：7 天窗口内输入事件满 50 条才生成洞察；
     // 旧后端无 gate 字段时退回平实静态文案
@@ -1181,6 +1185,7 @@ function setHeatmapRange(weeks) {
     // radio 惯例：Tab 只进组一次，组内方向键移动（keydown 见文件末尾委托区）
     b.tabIndex = on ? 0 : -1;
   });
+  syncUrl(); // 发现 ⑤：热力周范围同步进 URL（F5/关闭重开恢复）
   loadHeatmap().catch(() => {});
 }
 let HM_SEQ = 0;
@@ -1434,7 +1439,9 @@ function syncDayBtns() {
 function pickDay(n) {
   document.getElementById("report-date").value = dayOffset(n);
   syncDayBtns();
-  loadReport();
+  syncUrl();
+  // 发现 ④：固定过去日虽不 400，但服务失联时同型吞错——统一挂错误挂点
+  loadReport().catch(e => showViewError("report", e.message));
 }
 let REPORT_SEQ = 0;
 async function loadReport() {
@@ -1841,9 +1848,15 @@ async function loadInput() {
     : '<span class="muted">' + t("noData") + "</span>";
 }
 /* ─── Anomalies ─── */
+let ANOM_SEQ = 0;
 async function loadAnomalies() {
-  const a = await jget("/api/anomalies?days=7");
+  const seq = ++ANOM_SEQ;
   const el = document.getElementById("anomalies");
+  // 载入指示（发现 ②）：进页全窗重算此前零反馈，列表先显示"加载中"，
+  // 不再停留在旧数据上被误读为页签假死
+  el.innerHTML = '<li class="muted">' + t("loading") + "</li>";
+  const a = await jget("/api/anomalies?days=7");
+  if (seq !== ANOM_SEQ) return; // 同 loadReport：乱序防护（连点页签旧响应不覆盖新数据）
   // 页签角标：/api/status 不含异常计数，这里用现有 /api/anomalies 载荷统计
   // alert 级条数（红 chip）；为零时隐藏。仅在异常页载入/刷新时更新。
   const badge = document.getElementById("anom-badge");
@@ -2214,7 +2227,36 @@ function toggleOps(ev) {
     c.style.transform = willShow ? "rotate(90deg)" : "";
   });
 }
-function showView(name) {
+/* 筛选态 URL 化（发现 ⑤）：活动页签/两日期框/热力周范围写进查询串
+   (?view=&rd=&ad=&hm=)——F5/关闭重开按 URL 恢复，页签切换 push 历史条目
+   （返回/前进在页内逐步），筛选变化只 replace（不加条目）。URL 无参数
+   = 原默认行为，完全向后兼容。 */
+function buildViewUrl() {
+  const rd = document.getElementById("report-date").value || "";
+  const ad = document.getElementById("apps-date").value || "";
+  const q = new URLSearchParams();
+  if (currentView !== "overview") q.set("view", currentView);
+  if (rd && rd !== TODAY_STR) q.set("rd", rd);
+  if (ad && ad !== TODAY_STR) q.set("ad", ad);
+  if (HM_WEEKS !== 12) q.set("hm", String(HM_WEEKS));
+  const qs = q.toString();
+  return location.pathname + (qs ? "?" + qs : "");
+}
+function syncUrl() { history.replaceState(null, "", buildViewUrl()); }
+function parseUrlState() {
+  const q = new URLSearchParams(location.search);
+  const dOk = v => /^\d{4}-\d{2}-\d{2}$/.test(v || "") && v <= TODAY_STR;
+  const hm = +q.get("hm") || 0;
+  return {
+    view: ["overview", "report", "apps", "input", "insights", "anomalies", "settings"]
+      .includes(q.get("view")) ? q.get("view") : "overview",
+    rd: dOk(q.get("rd")) ? q.get("rd") : "",
+    ad: dOk(q.get("ad")) ? q.get("ad") : "",
+    hm: [12, 26, 52].includes(hm) ? hm : 0,
+  };
+}
+function showView(name, fromHistory) {
+  const prev = currentView;
   currentView = name;
   // 防御：任何 view/tab 元素缺失都不能让异常逃出 showView——否则会落在
   // refreshView 之前，页签能显示但 loader 永不触发、也无控制台报错可查
@@ -2230,6 +2272,10 @@ function showView(name) {
     tab.tabIndex = v === name ? 0 : -1;
   }
   clearViewError(name);
+  // 筛选态 URL（发现 ⑤）：用户切页签且视图变化 → push（前进/返回可逐步）；
+  // 重进同页签或历史恢复（fromHistory）→ 只 replace 同步 URL，不加条目
+  if (name !== prev && !fromHistory) history.pushState(null, "", buildViewUrl());
+  else history.replaceState(null, "", buildViewUrl());
   // 审查 P2：重进 settings 页（含点当前已激活页签）不再无条件重拉——
   // loadSettings 会用服务端状态重建全部控件，未保存的修改会被静默清掉
   //（与轮询豁免的保护意图一致）。
@@ -2252,7 +2298,6 @@ const savedLang = localStorage.getItem("kyn-lang") ||
   ((navigator.language || "en").startsWith("zh") ? "zh" : "en");
 document.querySelectorAll("#hm-range .hm-tab").forEach(b =>
   b.addEventListener("click", () => setHeatmapRange(+b.dataset.weeks)));
-setHeatmapRange(HM_WEEKS);
 applyLang(savedLang);
 // 日期框初始化为今天（显示具体日期，而不是 yyyy/mm/日 占位符）
 function todayStr() {
@@ -2260,12 +2305,35 @@ function todayStr() {
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
 }
 const TODAY_STR = todayStr(); // 仅作输入框初值；按钮点击现算（跨午夜选昨天修复）
+// 筛选态恢复（发现 ⑤）：URL 查询串 ?view=&rd=&ad=&hm=，F5/关闭重开恢复；
+// 非法值/未来日期/未知页签一律回退原默认（日期框 max 同时封顶今天——
+// 发现 ④ 从源头禁选未来，服务端 400 保留兜底）
+const REST = parseUrlState();
 for (const id of ["report-date", "apps-date"]) {
   const el = document.getElementById(id);
   if (el && !el.value) el.value = TODAY_STR;
+  el.max = TODAY_STR;
 }
+if (REST.rd) document.getElementById("report-date").value = REST.rd;
+if (REST.ad) document.getElementById("apps-date").value = REST.ad;
+setHeatmapRange(REST.hm || 12); // 替换原 setHeatmapRange(HM_WEEKS)（默认值即 12）
 syncDayBtns(); // 初始高亮"今天"，与所选日期一致
-refreshAll().catch(e => showViewError(currentView, e.message));
+if (REST.view !== "overview") {
+  // 恢复到非默认页签：走 showView（含数据加载与错误挂点），不加历史条目
+  showView(REST.view, true);
+} else {
+  refreshAll().catch(e => showViewError(currentView, e.message));
+}
+// 页内返回/前进（发现 ⑤）：历史条目变化时按 URL 恢复状态，不加条目
+window.addEventListener("popstate", function () {
+  const st = parseUrlState();
+  if (st.rd) document.getElementById("report-date").value = st.rd;
+  if (st.ad) document.getElementById("apps-date").value = st.ad;
+  const hm2 = st.hm || 12;
+  if (hm2 !== HM_WEEKS) setHeatmapRange(hm2);
+  syncDayBtns();
+  showView(st.view, true);
+});
 // 30s 轮询：document.hidden 或当前视图非 overview 时跳过重渲染（只更新状态行），
 // 避免全量重渲染摧毁悬停状态、并在后台标签页浪费请求。
 // 设置页不参与轮询：轮询重渲染会用服务器状态覆盖未保存的勾选。
@@ -2343,15 +2411,18 @@ function markDisconnected() {
   on("ops-toggle", "click", e => toggleOps(e));
   on("ops-h2", "click", () => toggleOps());
   on("report-date", "click", pick);
-  on("report-date", "change", () => { syncDayBtns(); loadReport(); });
+  // 发现 ④：四个筛选入口此前未挂 .catch（showView 路径有），服务端 400/
+  // 失联时 Promise 未处理 rejection、视图零提示、图表停在旧日期数据
+  on("report-date", "change", () => { syncDayBtns(); syncUrl(); loadReport().catch(e => showViewError("report", e.message)); });
   on("day-btn-0", "click", () => pickDay(0));
   on("day-btn-1", "click", () => pickDay(1));
   on("day-btn-2", "click", () => pickDay(2));
   on("apps-date", "click", pick);
-  on("apps-date", "change", () => loadApps());
+  on("apps-date", "change", () => { syncUrl(); loadApps().catch(e => showViewError("apps", e.message)); });
   on("apps-today", "click", () => {
     document.getElementById("apps-date").value = todayStr();
-    loadApps();
+    syncUrl();
+    loadApps().catch(e => showViewError("apps", e.message));
   });
   on("preset-essential", "click", () => applyPreset("essential"));
   on("preset-full", "click", () => applyPreset("full"));
