@@ -230,7 +230,7 @@ impl TrayCtx {
             // Error 态区分来源：采集器故障 > 数据库降级 > 采集停滞 > 看门狗
             // 保护未生效 > 面板故障（审查：stalled/降级此前只喂给看门狗/面板
             // 横幅，托盘永远绿色"采集中"，与面板"停滞"及看门狗强杀互相矛盾；
-            // 看门狗任务异常的模态框只弹一次，此 tooltip 持续承载该状态）
+            // 看门狗任务异常已减法掉模态框，此 tooltip 持续承载该状态）
             TrayState::Error => {
                 if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
                     "Kynoptic: collector error / 采集异常"
