@@ -556,17 +556,15 @@ fn main() {
                         return CheckOutcome::Failed;
                     };
                     let exe = exe_dir.join("kynoptic.exe");
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                     // Wave17 审查 P1：必须带超时。self_update/rustls 无内置
                     // 超时，网络半开（VPN 挂起等）会让 .output() 永久阻塞，
                     // 之后 24h 周期检查全部失效。
-                    let Ok(mut child) = std::process::Command::new(exe)
-                        .args(["update", "--check"])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .spawn()
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.args(["update", "--check"]);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::null());
+                    kynoptic_core::spawn::no_window(&mut cmd);
+                    let Ok(mut child) = cmd.spawn()
                     else {
                         return CheckOutcome::Failed;
                     };
@@ -1194,14 +1192,11 @@ fn apply_autostart(enable: bool) {
     // 审查修复：schtasks 退出码此前被 `let _` 吞掉——任务被组策略禁用/
     // 删除时开关静默失效且零日志。失败必须留痕（log 落 tray.log）。
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let flag = if enable { "/ENABLE" } else { "/DISABLE" };
-        match std::process::Command::new("schtasks")
-            .args(["/Change", "/TN", &task_name, flag])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
+        let mut cmd = std::process::Command::new("schtasks");
+        cmd.args(["/Change", "/TN", &task_name, flag]);
+        kynoptic_core::spawn::no_window(&mut cmd);
+        match cmd.output() {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1318,19 +1313,16 @@ fn xml_task_disabled(xml: &str) -> bool {
 /// 的"已启用/Enabled"文本随 locale 变，不可靠）；任务不存在时 schtasks
 /// 退出码 1。不解析 /FO LIST 的本地化文本。
 fn query_watchdog_task_health() -> WatchdogTaskHealth {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // 按本安装目录的指纹名查询（与安装器同算法，见 kynoptic_core::naming；
     // Wave40 挂账：旧全局名 "Kynoptic Watchdog" 只在取不到 exe 路径时兜底）
     let task_name = match kynoptic_core::naming::install_dir() {
         Some(d) => kynoptic_core::naming::watchdog_task_name(&d),
         None => kynoptic_core::naming::legacy_watchdog_task_name(),
     };
-    let out = match std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", &task_name, "/XML"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
+    let mut cmd = std::process::Command::new("schtasks");
+    cmd.args(["/Query", "/TN", &task_name, "/XML"]);
+    kynoptic_core::spawn::no_window(&mut cmd);
+    let out = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
             log::warn!("看门狗计划任务自检: schtasks 执行失败: {e}");
@@ -1367,19 +1359,16 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
 /// 安装目录时，按其状态返回健康态；否则 None（调用方继续走 Unavailable
 /// 告警）。只查询，不改任务。
 fn legacy_task_health_if_ours(missing_task_name: &str) -> Option<WatchdogTaskHealth> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe().ok()?;
-    let out = std::process::Command::new("schtasks")
-        .args([
-            "/Query",
-            "/TN",
-            kynoptic_core::naming::legacy_watchdog_task_name().as_str(),
-            "/XML",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("schtasks");
+    cmd.args([
+        "/Query",
+        "/TN",
+        kynoptic_core::naming::legacy_watchdog_task_name().as_str(),
+        "/XML",
+    ]);
+    kynoptic_core::spawn::no_window(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }

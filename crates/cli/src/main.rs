@@ -3002,14 +3002,12 @@ fn heartbeat_pid(txt: &str) -> Option<u32> {
 /// pid 就杀什么进程）。
 #[cfg(target_os = "windows")]
 fn pid_is_tray(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    cmd.stdin(Stdio::null());
+    kynoptic_core::spawn::no_window(&mut cmd);
+    cmd.output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .to_lowercase()
@@ -3030,9 +3028,7 @@ fn pid_is_tray(pid: u32) -> bool {
 /// 满足都返回 false（watchdog 留痕"kill 失败"，下一轮重试）。
 #[cfg(target_os = "windows")]
 fn kill_tray() -> bool {
-    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // 心跳与本 watchdog 同目录，属于"我们管理的那个托盘"
     let Ok(txt) = std::fs::read_to_string(
         std::env::current_exe()
@@ -3049,15 +3045,13 @@ fn kill_tray() -> bool {
     if !pid_is_tray(pid) {
         return false;
     }
-    Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string(), "/T"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/F", "/PID", &pid.to_string(), "/T"]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    kynoptic_core::spawn::no_window(&mut cmd);
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 fn cmd_watchdog(args: &[String]) -> Result<()> {
@@ -3094,7 +3088,6 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
     {
         use windows_sys::Win32::System::Threading::OpenMutexW;
         const SYNCHRONIZE: u32 = 0x0010_0000;
-        use std::os::windows::process::CommandExt;
         // Wave29 挂账收口：探活名字与 tray/collect 同源（core 单一事实源，
         // 含当前用户 SID；跨会话同用户也互斥）
         let name: Vec<u16> = kynoptic_core::singleton::singleton_mutex_name()
@@ -3351,15 +3344,16 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     }
                                     if tray.exists() {
                                         use std::process::{Command, Stdio};
-                                        const DETACHED_PROCESS: u32 = 0x0000_0008;
-                                        match Command::new(&tray)
-                                            .arg("--minimized")
-                                            .stdin(Stdio::null())
-                                            .stdout(Stdio::null())
-                                            .stderr(Stdio::null())
-                                            .creation_flags(DETACHED_PROCESS)
-                                            .spawn()
-                                        {
+                                        let mut cmd = Command::new(&tray);
+                                        cmd.arg("--minimized");
+                                        cmd.stdin(Stdio::null());
+                                        cmd.stdout(Stdio::null());
+                                        cmd.stderr(Stdio::null());
+                                        // 创建旗标统一走 spawn::no_window（原
+                                        // DETACHED_PROCESS：托盘为 GUI 子系统，
+                                        // 关键契约是「任何拉起路径都不开控制台」）
+                                        kynoptic_core::spawn::no_window(&mut cmd);
+                                        match cmd.spawn() {
                                             Ok(_) => {
                                                 mark_spawned(
                                                     &mut state,

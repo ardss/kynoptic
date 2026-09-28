@@ -77,11 +77,10 @@ pub mod windows_update;
 /// 构造不带控制台窗口的子进程命令：托盘/后台常驻进程轮询外部工具
 /// （nvidia-smi、powercfg、netstat、netsh、powershell）时，
 /// 不加 `CREATE_NO_WINDOW` 会每次采集都闪一个黑框。
+/// 创建旗标由 [`crate::spawn::no_window`] 单一收口（仓库铁律）。
 pub fn quiet_command(program: &str) -> std::process::Command {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = std::process::Command::new(program);
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    crate::spawn::no_window(&mut cmd);
     cmd
 }
 

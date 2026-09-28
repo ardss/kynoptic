@@ -403,8 +403,6 @@ impl TrayCtx {
                             .collect();
                     open_with_shell(&url);
                 } else if let Some(dir) = exe_dir {
-                    use std::os::windows::process::CommandExt;
-                    const DETACHED_PROCESS: u32 = 0x0000_0008;
                     // 输出落档（全库审查 P1：一键更新此前全程静默，失败无人知）
                     if let Some(db_dir) = self.args.db.parent() {
                         use std::io::Write;
@@ -426,19 +424,28 @@ impl TrayCtx {
                             // stderr 丢弃，更新照跑。
                             let errlog = open()
                                 .or_else(|| std::fs::File::create(db_dir.join("update.log")).ok());
+                            // 创建旗标统一走 spawn::no_window（原 DETACHED_PROCESS：
+                            // 托盘为 GUI 子系统，关键契约是「任何拉起路径都不开
+                            // 控制台」，kynoptic.exe 是控制台程序，必须显式压制）
                             let spawn_res = match errlog {
-                                Some(f) => std::process::Command::new(dir.join("kynoptic.exe"))
-                                    .arg("update")
-                                    .stdout(log)
-                                    .stderr(f)
-                                    .creation_flags(DETACHED_PROCESS)
-                                    .spawn(),
-                                None => std::process::Command::new(dir.join("kynoptic.exe"))
-                                    .arg("update")
-                                    .stdout(log)
-                                    .stderr(std::process::Stdio::null())
-                                    .creation_flags(DETACHED_PROCESS)
-                                    .spawn(),
+                                Some(f) => {
+                                    let mut cmd =
+                                        std::process::Command::new(dir.join("kynoptic.exe"));
+                                    cmd.arg("update");
+                                    cmd.stdout(log);
+                                    cmd.stderr(f);
+                                    kynoptic_core::spawn::no_window(&mut cmd);
+                                    cmd.spawn()
+                                }
+                                None => {
+                                    let mut cmd =
+                                        std::process::Command::new(dir.join("kynoptic.exe"));
+                                    cmd.arg("update");
+                                    cmd.stdout(log);
+                                    cmd.stderr(std::process::Stdio::null());
+                                    kynoptic_core::spawn::no_window(&mut cmd);
+                                    cmd.spawn()
+                                }
                             };
                             if let Err(e) = spawn_res {
                                 log::error!("一键更新子进程启动失败: {e}");

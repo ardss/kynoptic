@@ -324,17 +324,15 @@ pub fn updating_flag_active(exe_dir: &std::path::Path) -> bool {
 /// 静默运行（停留旧版），且全程无告警。
 #[cfg(windows)]
 fn list_process_paths(image: &str) -> Option<Vec<(u32, String)>> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let script = format!(
         "Get-CimInstance Win32_Process -Filter \"Name='{}'\" | \
          ForEach-Object {{ \"$($_.ProcessId)|$($_.ExecutablePath)\" }}",
         image.replace('\'', "")
     );
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    kynoptic_core::spawn::no_window(&mut cmd);
+    let out = cmd.output();
     let stdout = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         _ => return None,
@@ -375,8 +373,6 @@ fn path_in_dir(path: &str, dir: &std::path::Path) -> bool {
 /// 目录外同名进程一律不碰。
 #[cfg(windows)]
 fn kill_process(image: &str, dir: &std::path::Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // windows-sys Win32::System::Threading::CREATE_NO_WINDOW
     let self_pid = std::process::id();
     let mut killed = false;
     // 枚举失败（None）时无目标可杀：杀不掉的事实由调用方据探测结果告警
@@ -388,12 +384,10 @@ fn kill_process(image: &str, dir: &std::path::Path) -> bool {
         if !path_in_dir(&path, dir) {
             continue;
         }
-        let ok = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string(), "/T"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/PID", &pid.to_string(), "/T"]);
+        kynoptic_core::spawn::no_window(&mut cmd);
+        let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
         killed = killed || ok;
     }
     killed
@@ -407,14 +401,10 @@ fn kill_process(_image: &str, _dir: &std::path::Path) -> bool {
 /// 新 exe 是否可执行（隐藏窗口跑 `--version`，成功退出才算）
 #[cfg(windows)]
 fn verify_launch(exe: &std::path::Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new(exe)
-        .arg("--version")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    kynoptic_core::spawn::no_window(&mut cmd);
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 #[cfg(not(windows))]
