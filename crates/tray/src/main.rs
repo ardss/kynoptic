@@ -56,12 +56,13 @@ pub static COLLECTOR_FAILED: std::sync::atomic::AtomicBool =
 /// 分支把图标切黄三角、tooltip 换"采集停滞"。
 pub static COLLECTOR_STALLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// 看门狗计划任务不健康旗标（平台审查：任务被禁用/删除后每日循环模态框+
+/// 看门狗计划任务不健康旗标（平台审查：任务被禁用/删除后每日循环弹窗+
 /// 重复落库是打扰源）。每日自检发现 Disabled/Unavailable 时置位，托盘
-/// tooltip 据此持续提示；模态框与 events 落库只在进程内首次发现时各做一次。
+/// tooltip 据此持续提示；events 落库只在进程内首次发现时做一次。
+/// 减法后不再弹模态框（顶置模态框在任务缺失期间随每次拉起反复抢前台）。
 pub static WATCHDOG_TASK_UNHEALTHY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// 本进程内是否已弹过/落过看门狗任务告警（各一次，之后靠 tooltip 持续承载）。
+/// 本进程内是否已落过库看门狗任务告警（一次，之后靠 tooltip 持续承载）。
 static WATCHDOG_TASK_ALERTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -640,7 +641,8 @@ fn main() {
                     // 任务被禁用/删除后 watchdog_alert（唯一告警通道）本身就是
                     // 停摆的组件，托盘是唯一还能说话的进程。每日一次，随本循环。
                     // 健康态清旗标（tooltip 回正常）；异常态置旗标（tooltip 持续
-                    // 提示），模态框与落库只在进程内首次发现时各做一次。
+                    // 提示）+ 落库（面板横幅），进程内首次发现时各做一次；
+                    // 减法后不再弹模态框（9/25-27 顶置模态框反复抢前台事故）。
                     let task = kynoptic_core::naming::install_dir()
                         .map(|d| kynoptic_core::naming::watchdog_task_name(&d))
                         .unwrap_or_else(kynoptic_core::naming::legacy_watchdog_task_name);
@@ -1285,7 +1287,8 @@ fn rejected_start_feedback(reason: &str) {
 
 /// 看门狗计划任务健康自检结果（平台审查：计划任务被禁用/删除后三组件
 /// 全静默——watchdog_alert 是唯一告警通道而它就是被禁用的组件。托盘在
-/// 每日循环里自检一次，把"保护已失效"变成用户可见）。
+/// 每日循环里自检一次，把"保护已失效"变成用户可见；告警面收敛为
+/// tooltip 持续提示 + events 落库（面板横幅），减法后不弹顶置模态框）。
 enum WatchdogTaskHealth {
     Ok,
     /// 任务在但处于禁用状态（含被组策略整体停用后的禁用形态）
@@ -1539,10 +1542,12 @@ fn insert_recovered_notice(db_path: &std::path::Path) {
 }
 
 /// 看门狗计划任务异常告警：落库 notification 系统事件（复用 watchdog_alert
-/// 的表结构契约：events(timestamp,'system','notification',JSON 文本)）+
-/// 进程内首次发现时弹一次限时自动关闭的消息框（平台审查：旧实现每日循环
-/// 弹永不自动关闭的 MB_TOPMOST 模态框强抢焦点；现在模态只弹一次、events
-/// 落库也只落一条，之后的持续提示交给托盘 tooltip 与面板横幅承载）。
+/// 的表结构契约：events(timestamp,'system','notification',JSON 文本)）。
+/// 减法整改（2026-09-29，用户指令「监视器弹窗严重影响操作」）：不再弹任何
+/// 模态框——旧形制每日循环弹 MB_TOPMOST 强抢焦点，中间形制「限时 3.5s
+/// 自动关闭」在任务缺失期间随每次托盘拉起（看门狗每分钟拉起）仍反复抢
+/// 前台（9/25-27 生产误报 10 次）。现告警面 = 日志 + events 落库（面板
+/// 横幅承载）+ WATCHDOG_TASK_UNHEALTHY tooltip 持续提示，三件都在、零弹窗。
 /// 全程尽力而为：库打不开只留日志，不影响托盘。
 fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem_en: &str) {
     let (hint, hint_en) = task_scheduler_policy_hint();
@@ -1556,7 +1561,7 @@ fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem
         serde_json_string(&message),
         serde_json_string(&message_en)
     );
-    // 告警只做一次：落库 + 模态框都由 WATCHDOG_TASK_ALERTED 门闩（内存序
+    // 告警只做一次：落库由 WATCHDOG_TASK_ALERTED 门闩（内存序
     // Relaxed 足够：两次漏告警的后果只是少一条提示，tooltip 旗标仍在）
     if WATCHDOG_TASK_ALERTED
         .compare_exchange(
@@ -1581,38 +1586,11 @@ fn alert_watchdog_task_problem(db_path: &std::path::Path, problem: &str, problem
         }
         Err(e) => log::warn!("看门狗计划任务告警落库失败(库打不开): {e}"),
     }
-    // 限时自动关闭（复用 rejected_start_feedback 的模式）：弹框线程 + 3.5s
-    // 后按标题 FindWindowW 投 WM_CLOSE。模态框只此一次，不再每天打扰。
-    let text: Vec<u16> = format!(
-        "Kynoptic 的自动保护（看门狗）当前没有生效，程序异常退出时可能不会被自动恢复，数据可能出现空洞。\n\
-         请在计划任务程序里检查本安装目录对应的看门狗计划任务（任务名含安装路径指纹），或重新安装 Kynoptic。\n\
-         （{message}）\0"
-    )
-    .encode_utf16()
-    .collect();
-    let title: Vec<u16> = "Kynoptic 保护已失效\0".encode_utf16().collect();
-    std::thread::spawn(move || unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            0x0000_0030 | 0x0004_0000, // MB_ICONWARNING | MB_TOPMOST
-        );
-    });
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(3500));
-        let title: Vec<u16> = "Kynoptic 保护已失效\0".encode_utf16().collect();
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
-            let dlg = FindWindowW(
-                "#32770\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
-                title.as_ptr(),
-            );
-            if !dlg.is_null() {
-                PostMessageW(dlg, 0x0010, 0, 0); // WM_CLOSE
-            }
-        }
-    });
+    // 减法整改（2026-09-29，用户指令「监视器不许弹窗，别影响操作」）：
+    // 告警面收敛为 日志 + 落库（面板横幅按界面语言展示）+ 托盘 tooltip
+    // 持续提示，不再弹 MB_TOPMOST 模态框。任务缺失期间看门狗每分钟拉起
+    // 托盘都会重跑自检并重新告警，顶置模态框反复抢占前台（9/25-9/27 生产
+    // 误报 10 次即此形制）。任务缺失本身修复路径不变：重跑安装器重建任务。
 }
 
 #[cfg(test)]
