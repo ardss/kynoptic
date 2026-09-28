@@ -207,6 +207,27 @@ fn anomalies_shape_matches_core_entry_with_bridge() {
     assert_eq!(v["truncated"], json!(false));
 }
 
+/// 回归复审：daily_agg 表缺失（旧库未跑到该建表迁移，且 CLI 读路径不自动
+/// 迁移、无补迁移入口）时，api_anomalies 的 baseline_days 必须回落 events
+/// 口径（近 7 个本地日 COUNT DISTINCT），而不是查询失败静默落 0——前端
+/// baselineAccruing 门禁（bd < 3）会把「有事件但缺派生表」的库永远卡在
+/// 「基线积累中（0 天）」，挡住「未检测到异常」空态。
+#[test]
+fn anomalies_baseline_days_falls_back_to_events_when_daily_agg_missing() {
+    let conn = mem_conn();
+    conn.execute_batch("DROP TABLE daily_agg").unwrap();
+    // now-36h 在任何时区都落在近 7 个本地日内（昨日或前日）
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(36)).to_rfc3339();
+    insert(&conn, &ts, "keyboard", "press", None);
+    let db = Path::new("/tmp/kynoptic-test-nonexistent/settings.json");
+    let v = api_anomalies(&conn, 7, db);
+    assert_eq!(
+        v["baseline_days"],
+        json!(1),
+        "缺派生表时回落 events 口径：近 7 天一次键鼠输入应为 1，不得静默为 0"
+    );
+}
+
 // === status ===
 
 #[test]
@@ -2103,6 +2124,75 @@ fn report_data_since_uses_local_date() {
     };
     assert_eq!(since, expect, "data_since 应为最早事件的本地日");
     let _ = db;
+}
+
+/// 回归复审：坏时间戳不得让 data_since 整体缺失。「先取字符串 MIN 再单值
+/// 换算」的写法会选中字典序最前的坏值，datetime() 对坏值返回 NULL →
+/// 字段变 None；逐行口径跳过坏行，仍给出最早**可解析**事件的本地日。
+/// 注：SQLite 日期函数对越界日期是宽容解释（如 '2024-02-30' → '2024-03-01'，
+/// 并非 NULL），真正产生 NULL 的坏值是空串/乱码形，本用例用空串。
+#[test]
+fn report_data_since_skips_unparseable_min_timestamps() {
+    let conn = mem_conn();
+    // 空串在字符串序上排在一切合法 20xx 值之前（旧式 MIN 会选中它）
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) \
+         VALUES ('', 'keyboard', 'press', NULL, NULL, NULL, NULL)",
+        [],
+    )
+    .unwrap();
+    insert(
+        &conn,
+        "2026-01-05T20:30:00+00:00",
+        "window",
+        "switch",
+        Some("code"),
+    );
+    let s = settings::AppSettings::default();
+    let v = api_report_at(&conn, "2026-01-06", &s).unwrap_or_else(|e| panic!("{e}"));
+    let expect = chrono::DateTime::parse_from_rfc3339("2026-01-05T20:30:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        v["data_since"].as_str(),
+        Some(expect.as_str()),
+        "坏值不得让 data_since 消失：应给最早可解析事件的本地日"
+    );
+}
+
+/// 回归复审：混合编码（Z 与 ±HH:MM 并存）下 data_since 取**时间最早**
+/// 事件的本地日。A = 2026-09-02T23:59:00+14:00（=09-02 09:59Z）时间最早；
+/// B = 2026-09-02T23:58:00-12:00（=09-03 11:58Z）时间最晚，但 B 的字符串
+/// 字典序比 A 小（同 09-02 日期段，23:58 < 23:59）；C = 2026-09-03T00:30:00Z
+/// 保留 Z 编码形态。A 与 B 时刻相差 25h59m > 24h，任一时区下二者必落
+/// 不同本地日（同一本地日要求时刻差 < 24h）：本地日随时间单调不减，A 早于
+/// B ⇒ A 的本地日 < B 的本地日。故「先字符串 MIN 再单值换算」选中 B，结果
+/// 恒晚于逐行口径（A 的本地日），本测试在任一台/CI 时区（含 UTC）都抓得住
+/// 该退化；旧 fixture（+08:00 与 Z 相差 61 秒）只在 UTC+8 跨本地日，UTC 下
+/// 是哑防护。逐行口径在任一时区恒等于 A 的本地日，测试不 flaky。
+#[test]
+fn report_data_since_mixed_encodings_uses_earliest_local_date() {
+    let conn = mem_conn();
+    let a = "2026-09-02T23:59:00+14:00"; // 时间最早（= 09-02 09:59Z）
+    let b = "2026-09-02T23:58:00-12:00"; // 时间最晚、字典序最小（= 09-03 11:58Z）
+    let c = "2026-09-03T00:30:00Z"; // 时间介于 A、B 之间，Z 编码
+    insert(&conn, a, "window", "switch", Some("code"));
+    insert(&conn, b, "window", "switch", Some("code"));
+    insert(&conn, c, "window", "switch", Some("code"));
+    let s = settings::AppSettings::default();
+    let v = api_report_at(&conn, "2026-01-06", &s).unwrap_or_else(|e| panic!("{e}"));
+    let expect = chrono::DateTime::parse_from_rfc3339(a)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        v["data_since"].as_str(),
+        Some(expect.as_str()),
+        "混合编码下 data_since 必须取最早事件的本地日，不得被字典序较小的时间戳推晚"
+    );
 }
 
 // ─── 本轮修复回归（日期边界 / 空参数 / 幻影日 / 安全头 / host 尾点） ────────
