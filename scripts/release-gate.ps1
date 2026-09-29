@@ -74,6 +74,21 @@ if (Test-Path (Join-Path $RepoRoot 'Cargo.toml')) {
   Write-Host "[SKIP] G3 fmt 门：$RepoRoot 无 Cargo.toml（沙箱/纯 git 仓库）"
 }
 
+# G4 文档版本行一致性门（Wave46：版本一致性工具曾只护七处中的六处，
+# llms.txt 状态行在 0.3.1 发版时漂移在 v0.3.0，CHANGELOG.md:269-272 有
+# 同型事故记录）。只锚定头部/状态行，不做全文件扫描：APP.md:103/111 的
+# 「截至 v0.3.1」历史正文属有意不动，全文件扫描会误报。
+if (Test-Path (Join-Path $RepoRoot 'Cargo.toml') -and (Get-Command node -ErrorAction SilentlyContinue)) {
+  $null = & node (Join-Path $RepoRoot 'scripts/check-doc-version.mjs')
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "[FAIL] G4 文档版本行门：check-doc-version.mjs rc=$LASTEXITCODE（头部/状态行与 Cargo.toml 版本不一致）"
+    exit 1
+  }
+  Write-Host "[PASS] G4 文档版本行门：check-doc-version.mjs rc=0"
+} else {
+  Write-Host "[SKIP] G4 文档版本行门：$RepoRoot 无 Cargo.toml 或无 node（沙箱/纯 git 仓库）"
+}
+
 # 显式 add 清单：发布提交只含版本文件（CONTRIBUTING.md 第 3 节第 1-2 步），
 # 逐一显式 add，绝不 `git add -A`。
 $releaseFiles = @('Cargo.toml', 'Cargo.lock', 'CHANGELOG.md')

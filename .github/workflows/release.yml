@@ -27,6 +27,12 @@ jobs:
             exit 1
           }
           Write-Host "version check ok: v$tagVer == $cargoVer"
+      # ci 修复（Wave46）：文档版本行一致性门禁——llms.txt / index.html /
+      # README / README.zh-CN / APP.md 的状态行与 CHANGELOG 顶部段必须
+      # 与 tag 版本一致（tag 已在上一步与 Cargo.toml 校验；只锚定头部/
+      # 状态行，不做全文件扫描，APP.md 历史正文「截至 v0.3.1」属有意不动）
+      - name: Verify docs version lines match tag
+        run: node scripts/check-doc-version.mjs
       # ci 修复：构建时注入指纹（git hash + 构建时间），/api/status 暴露，
       # 审查/排障先比对运行态与源码版本，杜绝「源码已修、运行态未修」脱节
       - name: Build release
