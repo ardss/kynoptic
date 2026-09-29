@@ -922,6 +922,12 @@ pub fn start_collection_custom(
     );
 
     let db = Arc::new(Database::open(db_path).expect("数据库初始化失败"));
+    // 去重高水位必须与被去重的事件落在同一个库（回归修复：dedup 轻量连接
+    // 此前固定走 resolve_db_path() 默认解析，无视 --db 覆盖——自定义部署读
+    // 到别人库的高水位、推进后又 upsert 回默认库双向污染，纯 CLI 形态还会
+    // 在 exe 旁 data/ 静默生成空库）。主池此刻已打开/创建该库文件，登记
+    // 后监控线程首拍 load/save_baseline 即对准本库。
+    monitors::dedup::set_db_path(std::path::Path::new(db_path));
     // 启动时清扫上次未关闭的 session（崩溃/强杀留的幽灵）
     db.close_ghost_sessions();
     let session_id = db.start_session();

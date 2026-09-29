@@ -310,8 +310,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
     ),
     spec(
         "notification",
-        "Records system and app notification text",
-        "记录系统和应用的通知内容",
+        "Logs system and app notification events, never the full notification text",
+        "记录系统和应用的通知事件，不保存通知原文",
         false,
         Sensitivity::High,
         Dep::PowerShell,
@@ -350,8 +350,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
     ),
     spec(
         "uac",
-        "Logs user account control (UAC) prompt events",
-        "记录 UAC 提权确认弹窗事件",
+        "Logs UAC and related Windows security events, never the raw event text",
+        "记录 UAC 及 Windows 安全相关事件，不保存事件原文",
         false,
         Sensitivity::High,
         Dep::PowerShell,

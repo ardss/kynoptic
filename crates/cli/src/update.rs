@@ -480,9 +480,8 @@ pub fn recover_orphan_baks(exe_dir: &std::path::Path) -> usize {
 // 主流程
 // ---------------------------------------------------------------------------
 
-/// `update --check`：只查不装。打印 `UPDATE <ver>`（有新版）或
-/// `UP TO DATE`，退出码恒 0。供托盘每日自动检查复用（托盘无 HTTP 客户端，
-/// 子进程 + 文件是唯一低成本通路）。安装版也允许查（只有安装才被拒）。
+/// 判定版本 tag 是否为可用的稳定版（semver 预发布约定 + 严格数字格式，
+/// 详见函数体注释；单测直接调用本函数防同义反复）。
 pub fn is_stable_release(version: &str) -> bool {
     // semver 预发布约定：tag 含 '-' 即非稳定（v0.2.0-1 这类带后缀 tag 同样
     // 被拒——文档化的有意决定，测试直接调用本函数防同义反复）
@@ -501,24 +500,149 @@ pub fn is_stable_release(version: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// `update --check` 的三态结果（Wave46：check/一键更新共用同一套「可发布」
+/// 判定，消除旧版两套口径漂移——check 侧曾只要求五件套+SUMS（缺 SKILL.md
+/// 会假报 UPDATE），安装侧要求全量，check 承诺了安装装不完的更新）。
+pub enum UpdateCheck {
+    /// 有更新可安装（资产名集齐全 + 校验清单内容校验通过）
+    Update(String),
+    /// 无更新可安装。含 Case B 兜底场景：更新版 release 存在但其资产清单
+    /// 不全，且当前版本已是最新可装版本——与一键更新「UP TO DATE」
+    /// 口径一致，横幅得以清除、不滞留。
+    UpToDate,
+    /// 更新版稳定 release 存在，但资产名集不全或校验清单内容不达一键更新
+    /// 标准 → 暂不可一键更新（独立第三态，不与网络失败/无资产混同）。
+    Incomplete(String),
+}
+
+/// `update --check`：只查不装。供托盘每日自动检查复用（托盘无 HTTP 客户端，
+/// 子进程 + 文件是唯一低成本通路）。安装版也允许查（只有安装才被拒）。
+///
+/// 退出码（W42 两态拆分 + Wave46 第三态；三态文案在 stderr 互相可分）：
+/// - 0 = 正常，stdout 为 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`
+/// - 1 = ① 网络不可达/接口异常；② Releases 上没有完整稳定版资产；
+///   ③ 最新版校验清单不全（资产名集缺项或 SHA256SUMS.txt 条目不达标准，
+///   暂不可一键更新）
 pub fn cmd_check_only() -> crate::Result<()> {
     let cur = self_update::cargo_crate_version!();
-    match latest_stable_version()? {
-        Some(v) => {
+    match check_latest_update()? {
+        UpdateCheck::Update(v) => {
             println!("UPDATE {v}");
         }
-        None => {
+        UpdateCheck::UpToDate => {
             println!("UP TO DATE ({cur})");
+        }
+        UpdateCheck::Incomplete(v) => {
+            // 第三态：绝不假报 UPDATE（一键更新按同一标准必然失败，假报会让
+            // update-available.txt 永不清除、菜单/横幅永久挂住）
+            return Err(crate::Error::InvalidData(format!(
+                "最新版 {v} 校验清单不全，暂不可一键更新（资产清单或 SHA256SUMS.txt 条目不达更新标准）"
+            )));
         }
     }
     Ok(())
 }
 
-/// 查询最新稳定版版本号；无更新（<= 当前）返回 Some(None)。
-/// 错误两态区分（审查 low）：「网络不可达/接口异常」与「Releases 上没有
-/// 完整稳定版资产」必须可分——旧实现把两者压扁成同一个 None，
-/// `update --check` 在死代理下误报「找不到稳定的资产」。
-pub fn latest_stable_version() -> crate::Result<Option<String>> {
+/// 「可发布版本」判定（Wave46 单一事实源，check 与一键更新共用）：release
+/// 必须齐全 ASSET_NAMES（五件套 + SKILL.md）+ SHA256SUMS.txt。旧 check 侧
+/// 用 BIN_NAMES（五件套，不含 SKILL.md）+ SUMS，release 缺 SKILL.md 时
+/// check 假报「UPDATE <ver>」而一键安装必然失败（单测
+/// release_missing_skill_is_not_publishable 锚定）。
+fn release_assets_complete(r: &self_update::update::Release) -> bool {
+    ASSET_NAMES
+        .iter()
+        .all(|n| r.assets.iter().any(|a| a.name == *n))
+        && r.assets.iter().any(|a| a.name == SUMS_NAME)
+}
+
+/// 去掉版本号前导 'v'（GitHub API 与本地构建产物两种形态统一口径）
+fn norm_version(v: &str) -> String {
+    v.trim_start_matches('v').to_string()
+}
+
+/// check/一键更新共用的目标版本选择（Wave46）：最新一个通过「可发布」判定
+/// 的稳定 release。
+fn pick_update_release(
+    releases: &[self_update::update::Release],
+) -> Option<&self_update::update::Release> {
+    releases
+        .iter()
+        .filter(|r| is_stable_release(&r.version) && release_assets_complete(r))
+        .max_by(|a, b| version_cmp(&norm_version(&a.version), &norm_version(&b.version)))
+}
+
+/// 校验清单内容级校验（Wave46：旧 --check 只判资产名存在，SHA256SUMS.txt
+/// 缺条目/哈希错乱全部不可见 → 假报 UPDATE）：要求 ASSET_NAMES 全部条目
+/// 在列且每个哈希为 64 位 hex。返回问题清单（空 = 通过）。
+fn validate_sums_content(text: &str) -> Vec<String> {
+    let sums = parse_sums(text);
+    let mut problems: Vec<String> = Vec::new();
+    for name in ASSET_NAMES {
+        match sums.get(&name.to_ascii_lowercase()) {
+            Some(hex) => {
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    problems.push(format!("{name}（哈希不是 64 位十六进制）"));
+                }
+            }
+            None => problems.push(name.to_string()),
+        }
+    }
+    problems
+}
+
+/// 选版判定核心（纯函数，单测可覆盖）：按当前版本 cur 对 release 列表
+/// 分类。check_latest_update = 拉取 + 本函数 + 目标版校验清单内容校验。
+enum TargetPick<'a> {
+    /// 选中的更新版可发布目标（调用方须补做校验清单内容校验，失败降级
+    /// Incomplete）
+    Target(&'a self_update::update::Release),
+    /// 有更新版稳定 release 但其资产清单不全、且无完整兜底 → 第三态
+    Incomplete(String),
+    /// 无更新可装（最新可发布版本 <= 当前；或无任何更新版稳定 release）
+    UpToDate,
+    /// 整个仓库连一个稳定 release 都没有 → 保留 W42 无资产错误态
+    NoStableAssets,
+}
+
+fn classify_update<'a>(releases: &'a [self_update::update::Release], cur: &str) -> TargetPick<'a> {
+    let greater = std::cmp::Ordering::Greater;
+    match pick_update_release(releases) {
+        Some(r) => {
+            if version_cmp(&norm_version(&r.version), cur) == greater {
+                TargetPick::Target(r)
+            } else {
+                // Case B 兜底：最新可发布版本不新于当前（更新版 release 即使
+                // 存在也不全）→ 当前即最新可装版本，按「无更新」处理
+                TargetPick::UpToDate
+            }
+        }
+        None => {
+            let newer_incomplete = releases
+                .iter()
+                .filter(|r| is_stable_release(&r.version))
+                .filter(|r| version_cmp(&norm_version(&r.version), cur) == greater)
+                .map(|r| norm_version(&r.version))
+                .max_by(|a, b| version_cmp(a, b));
+            match newer_incomplete {
+                Some(v) => TargetPick::Incomplete(v),
+                None => {
+                    if releases.iter().any(|r| is_stable_release(&r.version)) {
+                        TargetPick::UpToDate
+                    } else {
+                        TargetPick::NoStableAssets
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 查询检查（Wave46 重构后取代 latest_stable_version）：拉取 release 列表
+/// → 共用选版（classify_update）→ 对选中的更新版追加下载校验清单（几百
+/// 字节）做内容级校验（validate_sums_content），全部通过才承诺
+/// 「UPDATE <ver>」；名集不全/清单内容不达标准的更新版 → 第三态
+/// Incomplete（check 与一键更新共享该判定，消除两套口径）。
+pub fn check_latest_update() -> crate::Result<UpdateCheck> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
@@ -531,23 +655,41 @@ pub fn latest_stable_version() -> crate::Result<Option<String>> {
             ))
         })?;
     let cur = self_update::cargo_crate_version!();
-    let release = releases.into_iter().find(|r| {
-        is_stable_release(&r.version)
-            && BIN_NAMES
-                .iter()
-                .all(|n| r.assets.iter().any(|a| &a.name == n))
-            && r.assets.iter().any(|a| a.name == SUMS_NAME)
-    });
-    let Some(release) = release else {
-        return Err(crate::Error::InvalidData(
+    match classify_update(&releases, cur) {
+        TargetPick::NoStableAssets => Err(crate::Error::InvalidData(
             "GitHub Releases 上找不到完整的稳定版资产".to_string(),
-        ));
-    };
-    let new_ver = release.version.trim_start_matches('v').to_string();
-    if version_cmp(&new_ver, cur) == std::cmp::Ordering::Greater {
-        Ok(Some(new_ver))
-    } else {
-        Ok(None)
+        )),
+        TargetPick::UpToDate => Ok(UpdateCheck::UpToDate),
+        TargetPick::Incomplete(v) => Ok(UpdateCheck::Incomplete(v)),
+        TargetPick::Target(target) => {
+            let v = norm_version(&target.version);
+            // 内容级校验：下载目标版校验清单（几百字节），缺条目/哈希错乱
+            // 全部拒绝假报 UPDATE
+            let url = target
+                .assets
+                .iter()
+                .find(|a| a.name == SUMS_NAME)
+                .map(|a| a.download_url.clone())
+                .ok_or_else(|| {
+                    crate::Error::InvalidData(
+                        "内部错误：目标 release 缺少 SHA256SUMS.txt 资产".to_string(),
+                    )
+                })?;
+            let tmp = self_update::TempDir::new()
+                .map_err(|err| crate::Error::InvalidData(format!("self-update tempdir: {err}")))?;
+            let sums_path = tmp.path().join(SUMS_NAME);
+            download_file(&url, &sums_path).map_err(|_| {
+                crate::Error::InvalidData(
+                    "校验清单（SHA256SUMS.txt）下载失败，请检查网络后重试".to_string(),
+                )
+            })?;
+            let text = std::fs::read_to_string(&sums_path).map_err(io_err)?;
+            if validate_sums_content(&text).is_empty() {
+                Ok(UpdateCheck::Update(v))
+            } else {
+                Ok(UpdateCheck::Incomplete(v))
+            }
+        }
     }
 }
 
@@ -580,6 +722,17 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
             "检测到本程序为安装版。请重新下载并运行 Kynoptic-Setup 完成升级（自更新仅适用于便携版）".to_string(),
         ));
     }
+    // Wave46：updating.flag 在位且未超龄 = 上一轮更新进行中或在中途被
+    // 强杀（现场为「exe 缺失、仅存 .bak」+ 上一轮的 .bak 完好）。旧流程
+    // 只是跳过 .bak 恢复后继续走完整替换，4a 会无条件删除上一轮 .bak（旧版
+    // 最后一份副本被静默销毁）——现整轮中止，交人工确认。旗标超龄残留时
+    // updating_flag_active 已自行删除并放行，后续孤儿恢复接管。
+    if updating_flag_active(&dir) {
+        return Err(crate::Error::InvalidData(
+            "检测到上一轮更新进行中或已中断（updating.flag 在位且未超龄），为避免销毁中断现场的 .bak，本轮更新已中止；若上一轮更新器被强杀，请人工确认后删除 exe 同目录的 updating.flag，再重跑 update"
+                .to_string(),
+        ));
+    }
     // 审查：上次更新中断可能留下「exe 缺失、仅存 .bak」——更新入口先做
     // 孤儿恢复，避免在残缺目录上继续替换。
     recover_orphan_baks(&dir);
@@ -587,7 +740,10 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     let cur = self_update::cargo_crate_version!();
     eprintln!("checking GitHub releases for kynoptic v{cur}...");
 
-    // 1. 取最新 release（要求同时具备三件套 + SHA256SUMS 资产）
+    // 1. 取目标 release（Wave46：与 check 共用同一「可发布」判定
+    // pick_update_release——五件套 + SKILL.md + SHA256SUMS.txt 全量资产，
+    // 消除旧版 check/install 两套名集口径漂移；prerelease 过滤在
+    // is_stable_release 内）
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
@@ -595,28 +751,17 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         .map_err(e)?
         .fetch()
         .map_err(e)?;
-    let release = releases
-        .into_iter()
-        .find(|r| {
-            // prerelease 过滤（审查 P1）：workflow 对任何 v* tag 都出全量资产，
-            // 不过滤会让 0.1.x 稳定用户被"更到"beta/RC（version_cmp 对
-            // 非数字尾缀组件的比较不可靠）。self_update 0.41 的 Release 不暴露
-            // prerelease 标志，用 semver 预发布约定（tag 含 '-'）判定。
-            is_stable_release(&r.version)
-                && ASSET_NAMES
-                    .iter()
-                    .all(|n| r.assets.iter().any(|a| &a.name == n))
-                && r.assets.iter().any(|a| a.name == SUMS_NAME)
-        })
-        .ok_or_else(|| {
-            crate::Error::InvalidData(
-                "GitHub Releases 上找不到完整的更新资产（五件套 + SKILL.md + SHA256SUMS.txt）"
-                    .to_string(),
-            )
-        })?;
-    let new_ver = release.version.trim_start_matches('v').to_string();
+    let release = pick_update_release(&releases).ok_or_else(|| {
+        crate::Error::InvalidData(
+            "GitHub Releases 上找不到完整的更新资产（五件套 + SKILL.md + SHA256SUMS.txt）"
+                .to_string(),
+        )
+    })?;
+    let new_ver = norm_version(&release.version);
     if version_cmp(&new_ver, cur) != std::cmp::Ordering::Greater {
-        println!("already up to date ({cur})");
+        // 与 check 侧同文案（Wave46：两侧 up-to-date 口径统一；托盘每日检查
+        // 解析的就是 --check 侧的 "UP TO DATE" 前缀，此处保持同形）
+        println!("UP TO DATE ({cur})");
         // Wave17：顺手清提示文件——一键更新成功后托盘进程仍是旧版，
         // 靠 update-available.txt 判断的菜单项会再挂最长 24h。
         let _ = std::fs::remove_file(dir.join("data").join("update-available.txt"));
@@ -705,7 +850,27 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     for name in &order {
         let dest = dir.join(name);
         let bak = std::path::PathBuf::from(format!("{}.bak", dest.display()));
-        let _ = std::fs::remove_file(&bak);
+        // Wave46：中断现场（上一轮更新器在 4a/4b 之间被强杀：dest 缺失、
+        // 旧版最后一份副本只在 .bak 里）。旧代码此处无条件 remove_file(&bak)
+        // 会把旧版副本静默销毁，成功文案还假称「旧版已保留」——现先还原
+        // .bak 回原位置，再走正常备份流程，保证替换前磁盘上旧版完整
+        // （rollback/看门狗孤儿恢复都有可靠旧版可依）。
+        if !dest.exists() && bak.exists() {
+            if !restore_from_bak(&dest, &bak) {
+                return Err(crate::Error::InvalidData(format!(
+                    "检测到上一轮更新中断（{name} 缺失、仅存 .bak），且 .bak 还原失败（可能被杀软/备份软件锁定），本轮中止，旧版保留于 {}",
+                    bak.display()
+                )));
+            }
+            eprintln!("检测到上一轮更新中断：{name} 已从 .bak 还原，继续正常备份流程");
+        } else if bak.exists() {
+            // dest 在位 + 旧 .bak 在位：.bak 是上一轮已完成更新的残留（更早
+            // 一版，「单代 .bak」约定由本轮备份覆盖）。此处删除的不是
+            // 「旧版最后一份副本」——那个场景（dest 缺失、仅存 .bak）已在
+            // 上面的中断分支还原回原位置，rename 会把它重新备份为 .bak，
+            // 全程不经 remove_file。
+            let _ = std::fs::remove_file(&bak);
+        }
         if dest.exists() && std::fs::rename(&dest, &bak).is_err() {
             // 沿用旧 replace_with_backup 的托盘解锁：先写退出旗标再定向 taskkill
             if name == &"kynoptic-tray.exe" {
@@ -810,10 +975,27 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
     }
 
     println!("updated to {new_ver}");
-    eprintln!(
-        "旧版本已保留为同名 .bak 文件（{}\\*.bak），确认无误后可手动删除",
-        dir.display()
-    );
+    // Wave46：逐文件如实报告实际存在的 .bak——旧静态文案对「没有 .bak」的
+    // 文件（更新前旧版本就不在盘上）也假称「旧版已保留」，用户按提示手动
+    // 删除时会面对不存在的文件。
+    let mut bak_kept: Vec<String> = Vec::new();
+    let mut bak_missing: Vec<String> = Vec::new();
+    for (dest, bak) in &backups {
+        if bak.exists() {
+            bak_kept.push(bak.display().to_string());
+        } else {
+            bak_missing.push(dest.display().to_string());
+        }
+    }
+    for p in &bak_kept {
+        eprintln!("旧版本已保留: {p}");
+    }
+    for p in &bak_missing {
+        eprintln!("{p} 无 .bak（旧版本已不在盘上，更新前可能本就不存在）");
+    }
+    if !bak_kept.is_empty() {
+        eprintln!("确认无误后可手动删除上述 .bak 文件");
+    }
     // 托盘换血（审查：Windows 上运行中 exe 被覆盖不报错，旧实现只靠 rename
     // 失败置位 tray_killed——该分支在本 OS 不可达，更新报成功但旧版托盘仍在
     // 内存里运行，用户静默停留在旧版）。统一处理两种来源：替换期间被杀的
@@ -915,6 +1097,173 @@ mod tests {
             assert_eq!(ASSET_NAMES[i], *n);
         }
         assert_eq!(ASSET_NAMES[BIN_NAMES.len()], SKILL_MD_NAME);
+    }
+
+    /// 构造测试用 Release（版本号无前缀，模拟 GitHub API 返回形态；
+    /// 资产名任意指定）
+    fn fake_release(version: &str, assets: &[&str]) -> self_update::update::Release {
+        self_update::update::Release {
+            name: version.to_string(),
+            version: version.to_string(),
+            date: "2026-01-01T00:00:00Z".to_string(),
+            body: None,
+            assets: assets
+                .iter()
+                .map(|n| self_update::update::ReleaseAsset {
+                    name: (*n).to_string(),
+                    download_url: format!("https://example.invalid/{version}/{n}"),
+                })
+                .collect(),
+        }
+    }
+
+    /// 完整资产清单 = ASSET_NAMES（五件套 + SKILL.md）+ SHA256SUMS.txt
+    fn complete_asset_names() -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = ASSET_NAMES.to_vec();
+        v.push(SUMS_NAME);
+        v
+    }
+
+    #[test]
+    fn release_missing_skill_is_not_publishable() {
+        // 锚定 Case A（Wave46）：缺 SKILL.md 资产的 release 不得使 --check
+        // 输出 UPDATE——check 与一键更新共用同一「可发布」判定（无完整兜底时
+        // 落入第三态 Incomplete，而非假报 UPDATE 或误报 UpToDate）
+        let assets: Vec<&str> = BIN_NAMES.iter().copied().chain([SUMS_NAME]).collect();
+        assert!(!assets.contains(&SKILL_MD_NAME), "前提：SKILL.md 缺失");
+        let r = fake_release("0.4.0", &assets);
+        assert!(
+            r.assets.iter().any(|a| a.name == SUMS_NAME),
+            "SUMS 在位、仅缺 SKILL.md（与 0.3.1 真实资产同构少一项的形态）"
+        );
+        assert!(
+            !release_assets_complete(&r),
+            "缺 SKILL.md 的 release 不得判可发布"
+        );
+        assert!(
+            pick_update_release(std::slice::from_ref(&r)).is_none(),
+            "Case A（无完整兜底）不得选出更新目标"
+        );
+        assert!(
+            matches!(classify_update(std::slice::from_ref(&r), "0.3.1"), TargetPick::Incomplete(v) if v == "0.4.0"),
+            "Case A 必须落入第三态 Incomplete（0.4.0 清单不全、无完整兜底）"
+        );
+    }
+
+    #[test]
+    fn complete_release_is_publishable() {
+        let r = fake_release("0.4.0", &complete_asset_names());
+        assert!(
+            release_assets_complete(&r),
+            "全量资产 + SUMS 的 release 必须可发布"
+        );
+        let picked = pick_update_release(std::slice::from_ref(&r)).unwrap();
+        assert_eq!(picked.version, "0.4.0");
+    }
+
+    #[test]
+    fn fallback_to_complete_older_release_when_newest_incomplete() {
+        // Case B 兜底（Wave46）：更新版清单不全但有完整旧版时，选版必须回退
+        // 到完整旧版——不得因过度过滤误报「无更新」（旧版 > 当前仍可装）
+        let incomplete: Vec<&str> = BIN_NAMES.iter().copied().chain([SUMS_NAME]).collect();
+        let newer = fake_release("0.5.0", &incomplete);
+        let complete = fake_release("0.4.0", &complete_asset_names());
+        let releases = [newer.clone(), complete.clone()];
+        let picked = pick_update_release(&releases).unwrap();
+        assert_eq!(
+            picked.version, "0.4.0",
+            "更新版（0.5.0）清单不全时必须回退到完整旧版（0.4.0）"
+        );
+        assert!(
+            matches!(classify_update(&releases, "0.3.1"), TargetPick::Target(r) if r.version == "0.4.0"),
+            "Case B 兜底须选中完整旧版为可安装目标（而非 UpToDate/Incomplete）"
+        );
+    }
+
+    #[test]
+    fn up_to_date_when_newest_complete_not_newer() {
+        // Case B 同版本（Wave46）：完整旧版 == 当前版本 + 更新版清单不全
+        // → 当前即最新可装版本，按「无更新」处理（与一键更新
+        // "UP TO DATE" 口径一致，横幅可清除、不永久挂住）
+        let incomplete: Vec<&str> = BIN_NAMES.iter().copied().chain([SUMS_NAME]).collect();
+        let newer_incomplete = fake_release("0.4.0", &incomplete);
+        let same_complete = fake_release("0.3.1", &complete_asset_names());
+        assert!(
+            matches!(
+                classify_update(&[newer_incomplete, same_complete], "0.3.1"),
+                TargetPick::UpToDate
+            ),
+            "当前版本已是最新可装版本 → UpToDate（不得因更新版清单不全误报第三态）"
+        );
+    }
+
+    #[test]
+    fn no_stable_release_keeps_no_assets_state() {
+        // 保留 W42 无资产态：整个仓库没有稳定 release（空列表/仅预发布）
+        // → 错误态（退出码 1），不是「无更新」
+        assert!(matches!(
+            classify_update(&[], "0.3.1"),
+            TargetPick::NoStableAssets
+        ));
+        let prerelease = fake_release("0.5.0-rc.1", &complete_asset_names());
+        assert!(
+            matches!(
+                classify_update(&[prerelease], "0.3.1"),
+                TargetPick::NoStableAssets
+            ),
+            "仅预发布 release 时维持无资产错误态"
+        );
+    }
+
+    /// 64 位十六进制哈希样例（测试构造用；不用 {:064} 填充——该格式说明
+    /// 对 str 实际按空格填充，会得到 2 位「哈希」误判）
+    const HEX64: &str = "abababababababababababababababababababababababababababababababab";
+
+    #[test]
+    fn validate_sums_content_accepts_full_list() {
+        // 6 条目齐全且均为 64 位 hex → 通过（0 问题）
+        let text = ASSET_NAMES
+            .iter()
+            .map(|n| format!("{HEX64}  {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            validate_sums_content(&text).is_empty(),
+            "完整 64 位 hex 清单必须通过"
+        );
+    }
+
+    #[test]
+    fn validate_sums_content_rejects_missing_entry() {
+        // 证据形态 B-1：缺 kynoptic-ctl.exe 条目 → 必须报出问题（不得通过）
+        let text = ASSET_NAMES
+            .iter()
+            .filter(|n| **n != "kynoptic-ctl.exe")
+            .map(|n| format!("{HEX64}  {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let problems = validate_sums_content(&text);
+        assert!(
+            problems.iter().any(|p| p.starts_with("kynoptic-ctl.exe")),
+            "缺条目必须被点名报出"
+        );
+    }
+
+    #[test]
+    fn validate_sums_content_rejects_bad_hex() {
+        // 证据形态 B-2：哈希错乱（长度不为 64）→ 必须报出问题
+        let mut lines: Vec<String> = ASSET_NAMES
+            .iter()
+            .map(|n| format!("{HEX64}  {n}"))
+            .collect();
+        lines[0] = format!("{}  {}", &HEX64[..63], ASSET_NAMES[0]); // 63 位
+        let problems = validate_sums_content(&lines.join("\n"));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains(ASSET_NAMES[0]) && p.contains("64")),
+            "非 64 位哈希必须被点名报出"
+        );
     }
 
     #[test]
