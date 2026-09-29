@@ -2393,29 +2393,16 @@ fn watchdog_log(msg: &str) {
 /// 同类告警去重窗口：窗口内同一 kind 只升级一次（落库+系统通知），防长
 /// 时间故障期把 events 表刷爆。去重时刻持久化在 watchdog-state.json——
 /// 生产形态是计划任务每分钟跑一次 `watchdog --once`（全新进程），进程内
-/// static 去重完全失效（持续故障每分钟弹框+插库）。
+/// static 去重完全失效（持续故障每分钟插库）。
 const WATCHDOG_ALERT_DEDUP_SECS: i64 = 1800;
-/// 告警升级是否触发过的原子旗标（--once 模式退出前据此等待模态框线程）
-static WATCHDOG_ALERT_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// --once 退出前需等待的告警模态框线程（windows 块内发射，跨函数交给退出
-/// 路径）。--once 进程退出会随进程销毁窗口，进程内的固定 1500ms 睡眠既等
-/// 不到用户、窗口也可能来不及画出。
-#[cfg(target_os = "windows")]
-static ALERT_BOX_THREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(Vec::new());
-/// 模态框存活上限：等用户关闭，但没人理时不能让计划任务进程被一个对话框
-/// 长期占住（互斥锁防并发 --once，但每分钟一个 60s 进程仍属浪费）。
-#[cfg(target_os = "windows")]
-const ALERT_BOX_MAX_LIFETIME_SECS: u64 = 60;
 
 /// 看门狗告警升级通道：异常不再只写 watchdog.log（复核发现生产库 29 分钟
-/// 采集空洞在库/UI 层面零痕迹），同时
-/// 1) 落库为 `notification` 系统事件（event_data 带 source=watchdog/kind/
-///    message），UI 与分析侧可读；沿用既有 action 枚举，不改 schema。
-/// 2) 尽力而为弹一次系统通知（独立线程，不阻塞检查循环；--once 退出路径
-///    会等它关闭或到存活上限）。
+/// 采集空洞在库/UI 层面零痕迹），而是
+/// 落库为 `notification` 系统事件（event_data 带 source=watchdog/kind/
+/// message），UI 与分析侧可读；沿用既有 action 枚举，不改 schema。
+/// 告警面收敛为 watchdog.log 日志 + 库内事件（面板横幅按界面语言承载），
+/// 不弹任何前台模态框——零前台抢占（9/25–9/27 顶置框误报与 9/29
+/// 06:27/06:34 两次抢前台均为此形制）。
 ///
 /// 全程尽力而为：库打不开/写失败只留 stderr，不影响看门狗主流程。
 /// 按 kind 去重（上次告警时刻持久化在 state.last_alert_epochs，跨进程
@@ -2429,14 +2416,12 @@ fn watchdog_alert(state: &mut WatchdogState, kind: &str, message: &str, message_
     }
     state.last_alert_epochs.insert(kind.to_string(), now_epoch);
     // 恢复门（跨进程持久化）：停摆类告警升级时记下 kind，心跳恢复的那一轮
-    // 据此落解除事件。进程内 WATCHDOG_ALERT_FIRED 旗标只保留「--once 退出前
-    // 等模态框线程」的用途，不能作恢复门——生产形态每分钟一个全新进程，
-    // 旗标在进程 N 置位后随进程退出丢弃，进程 N+1 读到的恒为 false。
+    // 据此落解除事件。恢复门必须落盘才能跨轮存活——生产形态每分钟一个
+    // 全新进程，进程内任何 static 状态都随进程退出丢弃。
     if kind_implies_collection_stall(kind) {
         state.pending_recovery_kind = Some(kind.to_string());
     }
     save_watchdog_state(state);
-    WATCHDOG_ALERT_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
     watchdog_log(&format!("告警[{kind}] {message}"));
     // 落库：复用 open_db（SCHEMA+迁移），库缺失时也能建全 schema 再插入
     let db_path = resolve_db();
@@ -2458,28 +2443,6 @@ fn watchdog_alert(state: &mut WatchdogState, kind: &str, message: &str, message_
             }
         }
         Err(e) => eprintln!("watchdog: 告警事件落库失败(库打不开): {e}"),
-    }
-    // 系统通知（Windows）：MB_ICONWARNING | MB_TOPMOST，独立线程发射；
-    // 线程句柄交给 ALERT_BOX_THREADS，--once 退出路径等待其关闭（上限
-    // ALERT_BOX_MAX_LIFETIME_SECS），不再依赖固定 1500ms 睡眠的渲染窗口。
-    #[cfg(target_os = "windows")]
-    {
-        let text: Vec<u16> = format!("kynoptic 告警: {message}")
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        let title: Vec<u16> = "kynoptic watchdog\0".encode_utf16().collect();
-        let h = std::thread::spawn(move || unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                std::ptr::null_mut(),
-                text.as_ptr(),
-                title.as_ptr(),
-                0x0000_0030 | 0x0004_0000,
-            );
-        });
-        if let Ok(mut q) = ALERT_BOX_THREADS.lock() {
-            q.push(h);
-        }
     }
 }
 
@@ -2539,10 +2502,10 @@ fn exit_flag_needs_record(state: &WatchdogState, latch_key: i64) -> bool {
 
 /// exit_flag 一次性状态记录（Wave46：从「故障告警」降为「状态记录」）：
 /// 落一条 notification 事件（面板横幅按 24h 窗口持续承载，exit_flag 非停摆
-/// 类 kind，无恢复门）+ 尽力弹一次模态框。仅在同一旗标（mtime 不变）的
-/// 首次发现时由调用方触发（持久闩 state.exit_flag_latched 保证跨 --once
-/// 进程一次性）。尽力而为语义与 watchdog_alert 相同；模态线程交
-/// ALERT_BOX_THREADS，--once 退出路径等它关闭（上限 ALERT_BOX_MAX_LIFETIME_SECS）。
+/// 类 kind，无恢复门）。仅在同一旗标（mtime 不变）的首次发现时由调用方
+/// 触发（持久闩 state.exit_flag_latched 保证跨 --once 进程一次性）。
+/// 尽力而为语义与 watchdog_alert 相同；告警面 = 日志 + 面板横幅，
+/// 不再弹 MB_TOPMOST 模态框。
 #[cfg(target_os = "windows")]
 fn record_exit_flag_notice() {
     let db_path = resolve_db();
@@ -2567,25 +2530,6 @@ fn record_exit_flag_notice() {
             }
         }
         Err(e) => eprintln!("watchdog: exit_flag 事件落库失败(库打不开): {e}"),
-    }
-    // 模态框：参数与 watchdog_alert 相同（MB_ICONWARNING | MB_TOPMOST），
-    // 独立线程发射；先置 WATCHDOG_ALERT_FIRED 再交线程，--once 退出等待据此生效
-    let text: Vec<u16> = "kynoptic 提示: 检测到托盘退出旗标，看门狗不拉起托盘"
-        .encode_utf16()
-        .chain([0])
-        .collect();
-    let title: Vec<u16> = "kynoptic watchdog\0".encode_utf16().collect();
-    let h = std::thread::spawn(move || unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            0x0000_0030 | 0x0004_0000,
-        );
-    });
-    WATCHDOG_ALERT_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut q) = ALERT_BOX_THREADS.lock() {
-        q.push(h);
     }
 }
 
@@ -2675,7 +2619,7 @@ struct WatchdogState {
     /// tray-exit.flag 首次发现闩（Wave46：exit_flag 从「故障告警」降为
     /// 「状态记录」）：存记录时旗标文件的 mtime（unix 秒）。0 = 未记录
     /// （也用作 mtime 不可读时的键值）。同一旗标（mtime 不变）持续存在
-    /// 期间，日志行/模态框/落库事件各至多一次；新旗标（托盘再次退出，
+    /// 期间，日志行/落库事件各至多一次；新旗标（托盘再次退出，
     /// mtime 变化）= 新一轮「全退」，再记录一次。--once 形态每分钟全新
     /// 进程，进程局部旗标无效，必须持久化（仿 tray 侧
     /// WATCHDOG_TASK_ALERTED 闩的落盘版）。
@@ -3516,10 +3460,9 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 // 删除点是托盘自身启动，被压制后无人清理。
                 // Wave46：exit_flag 从「故障告警」降为「状态记录」——旧实现
                 // 每个 --once 进程留痕一次（生产形态每分钟全新进程，日志行每
-                // 分钟一行），模态框+落库事件每 30min 重触发（整夜不重启
-                // 托盘 ≈48 次抢占焦点弹窗）。现按旗标文件 mtime 作「轮」边界，
-                // 持久闩（state.exit_flag_latched）保证同一旗标持续存在期间
-                // 日志行/模态框/落库事件各至多一次；新一轮「全退」（旗标
+                // 分钟一行），落库事件每 30min 重触发。现按旗标文件 mtime 作
+                // 「轮」边界，持久闩（state.exit_flag_latched）保证同一旗标
+                // 持续存在期间 日志行/落库事件各至多一次；新一轮「全退」（旗标
                 // 重现、mtime 变化）再记录一次。
                 let meta = std::fs::metadata(&exit_flag).ok();
                 let mtime = meta.as_ref().and_then(|m| m.modified().ok());
@@ -3543,25 +3486,6 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             }
             if once {
                 release_watchdog_lock(&lock_path);
-                // 告警模态框由独立线程发射、随进程销毁。旧的固定 1500ms 睡眠
-                // 既等不到用户（框一闪而没），窗口甚至可能来不及画出。改为
-                // 等待对话框线程本身：用户关闭（或框被系统收掉）即返回，无
-                // 人理时按 ALERT_BOX_MAX_LIFETIME_SECS 上限退出，不长期占住
-                // 计划任务进程。
-                #[cfg(target_os = "windows")]
-                if WATCHDOG_ALERT_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
-                    let handles: Vec<_> = match ALERT_BOX_THREADS.lock() {
-                        Ok(mut q) => q.drain(..).collect(),
-                        Err(_) => Vec::new(),
-                    };
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_secs(ALERT_BOX_MAX_LIFETIME_SECS);
-                    for h in handles {
-                        while !h.is_finished() && std::time::Instant::now() < deadline {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                    }
-                }
                 return Ok(());
             }
             // 锁续命（回归审查 P1）：锁只在启动时创建、从不刷新——120s 后任何
