@@ -64,4 +64,8 @@ replaceOnce("README.zh-CN.md", `状态：v${old}`, `状态：v${next}`);
 // 5. APP.md 标题版本号
 replaceOnce("APP.md", `# Kynoptic App (v${old})`, `# Kynoptic App (v${next})`);
 
+// 6. llms.txt 状态行（Wave46：七处一致性此前只护六处，0.3.1 发版时该行
+// 漂移在 v0.3.0，事后人肉补正，CHANGELOG.md:269-272 有同型事故记录）
+replaceOnce("llms.txt", `Status: v${old}`, `Status: v${next}`);
+
 console.log(`[bump-version] 完成。记得更新 CHANGELOG.md 并用 /DAppVersion=${next} 打包。`);

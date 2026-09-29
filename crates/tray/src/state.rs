@@ -51,10 +51,13 @@ impl MenuId {
     }
 
     /// Error 态的恢复项文案（按故障来源分：面板故障时 Resume 修不了面板，
-    /// 必须如实说，否则点了没反应还伴随图标闪烁）。
-    pub fn resume_label(&self, dash_failed: bool) -> &'static str {
+    /// 必须如实说；采集器故障（启动失败）同理——点它也不会立刻翻绿，
+    /// 文案指向 collector-error.log，避免许诺「恢复」却无反馈）。
+    pub fn resume_label(&self, dash_failed: bool, collector_failed: bool) -> &'static str {
         if dash_failed {
             "面板不可用（详见数据目录 dashboard-error.log） / Dashboard unavailable (see dashboard-error.log in the data folder)"
+        } else if collector_failed {
+            "采集启动失败（详见数据目录 collector-error.log） / Collection failed to start (see collector-error.log in the data folder)"
         } else {
             "恢复采集 / Resume"
         }
@@ -145,10 +148,15 @@ mod tests {
     #[test]
     fn error_resume_label_says_dashboard_when_dash_failed() {
         // 审查 medium：面板故障时菜单不得许诺"恢复采集"
-        let l = MenuId::TogglePause.resume_label(true);
+        let l = MenuId::TogglePause.resume_label(true, false);
         assert!(l.contains("面板不可用") && l.contains("dashboard-error.log"));
         assert!(!l.contains("恢复采集"));
-        let r = MenuId::TogglePause.resume_label(false);
+        // 平台审查（item 6）：采集器故障（启动失败）文案指向 collector-error.log，
+        // 不得许诺「恢复」却无反馈
+        let c = MenuId::TogglePause.resume_label(false, true);
+        assert!(c.contains("采集启动失败") && c.contains("collector-error.log"));
+        assert!(!c.contains("恢复采集"));
+        let r = MenuId::TogglePause.resume_label(false, false);
         assert!(r.contains("恢复采集"));
         // 双语规范：中文在前、半角 " / " 分隔
         for label in [

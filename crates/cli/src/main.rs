@@ -1287,8 +1287,18 @@ fn cmd_ghost() -> Result<()> {
 // === autostart ===
 /// Wave20 P0：CLI autostart 开关同步写 settings.json——否则托盘下次启动
 /// 按 settings 的 autostart 把注册表 Run 键写回去（CLI disable 被静默撤销）。
+///
+/// Wave46 补救：改用 resolve_db()（与其余子命令的 --db 语义对齐，DB_OVERRIDE
+/// 优先）——旧实现直走 resolve_db_path()（按 exe 推导的兜底目录），带 --db 的
+/// 自定义库部署形态会把 autostart 写进别处的 settings.json，disable 方向随后
+/// 被托盘按自己库旁的 settings 静默撤销（Run 键重建）。
 fn sync_settings_autostart(enable: bool) {
-    let db = kynoptic_core::db::resolve_db_path();
+    let db = resolve_db();
+    // 显式打印实际同步的 settings.json 路径（Wave46：静默写错目录是本次根因）
+    println!(
+        "同步配置文件: {}",
+        crate::settings::settings_path(&db).display()
+    );
     let mut st = crate::settings::load(&db);
     if st.autostart != enable {
         st.autostart = enable;
@@ -2051,6 +2061,10 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     let input_counts_only = crate::settings::load(std::path::Path::new(&db_path)).input_counts_only;
     let vk_frequency_enabled =
         crate::settings::load(std::path::Path::new(&db_path)).vk_frequency_enabled;
+    // 低配模式（Wave46 接线）：与 vk_frequency_enabled 同模式从 settings.json
+    // 读取——旧实现 ..default() 恒 false，用户开「低配模式」后 CLI collect
+    // 仍全速轮询（tray 侧已透传，三方字段集漂移）。
+    let low_power = crate::settings::load(std::path::Path::new(&db_path)).low_power;
     let csettings = collector::CollectorSettings {
         input_granularity: if input_counts_only {
             collector::InputGranularity::Minute
@@ -2059,6 +2073,8 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         },
         // vk 频次开关：settings.json → CollectorSettings → input_agg::set_vk_enabled
         vk_frequency_enabled,
+        // 低配模式：settings.json → CollectorSettings → monitors::set_low_power_mode
+        low_power,
         ..collector::CollectorSettings::default()
     };
     let mut c = collector::start_collection_custom(&enabled, csettings, &db_path);
@@ -2512,6 +2528,67 @@ fn watchdog_recovered_notice() {
     }
 }
 
+/// exit_flag「轮」判定（纯函数，单测覆盖）：持久闩与当前旗标 mtime 键
+/// （0 = 未记录/mtime 不可读）不同才需要记录——同一旗标（mtime 不变）
+/// 持续存在期间只记录一次；新旗标（托盘再次退出，mtime 变化）再记录
+/// 一次。
+#[cfg(target_os = "windows")]
+fn exit_flag_needs_record(state: &WatchdogState, latch_key: i64) -> bool {
+    state.exit_flag_latched != latch_key
+}
+
+/// exit_flag 一次性状态记录（Wave46：从「故障告警」降为「状态记录」）：
+/// 落一条 notification 事件（面板横幅按 24h 窗口持续承载，exit_flag 非停摆
+/// 类 kind，无恢复门）+ 尽力弹一次模态框。仅在同一旗标（mtime 不变）的
+/// 首次发现时由调用方触发（持久闩 state.exit_flag_latched 保证跨 --once
+/// 进程一次性）。尽力而为语义与 watchdog_alert 相同；模态线程交
+/// ALERT_BOX_THREADS，--once 退出路径等它关闭（上限 ALERT_BOX_MAX_LIFETIME_SECS）。
+#[cfg(target_os = "windows")]
+fn record_exit_flag_notice() {
+    let db_path = resolve_db();
+    match open_db(&db_path) {
+        Ok(conn) => {
+            let sql = "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                       VALUES (?1, 'system', 'notification', ?2)";
+            if let Err(e) = conn.execute(
+                sql,
+                params![
+                    Utc::now().to_rfc3339(),
+                    json!({
+                        "source": "watchdog",
+                        "kind": "exit_flag",
+                        "message": "检测到托盘退出旗标，看门狗不拉起托盘；若非本人主动退出，请删除 exe 同目录的 tray-exit.flag",
+                        "message_en": "Tray exit flag detected; the watchdog will not start the tray — if you did not quit the tray yourself, delete tray-exit.flag next to the exe"
+                    })
+                    .to_string(),
+                ],
+            ) {
+                eprintln!("watchdog: exit_flag 事件落库失败: {e}");
+            }
+        }
+        Err(e) => eprintln!("watchdog: exit_flag 事件落库失败(库打不开): {e}"),
+    }
+    // 模态框：参数与 watchdog_alert 相同（MB_ICONWARNING | MB_TOPMOST），
+    // 独立线程发射；先置 WATCHDOG_ALERT_FIRED 再交线程，--once 退出等待据此生效
+    let text: Vec<u16> = "kynoptic 提示: 检测到托盘退出旗标，看门狗不拉起托盘"
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let title: Vec<u16> = "kynoptic watchdog\0".encode_utf16().collect();
+    let h = std::thread::spawn(move || unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            0x0000_0030 | 0x0004_0000,
+        );
+    });
+    WATCHDOG_ALERT_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut q) = ALERT_BOX_THREADS.lock() {
+        q.push(h);
+    }
+}
+
 /// 轮转判定（纯函数，单测覆盖）：当前大小超过阈值即需要轮转。
 fn needs_log_rotation(size: u64) -> bool {
     size > WATCHDOG_LOG_MAX_BYTES
@@ -2595,6 +2672,17 @@ struct WatchdogState {
     ///（取出即清,兼作幂等门）。None = 当前没有待解除的告警。
     #[serde(default)]
     pending_recovery_kind: Option<String>,
+    /// tray-exit.flag 首次发现闩（Wave46：exit_flag 从「故障告警」降为
+    /// 「状态记录」）：存记录时旗标文件的 mtime（unix 秒）。0 = 未记录
+    /// （也用作 mtime 不可读时的键值）。同一旗标（mtime 不变）持续存在
+    /// 期间，日志行/模态框/落库事件各至多一次；新旗标（托盘再次退出，
+    /// mtime 变化）= 新一轮「全退」，再记录一次。--once 形态每分钟全新
+    /// 进程，进程局部旗标无效，必须持久化（仿 tray 侧
+    /// WATCHDOG_TASK_ALERTED 闩的落盘版）。
+    /// 注意：不用 Option<Option<i64>>——serde JSON 下 None 与 Some(None)
+    /// 都序列化为 null，往返丢失「已记录但 mtime 不可读」态。
+    #[serde(default)]
+    exit_flag_latched: i64,
 }
 
 fn watchdog_state_path() -> PathBuf {
@@ -3109,8 +3197,6 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             Some(p) => p,
             None => return Ok(()),
         };
-        // 旗标告警去重：常驻模式下 tray-exit.flag 持续存在，只留痕一次
-        let mut flag_warned = false;
         loop {
             let now_epoch = Utc::now().timestamp();
             let running = unsafe {
@@ -3422,29 +3508,38 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                         }
                     }
                 }
-            } else if !flag_warned {
+            } else {
                 // 静默停摆告警（低危，最小缓解）：tray-exit.flag 是固定名
                 // 文件，任何同用户进程写一个同名文件即可让看门狗永久停止
                 // 拉起（唯一不会被自动复活的停摆路径）。同用户可伪造内容，
                 // 读取侧校验不可行——至少留痕一次供人工判断；旗标唯一合法
                 // 删除点是托盘自身启动，被压制后无人清理。
-                flag_warned = true;
-                let age = std::fs::metadata(&exit_flag)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|d| d.as_secs())
+                // Wave46：exit_flag 从「故障告警」降为「状态记录」——旧实现
+                // 每个 --once 进程留痕一次（生产形态每分钟全新进程，日志行每
+                // 分钟一行），模态框+落库事件每 30min 重触发（整夜不重启
+                // 托盘 ≈48 次抢占焦点弹窗）。现按旗标文件 mtime 作「轮」边界，
+                // 持久闩（state.exit_flag_latched）保证同一旗标持续存在期间
+                // 日志行/模态框/落库事件各至多一次；新一轮「全退」（旗标
+                // 重现、mtime 变化）再记录一次。
+                let meta = std::fs::metadata(&exit_flag).ok();
+                let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+                let latch_key = mtime
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                watchdog_log(&format!(
-                    "tray-exit.flag 已存在（{}s 前写入），看门狗不拉起托盘；若非本人主动退出托盘，请删除该文件",
-                    age
-                ));
-                watchdog_alert(
-                    &mut state,
-                    "exit_flag",
-                    "检测到托盘退出旗标，看门狗已停止拉起托盘；若非本人主动退出，请删除 exe 同目录的 tray-exit.flag",
-                    "Tray exit flag detected; the watchdog has stopped starting the tray — if you did not quit the tray yourself, delete tray-exit.flag next to the exe",
-                );
+                if exit_flag_needs_record(&state, latch_key) {
+                    state.exit_flag_latched = latch_key;
+                    save_watchdog_state(&state);
+                    let age = mtime
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    watchdog_log(&format!(
+                        "tray-exit.flag 已存在（{}s 前写入），看门狗不拉起托盘；若非本人主动退出托盘，请删除该文件",
+                        age
+                    ));
+                    record_exit_flag_notice();
+                }
             }
             if once {
                 release_watchdog_lock(&lock_path);
@@ -4296,6 +4391,7 @@ mod tests {
                 555,
             )]),
             pending_recovery_kind: Some("collection_stalled".to_string()),
+            exit_flag_latched: 1_790_000_000,
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: WatchdogState = serde_json::from_str(&json).unwrap();
@@ -4322,6 +4418,14 @@ mod tests {
             partial.pending_recovery_kind.is_none(),
             "恢复门缺省为无待解除告警"
         );
+        assert_eq!(
+            back.exit_flag_latched, 1_790_000_000,
+            "exit_flag 持久闩须随 state 往返（--once 跨进程一次性记录的依据）"
+        );
+        assert_eq!(
+            partial.exit_flag_latched, 0,
+            "exit_flag 闩缺省为未记录（0 哨兵）"
+        );
         assert!(serde_json::from_str::<WatchdogState>("garbage").is_err());
     }
 
@@ -4343,6 +4447,40 @@ mod tests {
         // 用户主动退出托盘 / 更新进行中：非停摆，解除门不置位
         assert!(!kind_implies_collection_stall("exit_flag"));
         assert!(!kind_implies_collection_stall("updating_flag"));
+    }
+
+    // === exit_flag 一次性状态记录闩（Wave46：同一旗标 mtime 只记录一次） ===
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn exit_flag_latch_records_once_per_incarnation() {
+        // 首轮（闩 0=未记录）：mtime 可读（键>0）必须记录
+        let st = WatchdogState::default();
+        assert!(
+            exit_flag_needs_record(&st, 1_790_000_000),
+            "初始态（0）遇可读 mtime 须记录"
+        );
+        // 同一旗标（mtime 不变）持续存在期间：不重复记录
+        let st2 = WatchdogState {
+            exit_flag_latched: 1_790_000_000,
+            ..Default::default()
+        };
+        assert!(
+            !exit_flag_needs_record(&st2, 1_790_000_000),
+            "同一旗标（同 mtime）不得重复记录（--once 每分钟新进程静默的依据）"
+        );
+        // 新一轮「全退」（旗标重现、mtime 变化）：再记录一次
+        assert!(
+            exit_flag_needs_record(&st2, 1_790_003_600),
+            "新 mtime = 新一轮，须重新记录"
+        );
+        // mtime 不可读（键 0）：已记录过 mtime 的旗标变得不可读 → 视为
+        // 新一轮记一次（记 0 后不再重弹）；全新态（0）+ 不可读（0）静默
+        // （双重病态边角：文件存在但读不到 mtime，宁缺勿滥不刷屏）
+        assert!(exit_flag_needs_record(&st2, 0));
+        let mut st3 = st2;
+        st3.exit_flag_latched = 0;
+        assert!(!exit_flag_needs_record(&st3, 0));
     }
 
     // === watchdog 状态机（P1：观察窗内禁止重拉,秒退 3 次必入退避） ===
@@ -4395,6 +4533,7 @@ mod tests {
             observation_skips: 5,
             last_alert_epochs: std::collections::BTreeMap::new(),
             pending_recovery_kind: None,
+            exit_flag_latched: 0,
         };
         // t=100+90=190 > 观察窗, hb_mtime=120 > 90 → Recovered → 允许再拉起
         assert!(matches!(

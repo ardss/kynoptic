@@ -941,6 +941,87 @@ fn settings_post_reports_ignored_unknown_fields() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Wave46 回归：接受字段集 = 单一权威源 ACCEPTED_SETTING_FIELDS（请求接受/
+/// 响应键/ignored 判定三处共用）。10 个字段全发必须 200 且逐一生效落盘、
+/// 不出现 ignored（旧 KNOWN 表曾漏 update_check/low_power）。
+#[test]
+fn settings_post_full_accepted_set_never_ignored_and_persisted() {
+    let dir = tmpdir("accepted-set");
+    let db = dir.join("kyn.db");
+    let body: Value = json!({
+        "enabled_monitors": ["window", "keyboard_hook", "mouse_hook"],
+        "input_counts_only": false,
+        "vk_frequency_enabled": true,
+        "autostart": false,
+        "presence_bridge_minutes": 3,
+        "daily_goal_minutes": 60,
+        "categories": [],
+        "dashboard_port": 8422,
+        "update_check": false,
+        "low_power": true
+    });
+    let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &body.to_string(), &db);
+    assert_eq!(code, 200, "接受字段全集必须 200: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("ignored").is_none(),
+        "接受字段全集不得出现 ignored: {out}"
+    );
+    for field in ACCEPTED_SETTING_FIELDS {
+        assert_eq!(v[field], body[field], "字段 {field} 响应须回请求值: {out}");
+    }
+    assert!(
+        v["monitors"].is_array(),
+        "响应专用键 monitors 仍须在场: {out}"
+    );
+    // 落盘复核：GET 重读 settings.json 逐字段一致
+    let (_, _, out2) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let g: Value = serde_json::from_str(&out2).unwrap();
+    for field in ACCEPTED_SETTING_FIELDS {
+        assert_eq!(g[field], body[field], "字段 {field} 须落盘: {out2}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Wave46 回归：update_check/low_power 是接受字段，绝不列进 ignored；
+/// monitors 为响应专用键，请求误带它列进 ignored（与真未知字段同语义）。
+#[test]
+fn settings_post_accepted_fields_not_reported_ignored() {
+    let dir = tmpdir("ignored-accepted");
+    let db = dir.join("kyn.db");
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"update_check":false,"low_power":true,"monitors":[],"bogus_xyz":42}"#,
+        &db,
+    );
+    assert_eq!(code, 200, "接受字段不应 400: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["update_check"],
+        json!(false),
+        "update_check 应生效: {out}"
+    );
+    assert_eq!(v["low_power"], json!(true), "low_power 应生效: {out}");
+    // 按集合比对（不依赖 JSON map 键序）：恰为「响应专用键 + 真未知字段」
+    let ig: Vec<&str> = v["ignored"]
+        .as_array()
+        .unwrap_or_else(|| panic!("应有 ignored 列表: {out}"))
+        .iter()
+        .map(|x| {
+            x.as_str()
+                .unwrap_or_else(|| panic!("ignored 条目应为字符串: {out}"))
+        })
+        .collect();
+    assert_eq!(ig.len(), 2, "ignored 恰两项（monitors + bogus_xyz）: {out}");
+    assert!(
+        ig.contains(&"monitors") && ig.contains(&"bogus_xyz"),
+        "ignored 应恰为 [monitors, bogus_xyz]，不得含接受字段: {out}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // === settings：并发保存风暴（故障注入场景 6） ===
 
 /// 4 线程各 save 50 次不同 daily_goal_minutes。断言：

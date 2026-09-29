@@ -700,8 +700,9 @@ function kynHeaders(extra) {
   if (KYN_ACCESS_TOKEN) h["X-Kynoptic-Access-Token"] = KYN_ACCESS_TOKEN;
   return h;
 }
-/* 服务端错误码 → 英文文案（lib.rs err_json 的稳定 code）：后端校验错误正文
-   为中文，英文界面按 code 映射，避免 "load failed: date … 在未来…" 中英混排。
+/* 服务端错误码 → 英文文案（dashboard 服务稳定 code：err_json 校验错误与
+   传输层拒绝 413/503/431/403-host 均回 {"error","code"} JSON）：后端校验错误
+   正文为中文，英文界面按 code 映射，避免 "load failed: date … 在未来…" 中英混排。
    表外 code（含 db_error 的双语文案）原样显示后端文案。 */
 const ERR_TEXT = {
   future_date: "the requested date is in the future",
@@ -712,12 +713,20 @@ const ERR_TEXT = {
   method_not_allowed: "method not allowed",
   csrf_blocked: "write blocked: the request looks cross-site. Go back to the dashboard page and retry",
   session_token_invalid: "invalid session token — the page may be stale, refresh and retry",
-  unauthorized: "access token required (data\\dashboard-token.txt)"
+  unauthorized: "access token required (data\\dashboard-token.txt)",
+  payload_too_large: "the request body is too large (max 65536 bytes)",
+  header_too_large: "request headers are too large (max 8192 bytes) — refresh the page and retry",
+  service_unavailable: "too many concurrent connections — the dashboard is busy, try again shortly",
+  forbidden_host: "the dashboard accepts local connections only; this request came from another address and was rejected"
 };
 /* 中文界面的按码映射（ERR_TEXT 的中文对照）：服务端错误正文是英文/中文混排，
    中文界面按 code 给中文文案，不再直出英文原文 */
 const ERR_TEXT_ZH = {
-  unauthorized: "需要访问令牌（data\\dashboard-token.txt）"
+  unauthorized: "需要访问令牌（data\\dashboard-token.txt）",
+  payload_too_large: "请求内容过大（最大 65536 字节）",
+  header_too_large: "请求头过大（最大 8192 字节）——刷新页面后重试",
+  service_unavailable: "连接太多，服务繁忙，请稍后再试",
+  forbidden_host: "面板只接受本机连接；该请求来自其他地址，已被拒绝"
 };
 function apiErrText(e) {
   const en = document.documentElement.lang !== "zh";

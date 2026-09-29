@@ -26,7 +26,9 @@
 - Keyboard and mouse are stored as per-minute counts only - never key
   contents. Per-key frequency counts (used by the dashboard heatmap) are
   on by default and can be disabled in settings.
-- The dashboard and MCP server bind to 127.0.0.1 only.
+- The dashboard HTTP server binds to 127.0.0.1 only. The MCP server is
+  a stdio process (JSON-RPC over stdin/stdout) and has no network
+  socket of any kind.
 
 ## Architecture (four crates, plus a tray shell)
 

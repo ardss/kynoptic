@@ -11,7 +11,9 @@
 //! 仅在非 WAL 库上回退纯 READ_ONLY 连接 + busy_timeout（照搬原 cli 策略）。
 //! 唯一写路径是 POST /api/settings（写 settings.json，不触碰 events）。
 //!
-//! 端点（除 POST /api/settings 外全部 GET、JSON、只读）：
+//! 端点（除 POST /api/settings 外全部 GET、JSON、只读）。
+//! 完整端点清单的权威源是本文件 `route_req` 路由表与
+//! `crates/cli/src/assets/skill.md`（AI 客户端侧）；新增端点须同步两处。
 //! - `/`                             内嵌双语单页（Overview/Activity/Anomalies/Settings）
 //! - `/api/summary?date=`            当日 active_minutes / keys / clicks / top_app
 //! - `/api/timeline?hours=`          近 N 小时按本地小时桶的应用分布（top5 + other）
@@ -23,6 +25,14 @@
 //! - `/api/heatmap?weeks=`           按本地日聚合的活跃度 `[{date,value}]`，缺数天补零
 //! - `/api/apps?days=`               Top 应用排行（window 事件，空名排除）
 //! - `/api/hours?date=`              指定日 24 小时逐时输入量（按键+点击，缺时补零）
+//! - `/api/input?days=&date=`        近 N 天输入统计聚合（缺天补零；keyboard 行
+//!   含每键频次 `vk`）
+//! - `/api/insights`                 从既有键鼠/窗口事件挖掘的叙事式洞察（零新增采集）
+//! - `/api/report?date=`             单日报告（色带时间轴、类别占比、专注块）
+//! - `/api/trends`                   近 28 天每日 keys/clicks/active_minutes + 本 7 天
+//!   vs 上 7 天对比
+//! - `/api/apps_grid?date=`          指定日「小时 × 应用」使用矩阵（Top6 + other）
+//! - `/api/daily_top?days=`          近 N 天每日 Top3 应用（window 事件）
 //! - `/api/settings` (GET/POST)      设置读写（写 settings.json，不触碰 events）
 //! - `/api/autostart-status`         autostart 保存读回（settings 值 vs 注册表 Run 键现状）
 //! - `/api/diagnostics`              诊断留档文件清单（存在性/mtime/大小/尾部
@@ -2314,7 +2324,47 @@ pub fn api_settings(db_path: &Path) -> Value {
     settings_payload(&s)
 }
 
-/// 设置 + 监控器清单的统一响应体（GET 与 POST 共用）。
+/// `POST /api/settings` 接受字段集的唯一权威源（Wave46 补救：「请求接受字段」
+/// 「响应体键」「ignored 判定」三处共用本常量——此前 POST 侧的本地 KNOWN 表
+/// 与另两处漂移：缺 `update_check`/`low_power`（实际被接受并落盘却被列进
+/// ignored），还含响应专用键 `monitors`，同一响应既回显生效值又宣称被忽略）。
+/// 加字段时：加进本数组 + 补 [`setting_field_value`] 一臂（否则该字段在响应
+/// 里回显 null）+ 加一处 `req.get` 接受站点（否则该字段会被列进 ignored）；
+/// tests.rs 有回归测试固化「常量全集均被接受、落盘且不出现在 ignored」。
+/// 响应专用键 `monitors` 不属于本集——请求若误带它，按未知字段列进 ignored。
+const ACCEPTED_SETTING_FIELDS: [&str; 10] = [
+    "enabled_monitors",
+    "input_counts_only",
+    "vk_frequency_enabled",
+    "autostart",
+    "presence_bridge_minutes",
+    "daily_goal_minutes",
+    "categories",
+    "dashboard_port",
+    "update_check",
+    "low_power",
+];
+
+/// [`ACCEPTED_SETTING_FIELDS`] 各字段在响应侧的取值（响应键 = 常量条目）。
+fn setting_field_value(s: &AppSettings, field: &str) -> Value {
+    match field {
+        "enabled_monitors" => json!(s.enabled_monitors),
+        "input_counts_only" => json!(s.input_counts_only),
+        "vk_frequency_enabled" => json!(s.vk_frequency_enabled),
+        "autostart" => json!(s.autostart),
+        "presence_bridge_minutes" => json!(s.presence_bridge_minutes),
+        "daily_goal_minutes" => json!(s.daily_goal_minutes),
+        "categories" => json!(s.categories),
+        "dashboard_port" => json!(s.dashboard_port),
+        "update_check" => json!(s.update_check),
+        "low_power" => json!(s.low_power),
+        // 不可达：settings_payload 只按常量条目迭代；加常量条目后须补上臂。
+        _ => Value::Null,
+    }
+}
+
+/// 设置 + 监控器清单的统一响应体（GET 与 POST 共用）：字段键全部来自
+/// [`ACCEPTED_SETTING_FIELDS`]，只读键 `monitors` 单独追加。
 fn settings_payload(s: &AppSettings) -> Value {
     let monitors: Vec<Value> = registry::MONITOR_REGISTRY
         .iter()
@@ -2328,24 +2378,17 @@ fn settings_payload(s: &AppSettings) -> Value {
             })
         })
         .collect();
-    json!({
-        "enabled_monitors": s.enabled_monitors,
-        "autostart": s.autostart,
-        "input_counts_only": s.input_counts_only,
-        "dashboard_port": s.dashboard_port,
-        "daily_goal_minutes": s.daily_goal_minutes,
-        "presence_bridge_minutes": s.presence_bridge_minutes,
-        "vk_frequency_enabled": s.vk_frequency_enabled,
-        "update_check": s.update_check,
-        "low_power": s.low_power,
-        "categories": s.categories,
-        "monitors": monitors,
-    })
+    let mut payload = Value::Object(Default::default());
+    for field in ACCEPTED_SETTING_FIELDS {
+        payload[field] = setting_field_value(s, field);
+    }
+    payload["monitors"] = json!(monitors);
+    payload
 }
 
-/// POST /api/settings — 接受 `enabled_monitors` / `autostart` / `dashboard_port`
-/// / `input_counts_only` / `vk_frequency_enabled` 任一子集；监控器 id 必须全部在
-/// 注册表内，否则 400。写盘后返回新设置；实际变更追加审计行到 settings-audit.log。
+/// POST /api/settings — 接受 [`ACCEPTED_SETTING_FIELDS`]（10 字段）任一子集；
+/// 监控器 id 必须全部在注册表内，否则 400。写盘后返回新设置；实际变更
+/// 追加审计行到 settings-audit.log。
 pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
     // serde 原文（英文诊断串）不透传：只给行/列定位，细节进日志
     let req: Value = serde_json::from_str(body).map_err(|e| {
@@ -2465,23 +2508,15 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     SETTINGS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut payload = settings_payload(&next);
-    // 可选低成本兼容：未知顶层字段不 400，仅在响应里回 "ignored" 供前端排查
-    const KNOWN: [&str; 9] = [
-        "enabled_monitors",
-        "input_counts_only",
-        "vk_frequency_enabled",
-        "autostart",
-        "presence_bridge_minutes",
-        "daily_goal_minutes",
-        "categories",
-        "dashboard_port",
-        "monitors",
-    ];
+    // 可选低成本兼容：未知顶层字段不 400，仅在响应里回 "ignored" 供前端排查。
+    // ignored 判定与 req.get 接受站点、settings_payload 响应共用单一权威源
+    // ACCEPTED_SETTING_FIELDS（Wave46：旧本地 KNOWN 表缺 update_check/low_power
+    // 且含响应专用键 monitors，导致"已生效值"与"被忽略"同处一响应的自相矛盾）。
     let ignored: Vec<&str> = req
         .as_object()
         .map(|o| {
             o.keys()
-                .filter(|k| !KNOWN.contains(&k.as_str()))
+                .filter(|k| !ACCEPTED_SETTING_FIELDS.contains(&k.as_str()))
                 .map(String::as_str)
                 .collect()
         })
@@ -3279,9 +3314,15 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
     if access_token.is_some() {
         log::info!("dashboard: 访问令牌已启用（/api/* 需携带 token，见 dashboard-token.txt）");
     }
+    // 平台审查（item 8）：启动行日志此前把含账号名的绝对 DB 路径 display() 进
+    // 持久日志（每次启动重复累计）。改为只回文件名（数据目录），与项目「日志
+    // 只回文件名不回路径」的纪律对齐。
     log::info!(
         "dashboard: http://127.0.0.1:{bound}  (db: {}, read-only)",
-        db_path.display()
+        db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("kynoptic.db")
     );
     println!(
         "dashboard: http://127.0.0.1:{bound}  (db: {}, read-only; Ctrl+C 停止)",
@@ -3295,7 +3336,14 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
         if inflight.load(std::sync::atomic::Ordering::Relaxed) >= 64 {
             let mut s = stream;
             let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-            let _ = http_simple(&mut s, 503, "text/plain", "too many connections");
+            // Wave46：传输层拒绝统一 JSON+code（原为 text/plain 裸串，与
+            // 400/401/403/404/405 约定分叉）；code 供前端 ERR_TEXT 映射文案。
+            let _ = http_simple(
+                &mut s,
+                503,
+                "application/json",
+                "{\"error\":\"too many connections\",\"code\":\"service_unavailable\"}",
+            );
             continue;
         }
         // 每连接一线程 + 5s 读写超时（审查 P0：旧实现单线程串行且无超时，
@@ -3439,7 +3487,13 @@ fn handle_client(
             break pos + 4;
         }
         if raw.len() > 8192 {
-            return http_simple(&mut stream, 431, "text/plain", "headers too large");
+            // Wave46：同 JSON+code 约定（code=header_too_large）
+            return http_simple(
+                &mut stream,
+                431,
+                "application/json",
+                "{\"error\":\"headers too large\",\"code\":\"header_too_large\"}",
+            );
         }
     };
     let head = String::from_utf8_lossy(&raw[..header_end.min(raw.len())]).to_string();
@@ -3466,7 +3520,13 @@ fn handle_client(
     }
     // DNS rebinding 防线：Host 必须是回环名。
     if !loopback_host_ok(&host, port) {
-        return http_simple(&mut stream, 403, "text/plain", "forbidden host");
+        // Wave46：同 JSON+code 约定（code=forbidden_host）
+        return http_simple(
+            &mut stream,
+            403,
+            "application/json",
+            "{\"error\":\"forbidden host\",\"code\":\"forbidden_host\"}",
+        );
     }
     // CSRF 防线（审查 P0：无校验的 POST 可被任意网页打——最恶劣路径是静默
     // 开启逐键记录）。写请求必须带自定义头 X-Kynoptic: 1：跨站表单/simple
@@ -3528,12 +3588,14 @@ fn handle_client(
     }
     // fuzz 加固：超限 body 直接 413，不再静默截断解析（旧路径截断到 64KB 后
     // 仍进 JSON 解析，且与客户端期望的字节数不一致会导致连接重置）。
+    // Wave46：补稳定 code=payload_too_large（原无 code，前端只能显示裸英文
+    // error 文案），与 400/401/403/404/405 的 err_json 约定对齐。
     if content_length > 64 * 1024 {
         return http_simple(
             &mut stream,
             413,
             "application/json",
-            "{\"error\":\"payload too large (max 65536 bytes)\"}",
+            "{\"error\":\"payload too large (max 65536 bytes)\",\"code\":\"payload_too_large\"}",
         );
     }
     // 会话令牌校验（审查 P1 补强：marker/Origin/Sec-Fetch-Site 三防线均为

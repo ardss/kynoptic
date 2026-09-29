@@ -3,6 +3,9 @@
 //! 【默认关闭】PS 子进程实现（powershell spawn），待原生 API 重写后再考虑默认启用。
 //!
 //! 通过 PowerShell Get-WinEvent 读取 Windows 安全日志。
+//!
+//! 隐私边界：安全日志原文（含账号名/来源 IP/进程路径）不落库，只存加盐
+//! 摘要（前 8 hex）+ 长度 + 事件 id/名/时间（与 notification/clipboard 同粒度）。
 
 use crate::monitors::ps::run_ps;
 use crate::types::*;
@@ -86,11 +89,18 @@ Get-WinEvent -FilterHashtable @{LogName='Security';Id=$idlist} -MaxEvents 30 -Er
                     .map(|(_, n)| *n)
                     .unwrap_or("unknown");
                 if events.len() < 10 {
+                    // 隐私对齐（与 notification/clipboard 同粒度，平台审查 item 10）：
+                    // 安全日志原文含账号名/来源 IP（4625）、进程路径（4672）——PII
+                    // 红线。原文不落库，只存加盐摘要前 8 hex + 字节长度。正文仅在
+                    // 子进程 stdout → 本进程内存中转，算完摘要即丢弃。
+                    let msg = parts[2].trim();
+                    let digest = super::clipboard::salted_digest_hex(msg.as_bytes());
                     events.push(json!({
                         "event_id": eid,
                         "event_name": name,
                         "time": time,
-                        "message": parts[2].trim(),
+                        "digest": &digest[..8],
+                        "len": msg.len(),
                     }));
                 }
             }

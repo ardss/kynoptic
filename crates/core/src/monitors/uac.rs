@@ -3,6 +3,9 @@
 //! 【默认关闭】PS 子进程实现（powershell spawn），待原生 API 重写后再考虑默认启用。
 //!
 //! 通过 PowerShell 读取 Windows Defender 和安全日志中的 UAC 相关事件。
+//!
+//! 隐私边界：日志原文（可能含账号名/进程路径）不落库，只存加盐摘要（前
+//! 8 hex）+ 长度 + 事件 id/来源/时间（与 notification/clipboard 同粒度）。
 
 use crate::monitors::ps::run_ps;
 use crate::types::*;
@@ -69,11 +72,17 @@ $events
                     latest_time = Some(time.clone());
                 }
                 if events.len() < 10 {
+                    // 隐私对齐（与 notification/clipboard 同粒度，平台审查 item 10）：
+                    // Defender/安全日志原文可能含账号名/进程路径——PII 红线。
+                    // 原文不落库，只存加盐摘要前 8 hex + 字节长度。
+                    let msg = parts[3].trim();
+                    let digest = super::clipboard::salted_digest_hex(msg.as_bytes());
                     events.push(json!({
                         "event_id": parts[1].trim().parse::<u32>().unwrap_or(0),
                         "time": time,
                         "source": parts[2].trim(),
-                        "message": parts[3].trim(),
+                        "digest": &digest[..8],
+                        "len": msg.len(),
                     }));
                 }
             }

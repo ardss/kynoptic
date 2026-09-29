@@ -44,6 +44,7 @@ HTTP API（GET 全部只读）：
 `/api/overview`（三指标+机器值班+硬件）、`/api/timeline?hours=24`（全小时补零三色桶；hours 有效范围 1–744（31 天），超出范围的取值会被收拢到该区间）、
 `/api/insights`（6 张叙事卡）、`/api/report`、`/api/heatmap`、`/api/anomalies`（含 message_en）、
 `/api/settings`、`/api/status`、`/api/summary`、`/api/input?date=`（逐时输入序列，date 指定统计哪一天，缺省今天；空值或非法日期返回 400）、
+`/api/autostart-status`（自启同步读回：settings.json 的 autostart 值 vs 注册表 Run 键现状）、
 `/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours?date=`（每小时输入次数，含自动化注入输入；非黄金时段；黄金时段洞察取 /api/insights）、
 `/api/apps_grid`、`/api/daily_top`、`/api/trends`（本周/上周对比，注意 active_minutes 是 raw 口径）、`/api/diagnostics`（运行诊断信息）。
 查询参数统一语义（全 GET 端点）：重复参数取**首个**；显式空值（如 `?date=`、`?days=`）返回 400；数值参数非数字或低于下界返回 400，错误文案写明有效域（timeline `hours` 1–744、heatmap `weeks` 1–52、anomalies `days` 1–30、apps `days` 1–365、daily_top/input `days` 1–90）；超上限仍 200，但服务端钳制并在响应标注 `X_requested`+`note`（anomalies 同时置 `truncated=true`）；未识别或大小写错误的参数在响应 `ignored_params` 数组中回显。
@@ -54,7 +55,7 @@ HTTP API（GET 全部只读）：
 - **0 = 成功，1 = 失败（参数错误/环境错误/操作未完成）**：所有子命令通用；错误说明走 stderr（`✗` 开头）。
 - `probe` 特有：**0 = 全部 PASS/EXPECTED-LIMITED，3 = 存在 FAIL（探针判定监控器坏），1 = 参数/环境错误**。门禁脚本看退出码即可，不必解析 verdict 文本。
 - `db checkpoint` 打印 `✓ 完成` 才是成功；WAL 因有活跃读取而未截断时报错（stderr，退出码 1），不是警告。
-- `update --check`：stdout 输出 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`，退出码 0；网络不可达或 Releases 上没有完整稳定版资产时退出码 1，stderr 写明原因。
+- `update --check`：stdout 输出 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`，退出码 0；退出码 1 时三种文案在 stderr 互相可分：① 网络不可达（代理问题等）；② Releases 上没有完整稳定版资产；③ 最新版校验清单不全（资产清单缺项或 SHA256SUMS.txt 条目不达标准，暂不可一键更新）。
 
 ## 口径铁律（引用数字前必读）
 
