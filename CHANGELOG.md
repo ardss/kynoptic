@@ -66,6 +66,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   substring semantics (no word boundaries in Chinese). The `文档`
   default rule gained `winword`/`powerpnt` so Word/PowerPoint still
   classify by process name under the tighter matching.
+- Dashboard (`POST /api/settings`): the response's `ignored` array no
+  longer misreports accepted fields. `update_check` and `low_power`
+  are accepted and persisted, yet were listed in `ignored` (the
+  settings page sent both on every save, producing two spurious
+  entries per save), while `monitors` — a response-only key — was
+  excluded from the list; one response thus echoed effective values
+  while claiming they were ignored. The accepted-field set is now a
+  single constant shared by request handling, the settings payload,
+  and the `ignored` computation; `monitors` sent by a client is now
+  correctly reported as ignored.
+- Dashboard: transport-level rejections now use the same
+  `{"error","code"}` JSON as the other error responses (400/401/403/404/405).
+  413 (payload limit) adds `code: payload_too_large`, 503 (connection
+  cap) now sends `code: service_unavailable` instead of a plain-text
+  body, 431 sends `code: header_too_large`, and the loopback-Host 403
+  sends `code: forbidden_host`; previously 503/431/403-host were
+  plain text and 413 had no code, so programmatic consumers saw raw
+  English strings. The settings page maps the new codes to its
+  bilingual error text.
 
 ### Changed
 
@@ -112,6 +131,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array (mirroring POST `/api/settings`'s `ignored`), so `?DATE=…` is
   no longer silently dropped. API docs in
   `crates/cli/src/assets/skill.md` updated accordingly.
+
+- Docs: the dashboard module's endpoint list was missing six of the
+  seventeen API endpoints (`/api/input`, `/api/insights`, `/api/report`,
+  `/api/trends`, `/api/apps_grid`, `/api/daily_top`); it now lists all
+  of them and names the `route_req` route table and
+  `crates/cli/src/assets/skill.md` as the authoritative endpoint
+  lists. `llms.txt` and `SECURITY.md` no longer say the MCP server
+  "binds to 127.0.0.1" — it is a stdio process (JSON-RPC over
+  stdin/stdout) with no network socket of any kind; only the
+  dashboard HTTP server binds to 127.0.0.1.
 
 ## [0.3.1] - 2026-09-25
 

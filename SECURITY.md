@@ -12,8 +12,9 @@ fixes. Please update to the latest version before reporting.
 ## Outbound network & offline operation
 
 The only outbound call Kynoptic makes is a once-daily **version check**.
-Recorded data never leaves the machine, and local surfaces (dashboard,
-MCP server) bind to `127.0.0.1` only.
+Recorded data never leaves the machine. The dashboard HTTP server binds
+to `127.0.0.1` only; the MCP server is a stdio process (JSON-RPC over
+stdin/stdout) and has no network socket of any kind.
 
 - **What the check fetches.** The check is a single `GET` of GitHub's
   entire **Releases list** (owner/repo `releases`), not a lightweight
@@ -44,6 +45,7 @@ confidential until a fix is released. Please do not open a public
 issue for security reports.
 
 Kynoptic's threat model is local: the collector, dashboard, and MCP
-server must never transmit recorded data off the machine, and local
-surfaces (dashboard, MCP) must bind to 127.0.0.1 only. Reports about
-violations of that boundary are especially welcome.
+server must never transmit recorded data off the machine. The
+dashboard binds to 127.0.0.1 only; the MCP server is a stdio process
+(JSON-RPC over stdin/stdout) with no network surface to audit at all.
+Reports about violations of that boundary are especially welcome.
