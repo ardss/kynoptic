@@ -13,6 +13,9 @@ use serde_json::json;
 use std::cell::Cell;
 use std::time::Duration;
 
+/// 持久化去重高水位的 metadata 键（平台审查 item 11：跨进程重启保留去重基线）
+const DEDUP_KEY: &str = "monitor_notification_last_time";
+
 pub struct NotificationMonitor {
     last_event_time: Cell<Option<String>>,
 }
@@ -55,7 +58,18 @@ $events
             _ => return,
         };
 
-        let prev_time = self.last_event_time.take();
+        // 平台审查（item 11）：去重基线取「本进程内存 last_event_time ∪
+        // metadata 持久高水位」较新者。首轮（内存为空）时载入持久基线，避免
+        // 重启后 Get-WinEvent 日志窗口里的旧条目被整体重放落库（内容完全
+        // 重复的行 + retention=0 下永久留存、统计双计）。
+        let in_proc = self.last_event_time.take();
+        let persisted = super::dedup::load_baseline(DEDUP_KEY);
+        let prev_time = match (in_proc.as_ref(), persisted.as_ref()) {
+            (Some(a), Some(b)) => Some(if a >= b { a.clone() } else { b.clone() }),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
         let mut events = Vec::new();
         let mut latest_time = prev_time.clone();
 
@@ -88,7 +102,15 @@ $events
             }
         }
 
-        self.last_event_time.set(latest_time);
+        self.last_event_time.set(latest_time.clone());
+
+        // 把推进后的去重高水位写回 metadata（仅在较持久基线前进时才写，避免
+        // 每 60s 无谓 upsert）；尽力而为，失败不影响本轮采集。
+        if let Some(lt) = &latest_time {
+            if persisted.as_deref() != Some(lt.as_str()) {
+                super::dedup::save_baseline(DEDUP_KEY, lt);
+            }
+        }
 
         if !events.is_empty() {
             let event = Event::new(EventAction::Notification, EventType::System)

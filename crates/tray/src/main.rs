@@ -175,9 +175,16 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("tray.log"),
     );
+    // 平台审查（item 8）：启动行此前把含账号名的绝对 DB 路径 display() 进
+    // 持久 tray.log（每次启动重复累计）。改为只回文件名（数据目录），与项目
+    // 「日志只回文件名不回路径」的纪律对齐。
     log::info!(
-        "kynoptic-tray 启动: db={} port={}",
-        parsed.db.display(),
+        "kynoptic-tray 启动: db={}（数据目录） port={}",
+        parsed
+            .db
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("kynoptic.db"),
         parsed.port
     );
 
@@ -544,12 +551,21 @@ fn main() {
         let upd_handle = thread::Builder::new()
             .name("UpdateCheck".into())
             .spawn(move || {
-                // Some(v)=有新版；None=明确无更新或查询失败。二者都清提示文件；
-                // 查询失败（子进程/网络挂）时保留旧文件不清除（全库审查 P1：
-                // 一次网络抖动不该让已发现的更新提示消失 24h）。
+                // 四态（Wave46 收口：新增第三态「校验清单不全」——check 侧退出码 1、
+                // stdout 为空，唯一判据在 stderr；子进程现捕获 stdout+stderr，
+                // 按退出码 + stderr 文案分流）：
+                // - Update(v)：stdout 为 UPDATE <v>，写提示文件
+                // - UpToDate：stdout 为 UP TO DATE，清提示文件
+                // - Incomplete：stderr 含「校验清单不全」——最新版资产清单/
+                //   SHA256SUMS.txt 不齐、一键更新必然失败，按「无更新」清除
+                //   提示文件，防横幅滞留
+                // - Failed：spawn 失败/超时/其余退出码 1（网络不可达、无稳定
+                //   资产），保留旧提示文件（全库审查 P1：一次网络抖动不该让已
+                //   发现的更新提示消失 24h）
                 enum CheckOutcome {
                     Update(String),
                     UpToDate,
+                    Incomplete,
                     Failed,
                 }
                 let run_check = || -> CheckOutcome {
@@ -563,33 +579,40 @@ fn main() {
                     let mut cmd = std::process::Command::new(exe);
                     cmd.args(["update", "--check"]);
                     cmd.stdout(std::process::Stdio::piped());
-                    cmd.stderr(std::process::Stdio::null());
+                    // Wave46 收口：stderr 也捕获——第三态「校验清单不全」退出码
+                    // 1 且 stdout 为空，判据（「校验清单不全」字样）只在 stderr
+                    cmd.stderr(std::process::Stdio::piped());
                     kynoptic_core::spawn::no_window(&mut cmd);
                     let Ok(mut child) = cmd.spawn()
                     else {
                         return CheckOutcome::Failed;
                     };
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    let mut out = None;
+                    // (stdout, stderr, 退出状态)——Wave46：stderr 用于区分第三态
+                    // 「校验清单不全」（其余退出码 1 失败保留旧提示文件）
+                    let mut res: Option<(String, String, std::process::ExitStatus)> = None;
                     while std::time::Instant::now() < deadline {
                         match child.try_wait() {
                             Ok(Some(status)) => {
                                 // 读完管道再退出，避免子进程因管道满阻塞
                                 use std::io::Read;
-                                let mut buf = String::new();
+                                let mut out_buf = String::new();
                                 if let Some(mut io) = child.stdout.take() {
-                                    let _ = io.read_to_string(&mut buf);
+                                    let _ = io.read_to_string(&mut out_buf);
                                 }
-                                let _ = status;
-                                out = Some(buf);
+                                let mut err_buf = String::new();
+                                if let Some(mut io) = child.stderr.take() {
+                                    let _ = io.read_to_string(&mut err_buf);
+                                }
+                                res = Some((out_buf, err_buf, status));
                                 break;
                             }
                             Ok(None) => thread::sleep(std::time::Duration::from_millis(250)),
                             Err(_) => break,
                         }
                     }
-                    let Some(text) = (match out {
-                        Some(t) => Some(t),
+                    let Some((text, err_text, status)) = (match res {
+                        Some(r) => Some(r),
                         None => {
                             // 超时/等待出错：杀掉子进程，视为查询失败
                             let _ = child.kill();
@@ -599,17 +622,30 @@ fn main() {
                     }) else {
                         return CheckOutcome::Failed;
                     };
-                    if text.contains("UP TO DATE") {
-                        return CheckOutcome::UpToDate;
-                    }
-                    match text
-                        .lines()
-                        .find(|l| l.starts_with("UPDATE "))
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .map(|v| v.trim_start_matches('v').to_string())
-                    {
-                        Some(v) => CheckOutcome::Update(v),
-                        None => CheckOutcome::Failed,
+                    // 退出码 0：stdout 为 `UPDATE <ver>` 或 `UP TO DATE (<cur>)`；
+                    // 退出码 1：读 stderr 区分第三态「校验清单不全」与其他失败
+                    if status.success() {
+                        if text.contains("UP TO DATE") {
+                            CheckOutcome::UpToDate
+                        } else {
+                            match text
+                                .lines()
+                                .find(|l| l.starts_with("UPDATE "))
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .map(|v| v.trim_start_matches('v').to_string())
+                            {
+                                Some(v) => CheckOutcome::Update(v),
+                                None => CheckOutcome::Failed,
+                            }
+                        }
+                    } else if err_text.contains("校验清单不全") {
+                        // Wave46 第三态：最新版 release 资产清单/SHA256SUMS.txt
+                        // 不齐、一键更新必然失败 → 按「暂无可装更新」清除提示
+                        // 文件（区别于 Failed：查询故障保留旧提示文件）
+                        CheckOutcome::Incomplete
+                    } else {
+                        // 其余退出码 1 失败（网络不可达/无稳定资产）：保留旧提示文件
+                        CheckOutcome::Failed
                     }
                 };
                 let upd_path = db_for_upd
@@ -628,6 +664,13 @@ fn main() {
                                 let _ = std::fs::write(&upd_path, &v);
                             }
                             CheckOutcome::UpToDate => {
+                                let _ = std::fs::remove_file(&upd_path);
+                            }
+                            CheckOutcome::Incomplete => {
+                                // Wave46 第三态：最新版校验清单不全、一键更新
+                                // 暂不可行——按「暂无可装更新」清除提示文件，
+                                // 菜单/横幅不留滞（check 侧同一判定，重查时
+                                // 清单补齐后会重新报 UPDATE）
                                 let _ = std::fs::remove_file(&upd_path);
                             }
                             CheckOutcome::Failed => {
@@ -680,13 +723,24 @@ fn main() {
     let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCmd>();
     let owner_db = parsed.db.clone();
     let owner_all = parsed.all;
+    // 平台审查（item 2）：暂停语义不过进程重启边界的修复。用户在上一进程
+    // 显式「暂停采集」时 Pause 会落 paused.flag；崩溃被看门狗拉回（或开机
+    // 自启）后 boot 若无条件 Start 会静默恢复采集并删掉旗标——隐私采集在
+    // 用户不知情下重启。若旗标在场，属主线程初始 paused=true，不启动采集器，
+    // 等用户菜单显式「恢复采集」（与进程内「只有 Resume 才解除暂停」语义
+    // 跨进程保持一致）。
+    let boot_paused = owner_db
+        .parent()
+        .map(|d| d.join("paused.flag").exists())
+        .unwrap_or(false);
     let owner = thread::Builder::new()
         .name("CollectorOwner".into())
         .spawn(move || {
             let mut collector: Option<kynoptic_core::collector::Collector> = None;
             // Pause 状态记忆（审查 P2：设置保存触发的 Start 不能解除用户的
-            // 暂停——只有托盘菜单的 Resume 才解除）
-            let mut paused = false;
+            // 暂停——只有托盘菜单的 Resume 才解除；平台审查 item 2：初始值
+            // 来自 paused.flag，让「用户主动暂停」跨进程重启保留）
+            let mut paused = boot_paused;
             // 启用集为空的失败态：阻止 60s 超时空转重试（留档有界，只在
             // 设置再次变更时重新评估）
             let mut empty_set = false;
@@ -708,7 +762,10 @@ fn main() {
                 };
                 match cmd {
                     CollectorCmd::Start | CollectorCmd::Resume => {
-                        if matches!(cmd, CollectorCmd::Resume) {
+                        // 平台审查（item 2）：区分「用户显式 Resume」与「boot/设置
+                        // 变更触发的 Start」——只有 Resume 才清除 paused.flag
+                        let is_resume = matches!(cmd, CollectorCmd::Resume);
+                        if is_resume {
                             paused = false;
                         }
                         if paused {
@@ -775,7 +832,9 @@ fn main() {
                                 .unwrap_or(&owner_db)
                                 .join("collector-error.log");
                             let _ = std::fs::write(&err_path, &msg);
-                            log::error!("启用监控器集合为空，拒绝空采；已写入 {}", err_path.display());
+                            // 平台审查（item 8）：只回文件名不回绝对路径（与 dash
+                            // 诊断 API「只回文件名」纪律对齐，账号名不出现在 tray.log）
+                            log::error!("启用监控器集合为空，拒绝空采；已写入数据目录下的 collector-error.log");
                             COLLECTOR_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                             COLLECTOR_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
                             empty_set = true;
@@ -788,10 +847,14 @@ fn main() {
                             Ok(c) => {
                                 log::info!("采集器已启动({} 个监控器)", enabled.len());
                                 collector = Some(c);
-                                // 采集真正在跑：清除暂停旗标（paused.flag 与
-                                // paused 内存态同生命周期，恢复即清）
-                                if let Some(dir) = owner_db.parent() {
-                                    let _ = std::fs::remove_file(dir.join("paused.flag"));
+                                // 采集真正在跑：清除暂停旗标（平台审查 item 2：仅在
+                                // 用户显式 Resume 成功时清——boot/设置变更触发的
+                                // Start 不得抹掉用户的跨进程「用户主动暂停」旗标，
+                                // 否则崩溃拉回后暂停态又被静默推翻）
+                                if is_resume {
+                                    if let Some(dir) = owner_db.parent() {
+                                        let _ = std::fs::remove_file(dir.join("paused.flag"));
+                                    }
                                 }
                                 // 审查 P1：成功启动 = 心跳 stalled 判定的前提成立
                                 COLLECTOR_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -977,11 +1040,29 @@ fn main() {
         apply_autostart(st.autostart);
     }
 
-    // 初始启动采集
-    let _ = cmd_tx.send(CollectorCmd::Start);
+    // 初始启动采集（平台审查 item 2：用户在上一进程暂停、paused.flag 在场时
+    // 不得静默恢复采集——保持暂停，等托盘菜单显式「恢复采集」，与进程内
+    // 「只有 Resume 才解除暂停」语义跨进程一致；60s 超时自愈也不会自醒，
+    // 因其条件含 !paused）
+    if boot_paused {
+        log::info!("用户已暂停采集（paused.flag 在场），不自动恢复；等待托盘菜单「恢复采集」");
+    } else {
+        let _ = cmd_tx.send(CollectorCmd::Start);
+    }
+
+    // 回归修复：boot-paused 不得以 Running 初始态进托盘 UI——采集器实际未
+    // 运行，图标若绿色「采集中」、菜单项「暂停采集 / Pause」，用户须先点一次
+    // （把状态翻成 Paused 重写旗标）文案才会变成「恢复采集 / Resume」，恢复
+    // 需两步且第一步文案与意图相反。传入 Paused 初始态，图标/tooltip/菜单
+    // 与采集器真实状态从一开始一致（一步「恢复采集」即恢复）。
+    let initial_state = if boot_paused {
+        state::TrayState::Paused
+    } else {
+        state::TrayState::Running
+    };
 
     // 托盘消息循环(阻塞直到 Quit;内部初始化失败会返回 false)
-    let tray_ok = tray::run(parsed, cmd_tx.clone());
+    let tray_ok = tray::run(parsed, cmd_tx.clone(), initial_state);
     if !tray_ok {
         let _ = cmd_tx.send(CollectorCmd::Quit);
     }
@@ -1094,6 +1175,23 @@ fn apply_autostart_if_changed(enable: bool, last_applied: &mut Option<bool>) -> 
     true
 }
 
+/// 把 schtasks 失败退出码渲染成人话（平台审查 item 9）。
+///
+/// 旧实现用 `{:?}` 打 `Option<i32>` 落出 `Some(1)`，并把 raw stderr 经
+/// `from_utf8_lossy` 嵌入——zh-CN 系统 schtasks 的 stderr 走系统代码页
+/// （GBK），from_utf8_lossy 把中文错误文本变成不可辨读乱码，「任务不存在
+/// vs 服务停用 vs 组策略拦截」的诊断价值归零。现改为：不内嵌 raw stderr
+/// （其编码随系统码页，tray 无编码器不可靠），只报退出码 + 常见成因提示。
+fn schtasks_exit_hint(code: Option<i32>) -> String {
+    match code {
+        Some(1) => {
+            "操作未完成（常见原因：任务不存在/已删除、处于禁用状态、被组策略拦截，或「计划任务」服务未运行）".into()
+        }
+        Some(c) => format!("操作失败（退出码 {c}）"),
+        None => "未知（取不到退出码）".into(),
+    }
+}
+
 /// 把 autostart 设置同步到注册表 Run 项（与 `kynoptic-ctl autostart` 同一键值）。
 fn apply_autostart(enable: bool) {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -1201,13 +1299,13 @@ fn apply_autostart(enable: bool) {
         match cmd.output() {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
+                // 平台审查（item 9）：不内嵌 raw stderr（zh-CN 下为 GBK 乱码），
+                // 退出码以人话渲染
                 log::warn!(
-                    "schtasks /Change {} {} 失败(退出码 {:?}) {}。看门狗计划任务的启停可能未生效（任务被禁用/删除/组策略拦截）",
+                    "schtasks /Change {} {} 失败。看门狗计划任务的启停可能未生效：{}",
                     flag,
                     task_name,
-                    out.status.code(),
-                    stderr.trim()
+                    schtasks_exit_hint(out.status.code())
                 );
             }
             Err(e) => {
@@ -1343,9 +1441,10 @@ fn query_watchdog_task_health() -> WatchdogTaskHealth {
             return health;
         }
         // 自检找不到自己的任务：按日志告警，不静默（Wave40 挂账）
+        // 平台审查（item 9）：退出码人话化，不内嵌 raw stderr（GBK 乱码）
         log::warn!(
-            "看门狗计划任务自检: 未找到本安装的任务 \"{task_name}\"（退出码 {:?}），自启动保护可能失效",
-            out.status.code()
+            "看门狗计划任务自检: 未找到本安装的任务 \"{task_name}\"，自启动保护可能失效。{}",
+            schtasks_exit_hint(out.status.code())
         );
         return WatchdogTaskHealth::Unavailable;
     }

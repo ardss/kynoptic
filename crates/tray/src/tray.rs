@@ -67,6 +67,10 @@ struct TrayCtx {
     /// 当前图标的 NIM_ADD 数据副本（explorer 重启收到 TaskbarCreated 后
     /// 原样重发 NIM_ADD 重建图标）
     nid: NOTIFYICONDATAW,
+    /// 上一次「打开面板」动作时刻（平台审查：托盘左键双击会连发
+    /// LBUTTONUP+DBLCLK+LBUTTONUP 三条消息，逐条都开面板 → 一次双击开 2~3
+    /// 个重复 tab。记时间戳做 1s 合并窗，双击手势归并为 1 次打开）。
+    last_dashboard_open: Option<std::time::Instant>,
 }
 
 /// 自动更新检查结果文件（data\update-available.txt，内容=新版本号）。
@@ -106,19 +110,21 @@ fn version_gt(a: &str, b: &str) -> bool {
 }
 
 /// 实际 dashboard 端口：优先读 db 目录下 dashboard-port.txt（bind 成功才写）。
-fn dashboard_port_actual(fallback: u16) -> u16 {
-    match dashboard_port_file() {
+/// db 路径由调用方传入（与 dashboard_unavailable 同源，用 args.db 而非
+/// resolve_db_path）——--db PATH 启动时面板真正绑的是 args.db 目录，端口
+/// 文件也只写在那儿；读默认解析目录会拿到残留/他实例端口，开出死链。
+fn dashboard_port_actual(db: &std::path::Path, fallback: u16) -> u16 {
+    match dashboard_port_file(db) {
         Some(p) => p,
         None => fallback,
     }
 }
 
-/// 读 dashboard-port.txt：bind 成功 → Some(端口)；写明 "unavailable"（面板
-/// 故障）→ None 但调用方可用 [`dashboard_unavailable`] 区分；无文件/内容怪
-/// → None。统一解析口径（平台审查：旧 dashboard_port_actual 对 "unavailable"
-/// parse 失败后静默回退请求端口，打开死链）。
-fn dashboard_port_file() -> Option<u16> {
-    let db = kynoptic_core::db::resolve_db_path();
+/// 读 db 目录下 dashboard-port.txt：bind 成功 → Some(端口)；写明
+/// "unavailable"（面板故障）→ None 但调用方可用 [`dashboard_unavailable`]
+/// 区分；无文件/内容怪 → None。统一解析口径（平台审查：旧实现对
+/// "unavailable" parse 失败后静默回退请求端口，打开死链）。
+fn dashboard_port_file(db: &std::path::Path) -> Option<u16> {
     let dir = db.parent()?;
     let txt = std::fs::read_to_string(dir.join("dashboard-port.txt")).ok()?;
     txt.trim().parse::<u16>().ok()
@@ -320,6 +326,23 @@ impl TrayCtx {
         }
     }
 
+    /// 打开数据目录（db 的父目录；无父目录退回 cwd）——OpenDashboard 故障
+    /// 分支 / OpenDataFolder / UpdateError 共用的「开目录」动作（平台审查：
+    /// 三处此前各自内联同一段编码，抽成单一来源防漂移）。
+    fn open_data_dir(&self) {
+        // DB 所在目录;无父目录时退回 cwd
+        let dir = self
+            .args
+            .db
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        use std::os::windows::ffi::OsStrExt;
+        let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+        wide.push(0);
+        open_with_shell(&wide);
+    }
+
     fn handle_command(&mut self, hwnd: HWND, code: u32) {
         let Some(id) = MenuId::from_command(code) else {
             return;
@@ -336,19 +359,10 @@ impl TrayCtx {
                     log::warn!(
                         "打开面板被拒：dashboard 处于故障态，改开数据目录查看 dashboard-error.log"
                     );
-                    let dir = self
-                        .args
-                        .db
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    use std::os::windows::ffi::OsStrExt;
-                    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-                    wide.push(0);
-                    open_with_shell(&wide);
+                    self.open_data_dir();
                     return;
                 }
-                let port = dashboard_port_actual(self.args.port);
+                let port = dashboard_port_actual(&self.args.db, self.args.port);
                 let url: Vec<u16> = format!("http://127.0.0.1:{}\0", port)
                     .encode_utf16()
                     .collect();
@@ -362,28 +376,32 @@ impl TrayCtx {
                 }
                 TrayState::Paused | TrayState::Error => {
                     let _ = self.cmd_tx.send(CollectorCmd::Resume);
-                    // 面板故障（DASH_FAILED=1）时 Resume 修不了面板（dash 线程
-                    // 候选耗尽后已退出，全仓无重启路径）：不做图标乐观翻转，
-                    // 否则 2s 后 WM_TIMER 重读旗标打回 Error，绿↔黄闪烁。
-                    if self.state != TrayState::Error
-                        || crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) != 1
-                    {
+                    // 平台审查（item 3）：面板故障态该菜单项文案许诺「详见
+                    // 数据目录 dashboard-error.log」，点击必须真开数据目录，
+                    // 不能零查看入口（被重启的采集器修不了已退出的 dash 线程，
+                    // 但 Resume 仍承载「恢复采集」意图，开目录兑现文案承诺）。
+                    if crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                        log::warn!(
+                            "恢复采集点击：面板故障态，改开数据目录查看 dashboard-error.log"
+                        );
+                        self.open_data_dir();
+                    }
+                    // 平台审查（item 6）：故障态（采集器/面板/降级/停滞任一）
+                    // 下点击 Resume 无法立刻翻绿，不做图标乐观翻转——否则 ≤2s 后
+                    // WM_TIMER 重读旗标打回 Error，绿↔黄闪烁（W44 只覆盖面板故障
+                    // DASH_FAILED，漏防 COLLECTOR_FAILED 等采集器故障分支）。
+                    let error_active = crate::COLLECTOR_FAILED
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        || crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1
+                        || db_degraded(&self.args.db)
+                        || crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed);
+                    if !error_active {
                         self.set_state(hwnd, TrayState::Running);
                     }
                 }
             },
             MenuId::OpenDataFolder => {
-                // DB 所在目录;无父目录时退回 cwd
-                let dir = self
-                    .args
-                    .db
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                use std::os::windows::ffi::OsStrExt;
-                let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-                wide.push(0);
-                open_with_shell(&wide);
+                self.open_data_dir();
             }
             MenuId::UpdateNow => {
                 // 一键更新：安装版跳下载页（安装版原地自更新会造成卸载数据库
@@ -448,7 +466,17 @@ impl TrayCtx {
                                 }
                             };
                             if let Err(e) = spawn_res {
+                                // 平台审查（item 7）：便携形态更新器 kynoptic.exe 缺失
+                                // 时 spawn 失败（os error 2）此前只落 tray.log 一行，
+                                // 托盘/面板零反馈、update-available.txt 不消费 → 菜单项
+                                // 反复出现且反复静默失败。复用 update-error.txt 通道：
+                                // 写原因 + 下载页链接，菜单动态出现「查看原因」项。
                                 log::error!("一键更新子进程启动失败: {e}");
+                                let msg = format!(
+                                    "[{}] 一键更新未能启动：更新器 kynoptic.exe 缺失或无法运行（{e}）。请到下载页获取完整安装包（含更新器）：https://github.com/ardss/kynoptic/releases/latest\n",
+                                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                                );
+                                let _ = std::fs::write(db_dir.join("update-error.txt"), &msg);
                             }
                         } else {
                             // 审查修复：update.log 打不开（磁盘满/ACL）此前
@@ -459,31 +487,27 @@ impl TrayCtx {
                                 "[{}] 一键更新未能启动：无法写入更新日志 update.log（磁盘空间不足或权限受限？）。请到下载页手动获取新版本：https://github.com/ardss/kynoptic/releases/latest\n",
                                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                             );
-                            log::error!(
-                                "update.log 无法打开（{}），一键更新未启动",
-                                db_dir.join("update.log").display()
-                            );
+                            // 平台审查（item 8）：日志只回文件名不回绝对路径（与
+                            // dash 诊断 API 的「只回文件名」纪律对齐，账号名不出现在日志）
+                            log::error!("数据目录下的 update.log 无法打开，一键更新未启动");
                             let _ = std::fs::write(db_dir.join("update-error.txt"), &msg);
                         }
                     }
                 }
             }
             MenuId::UpdateError => {
-                // 打开数据目录让用户看到 update-error.txt 的原因与下一步指引，
-                // 提示即清（下次更新失败会重新出现）
-                let dir = self
-                    .args
-                    .db
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                if let Some(d) = self.args.db.parent() {
-                    let _ = std::fs::remove_file(d.join("update-error.txt"));
+                // 平台审查（item 5）：原实现在开目录**之前**就删掉
+                // update-error.txt，窗口弹出瞬间原因文件已不存在（「查看即
+                // 销毁」）。改为先开数据目录（explorer 异步渲染目录、可见
+                // update-error.txt 的原因与下载页指引），3 秒后才删文件——
+                // 留出 explorer 渲染时间，用户能读到原因，提示随即清。
+                self.open_data_dir();
+                if let Some(d) = self.args.db.parent().map(|p| p.to_path_buf()) {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let _ = std::fs::remove_file(d.join("update-error.txt"));
+                    });
                 }
-                use std::os::windows::ffi::OsStrExt;
-                let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-                wide.push(0);
-                open_with_shell(&wide);
             }
             MenuId::About => {
                 let url: Vec<u16> = String::from("https://github.com/ardss/kynoptic\0")
@@ -524,8 +548,10 @@ fn append_item(menu: win::HMENU, id: MenuId, state: TrayState) {
         // 采集/面板异常，菜单项却一律 Resume——面板故障时点它修不了面板）；
         // "打开面板"在面板故障时同样换文案（行为是打开数据目录看原因）
         let label = match id {
-            MenuId::TogglePause if state == TrayState::Error => MenuId::TogglePause
-                .resume_label(crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1),
+            MenuId::TogglePause if state == TrayState::Error => MenuId::TogglePause.resume_label(
+                crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1,
+                crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             MenuId::OpenDashboard
                 if crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1 =>
             {
@@ -570,7 +596,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if m == WM_RBUTTONUP || m == WM_CONTEXTMENU {
                     ctx.show_menu(hwnd);
                 } else if m == WM_LBUTTONDBLCLK || m == 0x0202 {
-                    // 单击/双击都直接开面板（交互审查：主操作不要求用户知道双击约定，左键=主行为是托盘惯例）
+                    // 单击/双击都直接开面板（交互审查：主操作不要求用户知道
+                    // 双击约定，左键=主行为是托盘惯例）。
+                    // 平台审查（item 1）：硬件双击会连发 up+dblclk(+up) 多条
+                    // 消息，逐条都开面板 → 一次双击开 2~3 个重复 tab。记上次
+                    // 打开时刻，1s 合并窗内归并为 1 次（双击手势收敛）。
+                    let now = std::time::Instant::now();
+                    if let Some(last) = ctx.last_dashboard_open {
+                        if now.duration_since(last) < std::time::Duration::from_millis(1000) {
+                            return 0; // 合并窗内已开过，跳过
+                        }
+                    }
+                    ctx.last_dashboard_open = Some(now);
                     ctx.handle_command(hwnd, MenuId::OpenDashboard as u32);
                 }
             }
@@ -669,7 +706,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 /// 注册托盘图标并进入消息循环(阻塞直到 Quit)。
 /// 返回 false 表示托盘不可用(调用方应退出)。
-pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
+/// `initial_state` 为初始 UI 态:正常启动传 Running;boot-paused（paused.flag
+/// 在场、采集器未启动）传 Paused——图标/tooltip/菜单从一开始即与采集器真实
+/// 状态一致（否则绿色「采集中」+ 误导性的「暂停采集」菜单项，且 WM_TIMER
+/// 只会把 Error 拉回 Running、永远不会纠正 Paused，误导态无限期保持）。
+pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>, initial_state: TrayState) -> bool {
     unsafe {
         let hinstance =
             windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
@@ -735,8 +776,16 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
         let mut nid = tray_base(hwnd);
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = icons.for_state(TrayState::Running);
-        set_tip(&mut nid, "Kynoptic: collecting");
+        // 回归修复:初始图标/提示跟随 initial_state——boot-paused 时不得以
+        // 绿色「采集中」开场（采集器实际未运行,菜单项为「恢复采集 / Resume」,
+        // 一步即可恢复）;tooltip 与 tip_text 的 Paused 分支同文案。
+        let tip = if initial_state == TrayState::Paused {
+            "Kynoptic: paused / 已暂停"
+        } else {
+            "Kynoptic: collecting"
+        };
+        nid.hIcon = icons.for_state(initial_state);
+        set_tip(&mut nid, tip);
         // explorer 可能晚于本进程就绪,NIM_ADD 短重试覆盖开机时序(500ms × 10)
         let mut added = false;
         for _ in 0..10 {
@@ -784,9 +833,10 @@ pub fn run(args: Args, cmd_tx: Sender<CollectorCmd>) -> bool {
         let ctx = Box::new(TrayCtx {
             icons,
             cmd_tx,
-            state: TrayState::Running,
+            state: initial_state,
             args,
             nid,
+            last_dashboard_open: None,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize);
 

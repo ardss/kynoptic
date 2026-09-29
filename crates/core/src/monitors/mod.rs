@@ -42,6 +42,9 @@ pub mod mouse_hook;
 // ── 窗口属主宿主感知解析（宿主名单与展示层共享，见 host.rs 头注）──
 pub mod host;
 
+// ── 去重高水位持久化（平台审查 item 11：notification/calendar 跨进程去重基线）──
+pub mod dedup;
+
 // ── 已恢复、默认关闭：纯 windows-sys（原生，无子进程）──
 pub mod bluetooth;
 pub mod browser;
