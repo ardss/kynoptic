@@ -304,7 +304,7 @@
     <h2><span class="l en">Straight answers</span><span class="l zh">直接回答</span></h2>
     <details>
       <summary><span class="l en">Where does my data go?</span><span class="l zh">我的数据去了哪里？</span></summary>
-      <p><span class="l en">Nowhere. Your data stays in one SQLite file on your machine. There are no servers, no telemetry, and no upload code path. The only outbound network call is a once-a-day version check against GitHub — a few hundred bytes, and it never installs anything on its own (you can verify this in the README).</span><span class="l zh">哪也不去。你的数据就在你机器上的一个 SQLite 文件里。没有服务器、没有遥测、没有上传代码路径。唯一的外联是每天一次到 GitHub 的版本检查——几百字节，绝不会自动安装任何东西（README 里有说明）。</span></p>
+      <p><span class="l en">Nowhere. Your data stays in one SQLite file on your machine. There are no servers, no telemetry, and no upload code path. The only outbound network call is a once-a-day version check against GitHub — a single GET that fetches the full GitHub Releases list (about 100 KB, and it grows with the number of releases and assets) — and it never installs anything on its own (you can verify this in the README).</span><span class="l zh">哪也不去。你的数据就在你机器上的一个 SQLite 文件里。没有服务器、没有遥测、没有上传代码路径。唯一的外联是每天一次到 GitHub 的版本检查——一次 GET 拉取 GitHub 完整 Releases 列表（约 100KB，随 release 数和资产数增长）——它绝不会自动安装任何东西（README 里有说明）。</span></p>
     </details>
     <details>
       <summary><span class="l en">Does it record my screen or my passwords?</span><span class="l zh">会录屏或记录我的密码吗？</span></summary>
