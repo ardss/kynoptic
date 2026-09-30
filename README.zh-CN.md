@@ -69,7 +69,7 @@ cd kynoptic
 cargo build --release -p kynoptic
 
 # 采集（前台运行，Ctrl+C 优雅停止；数据默认写 <exe 目录>\data\kynoptic.db）
-target\release\kynoptic.exe collect --help     # 查看可用参数
+target\release\kynoptic.exe collect   # 可用参数见顶层 kynoptic --help（collect 支持 --db PATH / --all）
 
 # 查询记录
 target\release\kynoptic.exe query --from today
@@ -90,8 +90,7 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 }
 ```
 
-指定数据库时 `--db <PATH>` 与 `KYNOPTIC_DB` 环境变量均可（`mcp --db` 内部
-即经 `KYNOPTIC_DB` 传递）：
+指定数据库时，可设 `KYNOPTIC_DB` 环境变量（MCP 配置的 `env` 字段即可）：
 
 ```json
 {
@@ -105,7 +104,24 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 }
 ```
 
-之后你的助手就能回答"昨天 CPU 飙高的时候我在干嘛"这类问题——数据始终不离开你的磁盘。
+`--db <PATH>` 与 `KYNOPTIC_DB` 环境变量均可——`mcp --db` 内部即经
+`KYNOPTIC_DB` 传递给 server：
+
+```json
+{
+  "mcpServers": {
+    "kynoptic": { "command": "kynoptic", "args": ["mcp", "--db", "D:/data/kynoptic.db"] }
+  }
+}
+```
+
+之后你的助手就能回答“昨天 CPU 飙高的时候我在干嘛”这类问题——数据始终不离开你的磁盘。
+
+威胁模型：任何能启动本地进程（或被你的助手授予 MCP 访问）的本机程序，
+都能以与这个 MCP server 相同的权限读取你的活动数据库——把 MCP 访问
+等同于对 `KYNOPTIC_DB` 的普通文件只读访问。server 以只读方式打开
+数据库、绝不把数据传出机器，但它无法保护数据库文件不被其他本地
+进程读取。
 
 ## 用脚本写设置（curl / 自动化）
 

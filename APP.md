@@ -116,7 +116,7 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 | `skill install` | ✅ | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
 | `probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]` | ✅ | 逐监控器硬件实测探针（0 = 自动推导首次采集等待上限，仍受 420s 上限约束） |
 | `watchdog [--db PATH] [--once]` | ✅ | 看门狗心跳（供计划任务调用，确保托盘存活） |
-| `update` | ✅ | 自更新（GitHub releases，SHA256 校验 + 三件套备份 + 失败回滚） |
+| `update` | ✅ | 自更新（GitHub releases，SHA256 校验 + 五件套 .bak 备份 + 失败回滚） |
 
 ### 用脚本写设置（POST /api/settings）
 
