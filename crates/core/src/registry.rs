@@ -474,7 +474,7 @@ pub fn create_monitors_for(
         out.push(Box::new(monitors::process::ProcessMonitor::default()));
     }
     if want("system") {
-        out.push(Box::new(monitors::system::SystemMonitor));
+        out.push(Box::new(monitors::system::SystemMonitor::default()));
     }
     if want("device") {
         out.push(Box::new(monitors::device::DeviceMonitor::default()));
