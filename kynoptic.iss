@@ -20,6 +20,15 @@
 #define OutTag ""
 #endif
 
+; 快捷方式隔离（与 OutTag/AppId 同一开关）：TestSuffix 构建的桌面图标与
+; 开始菜单组名拼同款后缀，沙箱构建不再覆写真实安装的 Kynoptic.lnk 与
+; 开始菜单组；卸载器对称删除自己创建的后缀快捷方式，不碰生产的
+#ifdef TestSuffix
+#define IconTag "-" + TestSuffix
+#else
+#define IconTag ""
+#endif
+
 ; 生产 AppId 永久不可改动：它是升级/卸载识别的惟一键，改动后旧版本无法被
 ; 新安装包覆盖升级。TestSuffix 构建派生独立 AppId（Inno 的 AppId 接受任意
 ; 字符串，非 GUID 也可；指向独立卸载注册，不触碰生产的添加/删除程序条目）。
@@ -51,7 +60,7 @@ WizardSmallImageFile=assets\wizard-small.png
 UninstallDisplayName={#AppName} {#AppVersion}
 UninstallDisplayIcon={app}\{#AppExeName}
 DefaultDirName={autopf}\{#AppName}
-DefaultGroupName={#AppName}
+DefaultGroupName={#AppName}{#IconTag}
 DisableProgramGroupPage=yes
 OutputDir=dist
 OutputBaseFilename=Kynoptic-Setup-{#AppVersion}{#OutTag}
@@ -84,9 +93,10 @@ Source: "crates\cli\src\assets\skill.md"; DestDir: "{app}"; DestName: "SKILL.md"
 Source: "scripts\migrate_legacy_db.py"; DestDir: "{app}\scripts"; Flags: ignoreversion
 
 [Icons]
+; {group} 条目随 DefaultGroupName 自动落入带后缀组，仅桌面图标需显式拼后缀
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\{#AppName} CLI"; Filename: "{app}\kynoptic.exe"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}{#IconTag}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Tasks]
 ; 桌面图标默认勾选（装机审查：唯一持久的"回到应用"入口，默认不勾会让

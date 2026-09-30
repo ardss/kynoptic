@@ -9,6 +9,9 @@
 // （头部/状态行各只含一个版本 token，一致即旧版不残留）。
 // 调用方：scripts/release-gate.ps1 G4 门（发布日本地）与
 // .github/workflows/release.yml 构建前步骤；不一致 exit 1 终止。
+// 断言清单第 10 项（W47）：SECURITY.md 支持表须含当前 minor 线——此前版本
+// 工具从不覆盖该文件，0.3.1 升到 1.0.0 时「0.3.x | Yes / pre-1.0」会静默
+// 失真且门禁放行（盲区已实测证伪）。同样只锚定支持表首行，不做全文件扫描。
 import { readFileSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +80,36 @@ requireContains("APP.md", `# Kynoptic App (v${ver})`, "标题行");
       failed = true;
     } else {
       console.log(`[doc-version] ok: CHANGELOG.md 顶部版本段 ${heads[0]}`);
+    }
+  }
+}
+
+// SECURITY.md 支持线：「## Supported versions」段的支持表须含当前 minor 线
+// 且标记 Yes（minor 线 = 取 Cargo.toml 版本前两段，0.3.1 → 0.3.x）
+{
+  const p = join(root, "SECURITY.md");
+  if (!existsSync(p)) {
+    console.error("[doc-version] 缺失 SECURITY.md");
+    failed = true;
+  } else {
+    const src = readFileSync(p, "utf8");
+    const minor = ver.split(".").slice(0, 2).join(".");
+    // CRLF 宽容：Windows 工作树行尾是 \r\n。段边界只认下一个标题行或文末——
+    // 勿用 m 标志下的 $ 做备选（会在首个换行处提前截断捕获段）
+    const sec = src.match(
+      /## Supported versions\r?\n([\s\S]*?)(?=\r?\n##[ \t]|\s*$)/,
+    );
+    const rowRe = new RegExp(
+      "^\\|\\s*" + minor.replace(/\./g, "\\.") + "\\.x\\s*\\|\\s*Yes\\s*\\|",
+      "m",
+    );
+    if (!sec || !rowRe.test(sec[1])) {
+      console.error(
+        `[doc-version] SECURITY.md 支持表须含 '| ${minor}.x | Yes |'（当前版本 ${ver}），支持线未随版本更新`,
+      );
+      failed = true;
+    } else {
+      console.log(`[doc-version] ok: SECURITY.md 支持线 ${minor}.x`);
     }
   }
 }
