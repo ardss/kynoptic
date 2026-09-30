@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, RecvTimeoutError};
 use rand::Rng;
 
 use crate::constants;
@@ -611,17 +611,84 @@ fn run_monitor(
     m: Box<dyn Monitor + Send>,
     tx: crossbeam_channel::Sender<Event>,
     shutdown: Arc<AtomicBool>,
+    first_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 ) {
     set_thread_priority_below_normal();
     let name = m.name().to_string();
     let interval = m.interval();
 
-    if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        m.collect(&tx);
-    })) {
-        log::warn!("{} 首次采集 panic: {:?}，继续重试", name, e);
-    } else {
-        log::info!("{} 首次采集完成", name);
+    // 首拍 collect 截止（W33-F7 收尾修复）：首拍枚举无间隔睡眠保护、停机旗标
+    // 在 collect 进行中不可见，病态系统（进程数大/杀软扫描）下可分钟级——旧
+    // 实现在主线程同步跑首拍，shutdown 的 join 被拖满。现首拍移入独立 worker，
+    // 主线程只等 MONITOR_FIRST_COLLECT_DEADLINE；超时弃拍（worker 后台跑完经
+    // 同一通道交还 monitor，主线程下一轮 interval 补齐），主线程不再阻塞于
+    // 进行中的首拍枚举。Monitor trait 只要求 Send（非 Sync，无法跨线程共享
+    // 引用），故 monitor 随 worker 消息整体移交、所有权单向流动。
+    // panic 仍由 worker 侧 catch_unwind 兜住（结果随消息转发主线程记录），
+    // 口径与旧实现一致。
+    // 回归修复（W33-F7 收尾）：弃拍/失联的 worker 不再无人跟踪——它的句柄
+    // 登记进共享 first_workers，由 Collector::shutdown 在排空 rx_tail 兜底前
+    // 统一 join。否则它是唯一未被 join 的生产者：CLI 退出路径下进程直接杀掉
+    // 仍跑 m.collect 的 worker（被弃首拍事件整体丢失），托盘路径下排空
+    // 通道之后它再送达的事件随通道断开静默丢失——「排空前所有生产者已退出」
+    // 不变量不成立。
+    let worker_tx = tx.clone();
+    let (mon_tx, mon_rx) = crossbeam_channel::bounded(1);
+    let worker = thread::Builder::new()
+        .name(format!("{name}-first-collect"))
+        .spawn(move || {
+            set_thread_priority_below_normal();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                m.collect(&worker_tx);
+            }));
+            let _ = mon_tx.send((r, m));
+        });
+    // monitor 所有权：常规路径 recv 回来；弃拍/失联路径留在后台，循环段用
+    // try_recv 逐轮取回（取回前跳轮、1 秒切片，下一轮 interval 补齐）。
+    let mut mon: Option<Box<dyn Monitor + Send>> = None;
+    match worker {
+        Ok(handle) => match mon_rx.recv_timeout(Duration::from_secs(
+            constants::MONITOR_FIRST_COLLECT_DEADLINE_SECS,
+        )) {
+            Ok((Ok(()), m)) => {
+                let _ = handle.join();
+                mon = Some(m);
+                log::info!("{} 首次采集完成", name);
+            }
+            Ok((Err(p), m)) => {
+                let _ = handle.join();
+                mon = Some(m);
+                log::warn!("{} 首次采集 panic: {:?}，继续重试", name, p);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // 弃拍 worker 登记为 shutdown join 对象（见 run_monitor 头注）：
+                // 稳态下「下一轮补齐」仍成立；shutdown 路径下不再丢事件。
+                first_workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(handle);
+                log::warn!(
+                    "{} 首次采集超 {}s 截止，本轮跳过（worker 后台跑完交还，下一轮补齐；shutdown 时 join 不丢事件）",
+                    name,
+                    constants::MONITOR_FIRST_COLLECT_DEADLINE_SECS
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // worker 未发消息即消失（理论不可达：发信号在 catch_unwind
+                // 之后）：monitor 丢失，本监控器本轮后不再产出（记日志）。
+                // 句柄仍登记——join 只是回收已死线程，无副作用。
+                first_workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(handle);
+                log::warn!("{} 首拍 worker 失联，监控器停摆", name);
+            }
+        },
+        Err(e) => {
+            // worker 启动失败：monitor 随闭包丢弃（spawn 失败路径），本监控器
+            // 停摆。spawn 失败本身即资源耗尽灾难场景，只记日志不叠加复杂度。
+            log::error!("{} 首拍 worker 启动失败: {e}，监控器停摆", name);
+        }
     }
 
     loop {
@@ -629,12 +696,35 @@ fn run_monitor(
             return;
         }
 
-        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            m.collect(&tx);
-        })) {
-            log::error!("{} 采集 panic: {:?}，5 秒后重试", name, e);
-            thread::sleep(Duration::from_secs(5));
-            continue;
+        // 弃拍路径取回 monitor（首拍 worker 后台跑完经 mon_rx 交还）：取回前
+        // 跳本轮、1 秒切片重试——主线程永不等进行中的首拍 collect。
+        if mon.is_none() {
+            match mon_rx.try_recv() {
+                Ok((r, m)) => {
+                    if let Err(p) = r {
+                        log::warn!(
+                            "{} 首次采集 panic（worker 迟到交付）: {:?}，继续重试",
+                            name,
+                            p
+                        );
+                    }
+                    mon = Some(m);
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            }
+        }
+
+        if let Some(m) = mon.as_ref() {
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                m.collect(&tx);
+            })) {
+                log::error!("{} 采集 panic: {:?}，5 秒后重试", name, e);
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
         }
 
         let base = interval.as_secs_f64();
@@ -674,8 +764,26 @@ pub struct Collector {
     /// 与 end_session 完成后，尚未查到停机旗标的监控线程仍可做最后一次
     /// send_event——事件进无人消费的通道随 Collector 销毁静默丢失且不可观测
     /// （send_event 的 Disconnected 分支不计数）。shutdown 在排空兜底之前
-    /// 全部 join（run_monitor 的睡眠是 1 秒切片，join 有界）。
+    /// 全部 join。W33-F7 收尾：join 有界的口径——首拍 collect 在独立 worker
+    /// 上带 MONITOR_FIRST_COLLECT_DEADLINE 截止（超时弃拍、下一轮 interval
+    /// 补齐，主线程永不等进行中的首拍枚举），循环段睡眠是 1 秒切片且切片
+    /// 间检查停机旗标。有界 = 首拍截止（≤10s）+ 至多一次进行中的循环段
+    /// collect（循环段 collect 仍为主线程同步执行、枚举慢的病态系统可能耗时
+    /// 较长——已知残留，见 W33-F7；首拍不再构成退出阻塞）。被弃首拍 worker
+    /// 不在本 vec 内（它是监控线程 spawn 的子线程），由
+    /// [`Collector::first_collect_workers`] 单独登记、shutdown 同点 join。
     monitor_handles: Vec<thread::JoinHandle<()>>,
+    /// 被弃首拍 collect worker 句柄登记表（回归修复 W33-F7 静默丢失）：
+    /// 超时弃拍/失联的 worker 持有 worker_tx 克隆，是 monitor_handles 未覆盖
+    /// 的生产者。run_monitor 在弃拍/失联分支把句柄登记进本共享 vec；
+    /// shutdown() 在 join 完监控线程之后、排空 rx_tail 兜底之前统一 join：
+    /// 其进行中的 collect 在 join 期间入队的事件由 writer 尾批排空落库，
+    /// 「排空前所有生产者都已退出」不变量重新成立（旧实现首拍在主线程同步
+    /// 执行、shutdown join 天然有界等待——本修复恢复该「不丢」口径，稳态
+    /// 弃拍行为不变）。worker 已跑完时 join 立即返回，正常退出零成本；
+    /// collect 卡死的病态场景 join 无界——与循环段 collect 同口径的已知
+    /// 残留（见 monitor_handles 字段注）。
+    first_collect_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     /// 已收尾旗标（审查 33-F3）：shutdown() 置位，Drop 据此判「是否需要兜底
     /// 收尾」。此前以 writer_handle 存在性作判据——wait() 先 take 掉句柄后
     /// 仅 join 不收尾，随后 Drop 误判「已收尾」留下 open 幽灵 session。
@@ -731,11 +839,28 @@ impl Collector {
         // hook stop 对称。
         monitors::window::stop_event_channel();
 
-        // 审查 33-F7：先 join 全部监控线程（旗标已置位，睡眠 1 秒切片 → join
-        // 有界），再进聚合/writer 的关停链——保证排空 rx_tail 兜底时所有
-        // 生产者都已退出，最后一次 send_event 不会落入无人消费的通道。
+        // 审查 33-F7 + W33-F7 收尾：先 join 全部监控线程（旗标已置位：首拍
+        // 有 ≤MONITOR_FIRST_COLLECT_DEADLINE 截止、循环段睡眠 1 秒切片 → join
+        // 有界，口径见 monitor_handles 字段注），再进聚合/writer 的关停链
+        // ——保证排空 rx_tail 兜底时所有生产者都已退出，最后一次 send_event
+        // 不会落入无人消费的通道。
         for h in self.monitor_handles.drain(..) {
             let _ = h.join();
+        }
+        // 回归修复（W33-F7 静默丢失）：被弃首拍 worker 是 monitor_handles 未
+        // 覆盖的生产者（持有 worker_tx 克隆，弃拍后仍可能执行 m.collect）。
+        // 在排空 rx_tail 兜底之前 join 掉：join 期间入队的事件仍由下方
+        // writer 尾批排空落库；CLI 退出路径 join 完进程终止时不再留有「被
+        // 杀掉、首拍事件整体丢失」的 worker；托盘路径排空之后不再有生产者
+        // 写入无人消费的通道（不变量口径见 first_collect_workers 字段注）。
+        {
+            let mut workers = self
+                .first_collect_workers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for h in workers.drain(..) {
+                let _ = h.join();
+            }
         }
 
         // minute 粒度的"最后一分钟不丢"由聚合线程负责：先 join 它（终值
@@ -942,6 +1067,9 @@ pub fn start_collection_custom(
     // 入队），writer 排空尾批退出——不再依赖"全部生产者断开通道"这一可能
     // 永远等不到的条件（监控线程卡死即挂死，审查 P1）。
     let writer_stop = Arc::new(AtomicBool::new(false));
+    // 被弃首拍 collect worker 登记表（回归修复 W33-F7 静默丢失）：run_monitor
+    // 的弃拍/失联分支登记句柄，Collector::shutdown 在排空 rx_tail 前统一 join。
+    let first_workers = Arc::new(Mutex::new(Vec::new()));
 
     let db_w = db.clone();
     let tw = total_written.clone();
@@ -956,7 +1084,7 @@ pub fn start_collection_custom(
     // （用宏而非闭包：闭包按引用捕获会把 db 借用拖到函数尾，与收尾的
     // Collector { db, .. } 移动冲突。）
     macro_rules! spawn_fail_collector {
-        ($writer:expr, $agg:expr, $maint:expr, $watch:expr, $monitors:expr, $hooks:expr) => {{
+        ($writer:expr, $agg:expr, $maint:expr, $watch:expr, $monitors:expr, $hooks:expr, $workers:expr) => {{
             Collector {
                 db: db.clone(),
                 session_id,
@@ -966,6 +1094,9 @@ pub fn start_collection_custom(
                 maintenance_handle: $maint,
                 watchdog_handle: $watch,
                 monitor_handles: $monitors,
+                // spawn 失败路径：被弃首拍 worker 登记表共享同一 Arc（已 spawn
+                // 的监控线程登记进来的句柄在兜底 shutdown 里同样 join）
+                first_collect_workers: $workers,
                 finished: false,
                 hooks: $hooks,
                 settings,
@@ -994,7 +1125,15 @@ pub fn start_collection_custom(
         }) {
         Ok(h) => h,
         Err(e) => {
-            spawn_fail_collector!(None, None, None, None, Vec::new(), Vec::new());
+            spawn_fail_collector!(
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                first_workers.clone()
+            );
             panic!("Writer 启动失败: {e}");
         }
     };
@@ -1008,9 +1147,10 @@ pub fn start_collection_custom(
     for m in monitors {
         let tx = tx.clone();
         let sd = shutdown.clone();
+        let fw = first_workers.clone();
         match thread::Builder::new()
             .name(m.name().into())
-            .spawn(move || run_monitor(m, tx, sd))
+            .spawn(move || run_monitor(m, tx, sd, fw))
         {
             Ok(handle) => monitor_handles.push(handle),
             Err(e) => {
@@ -1022,7 +1162,8 @@ pub fn start_collection_custom(
                     None,
                     None,
                     monitor_handles,
-                    Vec::new()
+                    Vec::new(),
+                    first_workers.clone()
                 );
                 panic!("Monitor 线程启动失败: {e}");
             }
@@ -1110,7 +1251,8 @@ pub fn start_collection_custom(
                         None,
                         None,
                         monitor_handles,
-                        Vec::new()
+                        Vec::new(),
+                        first_workers.clone()
                     );
                     panic!("InputAgg 聚合线程启动失败: {e}");
                 }
@@ -1186,7 +1328,8 @@ pub fn start_collection_custom(
             None,
             None,
             monitor_handles,
-            hooks
+            hooks,
+            first_workers.clone()
         );
         panic!("维护线程启动失败: {e}");
     }
@@ -1218,7 +1361,8 @@ pub fn start_collection_custom(
             maint_handle.ok(),
             None,
             monitor_handles,
-            hooks
+            hooks,
+            first_workers.clone()
         );
         panic!("丢弃看门狗线程启动失败: {e}");
     }
@@ -1232,6 +1376,7 @@ pub fn start_collection_custom(
         maintenance_handle: maint_handle.ok(),
         watchdog_handle: watch_handle.ok(),
         monitor_handles,
+        first_collect_workers: first_workers,
         finished: false,
         hooks,
         settings,

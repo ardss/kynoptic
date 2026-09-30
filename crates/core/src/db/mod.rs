@@ -78,22 +78,37 @@ pub fn clear_degraded_flag(db_file: &Path) {
     }
 }
 
-/// metadata 表里持久化的 events 水位键名（最近一次确认的 events max(rowid)）。
+/// metadata 表里持久化的 events 水位键名（最近一次确认的 events 行数，
+/// W33-F2 起改 COUNT(*) 语义）。
+///
+/// 语义口径（W33-F2 修复）：旧 MAX(rowid) 水位在 input_agg 冲突 UPSERT 路径
+/// 被持续耗损（冲突 upsert 也消耗 rowid 序列，与真实事件数永久背离，实测
+/// ~26x），把水位当「已写事件数」的读数会被放大。改 COUNT(*)——默认
+/// retention_days=0（append-only、无空洞）下行数单调不减，水位即真实事件数；
+/// 显式 opt-in 保留期清理删行后由 cleanup_old_events 与 CLI db cleanup 在同一
+/// 事务内同步推进水位，不会被下次 open 的对账误判为「回退」。
 ///
 /// 刷新时机不止正常停机——三处推进（见 [`persist_events_watermark`]）：
 /// 1. 每次批量事件落库（`insert_events` / `insert_events_with_agg`，与写入同事务）；
 /// 2. 每次成功的 WAL checkpoint（`maintenance` 的 `wal_checkpoint_truncate`）；
-/// 3. 正常停机（[`Database::mark_stopping`]）。
-const EVENTS_WATERMARK_KEY: &str = "events_watermark_max_rowid";
+/// 3. 正常停机（[`Database::mark_stopping`]）+ opt-in 保留期清理后（core
+///    `cleanup_old_events` 与 CLI `db cleanup` 均在**与删行同一事务内**推进，
+///    删行与水位要么一起落库、要么一起回滚，强杀窗口无假「回退」）。
+const EVENTS_WATERMARK_KEY: &str = "events_watermark_row_count";
 
-/// 把当前 events max(rowid) 刷新持久化到 metadata（水位写入的唯一落库点，
-/// 收敛原 `mark_stopping` 的内联 SQL，供批量落库 / checkpoint / 停机共用）。
-/// 查询失败（events 表不可用/已损坏）时**不写**——避免把水位误刷成 0 而丢失
-/// 后续回退检测能力；写入失败仅留日志，不阻塞调用方。
-pub(crate) fn persist_events_watermark(conn: &Connection) {
-    let n: i64 = match conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
-        r.get(0)
-    }) {
+/// 旧水位键（MAX(rowid) 语义，W33-F2 之前）：存量库 open 时清退——旧值与新
+/// 行数口径不可比（旧值恒 ≥ 行数），留着既占位又易误读。
+const LEGACY_EVENTS_WATERMARK_KEY: &str = "events_watermark_max_rowid";
+
+/// 把当前 events 行数（COUNT(*)）刷新持久化到 metadata（水位写入的唯一落库点，
+/// 收敛原 `mark_stopping` 的内联 SQL，供批量落库 / checkpoint / 停机 / 保留期
+/// 清理（core 与 CLI 各一条路径）共用）。查询失败（events 表不可用/已损坏）时
+/// **不写**——避免把水位误刷成 0 而丢失后续回退检测能力；写入失败仅留日志，
+/// 不阻塞调用方。调用方在开放事务内（BEGIN…COMMIT 之间）调用时，两条语句
+/// 加入该事务、随 COMMIT 原子落库——删行路径正是依此保证「删行与水位推进
+/// 同生同死」，强杀不会产生「删了行、水位没动」的假回退。
+pub fn persist_events_watermark(conn: &Connection) {
+    let n: i64 = match conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)) {
         Ok(n) => n,
         Err(_) => return,
     };
@@ -106,48 +121,58 @@ pub(crate) fn persist_events_watermark(conn: &Connection) {
     }
 }
 
-/// WAL 水位对账（WAL 静默蒸发防护 2026-09，覆盖面如实描述 2026-09 修订）：
+/// WAL 水位对账（WAL 静默蒸发防护 2026-09，覆盖面如实描述 2026-09 修订；
+/// W33-F2 起水位为 events 行数）：
 ///
-/// 机制：把 events max(rowid) 持久化到 metadata 作水位 W；open 时若当前
-/// max(rowid) **回退**到 W 之下（`persisted > current`），说明已提交数据蒸发
-/// （如 WAL 被外部截断/删除、云同步冲突、手动清理），走 [`mark_db_degraded`]
-/// 留档并暴露。对账同时把水位刷新为当前值（一次性，避免每次 open 重复告警）。
+/// 机制：把 events COUNT(*) 持久化到 metadata 作水位 W；open 时若当前行数
+/// **回退**到 W 之下（`persisted > current`），说明已提交数据蒸发（如 WAL
+/// 被外部截断/删除、云同步冲突、手动清理），走 [`mark_db_degraded`] 留档并
+/// 暴露。对账同时把水位刷新为当前值（一次性，避免每次 open 重复告警），并
+/// 清退旧 MAX(rowid) 口径的遗留键（其值与新口径不可比）。首开（无新键行）
+/// 只播种不做回退判定。
 ///
 /// **残余盲区（如实）**：水位本身也走 WAL，其持久性滞后一次 checkpoint。
 /// 凡「上一次成功 checkpoint（TRUNCATE）之后才提交、且对应的水位推进也未能
 /// 随之落进主文件」的事件（例如写完即被强杀、没等到下一次 maintenance 的
 /// checkpoint，或经外部进程绕开本库写路径直接落 WAL 后 WAL 被截断/删除），
-/// 事件与水位一起丢失，当前 max(rowid) 恰等于主文件水位、严格回退条件不触发，
+/// 事件与水位一起丢失，当前行数恰等于主文件水位、严格回退条件不触发，
 /// **不可检测**。本修复把盲区从「上一次正常停机以来」收窄到「上一次成功
-/// checkpoint 以来」：每次批量写 + 每次成功 checkpoint 都推进水位，窗口大幅
-/// 缩小；上述剩余窄带在不做带外独立水位文件的前提下不可消除，属已知局限。
+/// checkpoint 以来」：每次批量写 + 每次成功 checkpoint + 保留期清理后都推进
+/// 水位，窗口大幅缩小；上述剩余窄带在不做带外独立水位文件的前提下不可消除，
+/// 属已知局限。
 /// 返回回退告警文本（无回退返回 None）。
 fn reconcile_events_watermark(conn: &Connection) -> Option<String> {
     let current: i64 = conn
-        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM events", [], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
         .unwrap_or(0);
-    let persisted: i64 = conn
+    let persisted: Option<i64> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key = ?1",
             params![EVENTS_WATERMARK_KEY],
             |r| r.get::<_, String>(0),
         )
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.parse().ok());
+    // 旧口径 MAX(rowid) 遗留键清退（内部簿记值，非用户数据）：存量库升级
+    // 后若继续读旧值，会把旧语义数字与新行数比 → 存量库每次 open 必误报
+    // 「回退」进降级旗标。
+    let _ = conn.execute(
+        "DELETE FROM metadata WHERE key = ?1",
+        params![LEGACY_EVENTS_WATERMARK_KEY],
+    );
     let _ = conn.execute(
         "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
          ON CONFLICT(key) DO UPDATE SET value = ?2",
         params![EVENTS_WATERMARK_KEY, current.to_string()],
     );
-    if persisted > current {
-        return Some(format!(
-            "events 最大行号从 {persisted} 回退到 {current}：已提交数据丢失（WAL 可能被外部截断/删除，如云同步冲突或手动清理），请检查备份"
-        ));
+    match persisted {
+        // 首开（无新键行）：只播种、不做回退判定
+        None => None,
+        Some(p) if p > current => Some(format!(
+            "events 行数从 {p} 回退到 {current}：已提交数据丢失（WAL 可能被外部截断/删除，如云同步冲突或手动清理），请检查备份"
+        )),
+        Some(_) => None,
     }
-    None
 }
 
 /// 长路径阈值（实测 2026-09-25：>260 字符的非 verbatim 路径 rusqlite 报
@@ -826,9 +851,9 @@ impl Database {
         }
         log::info!("正在执行 WAL 检查点...");
         // 检查点成功后推进 events 水位：已提交数据此刻已确认落进主文件，
-        // 把水位刷到当前 max(rowid) 安全——其后 WAL 丢失不会误报回退（残余
+        // 把水位刷到当前行数安全——其后 WAL 丢失不会误报回退（残余
         // 盲区说明见 reconcile_events_watermark）。busy 跳过时不推进，保持
-        // 「水位 ≤ 主文件已持久化 max(rowid)」不变量。
+        // 「水位 ≤ 主文件已持久化行数」不变量。
         if wal_checkpoint_truncate(&conn) {
             persist_events_watermark(&conn);
         }
@@ -929,12 +954,18 @@ impl Database {
     }
 }
 
-/// TRUNCATE 检查点（审查 33-F8）：存在活跃 reader（dashboard 常驻只读池 /
-/// core 读池持未结束读事务）时 busy=1，WAL 无法截断——旧实现 execute_batch
-/// 丢弃返回值，「检查点完成」与实际不符。这里读出 busy 状态留痕日志。
+/// TRUNCATE 检查点（审查 33-F8；W33-F3 注释口径更正）：busy=1 只在「检查点
+/// 瞬间有读事务在飞」（reader 持未结束的 BEGIN/SELECT）时发生——常驻 idle
+/// 只读连接（dashboard 常驻只读池 / core 读池的空闲连接）不阻止 TRUNCATE
+/// （沙箱 S1/S2/S6 实测证伪旧注释「常驻只读池 ⇒ busy=1」的归因）。WAL
+/// 常驻 ~4MB 是默认 1000 页被动自动检查点后的磁盘高水位（文件字节保留），
+/// 与 reader 驻留无关；TRUNCATE 检查点仅 24h 维护节拍执行，
+/// journal_size_limit=16MB 为软封顶（其后下一笔写入回落）。
+/// 旧实现 execute_batch 丢弃返回值，「检查点完成」与实际不符。这里读出
+/// busy 状态留痕日志。
 ///
 /// 返回检查点是否真正完成（非 busy、非查询失败）：调用方据此决定是否推进
-/// events 水位——只有数据确已落进主文件后，把水位刷到当前 max(rowid) 才安全
+/// events 水位——只有数据确已落进主文件后，把水位刷到当前行数才安全
 /// （WAL 后续丢失不会误报回退，见 reconcile_events_watermark 的残余盲区说明）。
 fn wal_checkpoint_truncate(conn: &Connection) -> bool {
     match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
@@ -943,7 +974,7 @@ fn wal_checkpoint_truncate(conn: &Connection) -> bool {
         Ok(0) => true,
         Ok(busy) => {
             log::info!(
-                "WAL 检查点未能截断（busy={busy}，存在活跃 reader）；journal_size_limit 会在其后下一笔写入把 WAL 回落到 16MB 封顶"
+                "WAL 检查点未能截断（busy={busy}，检查点瞬间有读事务在飞）；journal_size_limit 会在其后下一笔写入把 WAL 回落到 16MB 封顶"
             );
             false
         }
@@ -1098,8 +1129,8 @@ mod tests {
         let _ = std::fs::remove_file(&plain);
     }
 
-    /// WAL 水位对账：水位不高于当前 max(rowid) 时正常；回退即报告（WAL 静默
-    /// 蒸发防护，见 reconcile_events_watermark）。
+    /// WAL 水位对账：水位不高于当前行数时正常；回退即报告（WAL 静默蒸发
+    /// 防护，见 reconcile_events_watermark；W33-F2 起水位为 COUNT(*) 口径）。
     #[test]
     fn watermark_regression_detected() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1112,17 +1143,17 @@ mod tests {
             conn.execute("INSERT INTO events(v) VALUES ('e')", [])
                 .unwrap();
         }
-        // 首次对账：建立水位 5，无回退
+        // 首次对账：新键播种水位 5，无回退判定
         assert!(reconcile_events_watermark(&conn).is_none());
         let wm: String = conn
             .query_row(
-                "SELECT value FROM metadata WHERE key = 'events_watermark_max_rowid'",
+                "SELECT value FROM metadata WHERE key = 'events_watermark_row_count'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(wm, "5");
-        // 模拟已提交行蒸发：当前 max(rowid) 回退到 2，持久化水位仍为 5
+        // 模拟已提交行蒸发：当前行数回退到 2，持久化水位仍为 5
         conn.execute("DELETE FROM events WHERE x > 2", []).unwrap();
         let msg = reconcile_events_watermark(&conn).expect("回退必须被发现");
         assert!(msg.contains("回退"), "告警文本须含回退: {msg}");

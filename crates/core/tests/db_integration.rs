@@ -12,22 +12,17 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 生成唯一的临时数据库路径：tests_tmp/<pid>_<seq>.db
 fn tmp_db_path() -> PathBuf {
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-    let mut p = std::env::temp_dir();
-    // 路钥含纳秒级时间戳：进程 id 会被 Windows 快速复用，若上次运行遗留同
-    // 名临时库（panic 跳过 cleanup / 删除时连接未关闭导致 delete-pending），
-    // 仅 pid+seq 会在同日重跑时命中旧文件，造成计数翻倍 / UNIQUE 冲突假失败。
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 + d.as_secs() * 1_000_000_000)
-        .unwrap_or(0);
-    p.push(format!(
-        "dp_test_{}_{}_{}.db",
-        std::process::id(),
-        seq,
-        nanos
-    ));
-    p
+    // 路径键不读真实时钟（时钟红线，agg_cache_test 范式）：纯 pid+seq。
+    // 上次运行遗留同名临时库（panic 跳过 cleanup / 删除时连接未关闭导致
+    // delete-pending）则递增 seq 取空名——Windows 快速复用 pid 也不撞。
+    let mut seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    loop {
+        let p = std::env::temp_dir().join(format!("dp_test_{}_{}.db", std::process::id(), seq));
+        if !p.exists() {
+            return p;
+        }
+        seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// 打开一个临时数据库，返回 (db, path)

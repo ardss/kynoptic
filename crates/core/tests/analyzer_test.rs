@@ -235,38 +235,66 @@ fn daily_agg_recompute_inserts_and_updates() {
     assert_eq!(keys2, 4);
 }
 
-// ─── recompute_recent_days（基于 Local::now，维护线程用） ─────────────────────
+// ─── recompute_recent_days（维护线程用；W33-F4 时钟收口） ────────────────────
+//
+// 时钟铁律（测试不读真实时钟）收口：日期只取一次锚点（NaiveDate），种子时刻
+// 手工定死锚点日/前一日正午（与 agg_cache_test 的 noon_anchor 范式同源）。
+// 生产 recompute_recent_days 内部再读一次 Local::now()（T1），与锚点读（T0）
+// 之间可能跨本地午夜——窗口 {T1, T1-1} 相对种子 {D, D-1} 滑一天，精确行数
+// 随日界翻转（W44 同根因，本文件此前未同步收口）。故断言只取时间无关量：
+// 锚点日行必存在（窗口 {T1, T1-1} 对 T1 ∈ {D, D+1} 恒覆盖 D）、总行数 ∈
+// {1,2}、幂等（二跑不增不 panic）。
+
+/// 本地日期正午 12:00 → UTC RFC3339（与本地午夜锚点同理：正午任何时区/DST
+/// 跳变日都存在，earliest 兜底异常时区）。
+fn local_noon_utc(d: chrono::NaiveDate) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .from_local_datetime(&d.and_hms_opt(12, 0, 0).unwrap())
+        .earliest()
+        .expect("本地正午 12:00 不存在（DST 跳变日请换锚点日期）")
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339()
+}
 
 #[test]
 fn daily_agg_recompute_recent_days_covers_today_and_yesterday() {
     let conn = setup_test_db();
-    // 插"本地今天"与"本地昨天"各一条按键事件。
-    // 用 Local::now() 换算成 UTC RFC3339 存储，与采集器一致口径。
-    let now_local = chrono::Local::now();
-    let today_utc = now_local.with_timezone(&chrono::Utc).to_rfc3339();
-    let yesterday_utc = (now_local - chrono::Duration::days(1))
-        .with_timezone(&chrono::Utc)
-        .to_rfc3339();
-    insert_event(&conn, &today_utc, "keyboard", "press");
-    insert_event(&conn, &yesterday_utc, "keyboard", "press");
+    // 日期只取一次锚点，种子时刻手工定死锚点日/前一日正午（不依赖生产侧
+    // 二次 Local::now() 的相对漂移构造种子）
+    let anchor = chrono::Local::now().date_naive();
+    let prev = anchor - chrono::TimeDelta::days(1);
+    insert_event(&conn, &local_noon_utc(anchor), "keyboard", "press");
+    insert_event(&conn, &local_noon_utc(prev), "keyboard", "press");
 
     let n = kynoptic_core::daily_agg::recompute_recent_days(&conn, 2).unwrap();
-    // 今天 + 昨天都有事件 → 2 行 daily_agg
+    // 时间无关断言（W33-F4）：不随日界翻转的口径——
+    // 1) 锚点日行必在（生产「今天」为锚点日或次日时，锚点日都在 {今,昨} 窗口）
+    let anchor_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM daily_agg WHERE date = ?1",
+            [anchor.format("%Y-%m-%d").to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(anchor_rows, 1, "锚点日行必须被重算写入");
+    // 2) 总行数 ∈ {1,2}（种子两天；生产窗口滑一天时仅锚点日命中）
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM daily_agg", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(rows, 2);
-    assert_eq!(n, 2);
+    assert!(
+        (1..=2).contains(&rows),
+        "总行数应在 1..=2（窗口是否覆盖前一日取决于是否跨午夜）: {rows}"
+    );
+    assert!((1..=2).contains(&n), "有变化的天数应在 1..=2: {n}");
 
-    // 幂等：再跑一次应无新增行
-    let n2 = kynoptic_core::daily_agg::recompute_recent_days(&conn, 2).unwrap();
+    // 幂等：再跑一次不新增行、不 panic（行一旦写入不被零值守误删——种子行
+    // 均非全零行）
+    let _n2 = kynoptic_core::daily_agg::recompute_recent_days(&conn, 2).unwrap();
     let rows2: i64 = conn
         .query_row("SELECT COUNT(*) FROM daily_agg", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(rows2, 2);
-    // recompute_day 在数据未变时仍返回 changed=true（INSERT ... ON CONFLICT 总改写），
-    // 故 n2 仍为 2；此测试只锁定"行数稳定 + 不 panic"。
-    let _ = n2;
+    assert!(rows2 >= rows && rows2 <= 2, "二跑行数只稳不缩: {rows2}");
 }
 
 #[test]

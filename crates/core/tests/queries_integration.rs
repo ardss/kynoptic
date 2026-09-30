@@ -14,22 +14,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_db_path() -> PathBuf {
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-    let mut p = std::env::temp_dir();
-    // 路钥含纳秒级时间戳：进程 id 会被 Windows 快速复用，若上次运行遗留同
-    // 名临时库（panic 跳过 cleanup / 删除时连接未关闭导致 delete-pending），
-    // 仅 pid+seq 会在同日重跑时命中旧文件，造成计数翻倍 / UNIQUE 冲突假失败。
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 + d.as_secs() * 1_000_000_000)
-        .unwrap_or(0);
-    p.push(format!(
-        "dp_qtest_{}_{}_{}.db",
-        std::process::id(),
-        seq,
-        nanos
-    ));
-    p
+    // 路径键不读真实时钟（时钟红线，agg_cache_test 范式）：纯 pid+seq。
+    // 上次运行遗留同名临时库（panic 跳过 cleanup / 删除时连接未关闭导致
+    // delete-pending）则递增 seq 取空名——Windows 快速复用 pid 也不撞。
+    let mut seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    loop {
+        let p = std::env::temp_dir().join(format!("dp_qtest_{}_{}.db", std::process::id(), seq));
+        if !p.exists() {
+            return p;
+        }
+        seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn fresh_db() -> (Database, PathBuf) {
@@ -119,35 +114,35 @@ fn count_today_clicks_excludes_keys() {
 
 #[test]
 fn today_range_format() {
-    use chrono::{Local, TimeZone, Utc};
+    use chrono::{Local, Timelike};
     let (today, tomorrow) = queries::today_range();
     // today_range 返回本地「今日」的 UTC RFC3339 边界：[本地今日午夜, 本地明日午夜)，
-    // 转成 UTC。验证三件事：1) today 是本地今日午夜对应的 UTC 时刻；2) tomorrow 是今日+1天；
-    // 3) 区间恰好 24 小时（86400 秒）。
-    let local_today = Local::now().format("%Y-%m-%d").to_string();
-    let expected_today = Local::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|n| {
-            Local
-                .from_local_datetime(&n)
-                .earliest()
-                .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
-        });
+    // 转成 UTC。W33-F4 时钟收口：不再二次读 Local::now() 与生产侧比对（跨本地
+    // 午夜即假失败）——改断言时间无关量：start 换算回本地必为 00:00:00、
+    // 区间恰好 24 小时、与 local_day_range(start 所在本地日) 同解（自洽性）。
+    let start_utc = chrono::DateTime::parse_from_rfc3339(&today).unwrap();
+    let start_local = start_utc.with_timezone(&Local);
     assert_eq!(
-        Some(today.clone()),
-        expected_today,
-        "today_range 的 start 应为本地 {} 午夜的 UTC RFC3339",
-        local_today
+        (
+            start_local.hour(),
+            start_local.minute(),
+            start_local.second()
+        ),
+        (0, 0, 0),
+        "today_range 的 start 换算回本地必须是本地午夜: {today}"
     );
     assert!(tomorrow > today, "tomorrow 应大于 today");
     // 区间恰好 24 小时
-    let start = chrono::DateTime::parse_from_rfc3339(&today).unwrap();
     let end = chrono::DateTime::parse_from_rfc3339(&tomorrow).unwrap();
-    let secs = (end - start).num_seconds();
-    assert_eq!(secs, 86400, "今日区间应为 86400 秒，实际 {secs}");
-    // 与 local_day_range 一致
-    let (ls, le) = queries::local_day_range(&local_today).expect("local_day_range 解析本地今日");
+    assert_eq!(
+        (end - start_utc).num_seconds(),
+        86400,
+        "今日区间应为 86400 秒"
+    );
+    // 与 local_day_range 一致（用 start 自身所在本地日回推，不依赖二次时钟读）
+    let local_today = start_local.format("%Y-%m-%d").to_string();
+    let (ls, le) =
+        queries::local_day_range(&local_today).expect("local_day_range 解析 start 本地日");
     assert_eq!(ls, today);
     assert_eq!(le, tomorrow);
 }
