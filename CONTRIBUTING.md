@@ -65,9 +65,13 @@ Release checklist (execute verbatim, in order):
    matches the actual asset name
    (`releases/download/vx.y.z/Kynoptic-Setup-x.y.z.exe`);
    SHA256SUMS.txt downloadable.
-7. Deploy the same commit's build locally and smoke-test
+7. Before any local manual acceptance, clear stale builds in `dist/`
+   (untracked local artifacts from earlier builds can embed outdated
+   UI copy): delete the old exes and rebuild, or empty `dist/`
+   entirely — never smoke-test against an old `dist/kynoptic*.exe`.
+8. Deploy the same commit's build locally and smoke-test
    (`GET /api/status` returns 200).
-8. Sync the website: the landing page (`index.html`, served by GitHub
+9. Sync the website: the landing page (`index.html`, served by GitHub
    Pages from the repo root) must show the released version in its
    badge and point the primary CTA at the release — done in the same
    release cycle via its own PR.

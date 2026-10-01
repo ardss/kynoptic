@@ -8,6 +8,8 @@
 --   2) 以安全版去重（严格限定 input_agg 行、保 MAX(rowid)=最新累计终值），
 --      重复行本不该存在，存在即损伤，清掉防止 UPSERT 撞索引静默失败。
 -- 原始事件（press/click/switch）本迁移绝不触碰。
+-- 铁律豁免：本文件含一处 DELETE，仅对派生聚合行（input_agg）做迁移期
+-- 重建式去重，不触用户原始事件（见 SECURITY.md "Data-handling policy"）。
 -- 修订（审查 HIGH）：与 0005 同序——去重 DELETE 必须在 CREATE UNIQUE
 -- INDEX 之前，否则任何含重复 input_agg 行的库在建索引一步失败、版本永久
 -- 卡在 v5（本迁移正是负责修复它的，语句顺序错即自锁）。

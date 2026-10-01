@@ -19,6 +19,9 @@ static CHANNEL_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// 未来时间戳拒绝计数（reject_future_events 专用，口径独立告警）。
 static FUTURE_REJECTED: AtomicU64 = AtomicU64::new(0);
 
+/// 不可解析时间戳拒收计数（Wave45 写入侧防线，与 FUTURE_REJECTED 同款独立口径）。
+static UNPARSEABLE_REJECTED: AtomicU64 = AtomicU64::new(0);
+
 /// 数据库写失败累计（P0）：磁盘写满/写失败时旧实现只在 db 层 log（"降级逐条
 /// → 跳过"后无任何观测），而 DropWatchdog 只看 DROPPED_EVENTS（通道满载），
 /// 写失败完全静默。db 层的整批失败点（整批尝试/重试失败）各按「批」口径累加
@@ -166,6 +169,7 @@ pub(crate) fn archive_write_failure(msg: &str) {
 fn watchdog_tick(
     chan_dropped: u64,
     future_rejected: u64,
+    unparseable_rejected: u64,
     write_failures: u64,
     failed_rows: u64,
     consecutive_wf: &mut u64,
@@ -178,6 +182,12 @@ fn watchdog_tick(
         log::warn!(
             "过去 60 秒拒绝了 {} 条未来时间戳事件（> UTC now+5min），不入库",
             future_rejected
+        );
+    }
+    if unparseable_rejected > 0 {
+        log::warn!(
+            "过去 60 秒拒绝了 {} 条不可解析时间戳事件（非 RFC3339），不入库",
+            unparseable_rejected
         );
     }
     if write_failures > 0 {
@@ -208,12 +218,14 @@ fn watchdog_tick(
 fn log_dropped_events_watchdog() {
     let chan_dropped = CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
     let future_rejected = FUTURE_REJECTED.swap(0, Ordering::Relaxed);
+    let unparseable_rejected = UNPARSEABLE_REJECTED.swap(0, Ordering::Relaxed);
     let write_failures = WRITE_FAILURES.swap(0, Ordering::Relaxed);
     let failed_rows = WRITE_FAILED_ROWS.swap(0, Ordering::Relaxed);
     let mut consecutive = CONSECUTIVE_WRITE_FAILURE_PERIODS.load(Ordering::Relaxed);
     watchdog_tick(
         chan_dropped,
         future_rejected,
+        unparseable_rejected,
         write_failures,
         failed_rows,
         &mut consecutive,
@@ -323,23 +335,43 @@ fn create_monitors_for(
 
 /// 未来时间戳防线（Wave30 挂账，根治读侧修补之外的写入源）：拒绝 timestamp
 /// 晚于当前 UTC 时间 5 分钟以上的事件（时钟漂移/系统时间回拨/外部注入），
-/// 计数进 DROPPED_EVENTS 并留日志——趋势/热力图永远不会再画出未来柱。
-/// 铁律：只拦截新入库，历史数据不清洗；不可解析的时间戳不在写入侧拦截
-/// （交由 db/events.rs 的 normalize_timestamp 与读侧容错处理）。
+/// 计数进 FUTURE_REJECTED 并留日志——趋势/热力图永远不会再画出未来柱。
+/// 不可解析时间戳防线（Wave45）：RFC3339 解析失败的时间戳同样在写入侧拒收
+/// （计数进 UNPARSEABLE_REJECTED）——events.timestamp 的范围谓词全是字符串
+/// 比较，这类串落库后既不进任何日期桶也无法被 normalize_timestamp 补救，
+/// 只会污染库并令读侧逐条跳过；拒收有独立计数与看门狗告警，非静默丢失。
+/// 铁律：只拦截新入库，历史数据不清洗（历史不可解析行仍由读侧容错兜底）。
 fn reject_future_events(batch: &mut Vec<Event>) {
     let cutoff = chrono::Utc::now() + chrono::Duration::minutes(5);
     let before = batch.len();
+    let mut future_dropped = 0u64;
+    let mut unparseable_dropped = 0u64;
     batch.retain(
         |e| match chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
-            Ok(t) => t.with_timezone(&chrono::Utc) <= cutoff,
-            Err(_) => true,
+            Ok(t) => {
+                if t.with_timezone(&chrono::Utc) <= cutoff {
+                    true
+                } else {
+                    future_dropped += 1;
+                    false
+                }
+            }
+            Err(_) => {
+                unparseable_dropped += 1;
+                false
+            }
         },
     );
     let dropped = before - batch.len();
-    if dropped > 0 {
-        FUTURE_REJECTED.fetch_add(dropped as u64, Ordering::Relaxed);
-        log::warn!("拒绝 {dropped} 条未来时间戳事件（> UTC now+5min），不入库");
+    if future_dropped > 0 {
+        FUTURE_REJECTED.fetch_add(future_dropped, Ordering::Relaxed);
+        log::warn!("拒绝 {future_dropped} 条未来时间戳事件（> UTC now+5min），不入库");
     }
+    if unparseable_dropped > 0 {
+        UNPARSEABLE_REJECTED.fetch_add(unparseable_dropped, Ordering::Relaxed);
+        log::warn!("拒绝 {unparseable_dropped} 条不可解析时间戳事件（非 RFC3339），不入库");
+    }
+    debug_assert_eq!(dropped, (future_dropped + unparseable_dropped) as usize);
 }
 
 /// 落库一批事件，返回是否成功（整批全失败时为 false）。
@@ -1019,9 +1051,10 @@ pub fn start_collection_custom(
     // store(0) 会静默抹零。非零即 log::error 并留档。
     let prev_chan = CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
     let prev_future = FUTURE_REJECTED.swap(0, Ordering::Relaxed);
-    if prev_chan > 0 || prev_future > 0 {
+    let prev_unparseable = UNPARSEABLE_REJECTED.swap(0, Ordering::Relaxed);
+    if prev_chan > 0 || prev_future > 0 || prev_unparseable > 0 {
         let msg = format!(
-            "上一采集实例遗留 {prev_chan} 条通道满载丢弃、{prev_future} 条未来时间戳拒绝未被看门狗消费（热重载复位前发现）"
+            "上一采集实例遗留 {prev_chan} 条通道满载丢弃、{prev_future} 条未来时间戳拒绝、{prev_unparseable} 条不可解析时间戳拒收未被看门狗消费（热重载复位前发现）"
         );
         log::error!("{msg}");
         archive_write_failure(&msg);
@@ -1433,17 +1466,39 @@ mod tests {
     fn watchdog_escalates_after_three_consecutive_write_failure_periods() {
         let mut consecutive = 0u64;
         // 无失败：不推进
-        assert_eq!(watchdog_tick(0, 0, 0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 0, 0, 0, 0, &mut consecutive), 0);
         // 连续三个周期有写失败：1 → 2 → 3（第 3 周期起 error）
-        assert_eq!(watchdog_tick(0, 0, 5, 300, &mut consecutive), 1);
-        assert_eq!(watchdog_tick(0, 0, 1, 0, &mut consecutive), 2);
-        assert_eq!(watchdog_tick(0, 0, 1, 0, &mut consecutive), 3);
-        assert_eq!(watchdog_tick(0, 0, 2, 0, &mut consecutive), 4);
+        assert_eq!(watchdog_tick(0, 0, 0, 5, 300, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(0, 0, 0, 1, 0, &mut consecutive), 2);
+        assert_eq!(watchdog_tick(0, 0, 0, 1, 0, &mut consecutive), 3);
+        assert_eq!(watchdog_tick(0, 0, 0, 2, 0, &mut consecutive), 4);
         // 一个干净周期即清零
-        assert_eq!(watchdog_tick(7, 0, 0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(7, 0, 0, 0, 0, &mut consecutive), 0);
         // 通道丢弃/未来时间戳拒绝独立于写失败计数推进（33-F4 拆分口径）
-        assert_eq!(watchdog_tick(9, 3, 0, 0, &mut consecutive), 0);
-        assert_eq!(watchdog_tick(0, 0, 1, 12, &mut consecutive), 1);
+        assert_eq!(watchdog_tick(9, 3, 0, 0, 0, &mut consecutive), 0);
+        assert_eq!(watchdog_tick(0, 0, 0, 1, 12, &mut consecutive), 1);
+    }
+
+    /// Wave45 写入侧防线回归：不可解析时间戳（非 RFC3339）在 reject_future_events
+    /// 一律拒收并计入 UNPARSEABLE_REJECTED。只投递不可解析样本、不断言具体数值
+    /// 只断言计数增量——判定与「未来」无关，测试不依赖真实时钟。
+    #[test]
+    fn reject_future_events_drops_unparseable_timestamps() {
+        use crate::types::{EventAction, EventType};
+        let before = UNPARSEABLE_REJECTED.load(Ordering::Relaxed);
+        let mut batch = vec![
+            Event::new(EventAction::Press, EventType::Keyboard),
+            Event::new(EventAction::Release, EventType::Mouse),
+        ];
+        batch[0].timestamp = "not-a-timestamp".to_string();
+        batch[1].timestamp = String::new();
+        reject_future_events(&mut batch);
+        assert!(batch.is_empty(), "不可解析时间戳事件应全部拒收");
+        assert_eq!(
+            UNPARSEABLE_REJECTED.load(Ordering::Relaxed) - before,
+            2,
+            "拒收应按条计入 UNPARSEABLE_REJECTED"
+        );
     }
 
     /// 回归：持久写失败（磁盘满/库锁）时 batch 必须有界、send 端背压必须生效。

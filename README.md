@@ -215,6 +215,15 @@ harness in this repo (full methodology and raw numbers in
 | Query p95 on a 1M-event database | < 50 ms for all tools (anomalies ~30 ms, via aggregate caches) |
 | Large legacy database open (1M rows, backfill pending) | ~8 ms (backfill runs chunked in background) |
 
+**Storage budget over time.** Raw events are kept forever by default:
+there is no automatic cleanup path (`DEFAULT_RETENTION_DAYS = 0`, and
+`kynoptic db cleanup` only deletes events with an explicit `--yes` and
+N ≥ 30). At a measured low-intensity workload of ~750 events/hour the
+database (main + WAL) grows ≈ 3.8 MB/hour — ≈ 92 MB/day, ≈ 33 GB/year.
+Plan disk space accordingly, or use `kynoptic db cleanup N --yes`
+periodically (it also prunes the derived aggregates for the deleted
+dates).
+
 ## Privacy
 
 - Recorded data never leaves your machine by default. There is no account, no

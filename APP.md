@@ -77,6 +77,8 @@ Windows 专用（依赖 windows-sys）；需要 MSVC 工具链。
 SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（事务执行，幂等）。
 概览：`0001_init`（采集基础表）、`0002_bucket_model`（开放 bucket 模型：schema_meta / buckets / event_types / agg_minute / agg_daily / current_state）、`0003` 起（perf/聚合读缓存覆盖索引等性能与派生缓存迁移）至 `0010`，逐个文件见 `crates/core/src/db/migrations/`。
 
+原始事件默认永久保留（无自动清理；`db cleanup` 需显式 `--yes` 且 N ≥ 30）。实测约 750 事件/小时时磁盘净增约 92 MB/天（含 WAL），请预留空间或定期手动清理。
+
 ### event_type/action → event_data JSON 键（采集器写入的主要负载）
 
 事件行主列为 `timestamp / event_type / event_action / app_name / window_title`，结构化负载在 `event_data` JSON 中（键随采集器版本演进，以代码为准）。高频 action 一览：
@@ -111,7 +113,7 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 | `query --from T --to T --bucket B --limit N --json` | ✅（营销口径的子集） | 时间范围事件查询。`--from/--to` 接受 `today`/`yesterday`/`YYYY-MM-DD`/RFC3339；`--bucket` 接受 bucket id（`activity/keys`、`activity/mouse`、`app/window`、`system/*`、`network/*`、`session/*`、`device/*`）或裸 event_type。网站的 `--metric gpu` / `--join window` 依赖 GPU/窗口聚合层，**至今未落地**（截至 v0.3.1 仍报"未知选项"；`current_state`/`agg_*` 表已建，采集器未写入） |
 | `mcp` | ✅ | 启动 MCP server（stdio，阻塞到 stdin 关闭） |
 | `collect` | ✅ | 前台运行采集器，Ctrl+C 优雅停止（`--db PATH` / `--all` 覆盖 settings） |
-| `dashboard [--port N] [--db PATH]` | ✅ | 仅本机可访问的只读网页面板（127.0.0.1） |
+| `dashboard [--port N] [--db PATH]` | ✅ | 仅本机可访问的网页面板（127.0.0.1）；活动数据只读，设置项仅可通过 `POST /api/settings` 写入 |
 | `presence [--days N]` | ✅ | 三指标日报（presence/automation/foreground + mixed），与 dashboard overview 同一权威实现 |
 | `skill install` | ✅ | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
 | `probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]` | ✅ | 逐监控器硬件实测探针（0 = 自动推导首次采集等待上限，仍受 420s 上限约束） |

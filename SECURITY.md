@@ -32,6 +32,19 @@ stdin/stdout) and has no network socket of any kind.
     non-zero and prints the failed URL. That is the expected
     "no network" signal, not a fault.
 
+## Data-handling policy (review ground rule)
+
+The user's **raw event layer is never deleted by product code**: the raw
+layer is append-only, and retention cleanup runs only when the user
+invokes `kynoptic db cleanup N --yes` explicitly. Derived aggregate rows
+(`input_agg`, `daily_agg`, `agg_minute`, `agg_daily` and the `app:*`
+buckets) are rebuildable read caches and are allowed one exception:
+migrations may perform rebuild-style dedup of derived aggregate rows
+(e.g. migration 0005/0006 dedup `input_agg` rows as a required
+prerequisite of creating their unique index). User raw events are
+untouched by those migrations — this exemption does not weaken the
+append-only guarantee for the raw layer.
+
 ## Reporting a vulnerability
 
 Email <kynoptic@outlook.com> with:

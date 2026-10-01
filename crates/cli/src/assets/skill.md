@@ -71,7 +71,7 @@ HTTP API（GET 全部只读）：
 1. **原始事件永不删除**：retention=0 表示永不清理。`db cleanup` 默认只清 sessions；删 events 需要 `--yes` 且 ≥30 天——用户没有明确说"清理数据"时禁止执行。
 2. **绝不直接写 SQLite**：一切读取可以直接开只读连接（`mode=ro`），但写入只经 CLI/API。聚合表（agg_minute/daily_agg）是派生缓存，重算用 `kynoptic-aggrepair --db X --from A --to B`（默认 dry-run，`--apply` 才执行）。
 3. **导出含敏感明文**（窗口标题原文含 URL/邮件标题，默认不脱敏）：把导出文件内容发给任何外部服务前必须先问用户。
-4. settings.json 损坏会自动留档 `.corrupt.bak`；文件丢失时托盘会告警并落一份默认文件——发现用户配置丢失先查这个文件和历史，不要默默重装。
+4. settings.json 损坏时：托盘/面板入口会自动留档 `.corrupt.bak`；仅跑 CLI 时不留档，文件原地保留、只在 stderr 打警告并回退默认值。文件丢失时托盘会告警并落一份默认文件——发现用户配置丢失先查这个文件和历史，不要默默重装。
 5. 面板并发上限 64 连接，超限 503；面板 503 先看是否服务被杀（watchdog.log、kynoptic-heartbeat 新鲜度），不要重试轰炸。
 
 ## 意图路由

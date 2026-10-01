@@ -81,6 +81,18 @@ requireContains("APP.md", `# Kynoptic App (v${ver})`, "标题行");
     } else {
       console.log(`[doc-version] ok: CHANGELOG.md 顶部版本段 ${heads[0]}`);
     }
+    // 底部链接定义区：[Unreleased] compare 基线必须等于当前版本
+    // （定版时若漏改 v0.3.1...HEAD → 悬空链接，此前十项断言全过门禁放行，
+    // 见 fixReport ci-low-1 实测记录。只锚定该行，不做全文件扫描。）
+    const unrel = `[Unreleased]: https://github.com/ardss/kynoptic/compare/v${ver}...HEAD`;
+    if (!src.includes(unrel)) {
+      console.error(
+        `[doc-version] CHANGELOG.md 底部 [Unreleased] compare 基线须为 '${unrel}'（漏改将悬空）`,
+      );
+      failed = true;
+    } else {
+      console.log(`[doc-version] ok: CHANGELOG.md [Unreleased] 基线 v${ver}`);
+    }
   }
 }
 
