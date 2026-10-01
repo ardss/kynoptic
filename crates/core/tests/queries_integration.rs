@@ -68,8 +68,27 @@ fn insert_event(db: &Database, ts: &str, etype: &str, eaction: &str, app: Option
     db.insert_events(&[e]);
 }
 
+/// 正午锚点：本地当日 12:00 转 UTC。测试内一切时间戳/日期窗口都从这一个
+/// 锚点派生（时钟铁律，与 analyzer_test 的 local_noon_utc 同范式）：正午
+/// 离本地/UTC 日界都远，两次派生之间跨日导致「事件落昨日、窗口从今日起」
+/// 的竞争分支不可能触发。
+fn noon_anchor() -> chrono::DateTime<Utc> {
+    use chrono::TimeZone;
+    let d = chrono::Local::now().date_naive();
+    chrono::Local
+        .from_local_datetime(&d.and_hms_opt(12, 0, 0).unwrap())
+        .earliest()
+        .expect("本地正午 12:00 不存在（DST 跳变日请换锚点）")
+        .with_timezone(&Utc)
+}
+
 fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
+    noon_anchor().to_rfc3339()
+}
+
+/// 从锚点派生第 offset 天的日期串（与锚点同一 UTC 日界）
+fn anchor_day(t: chrono::DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d").to_string()
 }
 
 // === today 范围查询 ===
@@ -77,11 +96,10 @@ fn now_rfc3339() -> String {
 #[test]
 fn count_today_keys_counts_only_today_presses() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
 
     // 今日 3 次按键 + 1 次点击（点击不计入 keys）
     insert_event(&db, &now, "keyboard", "press", None);
@@ -97,11 +115,10 @@ fn count_today_keys_counts_only_today_presses() {
 #[test]
 fn count_today_clicks_excludes_keys() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
 
     insert_event(&db, &now, "mouse", "click", None);
     insert_event(&db, &now, "mouse", "click", None);
@@ -161,11 +178,10 @@ fn today_range_format() {
 #[test]
 fn count_today_events_all_types() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
 
     insert_event(&db, &now, "keyboard", "press", None);
     insert_event(&db, &now, "mouse", "click", None);
@@ -181,15 +197,14 @@ fn count_today_events_all_types() {
 #[test]
 fn current_app_returns_latest_window_event() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
 
     insert_event(&db, &now, "window", "switch", Some("chrome"));
     // 稍晚一条
-    let later = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    let later = (anchor + chrono::Duration::seconds(1)).to_rfc3339();
     insert_event(&db, &later, "window", "switch", Some("code"));
 
     let conn = db.reader();
@@ -200,10 +215,9 @@ fn current_app_returns_latest_window_event() {
 #[test]
 fn current_app_empty_when_no_window_events() {
     let (db, path) = fresh_db();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
     let conn = db.reader();
     assert_eq!(queries::current_app(&conn, &today, &tomorrow), "");
     cleanup(&path);
@@ -214,8 +228,9 @@ fn current_app_empty_when_no_window_events() {
 #[test]
 fn count_all_keys_clicks_total() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let yesterday = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let yesterday = (anchor - chrono::Duration::days(1)).to_rfc3339();
 
     insert_event(&db, &now, "keyboard", "press", None);
     insert_event(&db, &yesterday, "keyboard", "press", None);
@@ -342,9 +357,10 @@ fn count_all_active_minutes_dedupes_same_minute() {
 #[test]
 fn count_all_active_minutes_covers_input_agg_rows() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let earlier = (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
-    let earlier2 = (Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let earlier = (anchor - chrono::Duration::seconds(3600)).to_rfc3339();
+    let earlier2 = (anchor - chrono::Duration::seconds(7200)).to_rfc3339();
 
     // 一条 raw press 行（1 分钟）+ 两条 input_agg 计数行（各自 1 分钟）
     insert_event(&db, &now, "keyboard", "press", None);
@@ -368,15 +384,16 @@ fn count_all_active_minutes_covers_input_agg_rows() {
 #[test]
 fn count_recent_input_window() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let old = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let old = (anchor - chrono::Duration::seconds(600)).to_rfc3339();
 
     insert_event(&db, &now, "keyboard", "press", None);
     insert_event(&db, &old, "keyboard", "press", None);
 
     let conn = db.reader();
     // 最近 60s 窗口内只有 1 条
-    let one_min_ago = (Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+    let one_min_ago = (anchor - chrono::Duration::seconds(60)).to_rfc3339();
     assert_eq!(queries::count_recent_input(&conn, &one_min_ago), 1);
     cleanup(&path);
 }
@@ -434,8 +451,9 @@ fn latest_event_data_none_when_no_match() {
 #[test]
 fn latest_event_data_multi_matches_individual() {
     let (db, path) = fresh_db();
-    let t_old = (Utc::now() - chrono::Duration::seconds(100)).to_rfc3339();
-    let t_new = now_rfc3339();
+    let anchor = noon_anchor();
+    let t_old = (anchor - chrono::Duration::seconds(100)).to_rfc3339();
+    let t_new = anchor.to_rfc3339();
 
     // 每个组合插入多条，验证取最新非 NULL 行
     // heartbeat: 旧(75.5) → 新(90.0)，应取 90.0
@@ -551,8 +569,9 @@ fn latest_event_data_multi_empty_db() {
 fn latest_event_data_multi_skips_null_event_data() {
     // event_data 为 NULL 的行应被跳过，取最新的非 NULL 行
     let (db, path) = fresh_db();
-    let t_new = now_rfc3339();
-    let t_old = (Utc::now() - chrono::Duration::seconds(100)).to_rfc3339();
+    let anchor = noon_anchor();
+    let t_new = anchor.to_rfc3339();
+    let t_old = (anchor - chrono::Duration::seconds(100)).to_rfc3339();
 
     // 最新行 event_data 为 NULL，旧行有数据 → 应取旧行数据
     let mut e_null = Event::new(EventAction::Heartbeat, EventType::System);
@@ -582,8 +601,20 @@ fn latest_event_data_multi_skips_null_event_data() {
 #[test]
 fn yesterday_total_same_time_counts_keyboard_mouse() {
     let (db, path) = fresh_db();
-    // 昨日同一时刻之前的键鼠事件
-    let yesterday = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    // 语义：窗口 = [本地昨日午夜, now-24h)（同刻对比）。单次读钟取该区间
+    // 中点作种子时刻：无论测试在本地几点评测，种子都落在窗口中部，测试侧
+    // 与生产侧的亚秒时钟差、跨午夜都不可能把种子挤出去。
+    let now_local = chrono::Local::now();
+    use chrono::TimeZone;
+    let y_date = (now_local - chrono::Duration::days(1)).date_naive();
+    let y_start = chrono::Local
+        .from_local_datetime(&y_date.and_hms_opt(0, 0, 0).unwrap())
+        .earliest()
+        .expect("本地午夜不存在（DST 跳变日请换锚点）")
+        .with_timezone(&chrono::Utc);
+    let y_end = now_local.with_timezone(&chrono::Utc) - chrono::Duration::days(1);
+    let yesterday =
+        (y_start + chrono::Duration::seconds((y_end - y_start).num_seconds() / 2)).to_rfc3339();
     let mk = |action: EventAction, etype: EventType| {
         let mut e = Event::new(action, etype);
         e.timestamp = yesterday.clone();
@@ -606,11 +637,10 @@ fn yesterday_total_same_time_counts_keyboard_mouse() {
 #[test]
 fn today_action_breakdown_matches_individual_counts() {
     let (db, path) = fresh_db();
-    let now = now_rfc3339();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let now = anchor.to_rfc3339();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
 
     // 混合插入各类今日事件
     insert_event(&db, &now, "keyboard", "press", None);
@@ -667,10 +697,9 @@ fn today_action_breakdown_matches_individual_counts() {
 #[test]
 fn today_action_breakdown_empty_when_no_events() {
     let (db, path) = fresh_db();
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Utc::now() + chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
+    let anchor = noon_anchor();
+    let today = anchor_day(anchor);
+    let tomorrow = anchor_day(anchor + chrono::Duration::days(1));
 
     let conn = db.reader();
     let (total, counts) = queries::today_action_breakdown(&conn, &today, &tomorrow);
