@@ -231,7 +231,7 @@
 
 <span class="cm"># <span class="l en">or query the history as plain SQL — the database lives in the</span><span class="l zh">也可以直接用 SQL 查历史，库文件在安装目录的 data\kynoptic.db</span></span>
 <span class="cm"># <span class="l en">install folder under data\kynoptic.db, or wherever KYNOPTIC_DB points</span><span class="l zh">（可用环境变量 KYNOPTIC_DB 修改位置）</span></span>
-<span class="kw">$</span> <span class="fn">sqlite3</span> <span class="str">"%LOCALAPPDATA%\Programs\kynoptic\data\kynoptic.db"</span> <span class="str">"SELECT * FROM events"</span>
+<span class="kw">$</span> <span class="fn">sqlite3</span> <span class="str">"%LOCALAPPDATA%\Programs\Kynoptic\data\kynoptic.db"</span> <span class="str">"SELECT * FROM events"</span>
 
 <span class="cm"># <span class="l en">the DB uses WAL mode: for read-only queries or copying the file,</span><span class="l zh">库使用 WAL 模式：只读查询或复制文件时，请连同 -wal / -shm 文件</span></span>
 <span class="cm"># <span class="l en">keep the -wal and -shm files together and don't truncate them, or you</span><span class="l zh">一起保留，不要单独截断它们，</span></span>
@@ -283,7 +283,7 @@
             <td><span class="l en">Disk usage</span><span class="l zh">磁盘占用</span></td>
             <td><span class="l en">GB-scale per week</span><span class="l zh">每周 GB 级</span></td>
             <td><span class="l en">MB–GB scale with auto-cleanup</span><span class="l zh">MB–GB 级，依赖自动清理</span></td>
-            <td class="us-col"><b><span class="l en">KB-scale per day</span><span class="l zh">每天 KB 级</span></b></td>
+            <td class="us-col"><b><span class="l en">KB-scale idle days; tens of MB/day in regular use (see README disk budget)</span><span class="l zh">空闲日 KB 级；常规使用约几十 MB/天（详见 README 磁盘预算）</span></b></td>
           </tr>
           <tr>
             <td><span class="l en">AI access</span><span class="l zh">AI 接入</span></td>
@@ -312,7 +312,7 @@
     </details>
     <details>
       <summary><span class="l en">How much resource does it use?</span><span class="l zh">资源占用多大？</span></summary>
-      <p><span class="l en">Designed for near-zero overhead: no video encoding, no OCR, no cloud calls. Writes are batched to minimize disk I/O; typical storage is KB-scale per day.</span><span class="l zh">按"接近零开销"设计：没有视频编码、没有 OCR、没有云调用。写入批量落盘以减少 I/O；典型存储为每天 KB 级。</span></p>
+      <p><span class="l en">Designed for near-zero overhead: no video encoding, no OCR, no cloud calls. Writes are batched to minimize disk I/O; idle days are KB-scale, regular use is roughly tens of MB per day (see the README disk budget).</span><span class="l zh">按"接近零开销"设计：没有视频编码、没有 OCR、没有云调用。写入批量落盘以减少 I/O；空闲日为 KB 级，常规使用约每天几十 MB（详见 README 磁盘预算）。</span></p>
     </details>
     <details>
       <summary><span class="l en">How is this different from Windows Recall or Rewind?</span><span class="l zh">和 Windows Recall、Rewind 有什么区别？</span></summary>
