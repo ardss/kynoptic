@@ -115,13 +115,24 @@ fn count_today_clicks_excludes_keys() {
 #[test]
 fn today_range_format() {
     use chrono::{Local, Timelike};
+    // 外部锚定：today_range 内部自行读钟，测试无法与其共享同一次读数；用
+    // 调用前后的测试进程本地日期把它的「今日」夹在中间（跨本地午夜时二者
+    // 可能相差一天，两个都算合法）。
+    let before = Local::now().date_naive();
     let (today, tomorrow) = queries::today_range();
+    let after = Local::now().date_naive();
     // today_range 返回本地「今日」的 UTC RFC3339 边界：[本地今日午夜, 本地明日午夜)，
-    // 转成 UTC。W33-F4 时钟收口：不再二次读 Local::now() 与生产侧比对（跨本地
-    // 午夜即假失败）——改断言时间无关量：start 换算回本地必为 00:00:00、
-    // 区间恰好 24 小时、与 local_day_range(start 所在本地日) 同解（自洽性）。
+    // 转成 UTC。start 换算回本地必为 00:00:00、区间恰好 24 小时、其本地日
+    // 必是测试进程当前本地日（容许跨午夜 ±0/±1 读数差）、且与
+    // local_day_range(该本地日) 同解。
     let start_utc = chrono::DateTime::parse_from_rfc3339(&today).unwrap();
     let start_local = start_utc.with_timezone(&Local);
+    let start_day = start_local.date_naive();
+    assert!(
+        start_day == before || start_day == after,
+        "today_range 的 start 本地日必须是测试进程当前本地日（容许跨午夜）: \
+         start_day={start_day}, before={before}, after={after}"
+    );
     assert_eq!(
         (
             start_local.hour(),

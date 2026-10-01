@@ -268,8 +268,12 @@ fn daily_agg_recompute_recent_days_covers_today_and_yesterday() {
     insert_event(&conn, &local_noon_utc(prev), "keyboard", "press");
 
     let n = kynoptic_core::daily_agg::recompute_recent_days(&conn, 2).unwrap();
-    // 时间无关断言（W33-F4）：不随日界翻转的口径——
-    // 1) 锚点日行必在（生产「今天」为锚点日或次日时，锚点日都在 {今,昨} 窗口）
+    // 跨午夜检测：只用于选择断言口径，不与生产侧时钟做精确比对。测试进程在
+    // 重算调用之后是否已翻日，决定生产窗口是 {锚点日, 前一日}（未翻日）还是
+    // {次日, 锚点日}（已翻日，前一种子落到窗外）。竞争窗口只有午夜前后的
+    // 亚毫秒级瞬间，该分支取宽松口径即可。
+    let crossed_midnight = chrono::Local::now().date_naive() != anchor;
+    // 锚点日行必在：无论窗口是否滑一天，锚点日都在生产 {今,昨} 窗口内
     let anchor_rows: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM daily_agg WHERE date = ?1",
@@ -278,15 +282,18 @@ fn daily_agg_recompute_recent_days_covers_today_and_yesterday() {
         )
         .unwrap();
     assert_eq!(anchor_rows, 1, "锚点日行必须被重算写入");
-    // 2) 总行数 ∈ {1,2}（种子两天；生产窗口滑一天时仅锚点日命中）
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM daily_agg", [], |r| r.get(0))
         .unwrap();
-    assert!(
-        (1..=2).contains(&rows),
-        "总行数应在 1..=2（窗口是否覆盖前一日取决于是否跨午夜）: {rows}"
-    );
-    assert!((1..=2).contains(&n), "有变化的天数应在 1..=2: {n}");
+    if crossed_midnight {
+        // 窗口已滑到 {次日, 锚点日}：前一日种子落在窗外，只能断言锚点日行
+        assert!(rows >= 1, "跨午夜分支至少写入锚点日行: {rows}");
+    } else {
+        // 常规分支：两天种子都必须被重算——精确断言，多天窗口少跑一天的
+        // 回归（如只重算今天）在此被捕获
+        assert_eq!(rows, 2, "两天种子都应被重算写入: {rows}");
+        assert_eq!(n, 2, "两天都有变化，n 应为 2: {n}");
+    }
 
     // 幂等：再跑一次不新增行、不 panic（行一旦写入不被零值守误删——种子行
     // 均非全零行）
@@ -294,7 +301,7 @@ fn daily_agg_recompute_recent_days_covers_today_and_yesterday() {
     let rows2: i64 = conn
         .query_row("SELECT COUNT(*) FROM daily_agg", [], |r| r.get(0))
         .unwrap();
-    assert!(rows2 >= rows && rows2 <= 2, "二跑行数只稳不缩: {rows2}");
+    assert_eq!(rows2, rows, "二跑行数必须与一跑一致: {rows2} vs {rows}");
 }
 
 #[test]
