@@ -12,6 +12,18 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # W48 清洁清单：发版前确认工作区无 tmp_* 等临时文件残留
+      #（历史教训：时钟铁律收口的临时复核测试残留工作区使整套件变红）
+      - name: Reject leftover temporary files
+        shell: pwsh
+        run: |
+          $dirty = git status --porcelain
+          if ($dirty) {
+            Write-Host $dirty
+            Write-Error "工作区不干净，存在未提交/临时文件残留，终止发版"
+            exit 1
+          }
+          Write-Host "workspace clean"
       - uses: dtolnay/rust-toolchain@stable
       # P2: 缓存 cargo 依赖/构建产物，加速发版构建
       - uses: Swatinem/rust-cache@v2

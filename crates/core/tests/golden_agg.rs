@@ -38,9 +38,16 @@ fn cleanup(path: &str) {
     let _ = std::fs::remove_file(format!("{path}-shm"));
 }
 
-/// 锚点：当前 UTC 时刻取整到分钟，再偏移 i 分钟（互不重叠的本地分钟桶）。
+/// 锚点：本地当日正午 12:00（转 UTC）取整到分钟，再偏移 i 分钟（互不重叠的
+/// 本地分钟桶）。正午锚点离任何日界都远，跨午夜分支不可能触发（时钟铁律）。
 fn ts_at_minute_offset(i: i64) -> String {
-    let base = chrono::Utc::now()
+    use chrono::TimeZone;
+    let d = chrono::Local::now().date_naive();
+    let base = chrono::Local
+        .from_local_datetime(&d.and_hms_opt(12, 0, 0).unwrap())
+        .earliest()
+        .expect("本地正午 12:00 不存在（DST 跳变日请换锚点）")
+        .with_timezone(&chrono::Utc)
         .with_second(0)
         .unwrap()
         .with_nanosecond(0)

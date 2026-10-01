@@ -123,9 +123,18 @@ fn marathon_bridge_gap_2_vs_15_split_or_merge() {
 /// 本地 12:00 开始的马拉松在异常卡上显示为 UTC 04:00。
 #[test]
 fn marathon_time_range_is_local_not_utc() {
-    // 锚定当前时刻的整分钟，构造 180 连续分钟
-    use chrono::Timelike;
-    let start = chrono::Utc::now()
+    // 锚定本地当日正午 12:00（正午离日界远，180 分钟窗口跨午夜分支不可能触发）
+    use chrono::{TimeZone, Timelike};
+    let start = chrono::Local
+        .from_local_datetime(
+            &chrono::Local::now()
+                .date_naive()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        )
+        .earliest()
+        .expect("本地正午 12:00 不存在")
+        .with_timezone(&chrono::Utc)
         .with_second(0)
         .unwrap()
         .with_nanosecond(0)
