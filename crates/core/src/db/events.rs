@@ -55,7 +55,8 @@ fn all_failed(rowids: &[i64], expected: usize) -> bool {
 /// RFC3339。events.timestamp 的全部范围谓词是字符串比较，一旦带非 +00:00
 /// 后缀（采集器 bug 或外部导入写成 '+08:00'/'Z'），字典序不再等于时间序，
 /// 事件会被静默计入错误的"今日"或直接丢弃。可解析的时间戳就地归一化；
-/// 不可解析的保持原样（不阻塞落库，由读侧既有容错兜底）。
+/// 不可解析的保持原样（采集写入侧已在 reject_future_events 拒收此类事件；
+/// 本函数兜底的是绕过 collector 直连 insert_events 的路径，读侧容错照旧）。
 fn normalize_timestamp(ts: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
         // to_rfc3339 输出固定 +00:00 后缀，字典序 == 时间序
