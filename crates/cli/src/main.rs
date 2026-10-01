@@ -70,7 +70,7 @@ Subcommands:
   skill install                               Sync bundled SKILL.md to AI client skill dirs
   --version / -V                              Print version
   probe     [--monitor ID] [--secs N] [--all] [--first-collect-timeout N] Live per-monitor hardware probe
-  dashboard [--port N] [--db PATH]          Local-only read-only web dashboard
+  dashboard [--port N] [--db PATH]          Local-only web dashboard (activity data read-only; settings via POST /api/settings)
   update [--check]                          Self-update from GitHub releases (--check: report only)
   watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary

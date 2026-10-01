@@ -3,6 +3,9 @@
 -- 设计变更：input_agg 是**派生聚合缓存**（不是原始事件），其"当前分钟"行
 -- 现在每秒被累计值 UPSERT 覆盖一次，使仪表盘键鼠数据 ~1-2 秒可见。
 -- 原始事件（press/click/switch/...）依然严格只增不改——铁律保护对象不变。
+-- 铁律豁免：本文件第 17 行的 DELETE 只做派生聚合行（input_agg）的迁移期
+-- 重建式去重（建唯一索引的必要前置），不触用户原始事件（见 SECURITY.md
+-- "Data-handling policy"）。
 --
 -- 修订记录：初版去重 DELETE 缺外层 event_action 过滤，NOT IN 会把所有
 -- 非 input_agg 行全部删掉（审查抓到的 P0）。现版：清洗严格限定 input_agg

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Core (ingest): events whose timestamp is not valid RFC 3339 are now
+  rejected at the write side instead of being written and tolerated at
+  read time. This includes empty-string timestamps. Rejected events are
+  counted (`UNPARSEABLE_REJECTED`) and logged so the watchdog surfaces
+  them — they are not silently dropped — because such rows could never
+  land in any date bucket (the `events.timestamp` range predicates are
+  plain string comparisons) and only polluted the database. Historical
+  rows are not cleaned up; read-side tolerance still covers them. This
+  complements the existing future-timestamp gate (`FUTURE_REJECTED`);
+  both now run in the same write-side filter.
+
 ### Added
 
 - Core: the session monitor now receives Windows session events
@@ -178,7 +191,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`daily_agg`, `agg_minute`, and the `app:*` buckets of `agg_daily`)
   in the same transaction, so the dashboard's minute/daily aggregate
   views no longer keep showing dates whose raw events have been
-  deleted.
+  deleted. The events high-watermark is advanced in the same
+  transaction: the watermark is a row-count figure, so leaving it
+  untouched after row deletion made the next database open misread the
+  legitimate post-cleanup decrease as corruption.
 - CLI (`export`): JSON/JSONL exports now serialize a NULL `window_title`
   as JSON `null` instead of `""`, so programmatic consumers can tell
   "no title" apart from "empty title" (CSV output is unchanged — both
@@ -209,6 +225,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "binds to 127.0.0.1" — it is a stdio process (JSON-RPC over
   stdin/stdout) with no network socket of any kind; only the
   dashboard HTTP server binds to 127.0.0.1.
+
+- Removed: the last two topmost (`MB_TOPMOST`) modal message boxes are
+  gone, per the "monitors must not pop dialogs over the user" rule.
+  The CLI `watchdog` alert path (`watchdog_alert` and the
+  tray-exit-flag notice) no longer opens a foreground-stealing message
+  box, and the tray's watchdog-task health alert no longer opens one
+  on its first self-check failure of each tray process. Alerts are
+  surfaced through the tray notification / heartbeat channels instead.
+
+- Changed: all console-tool spawns (`powershell`, `tasklist`,
+  `taskkill`, `schtasks`, and self-relaunches) now create their
+  process windows through a single `kynoptic_core::spawn::no_window`
+  helper instead of scattering `CREATE_NO_WINDOW` /
+  `DETACHED_PROCESS` flags at each call site, so no code path can
+  flash a console window from the resident tray or the per-minute
+  watchdog task. Behavior is unchanged — the flags were already
+  correct at every site; centralizing makes the next miss impossible.
+
+- Docs: the documentation set and its release gates were extended: a
+  new `check-doc-version` CI gate keeps the version badge and download
+  links in sync with the released tag; SECURITY.md's version table
+  now names its update-tooling blind spot; APP.md is regenerated
+  alongside each release as part of the doc set; and README documents
+  `collect --help` for the per-monitor flag list.
 
 ## [0.3.1] - 2026-09-25
 
