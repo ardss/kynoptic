@@ -68,9 +68,14 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
          PRAGMA temp_store=MEMORY;
          PRAGMA mmap_size=268435456;
          PRAGMA busy_timeout=5000;
-         -- WAL 高水位封顶（perf 审查 2026-09）：两次维护间隔内 checkpoint
-         -- TRUNCATE 可能因常驻 reader busy 而截断失败，journal_size_limit
-         -- 让 WAL 在其后下一笔写入回落到 16MB（实测不影响写入吞吐）。
+         -- WAL 驻留口径（W33-F3 注释更正 2026-09）：WAL 常驻 ~4MB 是默认
+         -- 1000 页被动自动检查点后的磁盘高水位（检查点完成的页字节保留在
+         -- WAL 文件里），与读池连接数无关（零 reader 亦复现）。TRUNCATE
+         -- 检查点仅 24h 维护节拍执行；TRUNCATE busy=1 只在「检查点瞬间有读
+         -- 事务在飞」时发生——常驻 idle 只读连接（dashboard 池/core 读池）
+         -- 不阻止截断（沙箱 S1/S2/S6 实测）。journal_size_limit=16MB 是软
+         -- 封顶：单笔超限写入把 WAL 撑大后，其后下一笔写入回落（W33-F3
+         -- S7 增压实测钳制有效，正常负载恒 ~4MB）。
          PRAGMA journal_size_limit=16777216;",
     )
 }

@@ -12,18 +12,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_db_path() -> String {
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 + d.as_secs() * 1_000_000_000)
-        .unwrap_or(0);
-    format!(
-        "{}\\kyn_midnight_{}_{}_{}.db",
-        std::env::temp_dir().display(),
-        std::process::id(),
-        seq,
-        nanos
-    )
+    // 路径键不读真实时钟（时钟红线，agg_cache_test 范式）：纯 pid+seq；
+    // 上次运行遗留同名临时库（panic 跳过清理）则递增 seq 取空名。
+    let mut seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    loop {
+        let name = format!(
+            "{}\\kyn_midnight_{}_{}.db",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            seq
+        );
+        if !std::path::Path::new(&name).exists() {
+            return name;
+        }
+        seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn cleanup_files(path: &str) {

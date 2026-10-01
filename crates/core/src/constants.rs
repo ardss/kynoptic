@@ -13,6 +13,14 @@ pub const WRITE_BATCH_SIZE: usize = 300;
 /// 与磁盘足迹之间取平衡（用户可见默认值变更，见 BENCHMARKS.md）。
 pub const WRITE_FLUSH_INTERVAL_SECS: u64 = 30;
 
+// === 监控线程 ===
+/// 监控器首拍 collect 的截止（W33-F7 收尾修复）：首拍枚举无间隔睡眠保护、
+/// 停机旗标在 collect 进行中不可见，病态系统（进程数大/杀软扫描）下首拍可
+/// 以分钟计——若首拍在监控主线程同步跑，shutdown 的 join 被其拖满。现首拍
+/// 移入独立 worker、主线程只等这么久，超时弃拍（worker 后台跑完投递通道、
+/// 由下一轮 interval 补齐），退出路径有界。健康系统首拍 ~2-3s，10s 余量充足。
+pub const MONITOR_FIRST_COLLECT_DEADLINE_SECS: u64 = 10;
+
 // === 后台线程间隔 ===
 pub const MAINTENANCE_INTERVAL_SECS: u64 = 24 * 3600;
 /// daily_agg 缓存刷新间隔。缓存读方（charts/insights）与实时读方（summary 卡片）

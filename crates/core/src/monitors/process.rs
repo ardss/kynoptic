@@ -288,18 +288,7 @@ fn query_process_memory_mb(pid: u32) -> f64 {
 /// GetProcessTimes 差分：两次采样间的 (kernel+user) 时间增量除以墙钟时间增量。
 /// EMA 平滑沿用上游的 α=0.3 口径，抑制瞬时抖动；已退出进程从平滑表淘汰。
 fn query_cpu_percent_map(pids: &[u32]) -> HashMap<u32, f64> {
-    use std::cell::RefCell;
     use std::time::Instant;
-
-    // pid -> 最近一次采样的 CPU 累计时间（100ns 单位，kernel+user）
-    thread_local! {
-        // HashMap::new 尚非 const fn（RandomState），无法用 const 初始化块
-        #[allow(clippy::missing_const_for_thread_local)]
-        static PREV_TIMES: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
-        static PREV_INST: RefCell<Option<Instant>> = const { RefCell::new(None) };
-        #[allow(clippy::missing_const_for_thread_local)]
-        static SMOOTHED: RefCell<HashMap<u32, f64>> = RefCell::new(HashMap::new());
-    }
 
     let now = Instant::now();
     let mut times: HashMap<u32, u64> = pids.iter().map(|&pid| (pid, 0)).collect();
@@ -322,56 +311,79 @@ fn query_cpu_percent_map(pids: &[u32]) -> HashMap<u32, f64> {
         }
     }
 
-    PREV_TIMES.with(|prev| {
-        PREV_INST.with(|prev_inst| {
-            SMOOTHED.with(|smoothed| {
-                let mut prev_times = prev.borrow_mut();
-                let elapsed = prev_inst
-                    .borrow_mut()
-                    .replace(now)
-                    .map(|t| now.duration_since(t).as_secs_f64())
-                    .unwrap_or(0.0);
-                let mut out: HashMap<u32, f64> = HashMap::new();
-                const ALPHA: f64 = 0.3;
-                // 全库审查 P1：PREV_TIMES 此前只读不写——CPU% 恒为 0。
-                // 先取上一轮快照，本轮结束回写，供下一轮差分。
-                let prev_snapshot: HashMap<u32, u64> = prev_times.clone();
-                for (pid, total) in &times {
-                    prev_times.insert(*pid, *total);
-                }
-                for (pid, total) in &times {
-                    let delta_pct = match (elapsed, prev_snapshot.get(pid)) {
-                        (e, Some(prev_t)) if e > 0.0 => {
-                            // GetProcessTimes 是全核累计：8 核满载 = 800%。
-                            // 除以逻辑核数归一成"占整机百分比"（Wave19 P0：
-                            // 原来钳到 100 让多核进程排名失真）
-                            let cores = std::thread::available_parallelism()
-                                .map(|n| n.get() as f64)
-                                .unwrap_or(1.0);
-                            (((total.saturating_sub(*prev_t) as f64 / 10_000_000.0) / e * 100.0)
-                                / cores)
-                                .clamp(0.0, 100.0)
-                        }
-                        _ => 0.0,
-                    };
-                    let ema = match smoothed.borrow().get(pid) {
-                        Some(p) => p * (1.0 - ALPHA) + delta_pct * ALPHA,
-                        None => delta_pct,
-                    };
-                    smoothed.borrow_mut().insert(*pid, ema);
-                    out.insert(*pid, ema);
-                }
-                // 淘汰已退出进程（Wave19 P1：prev_times 同步清理，否则
-                // 进程 churn 会无限残留条目）
-                smoothed
-                    .borrow_mut()
-                    .retain(|pid, _| times.contains_key(pid));
-                prev_times.retain(|pid, _| times.contains_key(pid));
-                out
-            })
-        })
-    })
+    // 中毒防护：首拍 worker 与循环段都 catch_unwind 包裹 collect——循环内
+    // panic 会把锁标记为 poisoned；into_inner 恢复继续采样（与「panic 只
+    // 跳过本轮」的口径一致，基线表本身是纯数据无不变量需守护）。
+    let mut g = CPU_BASELINE.lock().unwrap_or_else(|e| e.into_inner());
+    let elapsed = g
+        .prev_inst
+        .replace(now)
+        .map(|t| now.duration_since(t).as_secs_f64())
+        .unwrap_or(0.0);
+    let mut out: HashMap<u32, f64> = HashMap::new();
+    const ALPHA: f64 = 0.3;
+    // 全库审查 P1：PREV_TIMES 此前只读不写——CPU% 恒为 0。
+    // 先取上一轮快照，本轮结束回写，供下一轮差分。
+    let prev_snapshot: HashMap<u32, u64> = g.prev_times.clone();
+    for (pid, total) in &times {
+        g.prev_times.insert(*pid, *total);
+    }
+    for (pid, total) in &times {
+        let delta_pct = match (elapsed, prev_snapshot.get(pid)) {
+            (e, Some(prev_t)) if e > 0.0 => {
+                // GetProcessTimes 是全核累计：8 核满载 = 800%。
+                // 除以逻辑核数归一成"占整机百分比"（Wave19 P0：
+                // 原来钳到 100 让多核进程排名失真）
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get() as f64)
+                    .unwrap_or(1.0);
+                (((total.saturating_sub(*prev_t) as f64 / 10_000_000.0) / e * 100.0) / cores)
+                    .clamp(0.0, 100.0)
+            }
+            _ => 0.0,
+        };
+        let ema = match g.smoothed.get(pid) {
+            Some(p) => p * (1.0 - ALPHA) + delta_pct * ALPHA,
+            None => delta_pct,
+        };
+        g.smoothed.insert(*pid, ema);
+        out.insert(*pid, ema);
+    }
+    // 淘汰已退出进程（Wave19 P1：prev_times 同步清理，否则
+    // 进程 churn 会无限残留条目）
+    g.smoothed.retain(|pid, _| times.contains_key(pid));
+    g.prev_times.retain(|pid, _| times.contains_key(pid));
+    out
 }
+
+/// 逐进程 CPU 差分基线 + EMA 平滑表（进程级跨线程共享）。
+///
+/// 回归修复（W33-F7 收尾）：旧实现用 thread_local 存基线——当时首拍与循环段
+/// 同在监控主线程，首拍播种、首个循环 tick 出真实 CPU。首拍移入独立
+/// worker 后（见 collector::run_monitor），thread_local 基线随 worker 退出
+/// 丢弃，主线程首个循环 tick 又是该线程的「首调」（PREV_INST=None →
+/// elapsed=0 → 全帧 delta_pct=0）：会话起点多落一帧全零 CPU 的
+/// process_snapshot（指纹与首拍不同即额外落库），首个真实 CPU 样本推迟
+/// 一个 tick（process 间隔固定 120s）。改共享基线：任一线程采样即
+/// 播种/更新，下一采样（无论哪条线程）出真实差分；差分窗口是相邻两次
+/// 采样的墙钟间隔，多采集器并发时共享表交织仍得正确值（EMA 只是跨线程
+/// 平滑，不产生假值）。
+struct CpuBaseline {
+    /// pid -> 最近一次采样的 CPU 累计时间（100ns 单位，kernel+user）
+    prev_times: HashMap<u32, u64>,
+    /// 上一次采样的墙钟时刻（差分分母）
+    prev_inst: Option<std::time::Instant>,
+    /// pid -> EMA 平滑后的 CPU%（α=0.3，见 query_cpu_percent_map）
+    smoothed: HashMap<u32, f64>,
+}
+static CPU_BASELINE: std::sync::LazyLock<std::sync::Mutex<CpuBaseline>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(CpuBaseline {
+            prev_times: HashMap::new(),
+            prev_inst: None,
+            smoothed: HashMap::new(),
+        })
+    });
 
 #[cfg(test)]
 mod tests {

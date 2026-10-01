@@ -974,7 +974,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "automation_yesterday": yday.automation_minutes,
         "metrics_note": "在场按你的真实键鼠和滚轮操作统计，自动化脚本的操作不计入在场，单独计为自动化。",
         "unattended_fg_minutes": unattended_fg_minutes,
-        "unattended_fg_method": "保守近似：前台应用时长 −（在场 + 自动化 − 混合分钟），负值记 0",
+        "unattended_fg_method": "保守近似：前台应用时长 −（在场 + 自动化 − 两者重叠的分钟），负值记 0",
         "has_full_day": has_full_day,
         "presence_bridge": s.presence_bridge_minutes.min(15),
         "fg_dwell_min": fg_total_min,

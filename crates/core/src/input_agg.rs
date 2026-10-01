@@ -304,9 +304,21 @@ static PENDING: Mutex<Option<(MinuteKey, MinuteCounters)>> = Mutex::new(None);
 /// 已存的大终值覆盖回小值）；过期条件 = rollover 或 flush 遇到不同分钟，
 /// 且被抑制分钟的计数**直接丢弃**（注释语义"≤59s 不计数"的严格实现）。
 static SUPPRESS_MINUTE: Mutex<Option<MinuteKey>> = Mutex::new(None);
-/// 秒级可见：drain 每秒被调用一次，把当前分钟累计值整体 UPSERT 覆盖到
-/// 数据库同一行（0005 迁移的部分唯一索引）。派生缓存行的原地覆盖不违反
-/// 原始数据只增铁律（铁律保护对象是 press/click 等原始事件）。
+/// 秒级可见（drain 每秒被调用一次）节流（W33-F2 修复）：进行中分钟的行累计
+/// 快照 UPSERT 至多每 10s 一次——面板 30s 轮询，10s 延迟不可见；而 ~60 次/
+/// 分钟/通道的整行 UPSERT 每撞一次部分唯一索引就耗损一个 rowid 序列位
+/// （写放大与 AUTOINCREMENT 耗损同根）。rollover 终值行与关停 flush 不受
+/// 本节流约束——「最后一分钟不丢」与终值语义不变。
+const SNAPSHOT_UPSERT_THROTTLE_SECS: u64 = 10;
+
+/// 进行中分钟快照行最近一次落库时刻（W33-F2 节流用；值全部来自调用方注入的
+/// `now_local`，不读真实时钟——测试红线）。rollover 到新一分钟后首次同分钟
+/// drain 必放行（跨分钟判定），故节流只在同分钟 10s 窗口内生效。
+static LAST_SAME_MIN_SNAPSHOT: Mutex<Option<DateTime<Local>>> = Mutex::new(None);
+
+/// 秒级可见（drain 每秒被调用一次，把当前分钟累计值整体 UPSERT 覆盖到数据库
+/// 同一行，0005 迁移的部分唯一索引）取数：派生缓存行的原地覆盖不违反原始
+/// 数据只增铁律（铁律保护对象是 press/click 等原始事件）。
 fn drain_atomics() -> MinuteCounters {
     let vk: Vec<(u8, u64)> = VK
         .iter()
@@ -428,8 +440,32 @@ pub fn drain(now_local: DateTime<Local>) -> Vec<Event> {
         match g.take() {
             Some((key, mut acc)) if key == cur => {
                 acc.add(&drained);
-                // 秒级可见：只要本分钟有输入，就把累计值整行 UPSERT（下游幂等覆盖）
-                if !acc.is_empty() && !suppressing_cur {
+                // 秒级可见节流（W33-F2）：同分钟快照行至多每 10s 落一次（面板
+                // 30s 轮询不可见延迟）；跨分钟（rollover 后首拍）必放行。锁序
+                // PENDING → SUPPRESS → LAST_SAME_MIN_SNAPSHOT（单向，无死锁
+                // 对）。只在真正产出时推进档位（空桶/抑制不消耗节流窗口）。
+                let snapshot_due = {
+                    let last = LAST_SAME_MIN_SNAPSHOT
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    match *last {
+                        // 跨分钟（rollover 后首拍）：必放行（节流窗口随分钟
+                        // 翻转复位）
+                        Some(t) if MinuteKey::of(t) != key => true,
+                        Some(t) => {
+                            now_local.signed_duration_since(t)
+                                >= chrono::Duration::seconds(SNAPSHOT_UPSERT_THROTTLE_SECS as i64)
+                        }
+                        None => true,
+                    }
+                };
+                // 秒级可见（节流后）：本分钟有输入且到节流档，才把累计值整行
+                // UPSERT（下游幂等覆盖）；rollover 终值行与 flush_partial 不受
+                // 节流约束
+                if !acc.is_empty() && !suppressing_cur && snapshot_due {
+                    *LAST_SAME_MIN_SNAPSHOT
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(now_local);
                     out = events_for(key, &acc, false);
                 }
                 *g = Some((key, acc));
@@ -615,6 +651,10 @@ pub fn reset() {
     LAST_FINALIZED_MIN.store(0, Ordering::Relaxed);
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     *g = None;
+    // 节流档位随会话复位（避免上一会话的落库时刻钳制新会话首拍）
+    *LAST_SAME_MIN_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 进入 minute 聚合模式（仅 [`crate::collector::start_collection_with`] 调用）。
@@ -984,6 +1024,42 @@ mod tests {
         // vk map 为空（无 per-key 记录）
         let vk = d.get("vk").expect("vk 键仍存在（空 map）");
         assert!(vk.as_object().unwrap().is_empty(), "关闭时 vk map 必须为空");
+    }
+
+    /// W33-F2 节流锚定：进行中分钟快照行至多每 10s 落一次（跨分钟首拍与
+    /// rollover 终值行不受约束），rollover 终值语义不变。
+    #[test]
+    fn same_minute_snapshot_throttled() {
+        let _g = guard();
+        reset();
+        let t0 = local_min(2026, 6, 15, 10, 30);
+        record_key();
+        assert!(drain(t0).is_empty(), "建桶不产出");
+        record_key();
+        let ts1 = t0 + chrono::Duration::seconds(5);
+        let evts = drain(ts1);
+        assert_eq!(evts.len(), 1, "新分钟首拍快照必放行");
+        assert_eq!(counter_of(&evts, EventType::Keyboard, "keys"), 2);
+        // 10s 窗口内：节流
+        assert!(
+            drain(ts1 + chrono::Duration::seconds(5)).is_empty(),
+            "同分钟 10s 内不得重复落快照行"
+        );
+        // 到 10s 档：放行
+        let evts = drain(ts1 + chrono::Duration::seconds(10));
+        assert_eq!(evts.len(), 1, "到节流档应落库一次");
+        assert_eq!(counter_of(&evts, EventType::Keyboard, "keys"), 2);
+        // rollover 终值不受节流约束
+        record_key();
+        let t1 = t0 + chrono::Duration::minutes(1);
+        let evts = drain(t1 + chrono::Duration::seconds(1));
+        let kb = evts
+            .iter()
+            .find(|e| e.event_type == EventType::Keyboard)
+            .expect("rollover keyboard 终值行");
+        let d = kb.event_data.as_ref().unwrap();
+        assert_eq!(d.get("final").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(d.get("keys").and_then(|v| v.as_u64()), Some(2));
     }
 
     #[test]

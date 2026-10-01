@@ -190,8 +190,8 @@ impl Database {
             rowids.push(execute_event(&tx, e)?);
         }
         // 与事件写入同事务推进 events 水位（WAL 静默蒸发防护，见
-        // db::persist_events_watermark）：本批提交后把 max(rowid) 一并刷新，
-        // 回滚时水位随之回滚，不会留下「水位超前数据」。
+        // db::persist_events_watermark；W33-F2 起水位为 COUNT(*) 口径）：本批
+        // 提交后把行数一并刷新，回滚时水位随之回滚，不会留下「水位超前数据」。
         super::persist_events_watermark(&tx);
         tx.commit()?;
         Ok(rowids)
@@ -212,7 +212,7 @@ impl Database {
         }
         // 同事务推进 events 水位（WAL 静默蒸发防护，见 db::persist_events_
         // watermark）：events+agg+水位同生共死，回滚时一并回滚。纯 input_agg
-        // 批 max(rowid) 不变，重写同值无害。
+        // 批无新行时行数不变，重写同值无害；同分钟首写新增一行则计入。
         super::persist_events_watermark(&tx);
         tx.commit()?;
         Ok(rowids)
@@ -388,7 +388,18 @@ impl Database {
                         "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
                         [&cutoff_date],
                     );
+                    // 水位自 W33-F2 起是行数口径（COUNT(*)）：显式 opt-in 保留期
+                    // 清理删行后必须在**同一事务内（COMMIT 之前）**推进水位——
+                    // 否则下次 open 的对账会把合法的「清理后减少」误判为数据
+                    // 丢失（回退告警 + 降级旗标）。回归修复：此前水位推进在
+                    // COMMIT 之后（两条独立自动提交语句），进程恰在删行提交与
+                    // 水位 upsert 之间被强杀/断电时，持久化水位仍停在清理前
+                    // 行数 → 下次 open 假报「回退」。移进同事务后删行与水位
+                    // 推进随 COMMIT 原子落库，事务失败回滚时水位也一并还原。
                     let deleted = (deleted?, daily?, minute?, app?);
+                    if deleted.0 > 0 {
+                        super::persist_events_watermark(conn);
+                    }
                     conn.execute_batch("COMMIT")?;
                     Ok(deleted.0)
                 })();
@@ -533,11 +544,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 结构性修复（WAL 静默蒸发防护 2026-09）：每次批量事件落库后把 events
-    /// 水位（max(rowid)）与写入同事务推进持久化——此前水位只在正常停机
-    /// 写一次，「停机后写入再丢失」整段不可检测。此测试锚定新行为：
-    /// 批量提交后 metadata 水位即等于当前 MAX(rowid)，input_agg 批不改
-    /// MAX 时水位原样重写。
+    /// 结构性修复（WAL 静默蒸发防护 2026-09；W33-F2 起水位改 COUNT(*) 口径）：
+    /// 每次批量事件落库后把 events 水位（行数）与写入同事务推进持久化——
+    /// 此前水位只在正常停机写一次，「停机后写入再丢失」整段不可检测。
+    /// 此测试锚定新行为：批量提交后 metadata 水位即等于当前 COUNT(*)，
+    /// input_agg 批首写新增一行时行数随之推进。
     #[test]
     fn batch_write_persists_events_watermark() {
         let dir = tmp_dir("wm");
@@ -545,9 +556,9 @@ mod tests {
         let db_path = dir.join("wm.db");
         let db = Database::open(db_path.to_str().unwrap()).unwrap();
 
-        // 新库 open 时 reconcile 已把水位播种为 0（对账刷新为当前 max(rowid)）
+        // 新库 open 时 reconcile 已把水位播种为 0（对账刷新为当前 COUNT(*)）
         assert_eq!(
-            db.get_metadata("events_watermark_max_rowid"),
+            db.get_metadata("events_watermark_row_count"),
             Some("0".to_string()),
             "新库开库对账后水位应为 0"
         );
@@ -558,22 +569,22 @@ mod tests {
         assert!(!all_failed, "正常批量写不得报全败");
         assert_eq!(rowids, vec![1, 2, 3], "3 条普通事件 rowid 应为 1..3");
 
-        // 批量提交后水位推进到当前 MAX(rowid)=3
+        // 批量提交后水位推进到当前 COUNT(*)=3
         let wm: i64 = db
-            .get_metadata("events_watermark_max_rowid")
+            .get_metadata("events_watermark_row_count")
             .expect("批量落库后必须已写入水位")
             .parse()
             .unwrap();
-        let max: i64 = db
+        let count: i64 = db
             .reader()
-            .query_row("SELECT MAX(rowid) FROM events", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(wm, 3, "水位应等于当前 MAX(rowid)");
-        assert_eq!(wm, max, "水位与 MAX(rowid) 必须一致");
+        assert_eq!(wm, 3, "水位应等于当前行数 COUNT(*)");
+        assert_eq!(wm, count, "水位与 COUNT(*) 必须一致");
 
-        // 纯 input_agg 批：UPSERT 行本身是 events 表新行（同分钟同类型首写
-        // 即插入新 rowid），故 MAX(rowid) 同样推进、水位随之刷新（调用方
-        // 拿到的 rowid 记 0 只表示"无稳定新 rowid"，不代表表无新行）。
+        // 纯 input_agg 批：同分钟同类型首写即插入新行（部分唯一索引只约束
+        // 同键覆盖），COUNT(*) 推进、水位随之刷新（调用方拿到的 rowid 记 0
+        // 只表示"无稳定新 rowid"，不代表表无新行）。
         let agg_ev = Event::new(EventAction::InputAgg, EventType::Keyboard);
         let (agg_rowids, agg_failed) = db.insert_events_with_agg(std::slice::from_ref(&agg_ev));
         assert!(!agg_failed, "纯 input_agg 批合法成功");
@@ -583,17 +594,17 @@ mod tests {
             "input_agg 行调用方记 0（无稳定新 rowid）"
         );
         let wm2: i64 = db
-            .get_metadata("events_watermark_max_rowid")
+            .get_metadata("events_watermark_row_count")
             .unwrap()
             .parse()
             .unwrap();
-        let max2: i64 = db
+        let count2: i64 = db
             .reader()
-            .query_row("SELECT MAX(rowid) FROM events", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            wm2, max2,
-            "水位必须始终跟随当前 MAX(rowid)（input_agg 行也计入）"
+            wm2, count2,
+            "水位必须始终跟随当前 COUNT(*)（input_agg 新行也计入）"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

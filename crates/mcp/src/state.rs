@@ -751,7 +751,11 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
             longest >= kynoptic_core::constants::MARATHON_MIN_MINUTES
         }
         "network_down" => {
-            // 有系统心跳但 15 分钟内无网络快照 → 视为网络不可用
+            // 系统仍有心跳但 15 分钟内无网络快照 → 视为网络不可用
+            // hb 新鲜度窗口须 ≥ 心跳节拍：system 监控器已改为「变化才落 +
+            // 600s 强制心跳」（空闲时心跳最多 600s + 30s flush 滞后），故
+            // 探活窗口从 300s 放宽到 900s（与 net 窗口对称），否则空闲期
+            // 会误判「系统无心跳」而漏报网络不可用。
             let hb =
                 queries::latest_event_ts_by_action(conn, EventType::System, EventAction::Heartbeat);
             let net = queries::latest_event_ts_by_action(
@@ -764,7 +768,7 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
                     .map(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds() <= max_sec)
                     .unwrap_or(false)
             };
-            recent(hb, 300) && !recent(net, 900)
+            recent(hb, 900) && !recent(net, 900)
         }
         _ => false,
     })

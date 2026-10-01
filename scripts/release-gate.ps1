@@ -78,7 +78,9 @@ if (Test-Path (Join-Path $RepoRoot 'Cargo.toml')) {
 # llms.txt 状态行在 0.3.1 发版时漂移在 v0.3.0，CHANGELOG.md:269-272 有
 # 同型事故记录）。只锚定头部/状态行，不做全文件扫描：APP.md:103/111 的
 # 「截至 v0.3.1」历史正文属有意不动，全文件扫描会误报。
-if (Test-Path (Join-Path $RepoRoot 'Cargo.toml') -and (Get-Command node -ErrorAction SilentlyContinue)) {
+# 括号铁律：-and 的首操作数必须是括号表达式——裸命令开头会被 PowerShell 把
+# -and 解析成 Test-Path 的参数名而报参绑错（W47 实测 G4 从未跑通）
+if ((Test-Path (Join-Path $RepoRoot 'Cargo.toml')) -and (Get-Command node -ErrorAction SilentlyContinue)) {
   $null = & node (Join-Path $RepoRoot 'scripts/check-doc-version.mjs')
   if ($LASTEXITCODE -ne 0) {
     Write-Host "[FAIL] G4 文档版本行门：check-doc-version.mjs rc=$LASTEXITCODE（头部/状态行与 Cargo.toml 版本不一致）"

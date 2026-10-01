@@ -26,21 +26,24 @@ use kynoptic_core::types::{Event, EventAction, EventType};
 /// input_agg 全局原子与 collector 全局态被同进程全部测试共享，串行化。
 static SEQ: Mutex<()> = Mutex::new(());
 
+/// 临时目录序号（时钟红线：路径键不读真实时钟，纯 pid+seq，agg_cache_test 范式）。
+static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn seq_guard() -> std::sync::MutexGuard<'static, ()> {
     SEQ.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "kyn-fi-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // 上次运行遗留同名临时目录（panic 跳过清理）则递增 seq 取空名
+    let mut seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let dir = std::env::temp_dir().join(format!("kyn-fi-{tag}-{}-{}", std::process::id(), seq));
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir).unwrap();
+            return dir;
+        }
+        seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn hook_only_enabled() -> HashSet<String> {
