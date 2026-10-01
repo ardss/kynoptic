@@ -28,6 +28,7 @@ use serde_json::json;
 use kynoptic_core::analyzer;
 use kynoptic_core::anomaly;
 use kynoptic_core::daily_agg;
+use kynoptic_core::db;
 use kynoptic_core::db::Database;
 use kynoptic_core::queries;
 use kynoptic_core::{Error, Result};
@@ -986,6 +987,17 @@ fn db_cleanup(db_path: &Path, rest: &[String]) -> Result<()> {
                 "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
                 params![&cutoff_date],
             )?;
+            // 水位回归修复：W33-F2 起 events 水位是 COUNT(*) 行数口径——
+            // 删历史行后持久化水位必然高于当前行数，若不同步推进，下次
+            // tray/collector/dashboard 的 Database::open 对账会把合法的
+            // 「清理后减少」误判为数据丢失（一次性假回退告警 + degraded.flag
+            // + 重播种水位）。与删行同事务推进（core 侧
+            // Database::cleanup_old_events 的同一收口函数），COMMIT 失败
+            // 回滚时删行与水位一并还原；COMMIT 之后才推进则强杀窗口内
+            // 水位仍停在清理前行数。
+            if ev > 0 {
+                db::persist_events_watermark(&conn);
+            }
             conn.execute_batch("COMMIT")?;
             Ok(ev)
         })();
