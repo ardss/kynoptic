@@ -671,6 +671,15 @@ pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
 // ─── E. wait_for ────────────────────────────────────────────────────────────
 
 /// 检查信号当前是否成立（纯读取，单次）。
+/// late_night 判定纯函数：与 anomaly::detect 的 23:00-06:00 窗口同口径（双边界），
+/// 不能只判 >= 23——凌晨 0-5 点同样是深夜窗口。抽出来便于测试注入小时数，
+/// 避免测试直接读真实时钟导致跨小时瞬间误报。
+fn late_night_at_hour(hour: u32) -> bool {
+    !(kynoptic_core::constants::LATE_NIGHT_END_HOUR
+        ..kynoptic_core::constants::LATE_NIGHT_HOUR_START)
+        .contains(&hour)
+}
+
 pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
     if !SIGNALS.contains(&signal) {
         return Err(format!(
@@ -681,14 +690,7 @@ pub fn check_signal(conn: &Connection, signal: &str) -> Result<bool, String> {
         ));
     }
     Ok(match signal {
-        "late_night" => {
-            let hour = Local::now().hour();
-            // 与 anomaly::detect 的 23:00-06:00 窗口同口径（双边界），
-            // 不能只判 >= 23——凌晨 0-5 点同样是深夜窗口
-            !(kynoptic_core::constants::LATE_NIGHT_END_HOUR
-                ..kynoptic_core::constants::LATE_NIGHT_HOUR_START)
-                .contains(&hour)
-        }
+        "late_night" => late_night_at_hour(Local::now().hour()),
         "low_battery" => {
             let Some(d) = latest_event_data(conn, EventType::System, EventAction::BatteryStatus)
             else {
@@ -1473,14 +1475,32 @@ mod tests {
 
     /// late_night 信号必须与 anomaly::detect 的 23:00-06:00 窗口同口径
     /// （双边界）：此前只判 hour >= 23，凌晨 0-5 点漏判。
+    /// 对边界小时全量断言，不读真实时钟（避免跨小时瞬间误报）。
     #[test]
     fn late_night_signal_matches_detect_window() {
+        // 窗口内：23、0、5；窗口外：6、12、22
+        for (hour, expected) in [
+            (23u32, true),
+            (0, true),
+            (5, true),
+            (6, false),
+            (12, false),
+            (22, false),
+        ] {
+            assert_eq!(late_night_at_hour(hour), expected, "hour={hour}");
+        }
+    }
+
+    /// check_signal 的 "late_night" match 分支必须接到 late_night_at_hour。
+    /// check_signal 无法注入小时数，故用真实时钟作对照：两表达式恒同真同假，
+    /// 分支若被误删或改写（如固定 false）则此测试失败。
+    #[test]
+    fn check_signal_late_night_dispatches_to_at_hour() {
         let conn = mem_conn();
-        let hour = Local::now().hour();
-        let expected = !(kynoptic_core::constants::LATE_NIGHT_END_HOUR
-            ..kynoptic_core::constants::LATE_NIGHT_HOUR_START)
-            .contains(&hour);
-        assert_eq!(check_signal(&conn, "late_night").unwrap(), expected);
+        assert_eq!(
+            check_signal(&conn, "late_night").unwrap(),
+            late_night_at_hour(Local::now().hour())
+        );
     }
 
     /// get_anomalies 响应必须带 bridge_minutes（MCP 用 core 默认桥接值 2）。

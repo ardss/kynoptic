@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complements the existing future-timestamp gate (`FUTURE_REJECTED`);
   both now run in the same write-side filter.
 
+- MCP: the `wait_for` tool's timeout is now parameterized via
+  `timeout_sec` (defaulting to the previous 300 seconds); `0` is a hard
+  error. `wait_for` is no longer accepted inside a batch request — it
+  must be sent as a standalone request so it can run on the background
+  thread under the wait cap without stalling other queued calls.
+
 ### Added
 
 - Core: the session monitor now receives Windows session events

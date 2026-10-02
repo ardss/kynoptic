@@ -61,7 +61,9 @@ is uploaded.
   (idle CPU, memory, startup, storage per event, query p95 on a
   1M-event database); the fact-check source for any overhead claims.
 - [APP.md](APP.md) - extended workspace docs, including the 40-monitor
-  table with sensitivity labels.
+  table with sensitivity labels. Of the full 40-monitor list, the 14
+  monitors enabled by default are given as an inline list, while the 26
+  opt-in monitors are tabulated with sensitivity labels.
 - [CODE_NOTES.md](CODE_NOTES.md) - design and carve-out decisions.
 - [CHANGELOG.md](CHANGELOG.md) / [SECURITY.md](SECURITY.md) /
   [CONTRIBUTING.md](CONTRIBUTING.md).
