@@ -12,7 +12,17 @@
 // 断言清单第 10 项（W47）：SECURITY.md 支持表须含当前 minor 线——此前版本
 // 工具从不覆盖该文件，0.3.1 升到 1.0.0 时「0.3.x | Yes / pre-1.0」会静默
 // 失真且门禁放行（盲区已实测证伪）。同样只锚定支持表首行，不做全文件扫描。
+// 定版操作序列（此前只靠门禁失败信息现场教学，无文档记载，纯改名字段会
+// 被下方断言拒绝）：CHANGELOG.md 定版须同时做三件事——
+// 1) 顶部段 '## [Unreleased]' 改名 '## [x.y.z] - 日期'；
+// 2) 顶部重开一个空 '## [Unreleased]' 段；
+// 3) 底部链接区新增 '[x.y.z]: .../compare/v<上版>...vx.y.z'，并把
+//    '[Unreleased]' 基线从旧版前移到 'compare/vx.y.z...HEAD'（漏改悬空）。
+// skill 副本防漂移（ci-low-3）：本机 ~/.zcode|.claude|.cursor 的
+// skills/kynoptic/SKILL.md 与仓库内置 crates/cli/src/assets/skill.md 逐字节
+// 一致（三者是 main.rs SKILL_CLIENT_DIRS 的同步目标）；本机无副本时跳过。
 import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -122,6 +132,26 @@ requireContains("APP.md", `# Kynoptic App (v${ver})`, "标题行");
       failed = true;
     } else {
       console.log(`[doc-version] ok: SECURITY.md 支持线 ${minor}.x`);
+    }
+  }
+}
+
+// 本机 skill 副本防漂移：存在才比（CI runner 上通常没有，静默跳过）
+{
+  const asset = join(root, "crates", "cli", "src", "assets", "skill.md");
+  if (existsSync(asset)) {
+    const want = readFileSync(asset);
+    for (const dir of [".zcode", ".claude", ".cursor"]) {
+      const copy = join(homedir(), dir, "skills", "kynoptic", "SKILL.md");
+      if (!existsSync(copy)) continue;
+      if (readFileSync(copy).equals(want)) {
+        console.log(`[doc-version] ok: skill 副本一致 ${dir}/skills/kynoptic/SKILL.md`);
+      } else {
+        console.error(
+          `[doc-version] 本机 skill 副本漂移：${copy} 与 crates/cli/src/assets/skill.md 不一致，重跑 kynoptic skill install 同步`,
+        );
+        failed = true;
+      }
     }
   }
 }

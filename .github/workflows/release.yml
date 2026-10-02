@@ -75,7 +75,9 @@ jobs:
         run: |
           # pin 到 issrc release tag is-6_7_3 的具体 commit（4adf37ed7f3fd2bd11c6836ba056e3de170fbabf），
           # 避免上游 main 漂移破坏构建。升级 isl 时必须手动更新这里的 commit pin。
-          $url = "https://raw.githubusercontent.com/jrsoftware/issrc/4adf37ed7f3fd2bd11c6836ba056e3de170fbabf/Files/Languages/Unofficial/ChineseSimplified.isl"
+          # 用 github.com/<repo>/raw/<commit>/ 形态（与 raw.githubusercontent.com
+          # 同源但弱网可达性更好，审查机实测前者 TLS 失败、后者 302 可跳转）
+          $url = "https://github.com/jrsoftware/issrc/raw/4adf37ed7f3fd2bd11c6836ba056e3de170fbabf/Files/Languages/Unofficial/ChineseSimplified.isl"
           Invoke-WebRequest -Uri $url -OutFile "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
       - name: Stage assets
         shell: pwsh
