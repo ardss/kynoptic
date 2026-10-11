@@ -107,6 +107,11 @@ Kynoptic ships an MCP server (stdio JSON-RPC) with six tools:
 `get_current_status`, `get_summary`, `get_timeline`, `get_top_apps`,
 `get_anomalies`, `wait_for`. Point your MCP client at it:
 
+> The MCP server is the `mcp` subcommand of the installed `kynoptic`
+> executable — no separate `kynoptic-mcp.exe` is shipped. If a tool you
+> run reports a missing `kynoptic-mcp` binary, it is invoking the wrong
+> entry point.
+
 ```json
 {
   "mcpServers": {
