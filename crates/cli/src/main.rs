@@ -2385,6 +2385,19 @@ fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
 /// 追加一行看门狗日志到 exe 同目录 watchdog.log（尽力而为，失败忽略）。
 /// 写入前做大小轮转（P1）：超过 1MB 时改名为 watchdog.log.old（覆盖式），
 /// 再建新文件——日志永不无限增长，也保留最近一份历史。
+/// 拉起托盘的命令行参数（单测锁口径）：`--minimized` 恒带；全局 `--db`
+/// 覆盖必须原样透传——托盘 args.rs 支持同名参数，漏传会让隔离测试部署
+/// （`kynoptic-watchdog.exe watchdog --once --db X`）拉起的托盘静默落回
+/// 默认数据目录、误连生产库（实测缺陷 2026-10-12）。
+fn tray_launch_args(db_override: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args = vec![std::ffi::OsString::from("--minimized")];
+    if let Some(p) = db_override {
+        args.push(std::ffi::OsString::from("--db"));
+        args.push(p.as_os_str().to_os_string());
+    }
+    args
+}
+
 fn watchdog_log(msg: &str) {
     let line = format!("[{}] {}\n", Utc::now().to_rfc3339(), msg);
     eprint!("watchdog: {line}");
@@ -3387,7 +3400,14 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                     if tray.exists() {
                                         use std::process::{Command, Stdio};
                                         let mut cmd = Command::new(&tray);
-                                        cmd.arg("--minimized");
+                                        // 实测缺陷（2026-10-12）：全局 --db 覆盖
+                                        // 不透传，隔离测试部署（watchdog --db X）
+                                        // 拉起的托盘落回默认数据目录误连生产库。
+                                        let db_override =
+                                            DB_OVERRIDE.lock().ok().and_then(|g| g.clone());
+                                        for a in tray_launch_args(db_override.as_deref()) {
+                                            cmd.arg(a);
+                                        }
                                         cmd.stdin(Stdio::null());
                                         cmd.stdout(Stdio::null());
                                         cmd.stderr(Stdio::null());
@@ -3770,6 +3790,25 @@ mod tests {
     }
 
     // === 子命令定位（--db 任意位置） ===
+
+    #[test]
+    fn tray_launch_args_propagate_db_override_strictly() {
+        // 回归（实测缺陷 2026-10-12）：看门狗拉起托盘必须与自身 --db
+        // 语义严格一致——无覆盖恒为裸 --minimized（生产行为不变）；
+        // 有覆盖时必须带上 --db <同一路径>，隔离部署不得连生产库。
+        let plain = tray_launch_args(None);
+        assert_eq!(plain, vec![std::ffi::OsString::from("--minimized")]);
+
+        let with_db = tray_launch_args(Some(Path::new("D:/iso-accept/accept.db")));
+        assert_eq!(
+            with_db,
+            vec![
+                std::ffi::OsString::from("--minimized"),
+                std::ffi::OsString::from("--db"),
+                std::ffi::OsString::from("D:/iso-accept/accept.db"),
+            ]
+        );
+    }
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

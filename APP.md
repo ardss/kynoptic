@@ -130,6 +130,8 @@ scripts」一节；会话令牌实现在 `crates/dash/src/lib.rs`（`__KYN_CSRF_
 
 ### Claude Desktop / 任意 MCP 客户端接入
 
+MCP server 由已安装的 `kynoptic` 可执行文件的 `mcp` 子命令提供，**不随安装包附带独立的 `kynoptic-mcp.exe`**；若有工具报「找不到 kynoptic-mcp」，是它调错了入口。
+
 ```json
 {
   "mcpServers": {
