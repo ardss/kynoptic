@@ -1013,11 +1013,12 @@ async function loadOverview() {
       el.classList.remove("empty-note");
     }
   }
-  // 对比增量（定性审查：裸数字无上下文像报表）——vs 昨日同口径。
-  // 今日刚开始防线：昨日是完整自然日，今天刚过几分钟就比必然是大幅"下降"，
-  // 每个凌晨都系统性误导——距零点不足 3 小时不渲染对比。
+  // 对比增量（定性审查：裸数字无上下文像报表）——vs 昨日。
+  // 同时段基线（UX 走查 2026-10-12）：优先用昨日同时段（后端按今天已流逝
+  // 分钟截断的口径），消除上午「今天必然大幅低于昨天全天」的红色误导；
+  // 后端未提供时回退全天对比。今日刚开始防线保持不变。
   const elapsedToday = (() => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); })();
-  const delta = (today, yest, el) => {
+  const delta = (today, yest, el, yestSp) => {
     const e = document.getElementById(el);
     if (!e) return;
     if (collecting || typeof yest !== "number" || yest <= 0) { e.textContent = ""; e.style.color = ""; return; }
@@ -1026,14 +1027,17 @@ async function loadOverview() {
       e.style.color = "";
       return;
     }
-    const diff = today - yest;
-    if (Math.abs(diff) < 1) { e.textContent = zh ? "与昨日持平" : "same as yesterday"; return; }
+    const useSp = typeof yestSp === "number";
+    const base = useSp ? yestSp : yest;
+    const diff = today - base;
+    const tail = zh ? (useSp ? " vs 昨日同时段" : " vs 昨日") : (useSp ? " vs yesterday same time" : " vs yesterday");
+    if (Math.abs(diff) < 1) { e.textContent = zh ? (useSp ? "与昨日同时段持平" : "与昨日持平") : (useSp ? "same as yesterday same time" : "same as yesterday"); return; }
     const sign = diff > 0 ? "+" : "−";
-    e.textContent = sign + fmtDuration(Math.abs(diff)) + (zh ? " vs 昨日" : " vs yesterday");
+    e.textContent = sign + fmtDuration(Math.abs(diff)) + tail;
     e.style.color = diff > 0 ? "var(--ok)" : "var(--down)";
   };
-  delta(pm, o.presence_yesterday, "c-presence-delta");
-  delta(am, o.automation_yesterday, "c-automation-delta");
+  delta(pm, o.presence_yesterday, "c-presence-delta", o.presence_yesterday_same_period);
+  delta(am, o.automation_yesterday, "c-automation-delta", o.automation_yesterday_same_period);
   // 目标进度（设置里承诺"控制总览卡"——现在兑现）
   const gEl = document.getElementById("c-presence-goal");
   if (gEl) {
@@ -2292,12 +2296,15 @@ function showView(name, fromHistory) {
   refreshView(name).catch(e => showViewError(name, e.message));
 }
 async function refreshView(name) {
+  // 状态行任何视图都刷新（UX 走查 2026-10-12）：此前仅 overview 拉状态行，
+  // 深链/F5 直进报告、应用、输入、洞察、异常页时标题下状态行滞留
+  // "Loading…" 直到 30 秒轮询，期间采集状态不可见。
   if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
-  else if (name === "apps") await Promise.all([loadApps(), loadTopApps()]);
-  else if (name === "report") await Promise.all([loadReport(), loadHeatmap()]);
-  else if (name === "insights") await loadInsights();
-  else if (name === "input") await loadInput();
-  else if (name === "anomalies") await loadAnomalies();
+  else if (name === "apps") await Promise.all([loadStatus(), loadApps(), loadTopApps()]);
+  else if (name === "report") await Promise.all([loadStatus(), loadReport(), loadHeatmap()]);
+  else if (name === "insights") await Promise.all([loadStatus(), loadInsights()]);
+  else if (name === "input") await Promise.all([loadStatus(), loadInput()]);
+  else if (name === "anomalies") await Promise.all([loadStatus(), loadAnomalies()]);
   else if (name === "settings") await loadSettings();
 }
 async function refreshAll() {

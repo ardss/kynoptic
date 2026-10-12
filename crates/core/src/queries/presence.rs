@@ -269,6 +269,20 @@ pub fn classify_minutes_multi(
     local_days: &[String],
     bridge_min: u32,
 ) -> Vec<(String, PresenceDay)> {
+    classify_minutes_multi_capped(conn, local_days, bridge_min, None)
+}
+
+/// 多日版 + 当日分钟上限截断：`cap_minute_of_day` 为 Some(n) 时，只统计各本地日
+/// 当日 00:00 起 n 分钟以内的人/自动分钟（即「昨日同时段」基线——与今天已流逝
+/// 的分钟数对齐后再比，消除早晨「今天必然大幅低于昨天全天」的系统性误导，
+/// 语义与 MCP get_summary 的 same_time 基线一致）。桥接链也只在截断窗口内
+/// 计算：昨天 23:59 的在场不会隔着截断点桥进今天已流逝时段的口径。
+pub fn classify_minutes_multi_capped(
+    conn: &Connection,
+    local_days: &[String],
+    bridge_min: u32,
+    cap_minute_of_day: Option<i64>,
+) -> Vec<(String, PresenceDay)> {
     let hits = collect_day_hits(conn, local_days);
     let bridge = i64::from(bridge_min.min(15));
     local_days
@@ -278,6 +292,18 @@ pub fn classify_minutes_multi(
                 .get(day)
                 .cloned()
                 .unwrap_or_else(|| (Vec::new(), Vec::new(), 0));
+            if let Some(cap) = cap_minute_of_day {
+                // 各日本地日起点（UTC 纪元分钟）——hits 已按本地日分桶，
+                // 同桶分钟必然 ≥ 当日本地 00:00，减去起点即当日钟面分钟。
+                let day_start = super::local_day_range(day)
+                    .and_then(|(s, _)| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|t| t.timestamp() / 60);
+                if let Some(ds) = day_start {
+                    let until = ds + cap.max(0);
+                    human.retain(|&m| m < until);
+                    automation.retain(|&m| m < until);
+                }
+            }
             human.sort_unstable();
             human.dedup();
             automation.sort_unstable();
@@ -433,5 +459,47 @@ mod tests {
         );
         assert_eq!(d.last_activity, d.first_activity);
         assert!(d.presence_minutes >= 1);
+    }
+
+    /// 「昨日同时段」截断回归：cap 之后的分钟不计入在场/自动化，且截断口径下
+    /// 桥接不越过 cap 点（cap 窗口外的活动不得把窗口尾桥接进来）。
+    /// 今天 08:00（本地）有活动、昨天同日 08:00 与 23:00 各有活动：
+    /// cap=9h 只应看到 08:00 那一分钟，23:00 的活动不得计入。
+    #[test]
+    fn capped_classification_excludes_minutes_after_cap() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        let day = crate::queries::date_offset_str(-1);
+        let off = Local::now().format("%:z").to_string();
+        for (h, m) in [(8i64, 0i64), (8, 1), (23, 0)] {
+            let ts = format!("{day}T{h:02}:{m:02}:00{off}");
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action) VALUES (?1, 'keyboard', 'press')",
+                params![&ts],
+            )
+            .unwrap();
+        }
+        let full = classify_minutes(&conn, &day, 2);
+        assert!(
+            full.presence_minutes >= 2,
+            "全天口径应含 08:00-08:01 与 23:00"
+        );
+
+        let capped = classify_minutes_multi_capped(
+            &conn,
+            std::slice::from_ref(&day.to_string()),
+            2,
+            Some(9 * 60), // 当日 00:00 起 9 小时
+        )
+        .into_iter()
+        .next()
+        .unwrap()
+        .1;
+        assert_eq!(
+            capped.presence_minutes, 2,
+            "cap=9h 只保留 08:00/08:01 两分钟，23:00 不得计入（桥接不得越过截断点）"
+        );
+        assert_eq!(capped.automation_minutes, 0);
+        assert_eq!(capped.last_activity.as_deref(), Some("08:01"));
     }
 }
