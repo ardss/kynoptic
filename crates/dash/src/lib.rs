@@ -905,8 +905,31 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     let presence_minutes = presence_day.presence_minutes;
     let automation_minutes = presence_day.automation_minutes;
     let mixed_minutes = presence_day.mixed_minutes;
-    // 对比上下文（定性审查：Overview 数字无比较像裸报表）：昨日同口径三指标
+    // 对比上下文（定性审查：Overview 数字无比较像裸报表）：昨日同口径三指标。
+    // 同时段基线（UX 走查 2026-10-12）：只比「昨日同时段」——早晨拿今天已流逝
+    // 的几小时对比昨天全天，必然显示大幅「下降」，每个上午都系统性误导。
+    // elapsed = 今天本地 00:00 起已流逝分钟数；昨日值按同一钟面窗口截断。
+    let elapsed_today_min = {
+        let now_local = chrono::Local::now();
+        let midnight = now_local
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .and_then(|n| chrono::Local.from_local_datetime(&n).single());
+        midnight.map(|m| (now_local - m).num_minutes().max(0))
+    };
     let yesterday = queries::date_offset_str(-1);
+    let yday_sp = elapsed_today_min.map(|el| {
+        queries::classify_minutes_multi_capped(
+            conn,
+            std::slice::from_ref(&yesterday),
+            s.presence_bridge_minutes,
+            Some(el),
+        )
+        .into_iter()
+        .next()
+        .map(|(_, d)| d)
+        .unwrap_or_default()
+    });
     let yday = queries::classify_minutes(conn, &yesterday, s.presence_bridge_minutes);
     let first_presence = presence_day
         .first_activity
@@ -972,6 +995,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         "mixed_minutes": mixed_minutes,
         "presence_yesterday": yday.presence_minutes,
         "automation_yesterday": yday.automation_minutes,
+        "presence_yesterday_same_period": yday_sp.as_ref().map(|d| d.presence_minutes),
+        "automation_yesterday_same_period": yday_sp.as_ref().map(|d| d.automation_minutes),
+        "elapsed_today_minutes": elapsed_today_min,
         "metrics_note": "在场按你的真实键鼠和滚轮操作统计，自动化脚本的操作不计入在场，单独计为自动化。",
         "unattended_fg_minutes": unattended_fg_minutes,
         "unattended_fg_method": "保守近似：前台应用时长 −（在场 + 自动化 − 两者重叠的分钟），负值记 0",
