@@ -430,7 +430,7 @@
   <div class="kb-wrap"><svg id="kb-heatmap" class="kb" role="img" tabindex="0" aria-label="keyboard heatmap, per-key counts in tooltip and in the top-keys list below / 键盘热力图，逐键次数见悬浮提示与下方 Top 按键列表" width="100%" preserveAspectRatio="xMidYMid meet" viewBox="0 0 910 234"></svg></div>
   <div class="hm-legend">
     <span><span class="l en">less</span><span class="l zh">少</span></span>
-    <span class="sw" style="background:var(--hm-0);border:1px solid var(--border)"></span>
+    <span class="sw" style="background:var(--hm-idle);border:1px solid var(--border)"></span>
     <span class="sw" style="background:var(--hm-1)"></span>
     <span class="sw" style="background:var(--hm-2)"></span>
     <span class="sw" style="background:var(--hm-3)"></span>
@@ -1016,8 +1016,12 @@ async function loadOverview() {
   // 对比增量（定性审查：裸数字无上下文像报表）——vs 昨日。
   // 同时段基线（UX 走查 2026-10-12）：优先用昨日同时段（后端按今天已流逝
   // 分钟截断的口径），消除上午「今天必然大幅低于昨天全天」的红色误导；
-  // 后端未提供时回退全天对比。今日刚开始防线保持不变。
-  const elapsedToday = (() => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); })();
+  // 后端未提供（含 null=截断不可用）时回退全天对比并如实标注「vs 昨日」。
+  // 今日刚开始防线：优先用后端 elapsed_today_minutes（截断基线的时钟源，
+  // 审查修复：本地钟面在 DST 春推日会比后端流逝分钟大 1 小时，双时钟错位）。
+  const elapsedToday = (typeof o.elapsed_today_minutes === "number")
+    ? o.elapsed_today_minutes
+    : (() => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); })();
   const delta = (today, yest, el, yestSp) => {
     const e = document.getElementById(el);
     if (!e) return;
@@ -1567,12 +1571,15 @@ async function loadReport() {
   document.getElementById("r-goal").innerHTML = goal
     ? fmtMin(presenceMin) + " / " + fmtMin(goal) + rawNote
     : t("goalOff");
-  const tw = tr.this_week || {}, lw = tr.last_week;
+  // 审查修复：this_week 为 null（本周有数据日不足 3 天）而 last_week 有值时，
+  // 旧实现伪造 "0 分钟 vs X (▼ -100%)"，把「无数据」伪装成「整周挂零」——
+  // 无数据的周必须走与 lw 缺失相同的「数据不足」分支。
+  const tw = tr.this_week, lw = tr.last_week;
   const daysAcc = (tr.daily || []).filter(x => (x.active_minutes || 0) > 0).length;
   // 口径说明小字（trends.note）：字段缺失时静默留空
   const tn = document.getElementById("trend-note");
   if (tn) tn.textContent = tr.note || "";
-  document.getElementById("r-week").innerHTML = lw
+  document.getElementById("r-week").innerHTML = (tw && lw)
     ? fmtMin(tw.active_minutes || 0) + " <span class='muted'>vs " + fmtMin(lw.active_minutes || 0) +
       " (" + ((lw.active_minutes || 0) ? ((tw.active_minutes || 0) >= (lw.active_minutes || 0) ? "▲ +" : "▼ ") + Math.round(((tw.active_minutes || 0) - (lw.active_minutes || 0)) / (lw.active_minutes || 0) * 100) + "%" : "–") + ")</span>"
     : "<span class='muted'>" + t("weekInsufficient").replace("{n}", daysAcc) + "</span>";
@@ -1625,13 +1632,27 @@ async function loadApps() {
   const hmax = Math.max(1, ...ht);
   const bw = innerW / 24;
   const colorOf = {};
-  // 单一色源：按应用名稳定哈希取色（(other) 固定灰，不占主色）。原按数组序
-  // 上色让同一应用在 grid 图与 daily_top 两图颜色互换——两图必须同色同源。
-  const appColor = name => {
+  // 单一色源 + 冲突消解（审查修复：7 色调 6+ 应用，稳定哈希冲突率约 96%，
+  // 冲突的两应用同色后图例/色带不可区分）。改为按出现顺序去重分配：grid 数
+  // 据先定色，daily_top 的新应用按需取第一个未占色，全占则回退哈希；同一
+  // 应用在两图内仍同色同源（assigned 缓存，loadApps 每次重渲染时重算）。
+  const assigned = {};
+  const usedColors = new Set();
+  const pickColor = name => {
     if (name === "(other)") return "#6B7683";
     let h = 0;
     for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-    return APP_COLORS[h % APP_COLORS.length];
+    let idx = h % APP_COLORS.length;
+    if (usedColors.has(APP_COLORS[idx])) {
+      const free = APP_COLORS.findIndex(c => !usedColors.has(c));
+      if (free >= 0) idx = free;
+    }
+    usedColors.add(APP_COLORS[idx]);
+    return APP_COLORS[idx];
+  };
+  const appColor = name => {
+    if (!(name in assigned)) assigned[name] = pickColor(name);
+    return assigned[name];
   };
   grid.forEach(g => { colorOf[g.app] = appColor(g.app); });
   let svg = '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="hourly stacked app usage / 逐时应用堆叠柱状图">';
@@ -2305,13 +2326,19 @@ async function refreshView(name) {
   else if (name === "insights") await Promise.all([loadStatus(), loadInsights()]);
   else if (name === "input") await Promise.all([loadStatus(), loadInput()]);
   else if (name === "anomalies") await Promise.all([loadStatus(), loadAnomalies()]);
-  else if (name === "settings") await loadSettings();
+  // settings 分支同样带状态行（审查修复：#39 漏了本分支——深链
+  // ?view=settings 时状态行仍滞留 Loading 直到 30 秒轮询）。
+  else if (name === "settings") await Promise.all([loadStatus().catch(() => {}), loadSettings()]);
 }
 async function refreshAll() {
   await refreshView(currentView);
 }
-const savedLang = localStorage.getItem("kyn-lang") ||
-  ((navigator.language || "en").startsWith("zh") ? "zh" : "en");
+// 白名单校验（审查修复：localStorage 损坏值如 "fr" 会让 html[lang] 不命中
+// 任何隐藏规则，中英文同屏全部可见）——只接受 zh/en，其余按浏览器语言。
+const savedLangRaw = localStorage.getItem("kyn-lang");
+const savedLang = savedLangRaw === "zh" || savedLangRaw === "en"
+  ? savedLangRaw
+  : ((navigator.language || "en").startsWith("zh") ? "zh" : "en");
 document.querySelectorAll("#hm-range .hm-tab").forEach(b =>
   b.addEventListener("click", () => setHeatmapRange(+b.dataset.weeks)));
 applyLang(savedLang);

@@ -918,7 +918,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         midnight.map(|m| (now_local - m).num_minutes().max(0))
     };
     let yesterday = queries::date_offset_str(-1);
-    let yday_sp = elapsed_today_min.map(|el| {
+    let yday_sp = elapsed_today_min.and_then(|el| {
+        // 截断起点解析失败（DST 春推等）时该日为 None → 字段回 null，
+        // 前端据此回退全天对比并如实标注；绝不把全天值伪装成同时段基线。
         queries::classify_minutes_multi_capped(
             conn,
             std::slice::from_ref(&yesterday),
@@ -928,7 +930,7 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         .into_iter()
         .next()
         .map(|(_, d)| d)
-        .unwrap_or_default()
+        .unwrap_or(None)
     });
     let yday = queries::classify_minutes(conn, &yesterday, s.presence_bridge_minutes);
     let first_presence = presence_day
