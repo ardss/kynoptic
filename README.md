@@ -247,15 +247,24 @@ dates).
   "update available" prompt ever appears. Running `kynoptic update
   --check` by hand is **not** silent: it exits non-zero and prints the
   failed URL — that is the expected "no network" signal, not a fault.
-- **Keyboard and mouse are stored as per-minute counts only — never key
-  contents, key order, or timing.** The dashboard keyboard heatmap uses
-  per-key frequency counts (how many times each key was pressed), which are
-  aggregate statistics, not content. Per-key frequency is **on by default**
-  (local data completeness first) and can be disabled explicitly in settings
-  as an opt-out. Export writes `window_title` verbatim by default; pass
-  `--redact` to strip URL query strings from titles. Privacy hardening is
-  always available as a switch, but never at the cost of silently dropping
-  local data — if you share exports outside the machine, you own the risk.
+- **Keyboard and mouse are stored as per-minute counts by default — key
+  contents, key order, and timing are not recorded.** An **opt-in Raw
+  per-key mode** also exists (turn off "input counts only" in settings): it
+  stores virtual-key codes, scan codes, and modifiers per event, which can
+  approximately reconstruct typed text under a known layout — a diagnostic
+  feature, off by default; keep counts-only mode for maximum privacy. The
+  dashboard keyboard heatmap uses per-key frequency counts (how many times
+  each key was pressed), which are aggregate statistics, not content.
+  Per-key frequency is **on by default** (local data completeness first) and
+  can be disabled explicitly in settings as an opt-out. Export writes
+  `window_title` verbatim by default; pass `--redact` to strip URL query
+  strings from titles. The clipboard monitor (opt-in) stores only a salted
+  digest truncated to 8 hex chars plus length — **a digest is a comparison
+  fingerprint, not encryption**; targeted brute force over very short
+  plaintexts (numeric PINs) remains theoretically feasible. Privacy
+  hardening is always available as a switch, but never at the cost of
+  silently dropping local data — if you share exports outside the machine,
+  you own the risk.
 - Aggregates are derived caches; the raw event log is append-only.
 - Deleting anything is opt-in and off by default; schema migrations archive
   tables by renaming instead of dropping.

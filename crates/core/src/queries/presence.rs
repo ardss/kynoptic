@@ -269,7 +269,12 @@ pub fn classify_minutes_multi(
     local_days: &[String],
     bridge_min: u32,
 ) -> Vec<(String, PresenceDay)> {
+    // cap=None 时按契约恒 Some（见 classify_minutes_multi_capped 文档），
+    // unwrap 只是让「不截断」路径保持原签名；None 分支不可达。
     classify_minutes_multi_capped(conn, local_days, bridge_min, None)
+        .into_iter()
+        .map(|(d, p)| (d, p.expect("cap=None 截断不可用分支不可达")))
+        .collect()
 }
 
 /// 多日版 + 当日分钟上限截断：`cap_minute_of_day` 为 Some(n) 时，只统计各本地日
@@ -277,50 +282,71 @@ pub fn classify_minutes_multi(
 /// 的分钟数对齐后再比，消除早晨「今天必然大幅低于昨天全天」的系统性误导，
 /// 语义与 MCP get_summary 的 same_time 基线一致）。桥接链也只在截断窗口内
 /// 计算：昨天 23:59 的在场不会隔着截断点桥进今天已流逝时段的口径。
+///
+/// 截断起点解析失败（DST 春推日本地午夜钟面不存在等）时该日返回 **None**——
+/// 审查修复：旧实现静默放弃截断、把昨日**全天**值当「同时段」基线交给调用方，
+/// 正是要消除的误导以无声方式回归。None = 「截断不可用」，调用方应回退全天
+/// 口径并如实标注，而不是拿到假基线。
 pub fn classify_minutes_multi_capped(
     conn: &Connection,
     local_days: &[String],
     bridge_min: u32,
     cap_minute_of_day: Option<i64>,
-) -> Vec<(String, PresenceDay)> {
+) -> Vec<(String, Option<PresenceDay>)> {
     let hits = collect_day_hits(conn, local_days);
     let bridge = i64::from(bridge_min.min(15));
     local_days
         .iter()
         .map(|day| {
+            let cap_cut = cap_minute_of_day.map(|cap| {
+                // 各日本地日起点（UTC 纪元分钟）——hits 已按本地日分桶，
+                // 同桶分钟必然 ≥ 当日本地 00:00，减去起点即当日钟面分钟。
+                super::local_day_range(day)
+                    .and_then(|(s, _)| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|t| t.timestamp() / 60)
+                    .map(|ds| ds + cap.max(0))
+            });
+            // 截断被要求但起点解析失败 → 该日截断不可用，不产出假基线。
+            if matches!(cap_cut, Some(None)) {
+                return (day.clone(), None);
+            }
+            let until = match cap_cut {
+                Some(Some(u)) => Some(u),
+                _ => None,
+            };
             let (mut human, mut automation, mixed) = hits
                 .get(day)
                 .cloned()
                 .unwrap_or_else(|| (Vec::new(), Vec::new(), 0));
-            if let Some(cap) = cap_minute_of_day {
-                // 各日本地日起点（UTC 纪元分钟）——hits 已按本地日分桶，
-                // 同桶分钟必然 ≥ 当日本地 00:00，减去起点即当日钟面分钟。
-                let day_start = super::local_day_range(day)
-                    .and_then(|(s, _)| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|t| t.timestamp() / 60);
-                if let Some(ds) = day_start {
-                    let until = ds + cap.max(0);
-                    human.retain(|&m| m < until);
-                    automation.retain(|&m| m < until);
-                }
+            if let Some(until) = until {
+                human.retain(|&m| m < until);
+                automation.retain(|&m| m < until);
             }
             human.sort_unstable();
             human.dedup();
             automation.sort_unstable();
             automation.dedup();
+            // 审查修复：mixed 必须与 human/automation 同口径——截断后从两列
+            // 交集重算，否则昨日 23 点的混合分钟会混进「昨日同时段」基线。
+            let mixed = if until.is_some() {
+                let mut h: std::collections::HashSet<_> = human.iter().collect();
+                automation.iter().filter(|m| h.remove(*m)).count() as i64
+            } else {
+                mixed
+            };
             let presence = bridge_count(&human, bridge);
             // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"。
             let first_activity = human.first().copied().and_then(fmt_epoch_hm);
             let last_activity = human.last().copied().and_then(fmt_epoch_hm);
             (
                 day.clone(),
-                PresenceDay {
+                Some(PresenceDay {
                     presence_minutes: presence,
                     automation_minutes: automation.len() as i64,
                     mixed_minutes: mixed,
                     first_activity,
                     last_activity,
-                },
+                }),
             )
         })
         .collect()
@@ -494,12 +520,52 @@ mod tests {
         .into_iter()
         .next()
         .unwrap()
-        .1;
+        .1
+        .expect("正常日期截断必须可用");
         assert_eq!(
             capped.presence_minutes, 2,
             "cap=9h 只保留 08:00/08:01 两分钟，23:00 不得计入（桥接不得越过截断点）"
         );
         assert_eq!(capped.automation_minutes, 0);
         assert_eq!(capped.last_activity.as_deref(), Some("08:01"));
+    }
+
+    /// 审查回归（并行审查 #1）：截断起点解析失败时**不得**静默回退成全天值——
+    /// 那会把昨日全天当「昨日同时段」基线，正是 PR #39 要消除的误导无声回归。
+    /// 修复后该日返回 None（截断不可用），调用方回退全天口径并如实标注。
+    /// 用受控注入模拟解析失败：直接测不动 local_day_range 的失败分支不可达
+    /// （真实日期都能解析），因此这里验证契约的另一面——cap=None 时绝不返回
+    /// None，且 capped 与 full 完全一致（调用方拿 None 必须显式回退）。
+    #[test]
+    fn capped_result_is_some_iff_cap_requested_and_day_resolvable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        let day = crate::queries::date_offset_str(-1);
+        let off = Local::now().format("%:z").to_string();
+        let ts = format!("{day}T08:00:00{off}");
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action) VALUES (?1, 'keyboard', 'press')",
+            params![&ts],
+        )
+        .unwrap();
+        // cap=None：语义=不截断，必须 Some 且与 classify_minutes 等价
+        let uncapped =
+            &classify_minutes_multi_capped(&conn, std::slice::from_ref(&day.to_string()), 2, None)
+                [0];
+        assert!(uncapped.1.is_some(), "cap=None 不得产出 None");
+        assert_eq!(
+            uncapped.1.as_ref().unwrap(),
+            &classify_minutes(&conn, &day, 2)
+        );
+        // cap=Some 且正常日期：必须 Some（截断可用）
+        let capped = &classify_minutes_multi_capped(
+            &conn,
+            std::slice::from_ref(&day.to_string()),
+            2,
+            Some(9 * 60),
+        )[0];
+        assert!(capped.1.is_some());
+        // 截断可用性契约：返回 None 仅当「要求截断且起点解析失败」，
+        // 调用方（dash api_overview）据此回退全天口径并标注，禁止拿 Some 假基线。
     }
 }
