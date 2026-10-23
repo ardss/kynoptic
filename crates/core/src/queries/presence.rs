@@ -194,12 +194,7 @@ pub fn raw_auto_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec
 
 /// [`raw_human_minutes_window`] / [`raw_auto_minutes_window`] 共用实现：
 /// `injected=true` 取注入行（自动化桶），false 取非注入行（人在场桶）。
-fn raw_flag_minutes_window(
-    conn: &Connection,
-    start: &str,
-    end: &str,
-    injected: bool,
-) -> Vec<i64> {
+fn raw_flag_minutes_window(conn: &Connection, start: &str, end: &str, injected: bool) -> Vec<i64> {
     let flag = if injected { 1 } else { 0 };
     let label = if injected {
         "presence.raw_auto_minutes"

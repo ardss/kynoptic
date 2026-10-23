@@ -448,7 +448,8 @@ fn cmd_export(args: &[String]) -> Result<()> {
     // redact_event_data_title）：window/browser 行的标题同时存在 window_title
     // 列与 event_data JSON 内——旧实现只脱敏列，JSON 副本原样出库，--redact
     // 的隐私承诺被同文件第二份拷贝架空。
-    let event_data_out = |ed: &Option<String>| -> Option<String> { redact_event_data_title(ed, redact) };
+    let event_data_out =
+        |ed: &Option<String>| -> Option<String> { redact_event_data_title(ed, redact) };
 
     match format.as_str() {
         "csv" => {
@@ -628,8 +629,7 @@ fn redact_event_data_title(ed: &Option<String>, redact: bool) -> Option<String> 
         Some(s) if redact && s.contains("\"title\"") => {
             match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
-                    if let Some(t) = v.get("title").and_then(|t| t.as_str()).map(String::from)
-                    {
+                    if let Some(t) = v.get("title").and_then(|t| t.as_str()).map(String::from) {
                         v["title"] = serde_json::Value::String(sanitize_window_title(&t));
                     }
                     serde_json::to_string(&v).ok().or_else(|| Some(s.clone()))
@@ -4854,7 +4854,8 @@ mod tests {
     /// 时不碰任何 event_data。
     #[test]
     fn redact_event_data_title_sanitizes_embedded_copy() {
-        let win_row = Some(r#"{"hwnd":123,"title":"登录 - https://ex.io/p?token=abc","pid":42}"#.to_string());
+        let win_row =
+            Some(r#"{"hwnd":123,"title":"登录 - https://ex.io/p?token=abc","pid":42}"#.to_string());
         let out = redact_event_data_title(&win_row, true).unwrap();
         assert!(
             out.contains("https://ex.io/p") && !out.contains("token=abc"),

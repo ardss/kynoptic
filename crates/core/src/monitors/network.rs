@@ -118,11 +118,8 @@ fn collect_network_io() -> (u64, u64, Option<u64>, Option<u64>) {
 /// 调用 `netstat -e` 并解析输出。有界等待 3s（联合审查 P2：`.output()`
 /// 无超时会在 netstat 挂死时冻结 monitor 线程；超时 kill 走 FFI 兜底）。
 fn netstat_eth_stats() -> Option<(u64, u64, Option<u64>, Option<u64>)> {
-    let text = super::quiet_command_output_bounded(
-        "netstat",
-        &["-e"],
-        std::time::Duration::from_secs(3),
-    )?;
+    let text =
+        super::quiet_command_output_bounded("netstat", &["-e"], std::time::Duration::from_secs(3))?;
     parse_netstat_e(&text)
 }
 

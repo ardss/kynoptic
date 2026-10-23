@@ -694,9 +694,8 @@ pub fn seed_restart_baseline(
     keyboard: Option<&serde_json::Value>,
     mouse: Option<&serde_json::Value>,
 ) -> bool {
-    let num = |v: &serde_json::Value, k: &str| -> u64 {
-        v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
-    };
+    let num =
+        |v: &serde_json::Value, k: &str| -> u64 { v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) };
     let mut base = MinuteCounters::default();
     if let Some(kd) = keyboard {
         base.keys = num(kd, "keys");

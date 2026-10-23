@@ -949,13 +949,9 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
     // 仍在前台的末段（≤2h 封顶），否则「正在用 3 小时的应用」在总览里
     // 时长为 0。
     let mut fg_dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for (app, secs) in queries::foreground_dwell_by_app(
-        conn,
-        &start,
-        &end,
-        queries::FG_DWELL_STALL_CAP_SECS,
-        true,
-    ) {
+    for (app, secs) in
+        queries::foreground_dwell_by_app(conn, &start, &end, queries::FG_DWELL_STALL_CAP_SECS, true)
+    {
         fg_dwell.insert(app, secs);
     }
     let fg_top = fg_dwell

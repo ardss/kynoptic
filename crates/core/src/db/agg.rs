@@ -1186,8 +1186,16 @@ mod tests {
         };
         let events = [
             mk(EventAction::Switch, "code", "2026-06-15T02:30:10+00:00"),
-            mk(EventAction::TabChange, "chrome", "2026-06-15T02:30:20+00:00"),
-            mk(EventAction::TabChange, "chrome", "2026-06-15T02:30:30+00:00"),
+            mk(
+                EventAction::TabChange,
+                "chrome",
+                "2026-06-15T02:30:20+00:00",
+            ),
+            mk(
+                EventAction::TabChange,
+                "chrome",
+                "2026-06-15T02:30:30+00:00",
+            ),
             empty_agg,
         ];
         for (i, ev) in events.iter().enumerate() {

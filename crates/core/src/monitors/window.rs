@@ -322,12 +322,8 @@ fn capture_foreground() {
         // 同窗口重试。自排除等早退路径不回滚：那是「有观测、无事件」的
         // 有意语义，不是发送失败。
         if !crate::collector::send_event(&tx, event) {
-            let _ = FG_LAST_EMITTED.compare_exchange(
-                key,
-                prev,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let _ =
+                FG_LAST_EMITTED.compare_exchange(key, prev, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 }

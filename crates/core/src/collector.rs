@@ -1312,8 +1312,11 @@ pub fn start_collection_custom(
         match read_current_minute_baseline(&db) {
             MinuteBaseline::Rows { keyboard, mouse } => {
                 let has_row = keyboard.is_some() || mouse.is_some();
-                if input_agg::seed_restart_baseline(chrono::Local::now(), keyboard.as_ref(), mouse.as_ref())
-                    || !has_row
+                if input_agg::seed_restart_baseline(
+                    chrono::Local::now(),
+                    keyboard.as_ref(),
+                    mouse.as_ref(),
+                ) || !has_row
                 {
                     input_agg::clear_restart_suppression();
                     if has_row {
