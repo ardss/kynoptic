@@ -193,16 +193,29 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
                 params![date, hour, minute, "window_switches", 1, 1, rowid],
             )?;
             // 审查 MEDIUM：app_name 为 Some("") 的 switch 行不得写 'app:' 桶——
-            // rebuild_all / backfill_chunk 的 agg_daily 重算都过滤 app_name != ''，
-            // 该行会被下次重建/自愈删除，增量与重建语义分叉（违反模块头的
-            // 等价性契约）。空名一律跳过，与重建口径对齐。
-            if let Some(app) = e.app_name.as_deref() {
-                if !app.is_empty() {
-                    conn.execute(UPSERT_DAILY_APP, params![date, app, 1])?;
-                }
-            }
+            // 该行会被下次重建/自愈删除。空名一律跳过，与重建口径对齐
+            // （统一化后由 match 之后的 app 桶统一块处理，见下）。
         }
         _ => {}
+    }
+
+    // ─── app 日桶（统一口径，联合审查 P1-1）───
+    // 增量路径此前只认 (Window, Switch)，与 rebuild_all / backfill_chunk /
+    // events 回退查询（charts.rs top_apps_by_event_types 等）的谓词
+    // 「keyboard/mouse/window 且 app_name 非空、无 action 过滤」分叉：
+    // TabChange 等带 app_name 的非 switch 行只在重建路径计入，heal/backfill
+    // 重写当日后 new_app_surge 基线跳变、同一指标三种读路径两种答案。
+    // 统一为同一谓词；input_agg 行的 app_name 是空串（.app("","") 落库），
+    // 自然跳过。
+    if matches!(
+        e.event_type,
+        EventType::Keyboard | EventType::Mouse | EventType::Window
+    ) && e.app_name.as_deref().is_some_and(|a| !a.is_empty())
+    {
+        conn.execute(
+            UPSERT_DAILY_APP,
+            params![date, e.app_name.as_deref().unwrap_or_default(), 1],
+        )?;
     }
     Ok(())
 }
@@ -292,6 +305,27 @@ impl super::Database {
 /// 兼容两种事件形态：raw（press/click/switch 逐行）与 input_agg（计数 JSON）。
 pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
     let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
+    // 联合审查 GPT#9a：整体原子化——先删后插的中间态（已删未建/半建）此前
+    // 对并发读者可见，失败后部分查询走缓存部分回退 events，答案互相矛盾。
+    // 自持事务：仅当连接处于 autocommit（调用方未包事务）时开启；外层已有
+    // 事务则维持原状（原子性由外层负责）。失败时整个回滚到重建前缓存。
+    let own_tx = conn.is_autocommit();
+    if own_tx {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    let result = rebuild_all_inner(conn, off);
+    if own_tx {
+        match result {
+            Ok(_) => conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    result
+}
+
+fn rebuild_all_inner(conn: &Connection, off: &str) -> crate::Result<usize> {
     conn.execute("DELETE FROM agg_minute", [])?;
     conn.execute("DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%'", [])?;
 
@@ -781,7 +815,9 @@ pub fn has_minute_for_date(conn: &Connection, date: &str) -> bool {
                     OR COALESCE(json_extract(event_data, '$.clicks'), 0) > 0
                     OR COALESCE(json_extract(event_data, '$.moves'), 0) > 0
                     OR COALESCE(json_extract(event_data, '$.move_distance_px'), 0) > 0))
-               > (SELECT COUNT(DISTINCT hour * 60 + minute) FROM agg_minute WHERE date = ?1)
+               > (SELECT COUNT(DISTINCT hour * 60 + minute) FROM agg_minute
+                   WHERE date = ?1
+                     AND bucket_id IN ('input_keys','input_clicks','input_moves'))
              )",
             off = crate::queries::LOCAL_MODIFIER_AT_EVENT,
         ),
@@ -820,12 +856,17 @@ pub fn minutes_complete_for_dates(conn: &Connection, dates: &[String]) -> Vec<bo
         return Vec::new();
     }
     // agg_minute 侧：逐日去重分钟数（主键含 bucket_id，同一分钟至多 4 行，
-    // 与单点探测同口径按 hour*60+minute 去重）
+    // 与单点探测同口径按 hour*60+minute 去重）。审查修复（联合审查 P2-1 /
+    // has_minute 假完备）：**只数输入桶**——窗口切换密集日若把 window_switches
+    // 行计入，agg 侧分钟数可被「垫高」，把输入桶残缺的日期误判成覆盖完整，
+    // 缓存读路径整日漏算输入。与单点探测同谓词过滤。
     let placeholders: Vec<String> = (1..=n).map(|i| format!("?{i}")).collect();
     let sql_agg = format!(
         "SELECT date, COUNT(DISTINCT hour * 60 + minute) \
-         FROM agg_minute WHERE date IN ({}) GROUP BY date",
-        placeholders.join(", ")
+         FROM agg_minute WHERE date IN ({placeholders}) \
+           AND bucket_id IN ('input_keys','input_clicks','input_moves') \
+         GROUP BY date",
+        placeholders = placeholders.join(", ")
     );
     let mut agg_min: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare(&sql_agg) {
@@ -1122,6 +1163,69 @@ mod tests {
         let rebuilt = any_local_minute_row(&c, "input_keys");
         assert_eq!(incremental, rebuilt, "增量维护必须与全量重建等价");
         assert_eq!(incremental, 6);
+    }
+
+    /// 联合审查 P1-1 回归：app 日桶增量与重建同谓词——带 app_name 的非
+    /// switch 行（browser 的 tab_change）此前只在重建路径计入，增量写出的
+    /// agg_daily 在 heal/backfill 重写当日后计数跳变、new_app_surge 基线
+    /// 失真（同一指标三读路径两种答案）。统一后增量/重建必须逐行一致。
+    #[test]
+    fn app_daily_incremental_matches_rebuild_with_tab_change() {
+        let c = conn();
+        let mk = |action: EventAction, app: &str, ts: &str| {
+            let mut e = Event::new(action, EventType::Window).app(app, "t");
+            e.timestamp = ts.into();
+            e
+        };
+        let empty_agg = {
+            let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard)
+                .data(serde_json::json!({"keys": 5, "samples": 5}))
+                .app("", "");
+            e.timestamp = "2026-06-15T02:30:40+00:00".into();
+            e
+        };
+        let events = [
+            mk(EventAction::Switch, "code", "2026-06-15T02:30:10+00:00"),
+            mk(EventAction::TabChange, "chrome", "2026-06-15T02:30:20+00:00"),
+            mk(EventAction::TabChange, "chrome", "2026-06-15T02:30:30+00:00"),
+            empty_agg,
+        ];
+        for (i, ev) in events.iter().enumerate() {
+            apply_event(&c, ev, i as i64 + 1).unwrap();
+            ins(
+                &c,
+                &ev.timestamp,
+                ev.event_type.as_str(),
+                ev.event_action.as_str(),
+                ev.app_name.as_deref(),
+                ev.event_data.as_ref().map(|v| v.to_string()).as_deref(),
+            );
+        }
+        let app_rows = |c: &Connection| -> Vec<(String, i64)> {
+            let mut stmt = c
+                .prepare(
+                    "SELECT substr(bucket_id,5), COALESCE(count_value,0) \
+                     FROM agg_daily WHERE bucket_id LIKE 'app:%' ORDER BY 1",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        let incremental = app_rows(&c);
+        assert_eq!(
+            incremental,
+            vec![("chrome".into(), 2), ("code".into(), 1)],
+            "增量必须计入 tab_change（与重建同谓词），空名 input_agg 行不得计入"
+        );
+
+        rebuild_all(&c).unwrap();
+        let rebuilt = app_rows(&c);
+        assert_eq!(
+            incremental, rebuilt,
+            "app 日桶增量必须与全量重建等价（tab_change 不再分叉）"
+        );
     }
 
     /// 审查 P1 回归：mouse input_agg 行同时带 samples 与 moves 时，

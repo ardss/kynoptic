@@ -10,7 +10,7 @@ use crate::constants;
 use crate::db::Database;
 use crate::input_agg;
 use crate::monitors;
-use crate::types::{Event, EventHook, Monitor};
+use crate::types::{Event, EventAction, EventHook, Monitor};
 
 /// 通道满载丢弃计数（审查 33-F4：与未来时间戳拒绝拆分——两者此前共用一个
 /// 计数器，看门狗对两者都打「通道已满」，无法区分丢数原因）。
@@ -440,6 +440,40 @@ fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsiz
     let (rowids, all_failed) = db.insert_events_with_agg(batch);
     let landed = !all_failed && rowids.len() == batch.len();
     if landed {
+        // 联合审查（部分提交失败可恢复化）：降级路径部分行失败时该行
+        // rowid=0；input_agg 行 rowid 合法为 0（部分唯一索引 UPSERT，见
+        // all_failed 注释），**普通事件 rowid=0 才是真失败**。对失败普通
+        // 事件做一轮逐条重试（独立单事务、含聚合维护），把「误判整批成功
+        // 后静默丢行」变成可恢复路径。仍失败者已由 insert 层计入
+        // WRITE_FAILED_ROWS（重试成功不回冲口径：该行确实失败过一次），
+        // 此处 archive 留档条数。
+        let failed: Vec<usize> = rowids
+            .iter()
+            .zip(batch.iter())
+            .enumerate()
+            .filter(|(_, (r, e))| **r == 0 && e.event_action != EventAction::InputAgg)
+            .map(|(i, _)| i)
+            .collect();
+        if !failed.is_empty() {
+            let mut recovered = 0usize;
+            let mut still_failed = 0usize;
+            for &i in &failed {
+                let (r2, af2) = db.insert_events_with_agg(std::slice::from_ref(&batch[i]));
+                if !af2 && r2.first().map(|r| *r != 0).unwrap_or(false) {
+                    recovered += 1;
+                } else {
+                    still_failed += 1;
+                }
+            }
+            if recovered > 0 {
+                log::info!("降级批部分行失败：逐条重试成功 {recovered} 条");
+            }
+            if still_failed > 0 {
+                archive_write_failure(&format!(
+                    "降级批 {still_failed} 条事件逐条重试后仍未落库（磁盘/锁持续），已计入 WRITE_FAILED_ROWS"
+                ));
+            }
+        }
         total_written.fetch_add(batch.len(), Ordering::Relaxed);
         // 审查 P1：事务成功即刷新"最近落库"时钟，供 tray 心跳判定采集是否停滞
         LAST_FLUSH_EPOCH.store(
@@ -459,6 +493,34 @@ fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsiz
         );
     }
     landed
+}
+
+/// 关停路径的尾批落库（联合审查 C2）：与主循环「整批保留重试」口径对齐
+/// ——写失败时有界重试（500ms 起三 次×2 退避，约 3.5s 上限，与 insert 层
+/// 内部重试窗口同量级，不显著拖慢优雅关停），仍失败则 archive_write_failure
+/// 留档条数。此前退出分支忽略 write_batch 返回值，持久写失败（磁盘满/锁库）
+/// 时已 pop 出通道的尾批随线程栈销毁，仅计数不留痕。
+fn write_batch_shutdown(
+    db: &Database,
+    batch: &mut Vec<Event>,
+    total_written: &AtomicUsize,
+) -> bool {
+    const SHUTDOWN_RETRIES: usize = 3;
+    let mut backoff = Duration::from_millis(500);
+    for attempt in 0..=SHUTDOWN_RETRIES {
+        if write_batch(db, batch, total_written) {
+            return true;
+        }
+        if attempt < SHUTDOWN_RETRIES {
+            thread::sleep(backoff);
+            backoff *= 2;
+        }
+    }
+    archive_write_failure(&format!(
+        "关停尾批落库失败（重试 {SHUTDOWN_RETRIES} 次后放弃）：{} 条事件未落库（磁盘满/库锁持续）",
+        batch.len()
+    ));
+    false
 }
 
 fn writer_loop(
@@ -542,7 +604,7 @@ fn writer_loop_inner(
             }
             let n = batch.len();
             if n > 0 {
-                write_batch(db, batch, total_written);
+                write_batch_shutdown(db, batch, total_written);
             }
             return Some(n);
         }
@@ -563,7 +625,7 @@ fn writer_loop_inner(
                 Err(TryRecvError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        write_batch(db, batch, total_written);
+                        write_batch_shutdown(db, batch, total_written);
                     }
                     return Some(n);
                 }
@@ -604,7 +666,7 @@ fn writer_loop_inner(
                 Err(RecvTimeoutError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        write_batch(db, batch, total_written);
+                        write_batch_shutdown(db, batch, total_written);
                     }
                     return Some(n);
                 }
@@ -630,7 +692,7 @@ fn writer_loop_inner(
                 Err(RecvTimeoutError::Disconnected) => {
                     let n = batch.len();
                     if n > 0 {
-                        write_batch(db, batch, total_written);
+                        write_batch_shutdown(db, batch, total_written);
                     }
                     return Some(n);
                 }
@@ -939,15 +1001,14 @@ impl Collector {
             }
         }
         if self.settings.input_granularity == InputGranularity::Minute {
-            // 审查 33-F1 第二道防线：当前分钟行已是上一会话的完整终值
-            // （$.final=true）时，直写 partial 会把大终值整行覆盖回本次重启
-            // 会话的几键小值——跳过（正常路径下 PendingFlush::take 已保留
-            // 抑制语义，此处兜底抑制失效场景，如同分钟内热重载后抑制被消费）。
-            if !current_minute_row_is_final(&self.db) {
-                let mut events = input_agg::flush_partial(chrono::Local::now());
-                if !events.is_empty() {
-                    write_batch(&self.db, &mut events, &self.total_written);
-                }
+            // 33-F1 第二道防线（联合审查 C3 后放宽）：启动基线种子成功时，
+            // 本会话计数器已含上一会话快照值，直写 partial 是**合并写**而非
+            // 小值覆盖——原「final=true 即跳过」不再必要，且跳过会丢最后一
+            // 分钟计数。危险路径（种子失败、抑制仍激活）由 PendingFlush::
+            // take 的抑制语义兜底：被抑制分钟 take 返回空，此处无事件可写。
+            let mut events = input_agg::flush_partial(chrono::Local::now());
+            if !events.is_empty() {
+                write_batch(&self.db, &mut events, &self.total_written);
             }
         }
 
@@ -998,33 +1059,56 @@ pub fn start_collection_with(settings: CollectorSettings, db_path: &str) -> Coll
     start_collection_custom(&enabled, settings, db_path)
 }
 
-/// 当前本地分钟在库里的 input_agg 行是否已是**完整终值**（`$.final` 为 true）。
+/// 当前本地分钟在库里的 input_agg 基线（联合审查 C3）。
+enum MinuteBaseline {
+    /// 查询失败（调用方维持抑制：宁丢勿覆，原语义）
+    Unreadable,
+    /// 该分钟现有 keyboard/mouse 行的 event_data（缺失侧为 None；
+    /// 两者皆 None = 该分钟无行）
+    Rows {
+        keyboard: Option<serde_json::Value>,
+        mouse: Option<serde_json::Value>,
+    },
+}
+
+/// 读取当前本地分钟的 input_agg 行作为重启合并基线。
 ///
-/// 审查 P1：重启抑制的判定依据。返回 true（终值已写出）或 false（无行 /
-/// 只有部分快照）语义如下：
-/// - true → 保持抑制：新会话的秒级小快照会覆盖大终值，必须丢弃；
-/// - false 且无行 → 保持抑制（该分钟本来就没有数据，防小值覆盖）；
-/// - false 且有行（部分快照，上次会话被硬杀、终值从未写出）→ 解除抑制
-///   （合并续写），由调用方据此调用 `input_agg::clear_restart_suppression`。
-///
-/// 查询失败按 false 处理（保持抑制，宁可丢当前分钟部分计数不冒覆盖风险）。
-fn current_minute_row_is_final(db: &Database) -> bool {
+/// 与旧 `current_minute_row_is_final` 的区别：不再按 `ORDER BY id DESC
+/// LIMIT 1` 的单行 final 判定（keyboard/mouse 两行 final 不一致时单行判定
+/// 有歧义），直接把两行原文交给 [`input_agg::seed_restart_baseline`] 合并
+/// ——final 真假无需判定：种子后覆盖即合并，对 final=true 的行同样安全。
+/// 查询失败返回 Unreadable（调用方维持抑制，宁可丢当前分钟部分计数不冒
+/// 覆盖风险）。
+fn read_current_minute_baseline(db: &Database) -> MinuteBaseline {
     // 与 input_agg 行时间戳同格式（分钟起点 epoch 取整 → UTC RFC3339）
     let now_min = (chrono::Utc::now().timestamp() / 60) * 60;
     let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(now_min, 0)
         .map(|t| t.to_rfc3339())
         .unwrap_or_default();
     let reader = db.reader();
-    reader
-        .query_row(
-            "SELECT COALESCE(json_extract(event_data, '$.final'), 0) FROM events \
-             WHERE event_action = 'input_agg' AND timestamp = ?1 \
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![&ts],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|v| v != 0)
-        .unwrap_or(false)
+    let Ok(mut stmt) = reader.prepare(
+        "SELECT event_type, event_data FROM events \
+         WHERE event_action = 'input_agg' AND timestamp = ?1",
+    ) else {
+        return MinuteBaseline::Unreadable;
+    };
+    let Ok(rows) = stmt.query_map(rusqlite::params![&ts], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) else {
+        return MinuteBaseline::Unreadable;
+    };
+    let mut keyboard = None;
+    let mut mouse = None;
+    for row in rows.flatten() {
+        let (etype, data) = row;
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+        match etype.as_str() {
+            "keyboard" => keyboard = Some(v),
+            "mouse" => mouse = Some(v),
+            _ => {}
+        }
+    }
+    MinuteBaseline::Rows { keyboard, mouse }
 }
 
 /// 以显式启用集启动采集器（probe/诊断用）。
@@ -1219,13 +1303,29 @@ pub fn start_collection_custom(
     let mut agg_handle: Option<thread::JoinHandle<()>> = None;
     if minute_mode {
         input_agg::activate();
-        // 审查 P1：硬杀后的部分分钟快照修复。重启抑制只应丢弃"当前分钟已有
-        // 完整终值（$.final: true）或没有行"的会话重启小快照；若库里该分钟
-        // 只有部分快照（final 非 true，上次会话被强杀、终值从未写出），
-        // 抑制会把那部分计数整体丢掉——改为合并续写（解除抑制）。
-        if !current_minute_row_is_final(&db) {
-            input_agg::clear_restart_suppression();
-            log::info!("上一会话在当前分钟留有部分快照，重启抑制改为合并续写");
+        // 联合审查 C3：同分钟重启合并——把库里当前分钟的 input_agg 行作为
+        // 基线种进本会话计数器，此后快照/终值写出的都是「上一会话部分计数
+        // + 本会话新增」的合并值，UPSERT 覆盖从丢数据变成无害合并。种子
+        // 成功（或该分钟无行）则解除抑制；种子为空/查询失败维持抑制
+        // （宁丢勿覆，原语义）。此前只解除抑制不合并计数，「合并续写」
+        // 名不副实——旧快照 30 键会被新会话 2 键整行覆盖。
+        match read_current_minute_baseline(&db) {
+            MinuteBaseline::Rows { keyboard, mouse } => {
+                let has_row = keyboard.is_some() || mouse.is_some();
+                if input_agg::seed_restart_baseline(chrono::Local::now(), keyboard.as_ref(), mouse.as_ref())
+                    || !has_row
+                {
+                    input_agg::clear_restart_suppression();
+                    if has_row {
+                        log::info!("同分钟重启：已载入上一会话快照为基线，合并续写");
+                    }
+                } else {
+                    log::info!("同分钟重启：基线载入为空，维持重启抑制（宁丢勿覆）");
+                }
+            }
+            MinuteBaseline::Unreadable => {
+                log::info!("同分钟重启：基线查询失败，维持重启抑制（宁丢勿覆）");
+            }
         }
         let tx_agg = tx.clone();
         let sd_agg = shutdown.clone();

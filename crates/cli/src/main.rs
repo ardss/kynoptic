@@ -444,6 +444,11 @@ fn cmd_export(args: &[String]) -> Result<()> {
         t.clone()
             .map(|t| if redact { sanitize_window_title(&t) } else { t })
     };
+    // --redact 对 event_data 的 title 字段同样生效（联合审查 C4，实现见
+    // redact_event_data_title）：window/browser 行的标题同时存在 window_title
+    // 列与 event_data JSON 内——旧实现只脱敏列，JSON 副本原样出库，--redact
+    // 的隐私承诺被同文件第二份拷贝架空。
+    let event_data_out = |ed: &Option<String>| -> Option<String> { redact_event_data_title(ed, redact) };
 
     match format.as_str() {
         "csv" => {
@@ -475,7 +480,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
                     r.timestamp.clone(),
                     r.event_type.clone(),
                     r.event_action.clone(),
-                    csv_cell(&r.event_data.unwrap_or_default()),
+                    csv_cell(&event_data_out(&r.event_data).unwrap_or_default()),
                     csv_cell(&r.app_name.unwrap_or_default()),
                     csv_cell(&title_out(&r.window_title)),
                     r.session_id.map(|x| x.to_string()).unwrap_or_default(),
@@ -501,7 +506,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 let n = rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_json(&r.window_title), "session_id": r.session_id
+                    "event_data": event_data_out(&r.event_data), "app_name": r.app_name, "window_title": title_json(&r.window_title), "session_id": r.session_id
                 });
                 let line = serde_json::to_string_pretty(&obj).unwrap_or_default();
                 if n > 0 {
@@ -541,7 +546,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
                 rc.fetch_add(1, AOrdering::Relaxed);
                 let obj = json!({
                     "id": r.id, "timestamp": r.timestamp, "event_type": r.event_type, "event_action": r.event_action,
-                    "event_data": r.event_data, "app_name": r.app_name, "window_title": title_json(&r.window_title), "session_id": r.session_id
+                    "event_data": event_data_out(&r.event_data), "app_name": r.app_name, "window_title": title_json(&r.window_title), "session_id": r.session_id
                 });
                 let _ = writeln!(w, "{}", serde_json::to_string(&obj).unwrap_or_default());
             });
@@ -612,6 +617,28 @@ fn sanitize_window_title(title: &str) -> String {
         .split_inclusive(|c: char| c.is_whitespace())
         .map(sanitize_url_query)
         .collect()
+}
+
+/// --redact 对 event_data 内嵌 title 的脱敏（联合审查 C4）：仅当 `redact`
+/// 开启且 JSON 含 "title" 字符串字段时重写该字段为
+/// [`sanitize_window_title`] 结果；非 JSON / 无 title 键 / 解析失败的行
+/// 原样保留——脱敏不得破坏导出（不炸不丢）。
+fn redact_event_data_title(ed: &Option<String>, redact: bool) -> Option<String> {
+    match ed {
+        Some(s) if redact && s.contains("\"title\"") => {
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(mut v) => {
+                    if let Some(t) = v.get("title").and_then(|t| t.as_str()).map(String::from)
+                    {
+                        v["title"] = serde_json::Value::String(sanitize_window_title(&t));
+                    }
+                    serde_json::to_string(&v).ok().or_else(|| Some(s.clone()))
+                }
+                Err(_) => Some(s.clone()),
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 fn ext(f: &str) -> &'static str {
@@ -4820,6 +4847,35 @@ mod tests {
     }
 
     // === export 脱敏（--redact opt-in）与缺省目录 ===
+    //
+    /// 联合审查 C4 回归：--redact 必须同时脱敏 event_data JSON 内嵌的
+    /// title 字段（window/browser 行的标题在列与 JSON 各有一份，只脱列
+    /// 时 JSON 副本原样出库）。非 JSON/无 title 键原样保留；未开 --redact
+    /// 时不碰任何 event_data。
+    #[test]
+    fn redact_event_data_title_sanitizes_embedded_copy() {
+        let win_row = Some(r#"{"hwnd":123,"title":"登录 - https://ex.io/p?token=abc","pid":42}"#.to_string());
+        let out = redact_event_data_title(&win_row, true).unwrap();
+        assert!(
+            out.contains("https://ex.io/p") && !out.contains("token=abc"),
+            "内嵌 title 必须剥查询串: {out}"
+        );
+        // 其余字段不受影响（解析-重序列化保真）
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hwnd"], 123);
+        assert_eq!(v["pid"], 42);
+
+        // 无 title 键：原样返回
+        let plain = Some(r#"{"keys":5,"samples":5}"#.to_string());
+        assert_eq!(redact_event_data_title(&plain, true), plain);
+        // 非 JSON：原样返回（脱敏不得炸导出）
+        let junk = Some("not-json".to_string());
+        assert_eq!(redact_event_data_title(&junk, true), junk);
+        // 未开 --redact：原样返回
+        assert_eq!(redact_event_data_title(&win_row, false), win_row);
+        // None 透传
+        assert_eq!(redact_event_data_title(&None, true), None);
+    }
 
     // 默认导出 window_title 原文（不脱敏）；sanitize_window_title 仅在显式
     // --redact 时被调用。本测试锁定 opt-in 脱敏函数本身的语义。

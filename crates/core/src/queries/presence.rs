@@ -33,7 +33,7 @@ pub fn minute_classification(
     let mut stmt = conn
         .prepare(
             "SELECT substr(datetime(timestamp, ?1), 1, 16) AS minute_bucket, \
-                    MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0, \
+                    MAX(MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0), 0) + MAX(COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0), 0) + MAX(COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0), 0)) > 0, \
                     MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0 \
              FROM events \
              WHERE timestamp >= ?2 AND timestamp < ?3 AND event_action = 'input_agg' \
@@ -130,7 +130,7 @@ fn collect_minute_hits_window(conn: &Connection, start: &str, end: &str) -> Vec<
     // 时区后缀，两趟重复本地小时得到不同纪元分钟，不再互吞）。
     let Ok(mut stmt) = conn.prepare(
         "SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute_epoch, \
-                MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0, \
+                MAX(MAX(COALESCE(json_extract(event_data,'$.keys'),0) - COALESCE(json_extract(event_data,'$.injected_keys'),0), 0) + MAX(COALESCE(json_extract(event_data,'$.clicks'),0) - COALESCE(json_extract(event_data,'$.injected_clicks'),0), 0) + MAX(COALESCE(json_extract(event_data,'$.scroll_ticks'),0) - COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0), 0)) > 0, \
                 MAX(COALESCE(json_extract(event_data,'$.injected_keys'),0) + COALESCE(json_extract(event_data,'$.injected_clicks'),0) + COALESCE(json_extract(event_data,'$.injected_scroll_ticks'),0)) > 0 \
          FROM events \
          WHERE timestamp >= ?1 AND timestamp < ?2 AND event_action = 'input_agg' \
@@ -151,6 +151,21 @@ fn collect_minute_hits_window(conn: &Connection, start: &str, end: &str) -> Vec<
     super::collect_rows_warn(rows, "presence.minute_hits_window")
 }
 
+/// timestamp → UTC 纪元分钟（raw 侧共用解析）：优先整串 RFC3339（同时接受
+/// 'Z' 与 '+08:00' 后缀，存量/外部写入的带偏移行不错算时区）；不可解析的
+/// 旧行退回 naive-UTC 路径（与写路径 normalize_timestamp 同口径）；仍失败
+/// 返回 None（调用方跳过）。
+fn rfc3339_or_naive_to_epoch_min(ts: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) {
+        Some(t.with_timezone(&Utc).timestamp() / 60)
+    } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M") {
+        Some(Utc.from_utc_datetime(&t).timestamp() / 60)
+    } else {
+        None
+    }
+}
+
 /// 整窗 raw 模式（opt-in 逐键）人在场纪元分钟（未排序去重）。
 ///
 /// 排除注入事件——hook 已把 LLKHF_INJECTED / LLMHF_INJECTED 归一化为
@@ -165,28 +180,48 @@ fn collect_minute_hits_window(conn: &Connection, start: &str, end: &str) -> Vec<
 /// 转 UTC；不可解析的旧行退回原 naive-UTC 路径，与写路径
 /// normalize_timestamp 同口径。
 pub fn raw_human_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec<i64> {
+    raw_flag_minutes_window(conn, start, end, false)
+}
+
+/// 整窗 raw 模式**自动化**纪元分钟（联合审查 P2/raw 条件 P1 补齐）：注入
+/// 事件单独成桶。raw 模式此前只有 human 侧（排除注入），纯注入分钟的
+/// 自动化指标恒 0——「机器替人值班」指标在 raw 档完全失明（SendKeys 跑
+/// 一整夜，自动化=0 分钟）。与 [`raw_human_minutes_window`] 同解析口径，
+/// 只取 injected=1 的行。
+pub fn raw_auto_minutes_window(conn: &Connection, start: &str, end: &str) -> Vec<i64> {
+    raw_flag_minutes_window(conn, start, end, true)
+}
+
+/// [`raw_human_minutes_window`] / [`raw_auto_minutes_window`] 共用实现：
+/// `injected=true` 取注入行（自动化桶），false 取非注入行（人在场桶）。
+fn raw_flag_minutes_window(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    injected: bool,
+) -> Vec<i64> {
+    let flag = if injected { 1 } else { 0 };
+    let label = if injected {
+        "presence.raw_auto_minutes"
+    } else {
+        "presence.raw_human_minutes"
+    };
     let Ok(mut stmt) = conn.prepare(
         "SELECT DISTINCT timestamp FROM events \
          WHERE event_action IN ('press','click','scroll') \
            AND timestamp >= ?1 AND timestamp < ?2 \
-           AND COALESCE(json_extract(event_data,'$.injected'), 0) = 0",
+           AND COALESCE(json_extract(event_data,'$.injected'), 0) = ?3",
     ) else {
         return Vec::new();
     };
-    let Ok(rows) = stmt.query_map(params![start, end], |r| r.get::<_, String>(0)) else {
+    let Ok(rows) = stmt.query_map(params![start, end, flag], |r| r.get::<_, String>(0)) else {
         return Vec::new();
     };
-    use chrono::TimeZone;
     let mut out = Vec::new();
-    for ts in super::collect_rows_warn(rows, "presence.raw_human_minutes") {
-        let epoch_min = if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&ts) {
-            t.with_timezone(&Utc).timestamp() / 60
-        } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M") {
-            Utc.from_utc_datetime(&t).timestamp() / 60
-        } else {
-            continue;
-        };
-        out.push(epoch_min);
+    for ts in super::collect_rows_warn(rows, label) {
+        if let Some(epoch_min) = rfc3339_or_naive_to_epoch_min(&ts) {
+            out.push(epoch_min);
+        }
     }
     out
 }
@@ -234,6 +269,14 @@ fn collect_day_hits(
     for mepoch in raw_human_minutes_window(conn, &wstart, &wend) {
         if let Some(day) = bucket(mepoch) {
             out.entry(day).or_default().0.push(mepoch);
+        }
+    }
+    // 联合审查（raw 自动化桶）：注入行单独计入自动化——纯注入分钟不再
+    // 失明。raw 模式的混合分钟（同人同机）两桶都进：与 minute 模式的
+    // human∩auto 双计语义对齐（e.2 mixed 计数仍只由分钟 SQL 分支维护）。
+    for mepoch in raw_auto_minutes_window(conn, &wstart, &wend) {
+        if let Some(day) = bucket(mepoch) {
+            out.entry(day).or_default().1.push(mepoch);
         }
     }
     out
@@ -394,9 +437,11 @@ pub const FG_DWELL_METHOD: &str = "按窗口切换间隔累计前台时长，剔
 /// report、MCP get_top_apps 各写一份，封顶策略不一致导致同一问题两个答案）。
 ///
 /// 口径：应用驻留 = 本次 switch 到下次 switch 的间隔；相邻间隔超过
-/// `stall_cap_secs`（停摆）不归属；倒序/漂移产生的负间隔按 0 计；
-/// `credit_tail` 为 true 时末次 switch 记到窗口上界（不超过封顶）——
-/// 报告/MCP 的分段视图需要末段，CLI/overview 汇总不需要。
+/// `stall_cap_secs`（停摆）按封顶归属而非整体丢弃（联合审查 P1-6：单
+/// switch 日整段驻留全丢——3 小时连续使用记 0 秒，出现「用了 3 小时却无
+/// top 应用」；停摆防挂机语义保留为归属上限）；倒序/漂移产生的负间隔按
+/// 0 计；`credit_tail` 为 true 时末次 switch 记到窗口上界（不超过封顶）
+/// ——dash overview / MCP 分段视图传 true，CLI presence 汇总保持 false。
 /// 返回 (app, dwell_secs) 按 dwell 降序、app 升序。
 pub fn foreground_dwell_by_app(
     conn: &Connection,
@@ -426,12 +471,12 @@ pub fn foreground_dwell_by_app(
         .filter_map(|(ts, app)| parse(ts).map(|t| (t, app)))
         .collect();
     for pair in parsed.windows(2) {
-        // 采集停摆（暂停/看门狗杀/关机）的超长间隔不归属；负间隔按 0
-        // （时间戳时区偏移漂移时字符串序可能与瞬时序相反）。
-        let secs = (pair[1].0 - pair[0].0).num_seconds().max(0);
-        if secs > stall_cap_secs {
-            continue;
-        }
+        // 采集停摆（暂停/看门狗杀/关机）的超长间隔按封顶归属而非整体丢弃
+        // （联合审查 P1-6：旧实现 `continue` 整段清零——单 switch 日 3 小时
+        // 连续使用在前台驻留里完全不可见）；防挂机语义保留：归属上限 =
+        // stall_cap_secs。负间隔按 0（时间戳时区偏移漂移时字符串序可能与
+        // 瞬时序相反）。
+        let secs = ((pair[1].0 - pair[0].0).num_seconds().max(0)).min(stall_cap_secs);
         *dwell.entry(pair[0].1.clone()).or_insert(0) += secs;
     }
     if credit_tail {
@@ -485,6 +530,84 @@ mod tests {
         );
         assert_eq!(d.last_activity, d.first_activity);
         assert!(d.presence_minutes >= 1);
+    }
+
+    /// 联合审查 P1-6 回归：超长间隔按封顶归属而非整段丢弃；credit_tail
+    /// 把末次 switch 记到窗口上界（≤ 封顶）。旧实现单 switch 日 3 小时
+    /// 连续使用在前台驻留里记 0 秒（`secs > cap → continue`）。
+    #[test]
+    fn dwell_credits_capped_gap_and_tail() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        let ins = |conn: &Connection, ts: &str, app: &str| {
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, app_name) \
+                 VALUES (?1, 'window', 'switch', ?2)",
+                params![ts, app],
+            )
+            .unwrap();
+        };
+
+        // 单 switch：01:00 起 3 小时无后续切换 —— 停摆段按 2h 帽归属
+        ins(&conn, "2026-06-15T01:00:00+00:00", "code");
+        let out = foreground_dwell_by_app(
+            &conn,
+            "2026-06-15T00:00:00+00:00",
+            "2026-06-15T04:00:00+00:00",
+            7200,
+            true,
+        );
+        assert_eq!(
+            out,
+            vec![("code".into(), 7200)],
+            "3h 单 switch 段必须按 2h 帽归属（旧实现整段丢弃记 0）"
+        );
+
+        // 停摆段 + 帽内正常段 + 末段 tail：code = 停摆封顶 7200 + 正常 1800；
+        // web = 05:30 → 窗口上界 06:00 = 1800（credit_tail）
+        let conn2 = Connection::open_in_memory().unwrap();
+        conn2.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        ins(&conn2, "2026-06-15T01:00:00+00:00", "code");
+        ins(&conn2, "2026-06-15T05:00:00+00:00", "code");
+        ins(&conn2, "2026-06-15T05:30:00+00:00", "web");
+        let out = foreground_dwell_by_app(
+            &conn2,
+            "2026-06-15T00:00:00+00:00",
+            "2026-06-15T06:00:00+00:00",
+            7200,
+            true,
+        );
+        assert_eq!(
+            out,
+            vec![("code".into(), 9000), ("web".into(), 1800)],
+            "停摆段封顶 + 正常段全记 + tail 记到上界"
+        );
+    }
+
+    /// 联合审查（raw 自动化桶）回归：raw 模式纯注入分钟必须计入自动化
+    /// 而非人在场——此前 raw 侧只有 human 桶，SendKeys 整夜跑自动化恒 0。
+    #[test]
+    fn raw_injected_rows_fill_automation_bucket() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        let day = crate::queries::today_local_str();
+        let off = Local::now().format("%:z").to_string();
+        let ts = format!("{day}T02:00:00{off}");
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data) \
+             VALUES (?1, 'keyboard', 'press', '{\"injected\": true}')",
+            params![&ts],
+        )
+        .unwrap();
+        let d = classify_minutes(&conn, &day, 2);
+        assert!(
+            d.automation_minutes >= 1,
+            "注入行必须计入自动化分钟，实际 {}",
+            d.automation_minutes
+        );
+        assert_eq!(d.presence_minutes, 0, "纯注入分钟不得计人在场");
+        // first_activity/last_activity 是「人在场」首末活动：纯注入日应为空
+        assert_eq!(d.first_activity, None);
     }
 
     /// 「昨日同时段」截断回归：cap 之后的分钟不计入在场/自动化，且截断口径下

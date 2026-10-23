@@ -87,6 +87,46 @@ pub fn quiet_command(program: &str) -> std::process::Command {
     cmd
 }
 
+/// [`quiet_command`] + 有界等待（联合审查 P2：`.output()` 无超时——netstat
+/// 等外部工具在病态系统上可能挂死，monitor 线程随它一起冻结，该传感器
+/// 静默失明且拖累采集循环）。轮询 try_wait（50ms 步进）到 `timeout` 即
+/// kill 并回收，返回 None（调用方走 FFI 兜底）。wait 结束后仍需 read
+/// 拿输出；kill 分支必须 wait 收尸，避免僵尸进程堆积。
+pub fn quiet_command_output_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let mut cmd = quiet_command(program);
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let started = std::time::Instant::now();
+    let step = std::time::Duration::from_millis(50);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break, // 正常退出
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait(); // 收尸，避免僵尸
+                    log::warn!("外部工具 {program} 超时（{timeout:?}）已终止");
+                    return None;
+                }
+                std::thread::sleep(step);
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut out = String::new();
+    use std::io::Read;
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    Some(out)
+}
+
 /// monitor 级降级事件计数（审查：鼠标 Hook 安装失败、powershell 被杀软
 /// 拦截等依赖性故障此前只留一句日志甚至完全静默，与"没这传感器"无法
 /// 区分）。任何监控器进入降级态都调 [`note_degraded`]：计数 +1 并写

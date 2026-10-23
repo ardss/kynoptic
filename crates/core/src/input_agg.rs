@@ -676,6 +676,86 @@ pub fn clear_restart_suppression() {
     *sup = None;
 }
 
+/// 联合审查 C3（同分钟重启合并）：把库里当前分钟的既有 input_agg 行作为
+/// 基线种进本会话计数器。
+///
+/// 此前「合并续写」只解除抑制、计数器仍从零开始，本会话写出的快照/终值
+/// UPSERT 会把上一会话的部分计数整行覆盖掉（30 键旧快照被新会话的 2 键
+/// 覆盖，agg_minute 的 MAX 却仍留 30——events/agg/真值三方分裂）。种子后
+/// 本会话写出的就是「旧部分计数 + 本会话新增」的合并值，覆盖变无害合并，
+/// 重启抑制的覆盖风险因此消除（抑制退位为「种子失败时的兜底」）。
+///
+/// 入参：`now_local`（调用方注入时钟，测试红线）与 collector 启动时从库
+/// 读出的当前分钟 keyboard/mouse 两行 event_data（缺失侧为 None）。解析
+/// 失败的键按 0 计——宁少勿错，本会话新增计数不受影响。返回是否种入了
+/// 任何非零基线。
+pub fn seed_restart_baseline(
+    now_local: DateTime<Local>,
+    keyboard: Option<&serde_json::Value>,
+    mouse: Option<&serde_json::Value>,
+) -> bool {
+    let num = |v: &serde_json::Value, k: &str| -> u64 {
+        v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+    };
+    let mut base = MinuteCounters::default();
+    if let Some(kd) = keyboard {
+        base.keys = num(kd, "keys");
+        base.keys_samples = kd
+            .get("keys_samples")
+            .and_then(|x| x.as_u64())
+            .unwrap_or_else(|| num(kd, "samples"));
+        // keyboard 行的 samples 输出即 keys_samples（events_for 同值输出）
+        base.samples = base.keys_samples;
+        base.injected_keys = num(kd, "injected_keys");
+        if let Some(serde_json::Value::Object(map)) = kd.get("vk") {
+            for (k, v) in map {
+                if let (Ok(idx), Some(cnt)) = (k.parse::<u8>(), v.as_u64()) {
+                    if cnt > 0 {
+                        base.vk.push((idx, cnt));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(md) = mouse {
+        base.clicks = num(md, "clicks");
+        base.scroll_ticks = num(md, "scroll_ticks");
+        base.moves = num(md, "moves");
+        base.move_dist_px = num(md, "move_distance_px");
+        base.samples = num(md, "samples");
+        base.injected_clicks = num(md, "injected_clicks");
+        base.injected_scroll_ticks = num(md, "injected_scroll_ticks");
+        base.buttons = [
+            num(md, "clicks_left"),
+            num(md, "clicks_right"),
+            num(md, "clicks_middle"),
+            num(md, "clicks_side1"),
+            num(md, "clicks_side2"),
+        ];
+    }
+    let has_any = base.keys > 0
+        || base.keys_samples > 0
+        || base.clicks > 0
+        || base.scroll_ticks > 0
+        || base.moves > 0
+        || base.move_dist_px > 0
+        || base.samples > 0
+        || !base.vk.is_empty();
+    if !has_any {
+        return false;
+    }
+    // 种子作为当前分钟的既有累计进入 PENDING：下一次 drain 会把新原子计数
+    // add 进来，快照/终值写出的即合并值。若 drain 已先建桶（启动竞态窗口），
+    // add 进既有桶，结果等价。
+    let cur = MinuteKey::of(now_local);
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_mut() {
+        Some((key, counters)) if *key == cur => counters.add(&base),
+        _ => *g = Some((cur, base)),
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +953,46 @@ mod tests {
             evts.is_empty(),
             "空分钟不应写行（活跃分钟语义依赖行的存在）"
         );
+    }
+
+    /// 联合审查 C3 回归：同分钟重启基线种子——种子后本会话折叠出的终值
+    /// 必须是「上一会话部分计数 + 本会话新增」的合并值。此前只解除抑制、
+    /// 计数器从零开始，旧快照 30 键会被新会话 2 键整行覆盖（agg_minute
+    /// MAX 留 30，events=2，真值 32，三方分裂）。
+    #[test]
+    fn restart_baseline_seed_merges_old_partial() {
+        let _g = guard();
+        reset();
+        let t0 = local_min(2026, 6, 15, 10, 30);
+        // 上一会话的 partial 快照（30 键，vk 65×30）
+        let kb = serde_json::json!({
+            "keys": 30, "samples": 30, "keys_samples": 30, "final": false,
+            "vk": {"65": 30},
+        });
+        assert!(seed_restart_baseline(t0, Some(&kb), None));
+        // 同种子分钟重复种子（双行场景：collector 重读）不得翻倍——PENDING
+        // 同键走 add 是设计语义，这里只验证单次种子的正确性
+        // 新会话同一分钟内 2 键（65×1 + 66×1）
+        record_key_vk(65, false);
+        record_key_vk(66, false);
+        // 测试时钟注入（测试红线）：record_* 以真实时钟打事件纪元，这里强制
+        // 指回 t0 分钟，模拟「新会话与上一会话在同一分钟内输入」
+        LAST_EVENT_EPOCH_MIN.store(
+            (t0.with_timezone(&Utc).timestamp() / 60) as u64,
+            Ordering::Relaxed,
+        );
+        // rollover 折叠终值：必须是合并值 32，而不是覆盖值 2
+        let evts = drain(local_min(2026, 6, 15, 10, 31));
+        assert_eq!(
+            counter_of(&evts, EventType::Keyboard, "keys"),
+            32,
+            "终值必须是 旧30 + 新2 的合并值"
+        );
+        assert_eq!(counter_of(&evts, EventType::Keyboard, "samples"), 32);
+        assert_eq!(counter_of(&evts, EventType::Keyboard, "keys_samples"), 32);
+        // 空基线（无行）返回 false：调用方据此走「无行解除抑制」路径
+        reset();
+        assert!(!seed_restart_baseline(t0, None, None));
     }
 
     /// 审查 P1（硬杀部分快照修复）：`$.final` 区分"完整分钟终值"与

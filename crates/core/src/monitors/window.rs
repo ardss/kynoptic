@@ -229,6 +229,12 @@ pub fn stop_event_channel() {
     // 允许下一代 collector 首拍重开事件线程（代际竞态无害：旧线程靠
     // FG_THREAD_ID 的 CAS 自清理，双钩子短暂并存时全局去重保证不双发）
     FG_THREAD_STARTED.store(false, Ordering::Release);
+    // 联合审查（FG 生命周期）：会话结束即重置前台去重——旧会话「已发出」
+    // 的记忆对新会话无效（联合审查根因综合：进程级状态被误当跨会话状态）。
+    // 不重置时，热重载/重启后若前台窗口未变，本会话首段切换事件缺失，
+    // dwell/top_apps 少记会话首窗。代价：代际短暂并存时同窗可能双发一次
+    // switch（单行重复，计数聚合无感），远好于静默丢段。
+    FG_LAST_EMITTED.store(0, Ordering::Release);
 }
 
 /// 共享前台捕获路径（轮询与事件通道同走）：全局去重 → 读标题/pid →
@@ -248,6 +254,8 @@ fn capture_foreground() {
         let key = hwnd as u64;
         // 全局去重（无锁 CAS 重试）：同一前台窗已发过即跳过；A→B→A
         // 切回时 last≠A 重新发出。双通道并发时恰一者胜出。
+        // prev = CAS 前的旧值，供发送失败回滚（联合审查 FG 先发后记）。
+        let prev;
         loop {
             let last = FG_LAST_EMITTED.load(Ordering::Acquire);
             if last == key {
@@ -257,6 +265,7 @@ fn capture_foreground() {
                 .compare_exchange(last, key, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                prev = last;
                 break;
             }
         }
@@ -306,7 +315,20 @@ fn capture_foreground() {
             .data(data)
             .app(&app_name, &title);
 
-        crate::collector::send_event(&tx, event);
+        // 联合审查（FG 先发后记）：send_event 返回 false = 通道满载丢弃。
+        // 去重状态已在 CAS 提前推进，不回滚则同一 hwnd 永不重发——本次
+        // 切换永久丢失（且与 FG_LAST_EMITTED 跨会话残留叠加成「重启丢首段」
+        // 的孪生症状）。CAS 守卫回滚防覆盖并发推进的新值，下一拍（≤200ms）
+        // 同窗口重试。自排除等早退路径不回滚：那是「有观测、无事件」的
+        // 有意语义，不是发送失败。
+        if !crate::collector::send_event(&tx, event) {
+            let _ = FG_LAST_EMITTED.compare_exchange(
+                key,
+                prev,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 }
 

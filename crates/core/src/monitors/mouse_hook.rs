@@ -136,6 +136,28 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) ->
                     }));
                     crate::collector::send_event(&tx, event);
                 }
+                WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                    // 联合审查（raw 侧键缺口）：minute 分支自初版就分键计数
+                    // side1/side2，raw 分支漏接——鼠标侧键点击在默认 raw 档
+                    // 整体丢失（top_apps/click 计数偏小）。LL hook：X 按钮
+                    // 编号在 mouse_data 低字（1/2），与 minute 分支同映射。
+                    let button = match (ms.mouse_data & 0xffff).clamp(1, 2) {
+                        1 => "side1",
+                        _ => "side2",
+                    };
+                    let pressed = wparam as u32 == WM_XBUTTONDOWN;
+                    let action = if pressed {
+                        EventAction::Click
+                    } else {
+                        EventAction::Release
+                    };
+                    let injected = ms.flags & 0x1 != 0;
+                    let event = Event::new(action, EventType::Mouse).data(json!({
+                        "button": button, "x": ms.pt.x, "y": ms.pt.y, "pressed": pressed,
+                        "injected": injected,
+                    }));
+                    crate::collector::send_event(&tx, event);
+                }
                 WM_MOUSEWHEEL => {
                     let delta = (ms.mouse_data >> 16) as i16 as i32;
                     let direction = if delta > 0 { "up" } else { "down" };

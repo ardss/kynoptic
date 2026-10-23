@@ -943,16 +943,18 @@ pub fn api_overview(conn: &Connection, db_path: &Path) -> Value {
         .unwrap_or(Value::Null);
 
     // 今日前台应用时长：统一走 core 权威实现 queries::foreground_dwell_by_app
-    // （窗口切换间隔推算，剔除 >2h 停摆间隔；与 CLI presence / report 页 /
-    // MCP get_top_apps 同一份实现与封顶策略——此前各写一份、口径分叉）。
-    // 负间隔按 0（时间戳时区漂移时字符串序可能与瞬时序相反）。
+    // （窗口切换间隔推算，超 2h 停摆间隔按封顶归属；与 CLI presence / report
+    // 页 / MCP get_top_apps 同一份实现与封顶策略——此前各写一份、口径分叉）。
+    // 联合审查 P1-6：overview 传 credit_tail=true——实时总览必须计入当前
+    // 仍在前台的末段（≤2h 封顶），否则「正在用 3 小时的应用」在总览里
+    // 时长为 0。
     let mut fg_dwell: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for (app, secs) in queries::foreground_dwell_by_app(
         conn,
         &start,
         &end,
         queries::FG_DWELL_STALL_CAP_SECS,
-        false,
+        true,
     ) {
         fg_dwell.insert(app, secs);
     }
