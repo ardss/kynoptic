@@ -588,6 +588,29 @@ impl Database {
                 backfill_done.1.notify_all();
             }
         } else {
+            // actor 证据缓存 bootstrap（0.4.0 F1，migration 0011）：存量库升级后
+            // 缓存为空而 events 有输入行 → 后台定向重建（不阻塞启动；查询层对
+            // 缺行日期本就回退 events 现算，这里只是把缓存提速补上）。
+            if agg::actor_backfill_needed(&writer) {
+                log::info!("actor 证据缓存为空，后台定向重建（不阻塞启动）");
+                let bg_path = path.to_string();
+                if let Err(e) =
+                    thread::Builder::new()
+                        .name("actor-backfill".into())
+                        .spawn(move || match Connection::open(&bg_path) {
+                            Ok(c) => {
+                                let _ = apply_pragmas(&c);
+                                match crate::db::agg::rebuild_actor_cache(&c) {
+                                    Ok(n) => log::info!("actor 证据缓存定向重建完成（{n} 行）"),
+                                    Err(e) => log::warn!("actor 证据缓存定向重建失败: {e}"),
+                                }
+                            }
+                            Err(e) => log::warn!("actor 证据缓存重建连接创建失败: {e}"),
+                        })
+                {
+                    log::warn!("actor 证据缓存后台重建线程 spawn 失败（下次打开重试）: {e}");
+                }
+            }
             // 欠聚合核对（P1，廉价：timestamp 下界 7 天 + 索引区间，见
             // agg::under_agg_dates 的取舍说明）：events 里应有聚合贡献的
             // 原始行（press/click/switch）最大 id 超过该日 agg_minute 已记录的

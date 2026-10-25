@@ -233,6 +233,20 @@ pub(crate) const INJECTED_CLICKS_ROW_EXPR: &str = "(CASE \
            THEN MAX(COALESCE(json_extract(event_data, '$.injected_clicks'), 0), 0) \
          ELSE 0 END)";
 
+/// 滚轮刻度行级计数（0.4.0 actor 证据缓存用）：滚轮只随 mouse input_agg 行落库
+/// （input_agg.rs：{"clicks","scroll_ticks","moves",...}），raw 滚轮行不参与
+/// 分钟分类（presence 权威口径从不读 raw 滚轮行），故本表达式对 raw 滚轮恒 0
+/// —— 与 presence 的 E_h/E_a 滚轮项同口径，禁止凭空「补全」raw 滚轮计数。
+pub(crate) const SCROLL_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+           THEN MAX(COALESCE(json_extract(event_data, '$.scroll_ticks'), 0), 0) \
+         ELSE 0 END)";
+
+pub(crate) const INJECTED_SCROLL_ROW_EXPR: &str = "(CASE \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+           THEN MAX(COALESCE(json_extract(event_data, '$.injected_scroll_ticks'), 0), 0) \
+         ELSE 0 END)";
+
 /// 人侧（剔注入）行级计数 = MAX(keys - injected_keys, 0)。深夜活动 / APM 突增
 /// 等异常口径统一用它——纯注入分钟（{"keys":500,"injected_keys":500}）不得被
 /// 算成"深夜按键"或"行为突增"（审查修复 2026-09：自动化注入不算人）。
@@ -270,6 +284,7 @@ pub struct DayTotals {
 
 // ─── Re-export：保持 `queries::xxx` 调用路径不变 ─────────────────────────────
 
+pub mod actor;
 pub use charts::*;
 pub use history::*;
 pub use maintenance::*;
