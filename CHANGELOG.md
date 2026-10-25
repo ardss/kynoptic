@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-25
+
 ### Added
 
 - Core (db): the actor evidence cache `agg_minute_actor` (schema migration
@@ -55,6 +57,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unattributed_sec` and the method note; new `get_topics` tool (default
   redacted keys, `raw` opt-in still filters sensitive titles), bringing the
   tool surface to seven.
+
+### Fixed
+
+- Core (monitors/gpu): the static GPU info query (Win32_VideoController via
+  PowerShell) is now cached with a 10-minute TTL. Model/driver/resolution
+  fields were re-queried every 10 s on the hot cadence meant for dynamic
+  metrics — with all monitors enabled this was a PowerShell cold start every
+  10 s for data that essentially never changes; it now runs 0.1 times per
+  minute. Dynamic metrics (nvidia-smi) keep the 10 s cadence, now under a
+  3-second bounded wait so a hung nvidia-smi can no longer stall the
+  collection thread. (Ops review P1/P3.)
+
+- Installer: the watchdog scheduled task is now registered via the
+  Task Scheduler COM API instead of `schtasks /Create /SC MINUTE`, whose
+  default XML carries `DisallowStartIfOnBatteries=true` — on battery power
+  the watchdog silently never ran, and there was no logon trigger. The new
+  registration removes both battery restrictions, adds a logon trigger plus
+  the 1-minute repetition, sets IgnoreNew and a 10-minute execution limit,
+  and still falls back to the old `schtasks` path if COM registration
+  fails. (Ops review P2.)
+
+- Installer: rebuilding the watchdog task no longer silently overwrites an
+  operator-applied `wscript` hidden-launch wrapper. The installer now
+  detects a wrapped action on the existing task and preserves it verbatim;
+  unwrapped installs get the bare exe as before. (Ops review P1.)
+
+- Core (registry): the `location` monitor description now says plainly that
+  it is a placeholder collecting nothing (the historical ipinfo.io public-IP
+  lookup was removed under the privacy红线); it no longer reads as a real
+  sensor. (Ops review P3.)
 
 ## [0.3.2] - 2026-10-24
 
@@ -984,7 +1016,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ardss/kynoptic/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ardss/kynoptic/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ardss/kynoptic/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ardss/kynoptic/compare/v0.2.2...v0.3.0

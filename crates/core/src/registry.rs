@@ -302,8 +302,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
     // ── R8 ③ 恢复（14，高敏感或主题外，默认关闭）──
     spec(
         "location",
-        "Records the device's geographic location",
-        "记录设备的地理位置信息",
+        "Placeholder — collects nothing (pending native Windows location API)",
+        "占位监控（不采集任何数据）— 历史公网 IP 外呼已按隐私红线移除，待 Windows 定位 API 原生实现并披露数据去向后再恢复",
         false,
         Sensitivity::High,
         Dep::PowerShell,

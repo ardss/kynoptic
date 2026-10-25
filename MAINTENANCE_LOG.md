@@ -2,6 +2,66 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-26 发版波（GPT 终审 REQUEST_CHANGES + 安装器修复，01:0x–01:2x）
+
+### GPT 终审裁决（「架构审查报告」专道，00:47 发出 / 00:5x 回）
+
+**REQUEST_CHANGES，仅针对发布收尾顺序与两处安装器可靠性细节**——无需重新提交功能
+设计提案，修正通过后即可按既定流程发布 v0.4.0。三项：① Tag 必须指向合并后包含最终
+代码的 main 提交，不得从 release 分支直接打（重蹈 v0.3.2「Release 已发 main 落后」）；
+② kynoptic.iss 兜底 schtasks /TR 用 Chr(39) 单引号包路径，Windows 命令行不以单引号为
+引号转义，含空格目录启动失败，改双引号转义并要求「COM 失败→兜底创建→实际运行任务」
+真机验证（仅验证创建返回码不够）；③ wscript 包装保留契约缺 WorkingDirectory 字段，
+原包装依赖工作目录时升级失效，应补保留并做真实包装升级测试。GPT 联网核实的仓库状态
+（36f7c079 存在/main 9faf8b49/领先 3 提交/#43 merged/test 绿）与本机一致。
+
+### 发版波全量门禁（00:25–00:35，唯一一次，一次全绿）
+
+fmt ✓ / clippy workspace -D warnings ✓ / workspace test ✓（core 217/217，全部套件 0 失败）
+/ check-doc-version 14 项 ✓。无需任何修复重跑。
+
+### 执行（只做裁决指出的改动，未 merge 未 tag）
+
+- kynoptic.iss 兜底 /TR：Chr(39) → `\"` 双引号转义。
+- TryGetWscriptWrappedAction/RegisterWatchdogTaskCom/RebuildWatchdogTask 三处签名补
+  WorkingDirectory 透传（包装分支保留原值，裸 exe 分支空串=系统默认行为不变）。
+- 新增 GateForceComFail 编译钩子（/D 开关强制 COM 失败走兜底，正常构建零开销）——裁决
+  第②项要求的强制失败验证注入点。
+- **意外收获（真机门禁首次暴露）**：StartBoundary 格式串里的字面 'T' 被
+  GetDateTimeString 当短时间格式符解析（产出 `2026-10-261:0501:05:06`），COM 注册必炸
+  全部静默落兜底——上一波仅 PowerShell 同接口验证 + ISCC 编译，iss 内注册路径从未真机
+  跑过。修复为日期/时间两段各取再拼 'T'。此 bug 说明「PowerShell 接口验证 ≠ iss 内
+  行为验证」，安装器改动必须过一次真机安装。
+- 提交 3f3d6bc 推 release/v0.4.0（PR #45 Head 同步更新）。
+
+### 真机隔离验证（TestSuffix=GATE 构建与生产完全并行 + 带空格目录，三件套全过）
+
+1. COM 成功路径：静默装 `kyn gate a`，任务 XML 逐项核对——电池限制 false、StopIfGoing
+   false、LogonTrigger、PT1M、IgnoreNew、PT10M、StartBoundary 正确、Command 干净拆分、
+   WorkingDirectory 空（默认）✓。
+2. COM 失败兜底：GateForceComFail 版装 `kyn gate b`，日志确认钩子生效落兜底，兜底任务
+   Command=`"…watchdog.exe"` Arguments 完整（含空格目录拆分正确，旧单引号会在空格截断），
+   schtasks /Run 实际运行，进程实证启动（GPT 要求的「实际运行」达成）✓。
+3. 包装升级保留：c 目录先装建基线 → 手工改写任务为 wscript 包装+WorkingDirectory=C:\Windows
+   （模拟运维处置）→ 升级装 → 日志命中 preserving 分支，Execute/Arguments/WorkingDirectory
+   三字段原样 ✓。
+4. 清理：a/b/c 三目录静默卸载 + GATE 任务清零 + 测试目录删除 + 残留 tray 进程击杀，生产
+   实例零触碰（指纹+后缀双隔离生效）。
+
+### 发版与否
+
+**未发版**（按任务卡：REQUEST_CHANGES → 只做指出的改动，不 tag，报告即止）。PR #45
+最新 Head（3f3d6bc）CI #172 绿（2m37s completed successfully）。合并 main 与 tag v0.4.0
+等用户指令或 GPT 下一轮确认（裁决原文已给预授权路径：修正通过→合并 main→tag 指向
+main→release.yml→验收资产）。
+
+### 下一步
+
+1. 用户确认后执行既定流程：merge PR #45 → pull main → tag v0.4.0（打在 main）→ 推 tag
+   → release.yml 出包 → 资产 10 项核验。
+2. 遗留一条安装器经验待入宪法/记忆：iss 内 COM/格式化行为必须真机安装验证，接口级
+   验证不可替代（本次 StartBoundary 即反例）。
+
 ## 2026-10-25（调度触发 07:15 +08:00 / 实际执行 07:20–09:3x）
 
 ### 巡检发现
@@ -138,3 +198,22 @@ PR #41 合并成功 + 官网 kynoptic.com 显示 v0.3.2 可访问并核实。未
 - api.github.com 匿名配额整点恢复（remaining 59）：补上了晨间没查成的 Issues——全仓 open issues+PRs 仅 #41 自身，无新用户反馈。
 - 复查：Cargo.toml/README 均 v0.3.2、CHANGELOG [Unreleased] 空、本地 main=79f58bb 树干净（仅本日志未跟踪）；SSH fetch 确认远端 main 仍 8467d2a（#41 未合并）。依赖 67 项沿用晨间结论（2 小时内不重复跑）。
 - 本轮裁定：晨间 GPT APPROVE（M1+M2 附约束）仍是当前有效裁决，状态零变化、不重提提案、零代码变更。M2 继续等用户完成 2FA；合并前「发布资产完成、主分支同步未完成」状态不变。
+
+## 2026-10-26（用户直接下发运维审查修复批，00:0x–00:2x）
+
+### 巡检发现（用户提供，Lead 现场复核）
+
+1. P1 性能：GPU 静态信息（Win32_VideoController）每 10s 重查——纯静态字段按动态节奏跑 PS 冷启动。
+2. P1 治理：安装器 RebuildWatchdogTask 裸 exe /Create 静默覆盖运维 wscript 包装（本机任务实况：action=wscript run-hidden.vbs "Kynoptic Watchdog 46516965"）。
+3. P2 看门狗：/SC MINUTE 默认 DisallowStartIfOnBatteries=true 且无 LogonTrigger——电池模式停摆。
+4. P2 冗余：tray/watchdog 均 GUI 子系统直启不弹窗，vbs 包装多余且制造竞态（duplicate-start.log 26 条「已有实例」）；本机 5 exe 已被另一会话 19:19 改 .off 停用——本轮不翻转该状态（属运维会话所有，装 0.4.0 后统一治理）。
+5. P3：nvidia-smi 无超时；location 空占位被启用无披露。
+6. 事实核对：任务名指纹 46516965=安装目录哈希（naming.rs 带测试向量），防多目录互抢，设计正确，无需改。
+
+### 执行（GPT 终审前，用户「有问题都修复」直接授权）
+
+- gpu.rs：静态信息 10min TTL 缓存（PS 冷启动 6 次/分→0.1 次/分）+ nvidia-smi 3s 有界等待。切片验证：monitors::gpu 6/6、core 全 lib 217/217、clippy -D warnings 干净。
+- kynoptic.iss：RebuildWatchdogTask 重写为 COM ITaskService 注册（电池限制取消 + LogonTrigger + PT1M + IgnoreNew + PT10M，CREATE_OR_UPDATE 原子覆盖）+ 既有 wscript 包装探测原样保留 + COM 失败兜底 schtasks 老路径。验证：本地装 Inno Setup 6.7.3（含 pin 版中文 isl）ISCC 编译通过；COM 语义经 PowerShell 同接口真机验证——临时任务 XML 逐项核对（电池 false/LogonTrigger/PT1M/IgnoreNew/PT10M 全落位）后即删。
+- registry：location 描述如实改「占位监控（不采集任何数据）」。
+- 本机态势：未触碰（.off 停用与 wscript 包装均为运维会话状态）；建议装 0.4.0 后删 K:\ops\bin\run-hidden.vbs 包装层（任务会被新安装器以电池友好配置重建）。
+- 待 GPT 终审后并入 v0.4.0 发版波（F1+F2 已在分支，发版提交 69f492f + 本批 e5a37fc）。
