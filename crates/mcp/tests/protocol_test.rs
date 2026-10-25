@@ -140,7 +140,8 @@ fn full_initialize_list_call_roundtrip() {
         json!("2024-11-05")
     );
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    // 0.4.0 新增 get_topics（F2）：七工具
+    assert_eq!(tools.len(), 7);
 
     let status = text_payload(&responses[2]);
     assert_eq!(status["cpu_pct"], json!(12.0));

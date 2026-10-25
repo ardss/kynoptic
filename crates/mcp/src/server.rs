@@ -230,6 +230,24 @@ impl McpServer {
                 }
                 Ok(v)
             }
+            "get_topics" => {
+                let from = match str_arg(args, "from")? {
+                    Some(f) => f.to_string(),
+                    None => default_from(),
+                };
+                let to = match str_arg(args, "to")? {
+                    Some(t) => t.to_string(),
+                    None => chrono::Utc::now().to_rfc3339(),
+                };
+                // raw=true 走显式原始读取路径（仍过敏感词表；默认脱敏键）
+                let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+                let (limit, clamped_to) = parse_limit(args)?;
+                let mut v = state::topics(&conn, &from, &to, raw, limit)?;
+                if let Some(n) = clamped_to {
+                    v["clamped_to"] = json!(n);
+                }
+                Ok(v)
+            }
             "get_anomalies" => {
                 // 审查 P2：days=1.5/"3"/true 这类错型此前静默回退 1 天，与
                 // limit 的硬错误约定矛盾——改为同样报错。
@@ -430,7 +448,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_top_apps",
-            "description": "窗口 [from,to) 内各前台应用的驻留秒数排行（降序）。驻留 = 相邻 window/switch 事件间隔，末段计到 to。适合『上周二我用的哪个工具/应用』这类问题。裸日期按本地日界解析",
+            "description": "窗口 [from,to) 内各前台应用的驻留秒数排行（降序）。驻留 = 相邻 window/switch 事件间隔，末段计到 to。响应另带五类 actor 驻留估算（estimated_actor_dwell_sec: user/agent/unattended/mixed/unknown，agent=注入输入代理指标非必为 AI；未归属秒数单列 unattributed_sec）。适合『上周二我用的哪个工具/应用』这类问题。裸日期按本地日界解析",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -438,6 +456,20 @@ fn tool_definitions() -> Vec<Value> {
                     "from": { "type": "string", "description": "起始（RFC3339 或 YYYY-MM-DD，裸日期按本地时区 00:00），默认今日起点" },
                     "to": { "type": "string", "description": "结束（RFC3339 或 YYYY-MM-DD，裸日期含该本地日全天），默认现在" },
                     "limit": limit_schema("最多返回应用数；超过 100 钳到 100 并带 clamped_to"),
+                }
+            },
+        }),
+        json!({
+            "name": "get_topics",
+            "description": "窗口 [from,to) 内主题聚合（窗口标题去浏览器尾缀聚类，source=title）。默认输出脱敏键（主标题级）；raw=true 走显式原始读取路径且仍过滤敏感标题（敏感键恒 <redacted:sensitive>，绝不从脱敏键假装恢复明文）。响应带 actor 驻留估算（口径同 get_top_apps）",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "from": { "type": "string", "description": "起始（RFC3339 或 YYYY-MM-DD，裸日期按本地时区 00:00），默认今日起点" },
+                    "to": { "type": "string", "description": "结束（RFC3339 或 YYYY-MM-DD，裸日期含该本地日全天），默认现在" },
+                    "raw": { "type": "boolean", "default": false, "description": "显式授权读取未脱敏主题键（仍过滤敏感标题）" },
+                    "limit": limit_schema("最多返回主题数；超过 100 钳到 100 并带 clamped_to"),
                 }
             },
         }),
@@ -776,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_six_spec_tools() {
+    fn tools_list_has_spec_tools() {
         let srv = McpServer::new(":memory:");
         let resp = srv
             .handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
@@ -794,6 +826,7 @@ mod tests {
                 "get_summary",
                 "get_timeline",
                 "get_top_apps",
+                "get_topics",
                 "get_anomalies",
                 "wait_for"
             ]
@@ -966,6 +999,26 @@ mod tests {
         .unwrap();
     }
 
+    /// 带窗口标题的 switch 行（get_topics 的 channel/主题归一测试用）。
+    fn insert_window_switch_titled(db: &str, ts: &str, app: &str, title: &str) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,'window','switch',json_object('title',?4),?2,?3,NULL)",
+            rusqlite::params![ts, app, title, title],
+        )
+        .unwrap();
+    }
+
+    /// 带分钟证据的 input_agg 行（actor 判定测试用）。
+    fn insert_input_agg(db: &str, ts: &str, data: &str) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,'keyboard','input_agg',?2,'','',NULL)",
+            rusqlite::params![ts, data],
+        )
+        .unwrap();
+    }
+
     fn call(srv: &McpServer, id: i32, name: &str, args: Value) -> Value {
         srv.handle(&json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
@@ -1028,6 +1081,12 @@ mod tests {
         insert_window_switch(&db, "2026-09-09T01:00:00+00:00", "code");
         insert_window_switch(&db, "2026-09-09T01:40:00+00:00", "web");
         insert_window_switch(&db, "2026-09-09T01:50:00+00:00", "code");
+        // 01:05 分钟真人输入（10 键）→ code 区间的该分钟 user 60s
+        insert_input_agg(
+            &db,
+            "2026-09-09T01:05:30+00:00",
+            r#"{"keys":10,"samples":10}"#,
+        );
         let srv = McpServer::new(&db);
         let r = call(
             &srv,
@@ -1046,6 +1105,99 @@ mod tests {
         assert_eq!(apps[0]["app"], json!("code"));
         assert_eq!(apps[0]["dwell_sec"], json!(3000));
         assert_eq!(apps[1]["dwell_sec"], json!(600));
+        // 0.4.0 F1：actor 拆分列（估算口径）+ 未归属秒数
+        assert_eq!(apps[0]["estimated_actor_dwell_sec"]["user"], json!(60));
+        assert_eq!(
+            apps[0]["estimated_actor_dwell_sec"]["unattended"],
+            json!(2940)
+        );
+        assert_eq!(apps[0]["agent_evidence_type"], json!("injected_input"));
+        assert!(v["unattributed_sec"].is_number());
+        assert!(v["actor_dwell_method"].is_string());
+    }
+
+    /// get_topics：主题聚合、脱敏默认、--raw 契约（不从脱敏键假装恢复明文）。
+    #[test]
+    fn get_topics_redaction_and_raw_contract() {
+        let (db, _guard) = mem_db_guarded();
+        // BrowserOS AI 通道：会话标题主题
+        insert_window_switch_titled(
+            &db,
+            "2026-09-09T01:00:00+00:00",
+            "chrome.exe",
+            "Kynoptic 架构讨论 - BrowserOS",
+        );
+        // 敏感标题：登录页
+        insert_window_switch_titled(
+            &db,
+            "2026-09-09T01:30:00+00:00",
+            "chrome.exe",
+            "登录 - Example",
+        );
+        insert_window_switch_titled(
+            &db,
+            "2026-09-09T02:00:00+00:00",
+            "chrome.exe",
+            "Kynoptic 架构讨论 - BrowserOS",
+        );
+        let srv = McpServer::new(&db);
+
+        // 默认（脱敏）：主标题级键
+        let r = call(
+            &srv,
+            1,
+            "get_topics",
+            json!({
+                "from": "2026-09-09T01:00:00+00:00",
+                "to": "2026-09-09T03:00:00+00:00"
+            }),
+        );
+        assert!(!r["isError"].as_bool().unwrap(), "{r}");
+        let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["redacted"], json!(true));
+        let topics = v["topics"].as_array().unwrap();
+        let kyn = topics
+            .iter()
+            .find(|t| t["topic"] == json!("Kynoptic 架构讨论"))
+            .expect("架构讨论主题应在");
+        assert_eq!(kyn["source"], json!("title"));
+        // [01:00,01:30) 1800s + 尾段 [02:00,03:00) 3600s = 5400s（channel 列）
+        assert_eq!(kyn["browseros_sec"], json!(5400));
+        let sens = topics
+            .iter()
+            .find(|t| t["topic"] == json!("<redacted:sensitive>"))
+            .expect("敏感标题应聚合为脱敏键");
+        assert_eq!(sens["sensitive"], json!(true));
+        assert!(
+            !serde_json::to_string(&v).unwrap().contains("登录"),
+            "默认输出不得含敏感明文"
+        );
+
+        // --raw：显式原始路径；敏感键仍恒脱敏（双保险），非敏感恢复全标题
+        let r = call(
+            &srv,
+            2,
+            "get_topics",
+            json!({
+                "from": "2026-09-09T01:00:00+00:00",
+                "to": "2026-09-09T03:00:00+00:00",
+                "raw": true
+            }),
+        );
+        let v2: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v2["redacted"], json!(false));
+        let kyn2 = v2["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["topic"] == json!("Kynoptic 架构讨论"))
+            .expect("raw 模式应保留去尾缀全标题");
+        assert_eq!(kyn2["source"], json!("title"));
+        let sens_str = serde_json::to_string(&v2).unwrap();
+        assert!(
+            !sens_str.contains("登录 - Example"),
+            "--raw 也不得输出敏感明文（双保险）"
+        );
     }
 
     /// KYNOPTIC_DB 环境变量决定数据面连的库（`kynoptic mcp --db` 经 cli 的

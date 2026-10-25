@@ -82,6 +82,45 @@ ON CONFLICT(date, bucket_id) DO UPDATE SET
     count_value = COALESCE(count_value, 0) + excluded.count_value
 ";
 
+// ─── actor 证据缓存（0.4.0 F1，migration 0011）───────────────────────────────
+// 契约（GPT 0.4.0 勘误 3）：agg_minute_actor 只存**单条输入事件可推导**的
+// 分钟级证据计数；actor/channel/前台覆盖标签在查询层计算（queries/actor.rs），
+// 绝不作为累加桶落库。合并语义与 agg_minute 对应桶逐条一致：
+// - input_agg 行 → 快照 MAX 合并（UPSERT_ACTOR_SNAPSHOT，同 UPSERT_MINUTE_SNAPSHOT）
+// - raw press/click 行 → 守卫累加（UPSERT_ACTOR_ADD，同 UPSERT_MINUTE 的
+//   max_event_rowid WHERE 守卫：迟到重复投递整体跳过）
+// 一个 apply_event 事件只触达自己模态的列；其余列传 0（MAX/累加均无副作用）。
+const UPSERT_ACTOR_SNAPSHOT: &str = "
+INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
+                              clicks_total, clicks_injected, scroll_total, scroll_injected,
+                              max_event_rowid)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT(date, hour, minute) DO UPDATE SET
+    keys_total      = MAX(COALESCE(keys_total, 0), excluded.keys_total),
+    keys_injected   = MAX(COALESCE(keys_injected, 0), excluded.keys_injected),
+    clicks_total    = MAX(COALESCE(clicks_total, 0), excluded.clicks_total),
+    clicks_injected = MAX(COALESCE(clicks_injected, 0), excluded.clicks_injected),
+    scroll_total    = MAX(COALESCE(scroll_total, 0), excluded.scroll_total),
+    scroll_injected = MAX(COALESCE(scroll_injected, 0), excluded.scroll_injected),
+    max_event_rowid = MAX(COALESCE(max_event_rowid, 0), excluded.max_event_rowid)
+";
+
+const UPSERT_ACTOR_ADD: &str = "
+INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
+                              clicks_total, clicks_injected, scroll_total, scroll_injected,
+                              max_event_rowid)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT(date, hour, minute) DO UPDATE SET
+    keys_total      = COALESCE(keys_total, 0) + excluded.keys_total,
+    keys_injected   = COALESCE(keys_injected, 0) + excluded.keys_injected,
+    clicks_total    = COALESCE(clicks_total, 0) + excluded.clicks_total,
+    clicks_injected = COALESCE(clicks_injected, 0) + excluded.clicks_injected,
+    scroll_total    = COALESCE(scroll_total, 0) + excluded.scroll_total,
+    scroll_injected = COALESCE(scroll_injected, 0) + excluded.scroll_injected,
+    max_event_rowid = excluded.max_event_rowid
+    WHERE excluded.max_event_rowid > COALESCE(agg_minute_actor.max_event_rowid, 0)
+";
+
 /// 单个事件对聚合缓存的增量贡献（本地时区分钟桶）。
 ///
 /// `rowid` = 该事件在 events 表的 rowid（落库时分配；未知传 0 → 增量行被
@@ -199,6 +238,10 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
         _ => {}
     }
 
+    // ─── actor 证据缓存（0.4.0 F1，0011）：与上方 agg_minute 写入同一事件
+    // 同一事务内维护，双路径（增量/重建）逐行同语义 ───
+    apply_actor_event(conn, e, &date, hour, minute, rowid)?;
+
     // ─── app 日桶（统一口径，联合审查 P1-1）───
     // 增量路径此前只认 (Window, Switch)，与 rebuild_all / backfill_chunk /
     // events 回退查询（charts.rs top_apps_by_event_types 等）的谓词
@@ -226,6 +269,88 @@ fn json_counter(e: &Event, key: &str) -> i64 {
         .and_then(|v| v.get(key))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
+}
+
+/// 单个输入事件对 actor 证据缓存（agg_minute_actor）的增量贡献。
+///
+/// 列语义与 [`apply_event`] 对 agg_minute 对应桶的处理逐条一致：
+/// - (Keyboard, InputAgg)：keys_total/keys_injected 快照 MAX 合并
+/// - (Mouse, InputAgg)：clicks/scroll 各自快照 MAX 合并
+/// - (Keyboard, Press) / (Mouse, Click)：raw 行守卫累加（$.injected 拆注入列）
+/// - 其余事件（滚轮 raw 行、switch、系统等）：不写证据缓存（见迁移 0011 头注
+///   与 queries::SCROLL_ROW_EXPR 口径说明）
+///
+/// 失败向上传播由 [`apply_event`] 的调用方按条跳过并记日志（缓存可重建）。
+fn apply_actor_event(
+    conn: &Connection,
+    e: &Event,
+    date: &str,
+    hour: i64,
+    minute: i64,
+    rowid: i64,
+) -> rusqlite::Result<()> {
+    match (e.event_type, e.event_action) {
+        (EventType::Keyboard, EventAction::InputAgg) => {
+            let keys = json_counter(e, "keys").max(0);
+            let inj = json_counter(e, "injected_keys").max(0);
+            if keys > 0 || inj > 0 {
+                conn.execute(
+                    UPSERT_ACTOR_SNAPSHOT,
+                    params![date, hour, minute, keys, inj, 0, 0, 0, 0, rowid],
+                )?;
+            }
+        }
+        (EventType::Mouse, EventAction::InputAgg) => {
+            let clicks = json_counter(e, "clicks").max(0);
+            let inj_clicks = json_counter(e, "injected_clicks").max(0);
+            let scroll = json_counter(e, "scroll_ticks").max(0);
+            let inj_scroll = json_counter(e, "injected_scroll_ticks").max(0);
+            if clicks > 0 || inj_clicks > 0 || scroll > 0 || inj_scroll > 0 {
+                conn.execute(
+                    UPSERT_ACTOR_SNAPSHOT,
+                    params![
+                        date, hour, minute, 0, 0, clicks, inj_clicks, scroll, inj_scroll, rowid
+                    ],
+                )?;
+            }
+        }
+        (EventType::Keyboard, EventAction::Press) => {
+            let inj = i64::from(json_flag(e, "injected"));
+            conn.execute(
+                UPSERT_ACTOR_ADD,
+                params![date, hour, minute, 1, inj, 0, 0, 0, 0, rowid],
+            )?;
+        }
+        (EventType::Mouse, EventAction::Click) => {
+            let inj = i64::from(json_flag(e, "injected"));
+            conn.execute(
+                UPSERT_ACTOR_ADD,
+                params![date, hour, minute, 0, 0, 1, inj, 0, 0, rowid],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 测试专用入口：按事件时间戳自行解析本地分钟桶后调用
+/// [`apply_actor_event`]（与 apply_event 的桶计算同构）。生产路径不走这里——
+/// 增量写入统一在 [`apply_event`] 内部与 events 落库同事务完成。
+#[cfg(test)]
+pub(crate) fn apply_actor_event_for_test(
+    conn: &Connection,
+    e: &Event,
+    rowid: i64,
+) -> rusqlite::Result<()> {
+    let ts = match chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let local = ts.with_timezone(&chrono::Local);
+    let date = local.format("%Y-%m-%d").to_string();
+    let hour = local.hour() as i64;
+    let minute = local.minute() as i64;
+    apply_actor_event(conn, e, &date, hour, minute, rowid)
 }
 
 fn json_flag(e: &Event, key: &str) -> bool {
@@ -284,6 +409,20 @@ impl super::Database {
         )
     }
 
+    /// actor 证据缓存定向重建（0.4.0 F1）。只重算 agg_minute_actor，
+    /// events 与其余聚合缓存原样不动。返回缓存行数，失败返回 0。
+    pub fn rebuild_actor_agg(&self) -> usize {
+        self.with_writer(
+            |conn| {
+                crate::db::agg::rebuild_actor_cache(conn).unwrap_or_else(|e| {
+                    log::warn!("actor 证据缓存重建失败: {e}");
+                    0
+                })
+            },
+            || 0,
+        )
+    }
+
     /// 欠聚合核对 + 自愈（写连接上执行）。返回自愈的日期数（0 = 一致，无需自愈）。
     /// 供每日 maintenance 与需要显式触发自愈的调用方使用；启动路径在
     /// [`super::Database::open`] 的后台线程里做（不阻塞启动）。
@@ -328,6 +467,9 @@ pub fn rebuild_all(conn: &Connection) -> crate::Result<usize> {
 fn rebuild_all_inner(conn: &Connection, off: &str) -> crate::Result<usize> {
     conn.execute("DELETE FROM agg_minute", [])?;
     conn.execute("DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%'", [])?;
+    // actor 证据缓存随重建一并重算（同一事务，见外层 rebuild_all 的原子化）；
+    // 列语义与 apply_actor_event 增量路径逐条一致（同一组 *_ROW_EXPR 宏）。
+    conn.execute("DELETE FROM agg_minute_actor", [])?;
 
     // 分钟桶：一次 GROUP BY 本地分钟扫描，产出 4 类 bucket 行（单语句 UNION ALL，
     // 共享同一 CTE 扫描）。
@@ -400,6 +542,39 @@ fn rebuild_all_inner(conn: &Connection, off: &str) -> crate::Result<usize> {
         clicks_row = crate::queries::CLICKS_ROW_EXPR,
         inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
         inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+    ))?;
+
+    // actor 证据缓存重建：与 agg_minute 共享同一组表达式宏（keys/clicks/
+    // injected 列逐字一致；scroll 列见 SCROLL_ROW_EXPR——仅 mouse input_agg
+    // 行，与 presence 权威口径一致）。有任一证据的分钟才落行。
+    conn.execute_batch(&format!(
+        "INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
+                                      clicks_total, clicks_injected, scroll_total, scroll_injected,
+                                      max_event_rowid)
+         WITH m AS (
+           SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d,
+                  CAST(substr(datetime(timestamp, '{off}'), 12, 2) AS INTEGER) AS h,
+                  CAST(substr(datetime(timestamp, '{off}'), 15, 2) AS INTEGER) AS mi,
+                  MAX(id) AS maxid,
+                  SUM({keys_row}) AS keys,
+                  SUM({clicks_row}) AS clicks,
+                  SUM({inj_keys_row}) AS ikeys,
+                  SUM({inj_clicks_row}) AS iclicks,
+                  SUM({scroll_row}) AS scroll,
+                  SUM({inj_scroll_row}) AS iscroll
+           FROM events
+           WHERE event_type IN ('keyboard','mouse')
+           GROUP BY d, h, mi
+         )
+         SELECT d, h, mi, keys, ikeys, clicks, iclicks, scroll, iscroll, maxid FROM m
+         WHERE keys > 0 OR ikeys > 0 OR clicks > 0 OR iclicks > 0 OR scroll > 0 OR iscroll > 0;",
+        off = off,
+        keys_row = crate::queries::KEYS_ROW_EXPR,
+        clicks_row = crate::queries::CLICKS_ROW_EXPR,
+        inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+        inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+        scroll_row = crate::queries::SCROLL_ROW_EXPR,
+        inj_scroll_row = crate::queries::INJECTED_SCROLL_ROW_EXPR,
     ))?;
 
     let n = conn.query_row("SELECT COUNT(*) FROM agg_minute", [], |r| r.get(0))?;
@@ -511,6 +686,109 @@ pub fn backfill_if_needed(conn: &Connection) -> bool {
             false
         }
     }
+}
+
+/// actor 证据缓存定向重建（不动 agg_minute / agg_daily，幂等）：
+/// DELETE 全表后按 rebuild 同一 SQL 重算。供存量库首开 bootstrap
+/// （migration 0011 后缓存为空）与 `recompute-actors` CLI 使用——
+/// 只写本派生缓存，events 原样不动（GPT 验收门禁：历史回算不改 events）。
+pub fn rebuild_actor_cache(conn: &Connection) -> crate::Result<usize> {
+    rebuild_actor_cache_inner(conn, None)
+}
+
+/// [`rebuild_actor_cache`] 的本地日期范围版（含两端）：只重算
+/// `[from, to]` 内日期的缓存行。`kynoptic-ctl recompute-actors --from --to` 用。
+pub fn rebuild_actor_cache_range(conn: &Connection, from: &str, to: &str) -> crate::Result<usize> {
+    rebuild_actor_cache_inner(conn, Some((from, to)))
+}
+
+fn rebuild_actor_cache_inner(
+    conn: &Connection,
+    date_range: Option<(&str, &str)>,
+) -> crate::Result<usize> {
+    let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
+    let own_tx = conn.is_autocommit();
+    if own_tx {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    let r = (|| -> crate::Result<usize> {
+        match date_range {
+            Some((from, to)) => {
+                conn.execute(
+                    "DELETE FROM agg_minute_actor WHERE date >= ?1 AND date <= ?2",
+                    params![from, to],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM agg_minute_actor", [])?;
+            }
+        }
+        let range_where = match date_range {
+            // 日期列由本地钟面生成，字符串比较即字典序（rebuild 同款）
+            Some((from, to)) => format!(
+                " WHERE substr(datetime(timestamp, '{off}'), 1, 10) BETWEEN '{from}' AND '{to}'"
+            ),
+            None => String::new(),
+        };
+        conn.execute_batch(&format!(
+            "INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
+                                          clicks_total, clicks_injected, scroll_total, scroll_injected,
+                                           max_event_rowid)
+             WITH m AS (
+               SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d,
+                      CAST(substr(datetime(timestamp, '{off}'), 12, 2) AS INTEGER) AS h,
+                      CAST(substr(datetime(timestamp, '{off}'), 15, 2) AS INTEGER) AS mi,
+                      MAX(id) AS maxid,
+                      SUM({keys_row}) AS keys,
+                      SUM({clicks_row}) AS clicks,
+                      SUM({inj_keys_row}) AS ikeys,
+                      SUM({inj_clicks_row}) AS iclicks,
+                      SUM({scroll_row}) AS scroll,
+                      SUM({inj_scroll_row}) AS iscroll
+               FROM events
+               WHERE event_type IN ('keyboard','mouse'){range_where}
+               GROUP BY d, h, mi
+             )
+             SELECT d, h, mi, keys, ikeys, clicks, iclicks, scroll, iscroll, maxid FROM m
+             WHERE keys > 0 OR ikeys > 0 OR clicks > 0 OR iclicks > 0 OR scroll > 0 OR iscroll > 0;",
+            off = off,
+            range_where = range_where,
+            keys_row = crate::queries::KEYS_ROW_EXPR,
+            clicks_row = crate::queries::CLICKS_ROW_EXPR,
+            inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+            inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+            scroll_row = crate::queries::SCROLL_ROW_EXPR,
+            inj_scroll_row = crate::queries::INJECTED_SCROLL_ROW_EXPR,
+        ))?;
+        Ok(conn.query_row("SELECT COUNT(*) FROM agg_minute_actor", [], |r| r.get(0))?)
+    })();
+    if own_tx {
+        match r {
+            Ok(_) => conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    r
+}
+
+/// actor 证据缓存 bootstrap 门槛：缓存空而 events 有输入行 → 存量库首开需补齐。
+/// 查询层对缺行日期回退 events 现算（queries/actor.rs），此 bootstrap 只是提速。
+pub fn actor_backfill_needed(conn: &Connection) -> bool {
+    let has_events: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_type IN ('keyboard','mouse'))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let has_actor: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM agg_minute_actor)", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(false);
+    has_events && !has_actor
 }
 
 /// 回填门槛检查（便宜：两条 EXISTS）。agg 非空时不回填——既有增量维护负责
@@ -699,6 +977,45 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                 dend = dend,
             ))?;
         }
+
+        // actor 证据缓存同块重算（与 agg_minute 同事务；列语义与增量
+        // apply_actor_event 及 rebuild 路径逐字一致，同一组表达式宏）。
+        conn.execute(
+            "DELETE FROM agg_minute_actor WHERE date = ?1 AND hour = ?2",
+            params![date, hour],
+        )?;
+        conn.execute_batch(&format!(
+            "INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
+                                          clicks_total, clicks_injected, scroll_total, scroll_injected,
+                                           max_event_rowid)
+             WITH m AS (
+               SELECT CAST(substr(datetime(timestamp, '{off}'), 15, 2) AS INTEGER) AS mi,
+                      MAX(id) AS maxid,
+                      SUM({keys_row}) AS keys,
+                      SUM({clicks_row}) AS clicks,
+                      SUM({inj_keys_row}) AS ikeys,
+                      SUM({inj_clicks_row}) AS iclicks,
+                      SUM({scroll_row}) AS scroll,
+                      SUM({inj_scroll_row}) AS iscroll
+               FROM events
+               WHERE event_type IN ('keyboard','mouse')
+                 AND timestamp >= '{start}' AND timestamp < '{end}'
+               GROUP BY mi
+             )
+             SELECT '{date}', {hour}, mi, keys, ikeys, clicks, iclicks, scroll, iscroll, maxid FROM m
+             WHERE keys > 0 OR ikeys > 0 OR clicks > 0 OR iclicks > 0 OR scroll > 0 OR iscroll > 0;",
+            off = off,
+            keys_row = crate::queries::KEYS_ROW_EXPR,
+            clicks_row = crate::queries::CLICKS_ROW_EXPR,
+            inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+            inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+            scroll_row = crate::queries::SCROLL_ROW_EXPR,
+            inj_scroll_row = crate::queries::INJECTED_SCROLL_ROW_EXPR,
+            start = start,
+            end = end,
+            date = date,
+            hour = hour,
+        ))?;
         Ok(())
     })();
     match r {

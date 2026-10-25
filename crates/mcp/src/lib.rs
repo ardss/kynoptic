@@ -21,6 +21,8 @@ pub enum Tool {
     GetTimeline,
     /// C2. get_top_apps —— 窗口内应用驻留排行
     GetTopApps,
+    /// F2（0.4.0）. get_topics —— 窗口内主题聚合排行（默认脱敏键）
+    GetTopics,
     /// D. get_anomalies —— 异常事件列表
     GetAnomalies,
     /// E. wait_for —— 阻塞轮询兜底（MCP Tool 无推送语义）
@@ -34,6 +36,7 @@ impl Tool {
             Tool::GetSummary => "get_summary",
             Tool::GetTimeline => "get_timeline",
             Tool::GetTopApps => "get_top_apps",
+            Tool::GetTopics => "get_topics",
             Tool::GetAnomalies => "get_anomalies",
             Tool::WaitFor => "wait_for",
         }
@@ -45,6 +48,7 @@ impl Tool {
             Tool::GetSummary,
             Tool::GetTimeline,
             Tool::GetTopApps,
+            Tool::GetTopics,
             Tool::GetAnomalies,
             Tool::WaitFor,
         ]
@@ -89,6 +93,7 @@ mod tests {
                 "get_summary",
                 "get_timeline",
                 "get_top_apps",
+                "get_topics",
                 "get_anomalies",
                 "wait_for"
             ]

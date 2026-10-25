@@ -8,6 +8,8 @@
 //! - 0002：开放 bucket 模型（schema_meta / buckets / event_types / agg_minute /
 //!   agg_daily / current_state）+ pet 遗留表清理
 //! - 0010：device_snapshot「最新含字段快照」部分索引（api_input / overview 硬件卡）
+//! - 0011：actor 证据缓存 agg_minute_actor（0.4.0 F1——只存分钟级输入证据计数，
+//!   actor/channel/E_f 标签在查询层计算，见 queries/actor.rs）
 //!
 //! PRAGMA 只在 [`apply_pragmas`] 出现一次。
 
@@ -53,6 +55,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0010_snapshot_partial_idx",
         include_str!("migrations/0010_snapshot_partial_idx.sql"),
+    ),
+    (
+        "0011_actor_evidence",
+        include_str!("migrations/0011_actor_evidence.sql"),
     ),
 ];
 

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Core (db): the actor evidence cache `agg_minute_actor` (schema migration
+  0011) stores per-minute input evidence counts only — total/injected keys,
+  clicks, and scroll ticks — maintained by the same three paths as the
+  existing aggregates (same-transaction incremental writes, full rebuild,
+  chunked backfill/heal) with row-level parity tests. Actor labels, AI-channel
+  flags, and foreground coverage are intentionally NOT stored: they are
+  derived in the query layer from window-switch intervals (joint review
+  contract 0.4.0, correction 3). Existing `agg_minute`/`agg_daily` rows and
+  their semantics are untouched. `kynoptic-ctl recompute-actors
+  [--from/--to] [--dry-run]` rebuilds this derived cache only; raw events
+  are never modified.
+
+- Core (queries): `foreground_actor_dwell` classifies foreground coverage
+  into five mutually-exclusive per-minute actors — `user` (human input),
+  `agent` (injected input; a proxy metric with `evidence_type=injected_input`,
+  not a claim that an AI did it), `mixed`, `unattended` (foreground, no
+  input), `unknown` (uncovered minutes: collection gaps, pre-first-switch,
+  stalls beyond the 2h cap — never silently merged into other classes).
+  Per-app seconds are split by foreground-overlap allocation and reported as
+  `estimated_actor_dwell_sec` (an estimate, not precise engaged time).
+  A `browseros` channel column (configurable title-suffix rule, default
+  " - BrowserOS") is auxiliary evidence only and never overrides the five
+  classes; `ai_suspect = agent ∪ (browseros ∧ unattended)` is a clearly
+  labeled speculative composite. The 0.3.2 `foreground_dwell_by_app`
+  behavior is unchanged.
+
+- Core (queries): `topics_summary` — window-title topic aggregation with
+  explicit source labels (`title` today; `domain` stays empty until events
+  carry verifiable URLs — never inferred from titles). Sensitive titles
+  (login/token/credential/password patterns) collapse to
+  `<redacted:sensitive>` and never surface as plaintext, including on the
+  explicit `--raw` path; non-sensitive keys are reported at main-title
+  granularity by default.
+
+- CLI: `kynoptic apps [--days N] [--actor CLASS] [--json]` — per-day per-app
+  actor dwell estimates with unknown/unattributed seconds shown explicitly;
+  `kynoptic topics [--days N] [--raw] [--json]` — topic aggregation with
+  redaction defaults; `kynoptic recompute-actors [--from YYYY-MM-DD]
+  [--to YYYY-MM-DD] [--dry-run]` — explicit one-shot actor-cache backfill
+  (never touches events, never runs automatically).
+
+- MCP: `get_top_apps` responses now include the per-app actor split
+  (`estimated_actor_dwell_sec`, `agent_evidence_type`, `browseros_sec`) plus
+  `unattributed_sec` and the method note; new `get_topics` tool (default
+  redacted keys, `raw` opt-in still filters sensitive titles), bringing the
+  tool surface to seven.
+
 ## [0.3.2] - 2026-10-24
 
 ### Changed

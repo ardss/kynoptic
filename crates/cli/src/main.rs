@@ -74,6 +74,11 @@ Subcommands:
   update [--check]                          Self-update from GitHub releases (--check: report only)
   watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary
+  apps      [--days N] [--actor user|agent|unattended|mixed|unknown|all] [--json]
+                                             Per-app actor dwell estimate (0.4.0; estimated split)
+  topics    [--days N] [--raw] [--json]     Topic aggregation from window titles (0.4.0; default redacted)
+  recompute-actors [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run]
+                                             Rebuild actor evidence cache (derived only; events untouched)
 
 Global options (all subcommands unless noted):
   --db PATH   Explicit db path, overrides the default resolution. When absent, \
@@ -2261,6 +2266,340 @@ fn cmd_presence(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ─── 0.4.0 F1/F2：apps / topics / recompute-actors ─────────────────────────
+// 契约要点（GPT 0.4.0 修订裁决）：应用级秒数是按前台覆盖分摊的估算值
+// （estimated_actor_dwell_sec）；agent = 注入输入代理指标（injected_input），
+// 不宣称一定来自 AI Agent；unknown/unattributed 必须显式可见，不静默归并。
+
+/// 解析 `--days N`（缺省 1，上限 365）。
+fn parse_days_arg(args: &[String], default: u32) -> Result<u32> {
+    let mut days = default;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--days" {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| Error::InvalidData("--days 需要一个数字".into()))?;
+            days = v
+                .parse::<u32>()
+                .map_err(|_| Error::InvalidData(format!("--days 不是合法数字: {v}")))?;
+            if days == 0 || days > 365 {
+                return Err(Error::InvalidData("--days 必须在 1..=365".into()));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(days)
+}
+
+fn fmt_dwell_split(
+    d: &kynoptic_core::queries::actor::EstimatedActorDwellSec,
+    filter: &str,
+) -> String {
+    let part = |label: &str, secs: i64, show: bool| -> String {
+        if show {
+            format!("{label}={secs}s ")
+        } else {
+            String::new()
+        }
+    };
+    let all = filter == "all";
+    format!(
+        "{}{}{}{}{}",
+        part("user", d.user, all || filter == "user"),
+        part("agent", d.agent, all || filter == "agent"),
+        part("unattended", d.unattended, all || filter == "unattended"),
+        part("mixed", d.mixed, all || filter == "mixed"),
+        part("unknown", d.unknown, all || filter == "unknown"),
+    )
+}
+
+/// `kynoptic apps`：按日的前台应用 actor 驻留估算（0.4.0 F1）。
+fn cmd_apps(args: &[String]) -> Result<()> {
+    let days = parse_days_arg(args, 1)?;
+    let mut filter = "all".to_string();
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--days" => i += 2,
+            "--actor" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| Error::InvalidData("--actor 需要取值".into()))?;
+                if !matches!(
+                    v.as_str(),
+                    "user" | "agent" | "unattended" | "mixed" | "unknown" | "all"
+                ) {
+                    return Err(Error::InvalidData(format!(
+                        "--actor 取值非法: {v}（user|agent|unattended|mixed|unknown|all）"
+                    )));
+                }
+                filter = v.clone();
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "apps 未知选项: {other}（支持 --days/--actor/--json）"
+                )));
+            }
+        }
+    }
+    let db_path = resolve_db();
+    let conn = open_db_read(&db_path)?;
+    let rules = kynoptic_core::queries::actor::ActorRules::default();
+    let mut all_rows: Vec<serde_json::Value> = Vec::new();
+    println!("=== Actor dwell last {days} day(s) (estimated; agent=injected_input proxy) ===");
+    for offset in (1 - days as i64)..=0 {
+        let date = queries::date_offset_str(offset);
+        let Some((start, end)) = queries::local_day_range(&date) else {
+            continue;
+        };
+        let (rows, uncovered) = queries::actor::foreground_actor_dwell(
+            &conn,
+            &start,
+            &end,
+            queries::FG_DWELL_STALL_CAP_SECS,
+            false,
+            &rules,
+        );
+        if json {
+            for r in &rows {
+                let d = &r.estimated_actor_dwell_sec;
+                all_rows.push(serde_json::json!({
+                    "date": date,
+                    "app": r.app,
+                    "estimated_actor_dwell_sec": {
+                        "user": d.user,
+                        "agent": d.agent,
+                        "unattended": d.unattended,
+                        "mixed": d.mixed,
+                        "unknown": d.unknown,
+                    },
+                    "browseros_sec": r.browseros_sec,
+                }));
+            }
+            all_rows.push(serde_json::json!({
+                "date": date, "app": "(unattributed)", "estimated_actor_dwell_sec": {
+                    "user": 0, "agent": 0, "unattended": 0, "mixed": 0, "unknown": uncovered,
+                },
+                "browseros_sec": 0,
+            }));
+            continue;
+        }
+        println!("{date}:");
+        for r in &rows {
+            let d = &r.estimated_actor_dwell_sec;
+            println!(
+                "  {:<28} total={:>6}s  {}browseros={:>6}s",
+                r.app,
+                d.total(),
+                fmt_dwell_split(d, &filter),
+                r.browseros_sec
+            );
+        }
+        println!(
+            "  {:<28} total={:>6}s  （无前台覆盖/停摆超限，不归属任何应用）",
+            "(unattributed)", uncovered
+        );
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "apps": all_rows,
+                "method": kynoptic_core::queries::actor::FG_ACTOR_DWELL_METHOD,
+                "agent_evidence_type": kynoptic_core::queries::actor::EstimatedActorDwellSec::AGENT_EVIDENCE_TYPE,
+            }))
+            .map_err(|e| Error::InvalidData(format!("JSON 序列化失败: {e}")))?
+        );
+    }
+    Ok(())
+}
+
+/// `kynoptic topics`：按日的主题聚合（0.4.0 F2，默认脱敏键；--raw 显式原始路径）。
+fn cmd_topics(args: &[String]) -> Result<()> {
+    let days = parse_days_arg(args, 1)?;
+    let mut raw = false;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--days" => i += 2,
+            "--raw" => {
+                raw = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "topics 未知选项: {other}（支持 --days/--raw/--json）"
+                )));
+            }
+        }
+    }
+    let db_path = resolve_db();
+    let conn = open_db_read(&db_path)?;
+    let rules = kynoptic_core::queries::actor::ActorRules::default();
+    let mut all_rows: Vec<serde_json::Value> = Vec::new();
+    println!(
+        "=== Topics last {days} day(s) ({} keys; sensitive titles always redacted) ===",
+        if raw { "raw" } else { "redacted" }
+    );
+    for offset in (1 - days as i64)..=0 {
+        let date = queries::date_offset_str(offset);
+        let Some((start, end)) = queries::local_day_range(&date) else {
+            continue;
+        };
+        let topics = queries::actor::topics_summary(
+            &conn,
+            &start,
+            &end,
+            queries::FG_DWELL_STALL_CAP_SECS,
+            false,
+            &rules,
+            raw,
+        );
+        if json {
+            for t in &topics {
+                let d = &t.estimated_actor_dwell_sec;
+                all_rows.push(serde_json::json!({
+                    "date": date,
+                    "topic": t.topic,
+                    "source": t.source.as_str(),
+                    "sensitive": t.sensitive,
+                    "event_count": t.event_count,
+                    "estimated_actor_dwell_sec": {
+                        "user": d.user, "agent": d.agent, "unattended": d.unattended,
+                        "mixed": d.mixed, "unknown": d.unknown,
+                    },
+                    "browseros_sec": t.browseros_sec,
+                }));
+            }
+            continue;
+        }
+        println!("{date}:");
+        if topics.is_empty() {
+            println!("  (no topics)");
+            continue;
+        }
+        for t in &topics {
+            let d = &t.estimated_actor_dwell_sec;
+            println!(
+                "  {:<36} [{source}] events={:<5} total={:>6}s {}",
+                t.topic,
+                t.event_count,
+                d.total(),
+                fmt_dwell_split(d, "all"),
+                source = t.source.as_str(),
+            );
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "topics": all_rows,
+                "redacted": !raw,
+                "method": kynoptic_core::queries::actor::TOPIC_METHOD,
+            }))
+            .map_err(|e| Error::InvalidData(format!("JSON 序列化失败: {e}")))?
+        );
+    }
+    Ok(())
+}
+
+/// `kynoptic recompute-actors`：actor 证据缓存显式回算（0.4.0 F1 验收）。
+/// 只写 agg_minute_actor（可重建派生缓存），events 与其余聚合缓存原样不动；
+/// --dry-run 只打印计划不落库。不做全库后台重算、不自动跑（契约）。
+fn cmd_recompute_actors(args: &[String]) -> Result<()> {
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut dry = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" => {
+                from = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| Error::InvalidData("--from 需要日期".into()))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--to" => {
+                to = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| Error::InvalidData("--to 需要日期".into()))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--dry-run" => {
+                dry = true;
+                i += 1;
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "recompute-actors 未知选项: {other}（支持 --from/--to/--dry-run）"
+                )));
+            }
+        }
+    }
+    regex_ok_date(from.as_deref())?;
+    regex_ok_date(to.as_deref())?;
+    let db_path = resolve_db();
+    let conn = open_db(&db_path)?;
+    let scope = match (&from, &to) {
+        (Some(f), Some(t)) => format!("{f} .. {t}"),
+        (Some(f), None) => format!("{f} .. (末尾)"),
+        (None, Some(t)) => format!("(开头) .. {t}"),
+        (None, None) => "(全库)".to_string(),
+    };
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM agg_minute_actor", [], |r| r.get(0))
+        .unwrap_or(0);
+    if dry {
+        println!("dry-run: 将重算 actor 证据缓存 范围={scope} 当前缓存行={before}（不落库）");
+        println!("events 只读不动；agg_minute/agg_daily 不受影响。");
+        return Ok(());
+    }
+    let n = match (&from, &to) {
+        (Some(f), Some(t)) => crate::db::agg::rebuild_actor_cache_range(&conn, f, t),
+        _ => crate::db::agg::rebuild_actor_cache(&conn),
+    }
+    .map_err(|e| Error::InvalidData(format!("actor 证据缓存重算失败: {e}")))?;
+    println!("✓ actor 证据缓存重算完成 范围={scope} 缓存行={n}（此前 {before}）");
+    println!("events 只读未动；增量路径自此维护新鲜度。");
+    Ok(())
+}
+
+/// YYYY-MM-DD 宽松校验（recompute-actors 入参防呆）。
+fn regex_ok_date(s: Option<&str>) -> Result<()> {
+    if let Some(s) = s {
+        let b = s.as_bytes();
+        let ok = b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+        if !ok {
+            return Err(Error::InvalidData(format!("日期格式应为 YYYY-MM-DD: {s}")));
+        }
+    }
+    Ok(())
+}
+
 /// `kynoptic watchdog`：托盘看门狗（给计划任务每分钟调一次，`--once` 单次检查）。
 /// 探活 = 打开托盘的命名互斥体；托盘不在且非用户主动退出（无旗标）才拉起。
 /// 常驻模式（默认）每 15s 检查一轮；被杀/崩溃 -> 重新拉起 --minimized。
@@ -3664,6 +4003,9 @@ fn main() -> ExitCode {
             }
             "watchdog" => cmd_watchdog(&rest),
             "presence" => cmd_presence(&rest),
+            "apps" => cmd_apps(&rest),
+            "topics" => cmd_topics(&rest),
+            "recompute-actors" => cmd_recompute_actors(&rest),
             "help" | "-h" | "--help" => {
                 print!("{}", USAGE);
                 Ok(())

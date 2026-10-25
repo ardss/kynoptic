@@ -591,12 +591,42 @@ pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result
     }
     let ranked =
         queries::foreground_dwell_by_app(conn, &from, &to, queries::FG_DWELL_STALL_CAP_SECS, true);
+    // 0.4.0 F1：五类 actor 驻留估算（勘误 4——按前台覆盖秒数分摊的估算值，
+    // 与 dwell_sec 的区间累计口径并列输出；agent = 注入输入代理指标
+    // （evidence_type=injected_input），不宣称一定来自 AI Agent）。
+    let rules = queries::actor::ActorRules::default();
+    let (actor_rows, unattributed_sec) = queries::actor::foreground_actor_dwell(
+        conn,
+        &from,
+        &to,
+        queries::FG_DWELL_STALL_CAP_SECS,
+        true,
+        &rules,
+    );
+    let actor_by_app: std::collections::HashMap<&str, &queries::actor::AppActorDwell> =
+        actor_rows.iter().map(|r| (r.app.as_str(), r)).collect();
     let total_apps = ranked.len();
     let truncated = ranked.len() > limit;
     let apps: Vec<Value> = ranked
         .into_iter()
         .take(limit)
-        .map(|(app, sec)| json!({ "app": app, "dwell_sec": sec }))
+        .map(|(app, sec)| {
+            let mut v = json!({ "app": app, "dwell_sec": sec });
+            if let Some(a) = actor_by_app.get(app.as_str()) {
+                let d = &a.estimated_actor_dwell_sec;
+                v["estimated_actor_dwell_sec"] = json!({
+                    "user": d.user,
+                    "agent": d.agent,
+                    "unattended": d.unattended,
+                    "mixed": d.mixed,
+                    "unknown": d.unknown,
+                });
+                v["agent_evidence_type"] =
+                    json!(queries::actor::EstimatedActorDwellSec::AGENT_EVIDENCE_TYPE);
+                v["browseros_sec"] = json!(a.browseros_sec);
+            }
+            v
+        })
         .collect();
     Ok(json!({
         "from": from,
@@ -605,6 +635,71 @@ pub fn top_apps(conn: &Connection, from: &str, to: &str, limit: usize) -> Result
         "total_apps": total_apps,
         "truncated": truncated,
         "dwell_method": queries::FG_DWELL_METHOD,
+        "actor_dwell_method": queries::actor::FG_ACTOR_DWELL_METHOD,
+        "unattributed_sec": unattributed_sec,
+    }))
+}
+
+/// 窗口 [from,to) 内主题聚合（get_topics 数据面，0.4.0 F2）。
+/// 默认输出脱敏键（主标题级）；`raw=true` 走显式原始读取路径且仍过敏感词表
+/// （绝不从脱敏键假装恢复明文）。来源标签恒为真实来源（当前只有 title——
+/// 事件尚无 URL 字段，domain 恒为空集，如实声明不伪造）。
+pub fn topics(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    raw: bool,
+    limit: usize,
+) -> Result<Value, String> {
+    let from = normalize_bound(from, false)?;
+    let to = normalize_bound(to, true)?;
+    if from >= to {
+        return Err(format!(
+            "Invalid range: from ({from}) must be before to ({to})（时间范围无效：from 必须早于 to）"
+        ));
+    }
+    let rules = queries::actor::ActorRules::default();
+    let all = queries::actor::topics_summary(
+        conn,
+        &from,
+        &to,
+        queries::FG_DWELL_STALL_CAP_SECS,
+        true,
+        &rules,
+        raw,
+    );
+    let total = all.len();
+    let truncated = total > limit;
+    let topics: Vec<Value> = all
+        .into_iter()
+        .take(limit)
+        .map(|t| {
+            let d = &t.estimated_actor_dwell_sec;
+            json!({
+                "topic": t.topic,
+                "source": t.source.as_str(),
+                "sensitive": t.sensitive,
+                "event_count": t.event_count,
+                "estimated_actor_dwell_sec": {
+                    "user": d.user,
+                    "agent": d.agent,
+                    "unattended": d.unattended,
+                    "mixed": d.mixed,
+                    "unknown": d.unknown,
+                },
+                "browseros_sec": t.browseros_sec,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "from": from,
+        "to": to,
+        "topics": topics,
+        "total_topics": total,
+        "truncated": truncated,
+        "redacted": !raw,
+        "actor_dwell_method": queries::actor::FG_ACTOR_DWELL_METHOD,
+        "topic_method": queries::actor::TOPIC_METHOD,
     }))
 }
 
