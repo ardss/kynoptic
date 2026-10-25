@@ -62,6 +62,23 @@ main→release.yml→验收资产）。
 2. 遗留一条安装器经验待入宪法/记忆：iss 内 COM/格式化行为必须真机安装验证，接口级
    验证不可替代（本次 StartBoundary 即反例）。
 
+### 已发布（2026-10-26 01:4x–01:5x，既定流程走完，全绿一次通过）
+
+1. PR #45 squash 合并入 main（保持仓库既有 `(#NN)` 单提交风格），合并提交 **58bb463**，
+   与 release 分支 Head 68b7400 树逐字节一致（`git diff 68b7400 FETCH_HEAD` 0 行差异），
+   终审三项修正代码全部包含——裁决①「tag 必须指向合并后含最终代码的 main」满足。
+2. 附注 tag **v0.4.0** 打在 58bb463（非 release 分支）并经 SSH 推送，远端
+   `refs/tags/v0.4.0` 到位。
+3. release.yml run #49（[runs/40218086889](https://github.com/ardss/kynoptic/actions/runs/40218086889)）
+   5m46s completed successfully；main CI #174 同绿（2m32s）。
+4. [Release v0.4.0](https://github.com/ardss/kynoptic/releases/tag/v0.4.0) 资产 **10 项**
+   核验通过（以页面实际清单为准）：kynoptic.exe / kynoptic-ctl.exe / kynoptic-watchdog.exe /
+   kynoptic-aggrepair.exe / kynoptic-tray.exe（5 exe）+ Kynoptic-Setup-0.4.0.exe +
+   Kynoptic-Portable-0.4.0.zip + kynoptic-0.4.0-x86_64-pc-windows-msvc.zip（crate zip）+
+   SHA256SUMS.txt + SKILL.md。无红无缺。
+5. 本机遗留（建议用户动作，非阻塞）：安装 0.4.0 正式版后，删除旧包装层
+   `K:\ops\bin\run-hidden.vbs`（新版安装器已原生包装治理，wscript 中转不再需要）。
+
 ## 2026-10-25（调度触发 07:15 +08:00 / 实际执行 07:20–09:3x）
 
 ### 巡检发现
