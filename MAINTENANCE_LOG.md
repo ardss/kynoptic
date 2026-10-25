@@ -2,6 +2,59 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-25（调度触发 07:15 +08:00 / 实际执行 07:20–09:3x）
+
+### 巡检发现
+
+1. **0.4.0 提案补发成功**：10-24 深夜因代理 403 失败的 F1+F2 提案（v2 修订版）经浏览器
+   通道于本轮发出（`K:\AIControl\kynoptic-040-proposal-v2.md`，4 项强制勘误按 GPT 逐条
+   修订吸收）。curl 直连 chatgpt.com 被拒（TLS 指纹 403），浏览器通道正常——技术通道
+   结论：审查类长文一律走浏览器，不重试 curl。
+2. 维护轨：无新增异常。上次轮遗留的 2FA 已由用户解除，PR/网页操作全通。Issues 无新条目。
+   release/v0.3.2 远端分支消失（#41 合并后自动删除，与 GPT 独立核查一致）。
+3. 依赖：本轮未动（67 项 semver 兼容更新继续挂账，与 GPT 裁决一致延后）。
+
+### GPT 裁决（0.4.0 功能提案，08:0x 回）
+
+**APPROVE · 附强制实现勘误**——批准 F1（五类 actor 归属）+ F2（应用/主题两级聚合）开工，
+四项强制勘误：① E_a = 注入键+注入点击+注入滚轮之和（阻断级：真人点击绝不进注入证据）；
+② agent = 注入输入代理指标（evidence_type=injected_input），ai_suspect 保持推测合成；
+③ 派生缓存只存分钟级输入证据计数，actor/channel/E_f 标签一律查询层算；④ 应用级秒数命名
+estimated_actor_dwell_sec（前台覆盖分摊估算）。**本轮不发版**；发布波次另行（代码→全量
+门禁→bump 0.4.0→PR→tag）。验收锚点：10-24 人工标注（DSH 143/14min，fal 64/28min），
+不要求估算相等，必须展示差异与误差来源。
+
+### 执行（F1+F2 全量落地，PR #43 已合并）
+
+- core：migration 0011 `agg_minute_actor`（勘误 3 语义）+ 三路径维护（增量/重建/回填）+
+  `rebuild_actor_cache[_range]`；`queries/actor.rs` 五类真值表 + 前台覆盖分摊（勘误 1/2/4）
+  + F2 `topics_summary`（敏感词表双保险、domain 源如实留空）；0.3.2 聚合口径零改动。
+- CLI：`apps` / `topics` / `recompute-actors` 三子命令；MCP：`get_top_apps` 扩 actor 拆分 +
+  新工具 `get_topics`（七工具面）。CLI/MCP 同调 `queries::actor`，语义同构。
+- 测试：GPT 必过清单 8 项全覆盖（等价/互斥完备/≤60s/停摆/敏感不泄漏/回算不动 events/
+  UPSERT 幂等/双面同源）；core lib 216 + actor 11 + agg 10 + presence 5 + mcp 59 + cli 81
+  全绿；fmt + 受影响 crate clippy -D warnings 过。
+- 验收锚点对照（活库只读实测 10-24）：WXQ 真人占比 59% vs 手工 57%（接近）；DSH user
+  130min vs 手工 14min——显著高估，误差来源=分钟级全局输入按前台分摊的估算语义 vs 会话级
+  人工判断（勘误 4 命名空间，不改规则凑数，已在 PR 描述显式呈现）；chrome 通道命中
+  1168/1171s；auth.exe 注入 agent=25s 被正确归类；未归属 2821s 显式输出。
+- 流程：PR #43（feat/040-actor-topics → main）CI run 166 绿后 squash 合并，
+  **main = 7eff60c**。发版判定：**未 bump 版本、未打 tag、未跑发布全量门禁**（按 GPT 约束）。
+  全量门禁（fmt+clippy workspace+workspace test+doc-version）留给发布波次一次性执行。
+
+### 版本
+
+- Cargo/README 仍为 0.3.2（本轮不发版）；CHANGELOG [Unreleased] 已填 F1/F2 条目，随 #43 进 main。
+
+### 下一步
+
+1. 发布波次（等用户指令或下轮裁决）：全量门禁 → `node scripts/bump-version.mjs 0.4.0` →
+   CHANGELOG 日期化 → PR → tag v0.4.0 → release.yml 出包。
+2. GPT 勘误②的可解释性补强：AI 通道识别规则（尾缀）与 ai_suspect 阈值留给用户可配置层
+   （0.4.x 小波或 0.5.0），当前硬编码默认「 - BrowserOS」。
+3. P2 挂账不变：cli god-file 拆分、open_reader 下沉 core、export Result 语义、cleanup 边界日、
+   双数据面文档化；67 项依赖更新搭发布波。
+
 ## 2026-10-24（调度触发 07:15 +08:00 / 实际执行 10:23–11:0x）
 
 ### 巡检发现
