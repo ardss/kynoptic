@@ -2,6 +2,66 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-26 发版波（GPT 终审 REQUEST_CHANGES + 安装器修复，01:0x–01:2x）
+
+### GPT 终审裁决（「架构审查报告」专道，00:47 发出 / 00:5x 回）
+
+**REQUEST_CHANGES，仅针对发布收尾顺序与两处安装器可靠性细节**——无需重新提交功能
+设计提案，修正通过后即可按既定流程发布 v0.4.0。三项：① Tag 必须指向合并后包含最终
+代码的 main 提交，不得从 release 分支直接打（重蹈 v0.3.2「Release 已发 main 落后」）；
+② kynoptic.iss 兜底 schtasks /TR 用 Chr(39) 单引号包路径，Windows 命令行不以单引号为
+引号转义，含空格目录启动失败，改双引号转义并要求「COM 失败→兜底创建→实际运行任务」
+真机验证（仅验证创建返回码不够）；③ wscript 包装保留契约缺 WorkingDirectory 字段，
+原包装依赖工作目录时升级失效，应补保留并做真实包装升级测试。GPT 联网核实的仓库状态
+（36f7c079 存在/main 9faf8b49/领先 3 提交/#43 merged/test 绿）与本机一致。
+
+### 发版波全量门禁（00:25–00:35，唯一一次，一次全绿）
+
+fmt ✓ / clippy workspace -D warnings ✓ / workspace test ✓（core 217/217，全部套件 0 失败）
+/ check-doc-version 14 项 ✓。无需任何修复重跑。
+
+### 执行（只做裁决指出的改动，未 merge 未 tag）
+
+- kynoptic.iss 兜底 /TR：Chr(39) → `\"` 双引号转义。
+- TryGetWscriptWrappedAction/RegisterWatchdogTaskCom/RebuildWatchdogTask 三处签名补
+  WorkingDirectory 透传（包装分支保留原值，裸 exe 分支空串=系统默认行为不变）。
+- 新增 GateForceComFail 编译钩子（/D 开关强制 COM 失败走兜底，正常构建零开销）——裁决
+  第②项要求的强制失败验证注入点。
+- **意外收获（真机门禁首次暴露）**：StartBoundary 格式串里的字面 'T' 被
+  GetDateTimeString 当短时间格式符解析（产出 `2026-10-261:0501:05:06`），COM 注册必炸
+  全部静默落兜底——上一波仅 PowerShell 同接口验证 + ISCC 编译，iss 内注册路径从未真机
+  跑过。修复为日期/时间两段各取再拼 'T'。此 bug 说明「PowerShell 接口验证 ≠ iss 内
+  行为验证」，安装器改动必须过一次真机安装。
+- 提交 3f3d6bc 推 release/v0.4.0（PR #45 Head 同步更新）。
+
+### 真机隔离验证（TestSuffix=GATE 构建与生产完全并行 + 带空格目录，三件套全过）
+
+1. COM 成功路径：静默装 `kyn gate a`，任务 XML 逐项核对——电池限制 false、StopIfGoing
+   false、LogonTrigger、PT1M、IgnoreNew、PT10M、StartBoundary 正确、Command 干净拆分、
+   WorkingDirectory 空（默认）✓。
+2. COM 失败兜底：GateForceComFail 版装 `kyn gate b`，日志确认钩子生效落兜底，兜底任务
+   Command=`"…watchdog.exe"` Arguments 完整（含空格目录拆分正确，旧单引号会在空格截断），
+   schtasks /Run 实际运行，进程实证启动（GPT 要求的「实际运行」达成）✓。
+3. 包装升级保留：c 目录先装建基线 → 手工改写任务为 wscript 包装+WorkingDirectory=C:\Windows
+   （模拟运维处置）→ 升级装 → 日志命中 preserving 分支，Execute/Arguments/WorkingDirectory
+   三字段原样 ✓。
+4. 清理：a/b/c 三目录静默卸载 + GATE 任务清零 + 测试目录删除 + 残留 tray 进程击杀，生产
+   实例零触碰（指纹+后缀双隔离生效）。
+
+### 发版与否
+
+**未发版**（按任务卡：REQUEST_CHANGES → 只做指出的改动，不 tag，报告即止）。PR #45
+最新 Head（3f3d6bc）CI #172 绿（2m37s completed successfully）。合并 main 与 tag v0.4.0
+等用户指令或 GPT 下一轮确认（裁决原文已给预授权路径：修正通过→合并 main→tag 指向
+main→release.yml→验收资产）。
+
+### 下一步
+
+1. 用户确认后执行既定流程：merge PR #45 → pull main → tag v0.4.0（打在 main）→ 推 tag
+   → release.yml 出包 → 资产 10 项核验。
+2. 遗留一条安装器经验待入宪法/记忆：iss 内 COM/格式化行为必须真机安装验证，接口级
+   验证不可替代（本次 StartBoundary 即反例）。
+
 ## 2026-10-25（调度触发 07:15 +08:00 / 实际执行 07:20–09:3x）
 
 ### 巡检发现
