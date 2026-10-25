@@ -1,4 +1,4 @@
-# Kynoptic App (v0.3.2)
+# Kynoptic App (v0.4.0)
 
 > **TL;DR (English)** — Kynoptic is a local-first Windows activity awareness
 > layer: a Rust workspace (`core` collectors + SQLite storage
