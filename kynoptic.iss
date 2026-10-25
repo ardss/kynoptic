@@ -1,4 +1,4 @@
-﻿; Kynoptic 安装器脚本（Inno Setup 6）
+; Kynoptic 安装器脚本（Inno Setup 6）
 ; CI: iscc kynoptic.iss /DAppVersion=<版本>（必须外部传入，见下）
 ; 版本漂移审查：忘传 /DAppVersion 时曾打包出 0.2.0 安装包而二进制是 0.2.2
 ; 的自相矛盾产物。本文件不再持有版本号缺省值，只认 /DAppVersion。
@@ -794,28 +794,119 @@ begin
     Log('task DISABLE NOT verified after retry: ' + TaskName);
 end;
 
-// 重建指向本次安装目录的看门狗任务：先删旧任务再建（/Create 一旦执行必刷新
-// StartBoundary，/Delete + /Create 保证不留半新半旧状态），/Create 带重试、
-// 退出码入日志，最后回读校验。任何失败都留日志，不再无声吞掉。
+// 读取既有看门狗任务的 EXEC action（P1 治理冲突 2026-10-26）：运维对旧构
+// 建 PowerShell 闪窗的手工处置是把任务 action 包一层 wscript 隐藏启动
+// （run-hidden.vbs）。此前 /Delete + /Create 裸 exe 会静默覆盖包装——下次
+// 升级回归闪窗。本函数探测包装形态：既有任务 action 含 wscript.exe 时返回
+// 其 Command/Arguments（重建时原样保留）；任务不存在（首次安装）或读取
+// 失败返回 False（按裸 exe 处理）。
+function TryGetWscriptWrappedAction(var WrapCmd: String; var WrapArgs: String): Boolean;
+var
+  Service, Folder, Task, Actions, A: Variant;
+  CmdS: String;
+  I, N: Integer;
+begin
+  Result := False;
+  try
+    Service := CreateOleObject('Schedule.Service');
+    Service.Connect('');
+    Folder := Service.GetFolder('\');
+    Task := Folder.GetTask(WatchdogTaskName());
+    Actions := Task.Definition.Actions;
+    N := Actions.Count;
+    for I := 1 to N do begin
+      A := Actions.Item(I);
+      // Variant→String 先落变量（内建函数对 Variant 实参编译期类型不符）；
+      // 不检查 A.Type（Type 是保留字）：action 命令含 wscript.exe 即运维
+      // 包装形态，裸 exe 路径永远不会命中
+      CmdS := A.Path;
+      if Pos('wscript.exe', LowerCase(CmdS)) > 0 then begin
+        WrapCmd := CmdS;
+        WrapArgs := A.Arguments;
+        Result := True;
+        Exit;
+      end;
+    end;
+  except
+    Log('watchdog task: existing action probe skipped (' + GetExceptionMessage + ')');
+  end;
+end;
+
+// COM ITaskService 注册看门狗任务（P2 笔记本修复 2026-10-26）：schtasks
+// /Create /SC MINUTE 的默认 XML 带 DisallowStartIfOnBatteries=true——笔记本
+// 电池模式下看门狗完全停摆，且无登录触发器（装完不等首个分钟 tick）。
+// 改走 COM 注册：电池限制取消 + LogonTrigger + 每分钟重复 + IgnoreNew +
+// PT10M 执行上限。TASK_CREATE_OR_UPDATE(6) 原子覆盖旧任务，替代 /Delete
+// +/Create 的半新半旧窗口。InteractiveToken(3) = 仅当前用户，无需密码。
+function RegisterWatchdogTaskCom(const ActionCmd, ActionArgs: String): Boolean;
+var
+  Service, Folder, Def, T, Act: Variant;
+begin
+  Result := False;
+  try
+    Service := CreateOleObject('Schedule.Service');
+    Service.Connect('');
+    Folder := Service.GetFolder('\');
+    Def := Service.NewTask(0);
+    Def.Settings.MultipleInstances := 2;      // TASK_INSTANCES_IGNORE_NEW
+    Def.Settings.DisallowStartIfOnBatteries := False;
+    Def.Settings.StopIfGoingOnBatteries := False;
+    Def.Settings.StartWhenAvailable := True;  // 睡眠错过的 tick 补跑
+    Def.Settings.ExecutionTimeLimit := 'PT10M';
+    Def.Settings.Enabled := True;
+    T := Def.Triggers.Create(9);              // TASK_TRIGGER_LOGON：登录即护
+    T.Enabled := True;
+    T := Def.Triggers.Create(1);              // TASK_TRIGGER_TIME + PT1M 重复
+    // Inno PascalScript 无 FormatDateTime，用 GetDateTimeString 拼 XML
+    // StartBoundary（无时区后缀 = 本地时间，schema 允许）
+    T.StartBoundary := GetDateTimeString('yyyy-mm-ddThh:nn:ss', '-', ':');
+    T.Repetition.Interval := 'PT1M';
+    T.Repetition.StopAtDurationEnd := False;
+    T.Enabled := True;
+    Act := Def.Actions.Create(0);             // TASK_ACTION_EXEC
+    Act.Path := ActionCmd;
+    Act.Arguments := ActionArgs;
+    Folder.RegisterTaskDefinition(WatchdogTaskName(), Def, 6, '', '', 3);
+    Result := True;
+  except
+    Log('watchdog task COM registration failed: ' + GetExceptionMessage);
+  end;
+end;
+
+// 重建指向本次安装目录的看门狗任务（P1 治理 + P2 笔记本，2026-10-26）：
+// 1) 既有 action 是 wscript 包装则原样保留（裸 exe /Create 会静默打回，
+//    下次升级回归闪窗——治理冲突修复）；否则裸 exe + watchdog --once。
+// 2) COM 注册（电池友好 + LogonTrigger）失败时兜底退回 schtasks /Create
+//    三次重试（老行为保底：电池限制仍在，但任务至少存在，日志留痕）。
+// 任何失败都留日志，不再无声吞掉。
 function RebuildWatchdogTask(): Boolean;
 var
+  UseCmd, UseArgs: String;
   I: Integer;
 begin
   Result := False;
-  // 旧任务可能指向旧 {app} 的死路径；不存在时 /Delete 失败，忽略
-  RunHidden('schtasks', '/Delete /F /TN "' + WatchdogTaskName() + '"');
-  for I := 1 to 3 do begin
-    if RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "' + WatchdogTaskName() +
-      '" /TR "' + Chr(39) +
-      ExpandConstant('{app}') + '\kynoptic-watchdog.exe' + Chr(39) + ' watchdog --once"') then begin
-      Result := True;
-      Break;
-    end;
-    Log('schtasks /Create failed, retry ' + IntToStr(I));
-    Sleep(500);
+  if TryGetWscriptWrappedAction(UseCmd, UseArgs) then begin
+    Log('watchdog task: preserving wscript-wrapped action from existing task');
+  end else begin
+    UseCmd := ExpandConstant('{app}') + '\kynoptic-watchdog.exe';
+    UseArgs := 'watchdog --once';
   end;
-  if not Result then
-    Log('watchdog task /Create FAILED after 3 retries');
+  if RegisterWatchdogTaskCom(UseCmd, UseArgs) then begin
+    Result := True;
+  end else begin
+    Log('watchdog task: COM registration failed, falling back to schtasks /Create');
+    for I := 1 to 3 do begin
+      if RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "' + WatchdogTaskName() +
+        '" /TR "' + Chr(39) + UseCmd + Chr(39) + ' ' + UseArgs + '"') then begin
+        Result := True;
+        Break;
+      end;
+      Log('schtasks /Create failed, retry ' + IntToStr(I));
+      Sleep(500);
+    end;
+    if not Result then
+      Log('watchdog task /Create FAILED after 3 retries');
+  end;
 end;
 
 // 重建指向本次安装目录的看门狗任务并转 DISABLE、清 Run 值

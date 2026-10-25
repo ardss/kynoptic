@@ -12,18 +12,43 @@
 use crate::monitors::ps::run_ps;
 use crate::types::*;
 use serde_json::json;
-use std::cell::Cell;
-use std::time::Duration;
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
+
+/// 静态信息 TTL：型号/驱动/分辨率几乎不变，10 分钟刷新一次足够捕捉换卡/
+/// 改分辨率/驱动升级。此前每 10s 全量重查 Win32_VideoController——纯静态
+/// 字段却按动态指标节奏跑 PS 冷启动，40 监控器全开场景下 gpu 监控的 PS
+/// 冷启动从 6 次/分降到 0.1 次/分（联合运维 P1 性能）。
+const STATIC_TTL: Duration = Duration::from_secs(600);
+
+/// 静态查询刷新判定（纯函数，可测）：无缓存或超过 TTL → 刷新。
+fn static_cache_expired(cached_at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+    match cached_at {
+        None => true,
+        Some(t) => now.duration_since(t) >= ttl,
+    }
+}
+
+/// Win32_VideoController 慢查询（PS 冷启动）结果的 TTL 缓存：存原始输出、
+/// 每拍重新解析（解析是纯内存操作，可忽略）。
+struct StaticCache {
+    fetched_at: Instant,
+    raw_output: String,
+}
 
 pub struct GpuMonitor {
     /// 上一次枚举到的静态 GPU 指纹，用于「GPU 列表本身没变则不重复发静态部分」的去重。
     prev_static_key: Cell<Option<String>>,
+    /// 静态信息 TTL 缓存（联合运维 P1）：TTL 内复用上次 PS 查询输出，
+    /// 动态指标（nvidia-smi）不受影响照常每拍拉取。
+    static_cache: RefCell<Option<StaticCache>>,
 }
 
 impl Default for GpuMonitor {
     fn default() -> Self {
         Self {
             prev_static_key: Cell::new(None),
+            static_cache: RefCell::new(None),
         }
     }
 }
@@ -39,15 +64,38 @@ impl Monitor for GpuMonitor {
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
         // 1) 静态信息：型号 / AdapterRAM / 刷新率 / 驱动 / 分辨率
-        let script = r#"
+        //    TTL 缓存内直接复用上次查询输出，不 spawn PowerShell（联合运维 P1）。
+        let need_refresh = {
+            let cache = self.static_cache.borrow();
+            static_cache_expired(
+                cache.as_ref().map(|c| c.fetched_at),
+                Instant::now(),
+                STATIC_TTL,
+            )
+        };
+        let output = if need_refresh {
+            let script = r#"
 Get-CimInstance Win32_VideoController -Namespace root/CIMV2 -ErrorAction SilentlyContinue |
   ForEach-Object {
     "$($_.Name)|$($_.AdapterRAM)|$($_.CurrentRefreshRate)|$($_.DriverVersion)|$($_.VideoModeDescription)"
   }
 "#;
-        let output = match run_ps(script) {
-            Some(o) if !o.trim().is_empty() => o,
-            _ => return,
+            match run_ps(script) {
+                Some(o) if !o.trim().is_empty() => {
+                    *self.static_cache.borrow_mut() = Some(StaticCache {
+                        fetched_at: Instant::now(),
+                        raw_output: o.clone(),
+                    });
+                    o
+                }
+                _ => return,
+            }
+        } else {
+            self.static_cache
+                .borrow()
+                .as_ref()
+                .map(|c| c.raw_output.clone())
+                .unwrap_or_default()
         };
 
         let mut gpus: Vec<GpuInfo> = Vec::new();
@@ -162,16 +210,19 @@ struct NvidiaStat {
 
 /// 调用 `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` 拉取每张 NVIDIA 卡的
 /// 利用率 / 温度 / 显存。失败或无 NVIDIA 驱动时返回空 Vec（调用方静默降级）。
+/// 3s 有界等待（联合运维 P3）：nvidia-smi 挂死曾无界阻塞采集线程，超时
+/// 返回空 Vec——本轮动态指标缺省，前端显示「—」，下一拍重试。
 fn query_nvidia_smi() -> Vec<NvidiaStat> {
-    let output = match super::quiet_command("nvidia-smi")
-        .args([
+    let output = match super::quiet_command_output_bounded(
+        "nvidia-smi",
+        &[
             "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return Vec::new(),
+        ],
+        Duration::from_secs(3),
+    ) {
+        Some(o) => o,
+        None => return Vec::new(),
     };
     parse_nvidia_smi(&output)
 }
@@ -211,6 +262,21 @@ fn parse_nvidia_smi(output: &str) -> Vec<NvidiaStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_cache_ttl_refresh_boundary() {
+        // 联合运维 P1 回归：静态缓存 TTL 判定——无缓存必刷新；TTL 内不刷新；
+        // 到点刷新
+        let t0 = Instant::now();
+        assert!(static_cache_expired(None, t0, STATIC_TTL));
+        assert!(!static_cache_expired(Some(t0), t0, STATIC_TTL));
+        assert!(!static_cache_expired(
+            Some(t0),
+            t0 + STATIC_TTL - Duration::from_secs(1),
+            STATIC_TTL
+        ));
+        assert!(static_cache_expired(Some(t0), t0 + STATIC_TTL, STATIC_TTL));
+    }
 
     #[test]
     fn parse_nvidia_smi_single_card() {
