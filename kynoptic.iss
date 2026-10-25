@@ -798,9 +798,10 @@ end;
 // 建 PowerShell 闪窗的手工处置是把任务 action 包一层 wscript 隐藏启动
 // （run-hidden.vbs）。此前 /Delete + /Create 裸 exe 会静默覆盖包装——下次
 // 升级回归闪窗。本函数探测包装形态：既有任务 action 含 wscript.exe 时返回
-// 其 Command/Arguments（重建时原样保留）；任务不存在（首次安装）或读取
-// 失败返回 False（按裸 exe 处理）。
-function TryGetWscriptWrappedAction(var WrapCmd: String; var WrapArgs: String): Boolean;
+// 其 Command/Arguments/WorkingDirectory（重建时原样保留，GPT 发版终审
+// 2026-10-26：仅保留 Path/Arguments 会在原包装依赖工作目录时升级失效）；
+// 任务不存在（首次安装）或读取失败返回 False（按裸 exe 处理）。
+function TryGetWscriptWrappedAction(var WrapCmd: String; var WrapArgs: String; var WrapWd: String): Boolean;
 var
   Service, Folder, Task, Actions, A: Variant;
   CmdS: String;
@@ -823,6 +824,7 @@ begin
       if Pos('wscript.exe', LowerCase(CmdS)) > 0 then begin
         WrapCmd := CmdS;
         WrapArgs := A.Arguments;
+        WrapWd := A.WorkingDirectory;
         Result := True;
         Exit;
       end;
@@ -838,11 +840,18 @@ end;
 // 改走 COM 注册：电池限制取消 + LogonTrigger + 每分钟重复 + IgnoreNew +
 // PT10M 执行上限。TASK_CREATE_OR_UPDATE(6) 原子覆盖旧任务，替代 /Delete
 // +/Create 的半新半旧窗口。InteractiveToken(3) = 仅当前用户，无需密码。
-function RegisterWatchdogTaskCom(const ActionCmd, ActionArgs: String): Boolean;
+function RegisterWatchdogTaskCom(const ActionCmd, ActionArgs, ActionWd: String): Boolean;
 var
   Service, Folder, Def, T, Act: Variant;
 begin
   Result := False;
+#ifdef GateForceComFail
+  // 发版门禁测试钩子（GPT 终审 2026-10-26 要求的 COM 失败兜底路径验证）：
+  // /DGateForceComFail 编译时跳过 COM 注册，强制走 schtasks 兜底分支。
+  // 未 define 时零开销，正常构建不受影响。
+  Log('watchdog task: GATE forced COM failure (test hook)');
+  Exit;
+#endif
   try
     Service := CreateOleObject('Schedule.Service');
     Service.Connect('');
@@ -858,14 +867,19 @@ begin
     T.Enabled := True;
     T := Def.Triggers.Create(1);              // TASK_TRIGGER_TIME + PT1M 重复
     // Inno PascalScript 无 FormatDateTime，用 GetDateTimeString 拼 XML
-    // StartBoundary（无时区后缀 = 本地时间，schema 允许）
-    T.StartBoundary := GetDateTimeString('yyyy-mm-ddThh:nn:ss', '-', ':');
+    // StartBoundary。日期与时间必须两段各自取再拼 'T'：格式串里的字面
+    // 'T' 会被当短时间格式符解析（真机门禁实测产出
+    // 2026-10-261:0501:05:06，COM 注册必炸走兜底——2026-10-26 修复）。
+    // 无 AM/PM 指示符时 hh 按 24 小时制输出；无时区后缀 = 本地时间，schema 允许
+    T.StartBoundary := GetDateTimeString('yyyy-mm-dd', '-', ':') + 'T' +
+      GetDateTimeString('hh:nn:ss', '-', ':');
     T.Repetition.Interval := 'PT1M';
     T.Repetition.StopAtDurationEnd := False;
     T.Enabled := True;
     Act := Def.Actions.Create(0);             // TASK_ACTION_EXEC
     Act.Path := ActionCmd;
     Act.Arguments := ActionArgs;
+    Act.WorkingDirectory := ActionWd;         // 空 = 系统默认（裸 exe 行为不变）
     Folder.RegisterTaskDefinition(WatchdogTaskName(), Def, 6, '', '', 3);
     Result := True;
   except
@@ -874,30 +888,34 @@ begin
 end;
 
 // 重建指向本次安装目录的看门狗任务（P1 治理 + P2 笔记本，2026-10-26）：
-// 1) 既有 action 是 wscript 包装则原样保留（裸 exe /Create 会静默打回，
-//    下次升级回归闪窗——治理冲突修复）；否则裸 exe + watchdog --once。
+// 1) 既有 action 是 wscript 包装则原样保留 Path/Arguments/WorkingDirectory
+//    （裸 exe /Create 会静默打回，下次升级回归闪窗——治理冲突修复）；
+//    否则裸 exe + watchdog --once（WorkingDirectory 空 = 系统默认）。
 // 2) COM 注册（电池友好 + LogonTrigger）失败时兜底退回 schtasks /Create
 //    三次重试（老行为保底：电池限制仍在，但任务至少存在，日志留痕）。
+//    /TR 内层路径用 \" 双引号转义（GPT 发版终审 2026-10-26：Windows 命令
+//    行不以单引号为引号转义，Chr(39) 包路径在含空格目录下启动失败）。
 // 任何失败都留日志，不再无声吞掉。
 function RebuildWatchdogTask(): Boolean;
 var
-  UseCmd, UseArgs: String;
+  UseCmd, UseArgs, UseWd: String;
   I: Integer;
 begin
   Result := False;
-  if TryGetWscriptWrappedAction(UseCmd, UseArgs) then begin
+  UseWd := '';
+  if TryGetWscriptWrappedAction(UseCmd, UseArgs, UseWd) then begin
     Log('watchdog task: preserving wscript-wrapped action from existing task');
   end else begin
     UseCmd := ExpandConstant('{app}') + '\kynoptic-watchdog.exe';
     UseArgs := 'watchdog --once';
   end;
-  if RegisterWatchdogTaskCom(UseCmd, UseArgs) then begin
+  if RegisterWatchdogTaskCom(UseCmd, UseArgs, UseWd) then begin
     Result := True;
   end else begin
     Log('watchdog task: COM registration failed, falling back to schtasks /Create');
     for I := 1 to 3 do begin
       if RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "' + WatchdogTaskName() +
-        '" /TR "' + Chr(39) + UseCmd + Chr(39) + ' ' + UseArgs + '"') then begin
+        '" /TR "\"' + UseCmd + '\" ' + UseArgs + '"') then begin
         Result := True;
         Break;
       end;
