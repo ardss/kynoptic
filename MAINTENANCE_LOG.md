@@ -2,6 +2,60 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-26（调度触发 07:15 / 实际执行 07:15–08:1x）
+
+### 巡检发现
+
+1. v0.4.0 发版链完整闭合：PR #45 squash→main 58bb463、tag v0.4.0=15287ed 指向合并后
+   main、release.yml run #49 绿、Release 资产 10 项核验通过；上轮「下一步」两项
+   （merge+tag 执行、iss 真机经验沉淀）均已收口。
+2. 新尾巴：发版收尾提交 378eda7（本文件「已发布」段 +17 行）滞留 release/v0.4.0 未回
+   main，与 origin/main 的全部差异仅此一文件——本轮 docs PR 收口。
+3. Issues 0 条 open（GitHub API HTTP 200 实证，含 0 个 open PR）；check-doc-version
+   15 项绿；CHANGELOG [Unreleased] 空开启、0.4.0 定版一致。
+4. 依赖：cargo update --dry-run 约 30+ 常规 patch/minor（cc/hyper/jiff/libc/quinn/icu
+   系等），无 major、无安全通告，按纪律只记录不升级。
+5. 本机生产实证（落实 GPT「包装存在≠未安装」纠正）：安装目录五 exe 已全部被手动改名
+   .off（rename 不破 mtime，均为 10-15 0.3.2 构建产物）；任务通道最后成功 10-25
+   15:23:41，最后一次拉起/心跳 19:19:03，19:22:06 起任务报「找不到文件」连续失败至今；
+   data/update-available.txt=0.3.2；当前无任何 kyn 进程。结论（高置信推断）：10-25
+   19:19–19:22 之间生产实例被手动停用（杀进程+改 .off），0.4.0 未安装。
+6. 连带发现：计划任务「Kynoptic Watchdog 46516965」（wscript→dispatch→watchdog
+   --once，PT1M 每分钟）自 19:22 起持续空转失败（10-25 晚 278 次 + 10-26 至 08:02 约
+   640 次，日志 ~134KB/天）。善后两选一：GPT 批准后禁用任务（schtasks /Change
+   /DISABLE，可逆）；或用户安装 0.4.0 正式版由安装器重建任务。本轮向 GPT 补充提案。
+7. 待办池：cli/main.rs 5077 行；open_reader 仍在 mcp/state.rs；P2 排序按 GPT 裁决更新：
+   ①db cleanup 边界日部分重算 ②export queries Result 语义 ③MCP/Dash 双数据面文档化
+   ④open_reader 下沉 core ⑤cli 滚动拆分（真实用户问题/复现证据出现前提权）。
+
+### GPT 裁决（07:41 发出 / 07:52 前回）
+
+**APPROVE · 执行 M1**：docs 收尾 PR（移植 378eda7 十七行 + 当日记录）为本轮唯一完成
+门禁；验收=diff 仅 MAINTENANCE_LOG.md、原日志完整不重复、check-doc-version 与 PR CI
+绿、合并后 main 含完整发版记录；不改版本号/Tag/Release/工作流/代码。M2（依赖/清理）
+保持记录；功能轨冻结；不发版。纠正一处判断：wscript 包装保留是新版安装器的设计行为，
+包装存在不足以证明 0.4.0 未安装，生产版本需二进制实证——已核实（见巡检 5）。P2 排序
+调整如巡检 7。通道备注：07:41 有一条因发送落在隐藏镜像草稿的半截重复消息（仅前三条
+巡检），完整提案紧随发出，GPT 确认裁决覆盖全部七项，无信息缺失。
+
+### 执行
+
+- 本 PR（分支 docs/maint-20261026，PR 号回填）：MAINTENANCE_LOG 收口（移植 17 行 +
+  本条记录）；check-doc-version 绿；PR CI test 绿后网页 squash 合并。
+- （视 GPT 对补充提案的裁决）禁用空转的看门狗计划任务。
+
+### 发版与否
+
+未发版（纯文档，无用户可感知变更；GPT 明确「不需要为文档变更制造新的 Release」）。
+
+### 下一步
+
+1. 生产停用善后：按 GPT 对补充提案的裁决执行（禁用任务或保留待装 0.4.0 重建）。
+2. 用户安装 0.4.0 后：核对任务 Action/Arguments/WorkingDirectory，再清理
+   K:\ops\bin\run-hidden.vbs 引用（GPT 要求防删仍被引用文件）；若用户只是临时停用，
+   把 .off 改回 .exe 后记得重开任务。
+3. 功能轨冻结中；P2 按新排序池化，等真实用户问题/复现证据提权。
+
 ## 2026-10-26 发版波（GPT 终审 REQUEST_CHANGES + 安装器修复，01:0x–01:2x）
 
 ### GPT 终审裁决（「架构审查报告」专道，00:47 发出 / 00:5x 回）
@@ -61,6 +115,23 @@ main→release.yml→验收资产）。
    → release.yml 出包 → 资产 10 项核验。
 2. 遗留一条安装器经验待入宪法/记忆：iss 内 COM/格式化行为必须真机安装验证，接口级
    验证不可替代（本次 StartBoundary 即反例）。
+
+### 已发布（2026-10-26 01:4x–01:5x，既定流程走完，全绿一次通过）
+
+1. PR #45 squash 合并入 main（保持仓库既有 `(#NN)` 单提交风格），合并提交 **58bb463**，
+   与 release 分支 Head 68b7400 树逐字节一致（`git diff 68b7400 FETCH_HEAD` 0 行差异），
+   终审三项修正代码全部包含——裁决①「tag 必须指向合并后含最终代码的 main」满足。
+2. 附注 tag **v0.4.0** 打在 58bb463（非 release 分支）并经 SSH 推送，远端
+   `refs/tags/v0.4.0` 到位。
+3. release.yml run #49（[runs/40218086889](https://github.com/ardss/kynoptic/actions/runs/40218086889)）
+   5m46s completed successfully；main CI #174 同绿（2m32s）。
+4. [Release v0.4.0](https://github.com/ardss/kynoptic/releases/tag/v0.4.0) 资产 **10 项**
+   核验通过（以页面实际清单为准）：kynoptic.exe / kynoptic-ctl.exe / kynoptic-watchdog.exe /
+   kynoptic-aggrepair.exe / kynoptic-tray.exe（5 exe）+ Kynoptic-Setup-0.4.0.exe +
+   Kynoptic-Portable-0.4.0.zip + kynoptic-0.4.0-x86_64-pc-windows-msvc.zip（crate zip）+
+   SHA256SUMS.txt + SKILL.md。无红无缺。
+5. 本机遗留（建议用户动作，非阻塞）：安装 0.4.0 正式版后，删除旧包装层
+   `K:\ops\bin\run-hidden.vbs`（新版安装器已原生包装治理，wscript 中转不再需要）。
 
 ## 2026-10-25（调度触发 07:15 +08:00 / 实际执行 07:20–09:3x）
 
