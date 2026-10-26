@@ -2,7 +2,7 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
-## 2026-10-26（调度触发 07:15 / 实际执行 07:15–08:1x）
+## 2026-10-26（调度触发 07:15 / 实际执行 07:15–08:3x）
 
 ### 巡检发现
 
@@ -38,11 +38,29 @@
 调整如巡检 7。通道备注：07:41 有一条因发送落在隐藏镜像草稿的半截重复消息（仅前三条
 巡检），完整提案紧随发出，GPT 确认裁决覆盖全部七项，无信息缺失。
 
+**补充提案 M1.5（禁用空转任务）08:21 回：APPROVE**，附执行协议——先导出任务 XML
+备份并核对任务名/Action/Arguments/WorkingDirectory（不符即停，不模糊匹配），仅对
+精确任务名执行 /DISABLE，回读 Disabled + 失败日志停止增长为验收；任务/vbs/.off 一律
+保留不删；恢复前先确认已装版本、程序路径与用户意愿。原文：
+K:\AIControl\kynoptic-rounds\2026-10-26-verdict2.md。
+
 ### 执行
 
-- 本 PR（分支 docs/maint-20261026，PR 号回填）：MAINTENANCE_LOG 收口（移植 17 行 +
-  本条记录）；check-doc-version 绿；PR CI test 绿后网页 squash 合并。
-- （视 GPT 对补充提案的裁决）禁用空转的看门狗计划任务。
+- M1：docs 收尾 PR **#46**（分支 docs/maint-20261026，diff 仅 MAINTENANCE_LOG.md
+  +71 行 = 移植 17 行 + 当日记录）于 08:15:26 squash 合并入 main（**efa5531**）；PR
+  CI test 绿，合并后 main CI 与 Pages 部署均绿；GPT 四项验收（diff 范围 / 原日志完整
+  不重复 / check-doc-version / main 含完整发版记录）全过。附注：合并发生在第二段浏览
+  器卡运行窗口内，卡回报自称「未合并」，与 GitHub API（merged_by=ardss，merged_at
+  08:15:26，紧随 CI 绿）矛盾，归因不定（卡误报或网页侧人工/自动合并）；结果与 GPT
+  授权一致，先绿后合并已核实。教训：执行卡的关键状态回报须以 API 交叉核验为准。
+- M1.5（08:27，按裁决协议逐步执行）：① XML 备份
+  K:\AIControl\kynoptic-rounds\2026-10-26-watchdog-task-backup.xml（1411B 可回导；
+  Action = wscript.exe / "K:\ops\bin\run-hidden.vbs" "Kynoptic Watchdog 46516965" /
+  WorkingDirectory 空，逐项核对一致，任务名精确匹配，改前 State=Ready）②
+  schtasks /Change /DISABLE 成功，回读 State=Disabled（08:27:22）③ 验收通过：08:28
+  与 08:29 两个触发点零新失败，任务日志停在 08:27:04 不再增长。未删除任务/vbs/.off，
+  未触碰其他计划任务。
+- 收尾回填：以上 M1 合并信息与 M1.5 执行记录经本 docs PR 补入 main。
 
 ### 发版与否
 
@@ -50,10 +68,10 @@
 
 ### 下一步
 
-1. 生产停用善后：按 GPT 对补充提案的裁决执行（禁用任务或保留待装 0.4.0 重建）。
-2. 用户安装 0.4.0 后：核对任务 Action/Arguments/WorkingDirectory，再清理
-   K:\ops\bin\run-hidden.vbs 引用（GPT 要求防删仍被引用文件）；若用户只是临时停用，
-   把 .off 改回 .exe 后记得重开任务。
+1. 用户安装 0.4.0 正式版后：由安装器重建看门狗任务并重新验收（不假定旧任务可恢复）；
+   核对新任务 Action/Arguments/WorkingDirectory 后，再清理 K:\ops\bin\run-hidden.vbs
+   引用（GPT 要求防删仍被引用文件）。
+2. 若生产只是临时停用：把 .off 改回 .exe，用备份 XML 回导或直接重启用任务即可恢复。
 3. 功能轨冻结中；P2 按新排序池化，等真实用户问题/复现证据提权。
 
 ## 2026-10-26 发版波（GPT 终审 REQUEST_CHANGES + 安装器修复，01:0x–01:2x）
