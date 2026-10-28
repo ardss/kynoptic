@@ -47,10 +47,13 @@
 3. **看门狗 1 分钟恢复活体实测 PASS**：03:17:03 杀 tray(71512)→03:17:04-05 看门狗拉起
    76916（≈2 秒），心跳 03:17:10 恢复，恢复后 API/DB 复检全绿、事件 643,494→643,600 只增不减。
    风险记录：看门狗只补缺席不杀挂死，tray 为提权进程，提权挂死需管理员（已知限制）。
-4. **归因正确性 + 估算偏差（如实，不改数据）**：分类器实测正常（WinB 今日 chrome browseros
+4. **归因正确性 + 估算偏差（如实，不改数据；03:4x 更正①）**：分类器实测正常（WinB 今日 chrome browseros
    10,641s→unattended+agent 50s、Terminal SendInput→agent 10s；WinA WXQ user=603s/
-   unattended=10,383s）。**偏差实证**：①WinB (unattributed) unknown=75,299s 出现在 3.2h 的
-   "今日"，结构上不可能（停摆上限分钟桶核算产物，同源 #48「idle 未闭合 70 对」）；
+   unattended=10,383s）。**偏差实证**：①WinB (unattributed) unknown=75,299s——已源码定案：
+   `kynoptic apps` 的"今天"窗口 end=未来午夜，unknown 含未来秒（cli/main.rs:2359-2371 +
+   actor.rs:312-313；10,691+410+75,299=86,400 整天秒精确对账；CLI credit_tail=false 与 MCP
+   get_top_apps credit_tail=true 双 surface 口径不一致）——**已立缺陷证据包
+   `kynoptic-rounds\2026-10-29-defect-apps-actor-window.md` 等 GPT 审查，未修码**；
    ②WinA 今日 unattended 130→173min vs presence 14→19min（agent 干活日形态）——
    **presence/unattended/estimated_actor_dwell/browseros_sec 全部是估算代理，严禁当真人
    工作时长考勤口径**；CDP 类 agent 作业不产生 OS 输入（human/automation 双低估、
