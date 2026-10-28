@@ -32,6 +32,31 @@
 2. Du 看门狗任务管理员收编（#48 原样待办）。
 3. CV GO 链归 CV Owner；KY 侧无动作。
 
+### 补充执行（03:0x–03:2x，用户七条执行令专项）
+
+按用户复核令逐项补实时证据（全记录 `K:\AIControl\kynoptic-rounds\2026-10-29-双机复核与恢复实测.md`，
+总索引 `kynoptic-rounds\INDEX.md`，协同件 `CV-KY-convergence-20261028\COORD-B-to-A-20261029.md`）：
+
+1. **WinB 只读盘点**：无 kyn 服务；五 exe SHA256 与官方资产逐一匹配
+   （A7E1DD2D/89AD238B/1D62A89F/DE281F5C/82CC8E6B）；全机仅 1 计划任务（无双看门狗）；
+   DB 556,937,216B + WAL 秒级；心跳 03:12 新鲜；日报三入口（面板 8422 / CLI report /
+   /api/report）实测可用。
+2. **冷备可恢复性复核**：`K:\AIControl\backups\kynoptic-coldbackup-20261028\` 在位
+   （598,760,949 B 与记录一致），备份库 SHA256=`A2A3E31C1F50BA53…` 与冻结值逐字吻合
+   （03:0x 重算）；回滚三件套齐（冷备+5 .bak+任务/Run 键未改结构）。
+3. **看门狗 1 分钟恢复活体实测 PASS**：03:17:03 杀 tray(71512)→03:17:04-05 看门狗拉起
+   76916（≈2 秒），心跳 03:17:10 恢复，恢复后 API/DB 复检全绿、事件 643,494→643,600 只增不减。
+   风险记录：看门狗只补缺席不杀挂死，tray 为提权进程，提权挂死需管理员（已知限制）。
+4. **归因正确性 + 估算偏差（如实，不改数据）**：分类器实测正常（WinB 今日 chrome browseros
+   10,641s→unattended+agent 50s、Terminal SendInput→agent 10s；WinA WXQ user=603s/
+   unattended=10,383s）。**偏差实证**：①WinB (unattributed) unknown=75,299s 出现在 3.2h 的
+   "今日"，结构上不可能（停摆上限分钟桶核算产物，同源 #48「idle 未闭合 70 对」）；
+   ②WinA 今日 unattended 130→173min vs presence 14→19min（agent 干活日形态）——
+   **presence/unattended/estimated_actor_dwell/browseros_sec 全部是估算代理，严禁当真人
+   工作时长考勤口径**；CDP 类 agent 作业不产生 OS 输入（human/automation 双低估、
+   unattended 高估）；user 类含未打标自动化污染（上界）；fg_dwell 为窗口切换累计+2h 停摆剔除。
+5. 双机协同件已发 WinA ZCode 部署 Owner（COORD-B-to-A-20261029.md）；WinB 冷备/回退包在位。
+
 ## 2026-10-27（调度触发 07:15 / 实际执行 07:15–08:1x；审查通道故障，零改动巡检日）
 
 ### 巡检发现
