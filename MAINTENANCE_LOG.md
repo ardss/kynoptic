@@ -2,6 +2,84 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-29（用户复核令专项：双机 fresh 取证 02:33–02:57；执行者 KY 唯一代码 Owner=DSH）
+
+### 背景
+
+用户复核令：10-26 记录（.off/任务禁用/0.4.0 未装）与当日「v0.3.1 运行恢复」报告存在时间差/矛盾可能，须以当日实时取证为准。本轮=纯只读取证 + 本记录，零代码零发版零 tag；与 #48（10-28 轮）互补不重复——该轮落地时 WinA 尚离线（「待其上线」），本轮补齐双机实时证据。完整数据表见 `K:\AIControl\CV-KY-convergence-20261028\B-VERIFY-20261029.md`。
+
+### 巡检发现（全部实时实测）
+
+1. WinB（Du 本机）：五 exe VersionInfo **0.4.0**（`kynoptic-ctl --version`→0.4.0）、dash git_hash=**58bb463**（=v0.4.0 发布提交）、任务 46516965 Ready/LastResult=0、events **642,978** 持续写入（WAL 秒级刷新）、**输入钩子活体证明**：F15×3 → apm_5min 0.0→0.6 / idle 45s→8s，`/api/input?date=2026-10-29` 2 时桶 +9 keys，7 日 keys_total 13311→13320 精确对账。
+2. WinB 10-28 口径澄清：presence=1min 系当日真实键鼠输入极少 + 安装操作 5min 注入输入归 automation（LLKHF_INJECTED 分类正确）——**presence≈0 是真实数据，非捕获故障**；foreground=550min 与两段运行窗口（0.3.2 14:43–18:28 + 0.4.0 18:30 起）精确吻合。
+3. WinA（SSH 192.168.31.64 实测）：四 exe **0.4.0**、tray 41660（19:15 起）、任务 `Kynoptic Watchdog F5383F50` Ready、last_event **秒级新鲜**、events 454,335 持续增长（+4,498）、**五分类 actor 真实输出**（user/unattended 分层、agent_evidence_type=injected_input）、presence 10-28=332min 健康——#48 的「WinA 待上线」缺口闭合。
+4. 仓库：main=#48 后 034a00b，本地/远端对齐。
+5. **新发现（仓库级）**：GitHub Actions 建 PR 被仓库设置硬阻塞——ops/token-ops 分支实验实测 `403 "GitHub Actions is not permitted to create or approve pull requests"`（诊断 run 40749971984）。影响：无网页 GitHub 会话时无法自动建 PR/合并 docs 轮。解锁=设置勾选「Allow GitHub Actions to create and approve pull requests」（ops/token-ops-20261028 分支保留可随时重跑）或网页会话登录走 10-26 已验证的 compare 页通路。
+6. 连带：chatgpt.com Turnstile 拒绝 CDP 合成点击（CV GO 链阻塞项，CV Owner 范围，KY 侧无待审变更）。
+
+### 执行
+
+- 双机取证（上述）+ 本记录 + 10-27 轮补录（见下）经分支 `docs/maint-20261027-29` 推送（SSH）；PR 合并待上项解锁。
+- 10-27 轮为当时未入 main 的记录（按「GPT 未裁决→只巡检不动代码」分支执行，仅落分支）。
+
+### 发版与否
+
+未发版（KY 无代码变更；双机 0.4.0 运行验收 PASS；CV GO 链不在 KY 范围）。
+
+### 下一步
+
+1. 解锁 GitHub 建 PR 后：合并本分支（10-27 + 10-29 两轮补录）。
+2. Du 看门狗任务管理员收编（#48 原样待办）。
+3. CV GO 链归 CV Owner；KY 侧无动作。
+
+## 2026-10-27（调度触发 07:15 / 实际执行 07:15–08:1x；审查通道故障，零改动巡检日）
+
+### 巡检发现
+
+1. 起点：工作树干净，本地 main b97f106 与远端对齐；上轮 M1（docs #46/#47）与
+   M1.5（看门狗禁用）均已闭合，无烂尾。
+2. Issues/PR open 均 0（GitHub API 实证）；功能轨冻结维持——生产实例停用中无反馈源，
+   P2 无复现证据提权。
+3. 生产状态与 10-26 完全一致：安装目录五 exe 仍 .off（0.3.2 构建 mtime 10-15）、
+   update-available.txt=0.3.2、任务「Kynoptic Watchdog 46516965」仍 Disabled
+   （禁用后零新触发，Last Run 停在 10-26 08:27）、无 kyn 进程——0.4.0 未安装，
+   上轮「下一步」1/2 仍待用户安装或明确恢复指令。
+4. 文档一致性：check-doc-version 全绿（CHANGELOG 0.4.0/Unreleased 基线、
+   SECURITY 支持线、skill 三副本一致）；CHANGELOG [Unreleased] 空开启。
+5. 依赖 dry-run（只记录不升级）：约 40+ patch/minor（webpki-roots/zerocopy/
+   yoke/winresource 系等），6 项被 semver 约束未动，无 major 迹象、无安全通告。
+6. 待办池无变化：cli/main.rs 5077 行（实测）；open_reader 仍在 mcp/state.rs；
+   P2 排序维持上轮裁决：①db cleanup 边界日 ②export queries Result 语义
+   ③双数据面文档化 ④open_reader 下沉 ⑤cli 滚动拆分。
+
+### GPT 裁决
+
+**未裁决——审查通道不可达**（按「15 分钟无回复」同分支处理：当日只巡检、
+不动代码、不 tag）。agent-browser 通道当日全坏：headless Chrome 任何 http(s)
+导航均挂起（data: URL 正常渲染=故障在网络层；pwsh+显式代理可达 GitHub API，
+代理本体健康），唯一嫌疑=代理客户端对 headless chrome 进程的路由规则或 AV 拦截。
+已穷尽 9 条路径（会话重启×3/僵尸清理 29 root/profile wipe 76 目录/daemon 重拉×3/
+--proxy 与原生 --proxy-server 双通道/CDP 附加）。唯一解锁动作：排查代理进程规则/AV。
+
+### 执行
+
+零改动巡检日（无批准项）。记录经分支 docs/maint-20261027 提交并 SSH 推送
+（3e74578）；受保护 main 须 PR+CI，建 PR 三通道（网页/gh/API-token）当日均不可用，
+PR 待通道恢复补建——后被 10-29 分支 docs/maint-20261027-29 取代。
+
+### 发版与否
+
+未发版（零用户可感知变更，纯巡检 + 日志）。
+
+### 下一步
+
+1. 【环境债】恢复浏览器自动化通道（已于 10-28 解除：agent-browser connect 9100
+   附着用户 BrowserOS 为正确姿势）；补建 docs PR 合并入 main（10-29 分支承接）。
+2. 用户安装 0.4.0 后：安装器重建看门狗任务→核对 Action/Arguments/
+   WorkingDirectory→清理 K:\ops\bin\run-hidden.vbs 引用（后被 10-28 实况取代：
+   0.4.0 经 kynoptic update 自更新落地，任务收编待管理员）。
+3. 功能轨维持冻结；P2 池化排序不变，等真实用户问题/复现证据提权。
+
 ## 2026-10-28（KY 责任归位核verify轮：WinB ZCode/KY 19:28–19:5x）
 
 ### 背景与职责边界（用户 2026-10-28 纠偏）
