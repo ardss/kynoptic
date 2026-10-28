@@ -40,7 +40,7 @@ jobs:
               -d @payload.json \
               "https://api.github.com/repos/$REPO/pulls" -o resp.json
             NUM=$(jq -r '.number // empty' resp.json)
-            if [ -z "$NUM" ]; then echo "::error::PR create failed"; cat resp.json; exit 1; fi
+            if [ -z "$NUM" ]; then echo "::error::PRCREATE_RESP::$(head -c 400 resp.json)"; exit 1; fi
             echo "::notice::PR #$NUM created"
           else
             echo "::notice::PR #$PR exists; checking test check-run"
