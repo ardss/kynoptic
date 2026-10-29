@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
+### Changed
+
+- Core (monitors/ps): PowerShell-backed collection now runs through a
+  persistent single-process host instead of a cold `powershell.exe` spawn
+  per sample — scripts are delivered base64-over-stdin (UTF-8 exact),
+  results delimited by a per-call sentinel, each call bounded by the same
+  60s deadline; a hung host is killed and lazily respawned, and if the
+  host cannot start at all the engine permanently falls back to per-call
+  spawn. With all 40 monitors enabled, PS process churn drops from
+  ~9 powershell spawns/min (isolated baseline) to one resident host.
+  `run_ps` / `run_ps_detailed` signatures and tri-state semantics are
+  unchanged.
+- Core (monitors/ps): the per-call spawn fallback now reads stdout
+  concurrently with the child lifetime; output larger than the pipe
+  buffer no longer wedges both sides into the 60s timeout (latent
+  deadlock, fixed).
+- Core (collector): monitors with a PowerShell dependency are throttled
+  through a 4-permit semaphore covering both the first sample and the
+  steady-state loop, capping the startup burst (previously ~13 monitors
+  raced their first collect within seconds); a monitor whose collect
+  consistently overruns its own interval backs off exponentially
+  (interval x 2^n, capped at 600s) and resets on a normal pass.
+- Dash: `/api/status` gains a per-monitor `monitors` array
+  (`last_success_age_secs`, `last_duration_ms`, `consecutive_slow`);
+  the settings view shows one line while any monitor is in backoff, and
+  tolerates older backends without the field.
+
+### Fixed
+
+- Core (registry): dependency labels corrected after a full 40-item audit
+  — `ime` (natively rewritten, registry API only) and `location`
+  (collects nothing) are now `native`; the three deviations the binary
+  Native/PowerShell split cannot express (network `netstat.exe` fallback,
+  device optional disk-io WMI query, gpu per-tick `nvidia-smi.exe`) are
+  documented next to their registry entries.
+
+### Notes
+
+- Default 14-monitor set behavior, presence/automation/foreground
+  semantics, and privacy boundaries are unchanged.
+- BENCHMARKS.md gains an all-40 isolated baseline measured on this code
+  line before the refactor; post-refactor numbers are backfilled only
+  after the released build is measured on real machines.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added
@@ -1016,7 +1062,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ardss/kynoptic/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ardss/kynoptic/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ardss/kynoptic/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ardss/kynoptic/compare/v0.3.0...v0.3.1
