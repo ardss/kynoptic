@@ -340,3 +340,12 @@ PR #41 合并成功 + 官网 kynoptic.com 显示 v0.3.2 可访问并核实。未
 - registry：location 描述如实改「占位监控（不采集任何数据）」。
 - 本机态势：未触碰（.off 停用与 wscript 包装均为运维会话状态）；建议装 0.4.0 后删 K:\ops\bin\run-hidden.vbs 包装层（任务会被新安装器以电池友好配置重建）。
 - 待 GPT 终审后并入 v0.4.0 发版波（F1+F2 已在分支，发版提交 69f492f + 本批 e5a37fc）。
+
+## 2026-10-29（KY Owner 验收轮：双机 0.4.0 收尾 + 看门狗根因实证）
+
+- 仓库：main 干净（#48 后零漂移）；v0.4.0 官方资产核验不变。
+- 双机：A/B 均 0.4.0 官方版健康运行（哈希级核验、单任务单托盘、心跳/8422/数据增长实测，B 库 652,064 事件）。
+- **看门狗根因实证（B）**：电池双限制+wscript 包装源于安装器 v0.4.0 对既有 wscript 任务的**有意保留**（kynoptic.iss:907，防覆盖运维包装），非缺陷；修复=一次管理员动作，移交包（含 XML 备份/方案 A/B/7 项回归/回滚）已交原 B 安装 Agent：K:\AIControl\CV-KY-convergence-20261028\work\ky-watchdog-fix-handoff-20261029.md。完成前不宣称 B 全场景 PASS。
+- A 机：唯一任务直启 watchdog（无包装）、schtasks 兜底与台式机相符；卸载双键维持已接受偏差。
+- **独立质量审查**：8467d2a..b97f106 全量对抗扫描，无 P0/P1；actor 缓存零读取系勘误 3 明文设计（写放大可忽略），SUM/MAX 契约与 normalize_topic 边界记技术债。
+- **裁定：不发 0.4.1**。验收报告：KY-DEV-ACCEPTANCE-20261029.md（CV/KY-convergence 目录）；结论已同步飞书主档。
