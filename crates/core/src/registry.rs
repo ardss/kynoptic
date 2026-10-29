@@ -5,10 +5,18 @@
 //! 因此默认启用集合仍精确等于 v0.1 的 14 个（BENCHMARKS.md 空载基准继续有效），
 //! 恢复的 26 个全部默认关闭，可通过 [`MonitorOverrides`] 按需启用。
 //!
-//! 依赖分类：
-//! - [`Dep::Native`]：纯 windows-sys，零子进程
-//! - [`Dep::PowerShell`]：每次采集 spawn 一个 powershell（慢、易触发杀软），
-//!   默认一律关闭；代码标注"PS 子进程，待原生重写"
+//! 依赖类别与实际实现的对照约定：
+//! - [`Dep::Native`]：采集路径零子进程。涵盖纯原生 Win32/windows-sys 采集，
+//!   也涵盖零采集占位（location）。
+//! - [`Dep::PowerShell`]：采集路径经 monitors/ps.rs 的 run_ps spawn
+//!   PowerShell 子进程，默认一律关闭。
+//!
+//! Dep 是二分类，表达不了「主路径原生 + 外部 exe 兜底」或「默认原生 +
+//! 可选 PS 路径」；这类偏差不新增枚举变体，以对应注册项的注释为准：
+//! - network：主路径原生 GetIfTable2，兜底 spawn 外部 netstat.exe（3s 有界）。
+//! - device：默认路径原生；enable_disk_io=true 时经 run_ps 查 WMI。
+//! - gpu：静态信息经 run_ps 查 WMI（600s TTL），动态指标每拍另 spawn
+//!   外部 nvidia-smi.exe（3s 有界，非 PowerShell）。
 //!
 //! `crates/core/config/monitors.json` 是随仓库分发的默认配置模板，
 //! 测试保证其内容与本注册表逐项一致。
@@ -138,6 +146,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
         Sensitivity::Low,
         Dep::Native,
     ),
+    // 依赖备注：主路径原生 GetIfTable2；不可用时兜底 spawn 外部 netstat.exe
+    // （3s 有界）。Native 指默认采集路径。
     spec(
         "network",
         "Records network connected / disconnected state changes",
@@ -154,6 +164,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
         Sensitivity::Low,
         Dep::Native,
     ),
+    // 依赖备注：Native 指默认配置（enable_disk_io=false，零子进程）；
+    // 该开关置 true 时磁盘 I/O 速率经 run_ps 查 WMI。
     spec(
         "device",
         "Lists basic info of connected hardware devices",
@@ -297,16 +309,17 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
         "记录输入法切换事件",
         false,
         Sensitivity::Medium,
-        Dep::PowerShell,
+        Dep::Native,
     ),
     // ── R8 ③ 恢复（14，高敏感或主题外，默认关闭）──
+    // 零采集占位：不 spawn 子进程、不访问网络，归 Native（零子进程）。
     spec(
         "location",
         "Placeholder — collects nothing (pending native Windows location API)",
         "占位监控（不采集任何数据）— 历史公网 IP 外呼已按隐私红线移除，待 Windows 定位 API 原生实现并披露数据去向后再恢复",
         false,
         Sensitivity::High,
-        Dep::PowerShell,
+        Dep::Native,
     ),
     spec(
         "notification",
@@ -404,6 +417,8 @@ pub const MONITOR_REGISTRY: &[MonitorSpec] = &[
         Sensitivity::High,
         Dep::PowerShell,
     ),
+    // 依赖备注：静态信息经 run_ps 查 WMI（600s TTL）；动态指标每拍另 spawn
+    // 外部 nvidia-smi.exe（3s 有界），非 PowerShell 子进程。
     spec(
         "gpu",
         "Samples GPU model and usage levels",
