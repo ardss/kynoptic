@@ -259,6 +259,187 @@ fn rand_jitter() -> f64 {
     rand::thread_rng().gen_range(-1.0..=1.0)
 }
 
+// ─── 重型采集并发预算（Dep::PowerShell 监控器限流） ──────────────────────────
+
+/// 计数信号量（Mutex+Condvar 自实现：core 不为限流引入异步运行时依赖）。
+/// 实例级而非进程级静态：probe/tray 热重载在同进程多次启停采集器，进程级
+/// 预算会把上一实例未归还的许可泄给下一实例（每 Collector 一份，口径同
+/// Collector.shutdown 字段注的停机旗标）。
+struct HeavySemaphore {
+    /// 剩余许可数（0 = 全部在途）
+    remaining: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl HeavySemaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            remaining: Mutex::new(permits),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// 获取一个许可，等待期间按至多 1 秒切片轮询停机旗标；旗标置位即返回
+    /// None（调用方放弃本轮采集，进入既有的睡眠切片/退出路径）。不允许
+    /// 无超时阻塞：阻塞式等待会破坏 shutdown 对监控线程的有界 join 口径
+    /// （监控线程的睡眠全部是 1 秒切片且切片间查旗标，见 monitor_handles
+    /// 字段注）。许可在途期间（在途 collect 未返回）等待时长无上界——与
+    /// "至多一次进行中的循环段 collect"同类的已知残留。
+    fn acquire_polling(self: &Arc<Self>, shutdown: &AtomicBool) -> Option<HeavyPermit> {
+        let mut remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return None;
+            }
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Some(HeavyPermit { sem: self.clone() });
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(remaining, Duration::from_secs(1))
+                .unwrap_or_else(|e| e.into_inner());
+            remaining = guard;
+        }
+    }
+
+    fn release(&self) {
+        let mut remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+        *remaining += 1;
+        drop(remaining);
+        self.cv.notify_one();
+    }
+}
+
+/// 许可的 RAII 句柄：drop 即归还。collect 的 panic 由 catch_unwind 兜住后
+/// 展开路径同样触发 drop，许可不随 panic 泄漏。
+struct HeavyPermit {
+    sem: Arc<HeavySemaphore>,
+}
+
+impl Drop for HeavyPermit {
+    fn drop(&mut self) {
+        self.sem.release();
+    }
+}
+
+/// 监控器是否重型（PowerShell 子进程依赖）。注册表是依赖分类的单一事实源；
+/// Monitor trait 无 dep()（最小面），按 name 反查注册表。
+fn is_heavy_monitor(name: &str) -> bool {
+    crate::registry::MONITOR_REGISTRY
+        .iter()
+        .any(|s| s.id == name && s.dep == crate::registry::Dep::PowerShell)
+}
+
+// ─── 慢采集退避（纯函数策略，时长全部由调用方注入，不读真实时钟） ────────────
+
+/// 慢采集判定：单次 collect 耗时超过监控器自身采样间隔即慢——采集跟不上
+/// 自己的节奏（占空比 > 100%），继续按原间隔只会积压。阈值相对化后无需
+/// 额外的绝对秒数常量，各监控器按自身 interval 自校准。
+fn is_slow_collect(duration: Duration, interval: Duration) -> bool {
+    duration > interval
+}
+
+/// 连续慢计数推进：慢则 +1（饱和不回绕），一次正常采集即清零（恢复正常
+/// 即复位）。
+fn advance_consecutive_slow(prev: u32, slow: bool) -> u32 {
+    if slow {
+        prev.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// 退避等待时长（纯函数）：连续慢 n 次 → 基础间隔 ×2^n，封顶
+/// constants::MONITOR_BACKOFF_MAX_WAIT_SECS；基础间隔本身已超过上限的
+/// 监控器不再放大（放大结果永不低于基础间隔）。n=0 恒为基础间隔。
+/// 既有 ±30% 随机抖动叠加在本函数结果之上，不受此上限约束。
+fn backoff_wait(base: Duration, consecutive_slow: u32) -> Duration {
+    if consecutive_slow == 0 {
+        return base;
+    }
+    let doubled = base.saturating_mul(2u32.saturating_pow(consecutive_slow.min(30)));
+    let capped = doubled.min(Duration::from_secs(
+        constants::MONITOR_BACKOFF_MAX_WAIT_SECS,
+    ));
+    base.max(capped)
+}
+
+// ─── 每监控器采集统计（/api/status 诊断出口） ────────────────────────────────
+//
+// 进程级静态量 + 访问器的跨 crate 暴露口径与 LAST_FLUSH_EPOCH 完全同款：
+// tray 主场景下 dash serve 与采集器同进程，读侧即见；cli 独立 serve 子进程
+// 无采集器，读到空表——与 db_degraded 的跨进程盲区同口径。
+
+/// 单监控器统计的内存态（写侧：run_monitor 循环段每轮成功采集后整体覆盖）。
+#[derive(Debug, Clone, Copy, Default)]
+struct MonitorStatInner {
+    /// 最近一次成功采集的 unix 秒（0 = 本进程内尚未成功采集过）
+    last_success_epoch: u64,
+    /// 最近一次完成采集的耗时毫秒（0 = 尚未完成过）
+    last_duration_ms: u64,
+    /// 连续慢采集次数（0 = 正常；>0 即处于退避状态）
+    consecutive_slow: u32,
+}
+
+/// 单监控器统计快照（dash /api/status 透出，serde 直出）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonitorStatSnapshot {
+    pub name: String,
+    /// 距上次成功采集的秒数（null = 本进程内尚未成功采集过）
+    pub last_success_age_secs: Option<u64>,
+    /// 最近一次完成采集的耗时毫秒（0 = 尚未完成过）
+    pub last_duration_ms: u64,
+    /// 连续慢采集次数（0 = 正常；>0 即处于退避状态）
+    pub consecutive_slow: u32,
+}
+
+/// 键为监控器名（= 注册表 id），BTreeMap 保证快照按名稳定排序。
+static MONITOR_STATS: Mutex<std::collections::BTreeMap<String, MonitorStatInner>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// 记录一次循环段采集结果（成功路径；panic 路径不计）。now_epoch 由调用方
+/// 注入，本函数不读真实时钟（测试铁律：策略与记录全部参数化，只有最外层
+/// 采集循环碰时钟）。
+fn record_monitor_stat(name: &str, duration: Duration, consecutive_slow: u32, now_epoch: u64) {
+    let mut map = MONITOR_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        name.to_string(),
+        MonitorStatInner {
+            last_success_epoch: now_epoch,
+            last_duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            consecutive_slow,
+        },
+    );
+}
+
+/// 当前 unix 秒（统计打点专用；策略函数不吃这个值）。
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 快照组装（纯函数）：age 由注入的 now 计算，测试用固定时刻断言。
+fn stat_snapshot(name: &str, s: &MonitorStatInner, now_epoch: u64) -> MonitorStatSnapshot {
+    MonitorStatSnapshot {
+        name: name.to_string(),
+        last_success_age_secs: (s.last_success_epoch > 0)
+            .then(|| now_epoch.saturating_sub(s.last_success_epoch)),
+        last_duration_ms: s.last_duration_ms,
+        consecutive_slow: s.consecutive_slow,
+    }
+}
+
+/// 全部监控器的采集统计快照（按监控器名排序，供 dash /api/status 透出）。
+/// 独立 serve 进程无采集器，返回空数组（前端按缺省容错）。
+pub fn monitor_stats() -> Vec<MonitorStatSnapshot> {
+    let map = MONITOR_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_unix_secs();
+    map.iter().map(|(n, s)| stat_snapshot(n, s, now)).collect()
+}
+
 // ─── 采集器设置 ───────────────────────────────────────────────────────────────
 
 /// 输入事件（键盘/鼠标 Hook）的存储粒度。
@@ -706,6 +887,7 @@ fn run_monitor(
     tx: crossbeam_channel::Sender<Event>,
     shutdown: Arc<AtomicBool>,
     first_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    heavy: Option<Arc<HeavySemaphore>>,
 ) {
     set_thread_priority_below_normal();
     let name = m.name().to_string();
@@ -727,14 +909,31 @@ fn run_monitor(
     // 通道之后它再送达的事件随通道断开静默丢失——「排空前所有生产者已退出」
     // 不变量不成立。
     let worker_tx = tx.clone();
+    // 首拍 worker 同样轮询停机旗标（重型预算的许可等待切片用）；预算句柄
+    // 按 clone 移交 worker，循环段保留原句柄
+    let worker_sd = shutdown.clone();
+    let worker_heavy = heavy.clone();
     let (mon_tx, mon_rx) = crossbeam_channel::bounded(1);
     let worker = thread::Builder::new()
         .name(format!("{name}-first-collect"))
         .spawn(move || {
             set_thread_priority_below_normal();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                m.collect(&worker_tx);
-            }));
+            // 重型预算（首拍同受限流，削启动尖峰）：先取许可再 collect。
+            // 等待切片轮询停机旗标，停机时不采集、直接交还 monitor（消息
+            // 必有 monitor 的交还语义不变，主循环按既有路径回收后退出）。
+            // 限流使部分首拍超过 MONITOR_FIRST_COLLECT_DEADLINE 截止时走
+            // 既有弃拍交还路径，主线程仍不等进行中的首拍。
+            let permit = worker_heavy
+                .as_ref()
+                .and_then(|s| s.acquire_polling(&worker_sd));
+            let r = if permit.is_some() || worker_heavy.is_none() {
+                let _permit = permit;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    m.collect(&worker_tx);
+                }))
+            } else {
+                Ok(())
+            };
             let _ = mon_tx.send((r, m));
         });
     // monitor 所有权：常规路径 recv 回来；弃拍/失联路径留在后台，循环段用
@@ -785,6 +984,8 @@ fn run_monitor(
         }
     }
 
+    // 慢采集退避的连续慢计数（每监控器线程本地；一次正常采集即清零）
+    let mut consecutive_slow: u32 = 0;
     loop {
         if shutdown.load(Ordering::Acquire) {
             return;
@@ -812,16 +1013,45 @@ fn run_monitor(
         }
 
         if let Some(m) = mon.as_ref() {
-            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                m.collect(&tx);
-            })) {
-                log::error!("{} 采集 panic: {:?}，5 秒后重试", name, e);
-                thread::sleep(Duration::from_secs(5));
-                continue;
+            // 重型预算（循环段）：PS 依赖监控器先取许可再 collect；等待按
+            // 至多 1 秒切片轮询停机旗标，旗标置位时放弃本轮采集（落到下方
+            // 睡眠切片，下一轮顶部检查退出），join 口径不因等待变差。
+            let permit = heavy.as_ref().and_then(|s| s.acquire_polling(&shutdown));
+            if permit.is_some() || heavy.is_none() {
+                let _permit = permit;
+                // 计时点在许可到手之后：只测 collect 本身耗时进退避策略与
+                // 统计，许可排队时间不算采集慢（排队是调度预算的预期行为，
+                // 计入会把正常采集误判成慢）。首拍不计时——已有 10 秒硬
+                // 截止与弃拍交还语义，不参与退避。
+                let started = std::time::Instant::now();
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    m.collect(&tx);
+                })) {
+                    log::error!("{} 采集 panic: {:?}，5 秒后重试", name, e);
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+                let duration = started.elapsed();
+                // 慢采集退避：连续超自身间隔按 2^n 放大下一轮间隔、封顶
+                // MONITOR_BACKOFF_MAX_WAIT_SECS，一次正常即复位；计数与
+                // 耗时同步落统计，退避中的监控器在 /api/status 可见。
+                consecutive_slow =
+                    advance_consecutive_slow(consecutive_slow, is_slow_collect(duration, interval));
+                record_monitor_stat(&name, duration, consecutive_slow, now_unix_secs());
+                if consecutive_slow > 0 {
+                    log::warn!(
+                        "{} 采集耗时 {}ms 超过采样间隔 {:?}（连续第 {} 次），下轮间隔放大至 {:?}",
+                        name,
+                        duration.as_millis(),
+                        interval,
+                        consecutive_slow,
+                        backoff_wait(interval, consecutive_slow)
+                    );
+                }
             }
         }
 
-        let base = interval.as_secs_f64();
+        let base = backoff_wait(interval, consecutive_slow).as_secs_f64();
         let jitter_factor = 1.0 + rand_jitter() * 0.3;
         let wait = Duration::from_secs_f64(base * jitter_factor);
 
@@ -863,7 +1093,9 @@ pub struct Collector {
     /// 补齐，主线程永不等进行中的首拍枚举），循环段睡眠是 1 秒切片且切片
     /// 间检查停机旗标。有界 = 首拍截止（≤10s）+ 至多一次进行中的循环段
     /// collect（循环段 collect 仍为主线程同步执行、枚举慢的病态系统可能耗时
-    /// 较长——已知残留，见 W33-F7；首拍不再构成退出阻塞）。被弃首拍 worker
+    /// 较长——已知残留，见 W33-F7；首拍不再构成退出阻塞）+ 重型预算的许可
+    /// 等待切片（PS 监控器等许可同样 1 秒切片查停机旗标；许可在途时长受
+    /// 在途 collect 时长约束，与在途 collect 同类残留）。被弃首拍 worker
     /// 不在本 vec 内（它是监控线程 spawn 的子线程），由
     /// [`Collector::first_collect_workers`] 单独登记、shutdown 同点 join。
     monitor_handles: Vec<thread::JoinHandle<()>>,
@@ -1155,6 +1387,13 @@ pub fn start_collection_custom(
         archive_write_failure(&msg);
     }
     CONSECUTIVE_WRITE_FAILURE_PERIODS.store(0, Ordering::Relaxed);
+    // 监控器采集统计是进程级观测态：新实例清零，上一实例的 consecutive_slow
+    // 与采集耗时不带入本实例（热重载复位口径，与上行写失败周期数同点执行）。
+    // 纯诊断数据、无告警语义，遗留不告警。
+    MONITOR_STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     // 回归审查 P1：flush epoch 是进程级全局，重启采集器时不清会带着上一
     // 会话的时间戳——心跳线程立即误判 stalled（raw 粒度安静机器上首笔
     // 落库可合法超过 300s），看门狗循环误杀健康托盘。置为当前时刻重启计时。
@@ -1259,15 +1498,21 @@ pub fn start_collection_custom(
     let monitor_count = monitors.len();
     log::info!("正在启动 {} 个 Monitor...", monitor_count);
 
+    // 重型采集并发预算（实例级，每 Collector 一份，口径同停机旗标字段注）：
+    // Dep::PowerShell 监控器共享 HEAVY_COLLECT_MAX_CONCURRENT 个许可，削平
+    // 启动尖峰与 PS 子进程突发；Native 监控器零子进程，不占预算。
+    let heavy_budget = Arc::new(HeavySemaphore::new(constants::HEAVY_COLLECT_MAX_CONCURRENT));
+
     // 审查 33-F7：保留监控线程句柄，shutdown 收尾时全部 join
     let mut monitor_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     for m in monitors {
         let tx = tx.clone();
         let sd = shutdown.clone();
         let fw = first_workers.clone();
+        let hb = is_heavy_monitor(m.name()).then(|| heavy_budget.clone());
         match thread::Builder::new()
             .name(m.name().into())
-            .spawn(move || run_monitor(m, tx, sd, fw))
+            .spawn(move || run_monitor(m, tx, sd, fw, hb))
         {
             Ok(handle) => monitor_handles.push(handle),
             Err(e) => {
@@ -1682,6 +1927,189 @@ mod tests {
             total_written.load(Ordering::Relaxed),
             0,
             "全失败不得虚增写入统计"
+        );
+    }
+
+    /// 慢采集判定相对监控器自身间隔：占空比 > 100% 才算慢（等于不算）。
+    #[test]
+    fn slow_collect_is_relative_to_own_interval() {
+        assert!(!is_slow_collect(
+            Duration::from_millis(999),
+            Duration::from_secs(1)
+        ));
+        assert!(!is_slow_collect(
+            Duration::from_secs(1),
+            Duration::from_secs(1)
+        ));
+        assert!(is_slow_collect(
+            Duration::from_millis(1001),
+            Duration::from_secs(1)
+        ));
+    }
+
+    /// 连续慢计数：慢推进、一次正常即复位、饱和不回绕。
+    #[test]
+    fn consecutive_slow_advances_and_resets() {
+        let mut n = 0u32;
+        n = advance_consecutive_slow(n, false);
+        assert_eq!(n, 0);
+        n = advance_consecutive_slow(n, true);
+        assert_eq!(n, 1);
+        n = advance_consecutive_slow(n, true);
+        assert_eq!(n, 2);
+        n = advance_consecutive_slow(n, false);
+        assert_eq!(n, 0, "恢复正常即复位");
+        assert_eq!(advance_consecutive_slow(u32::MAX, true), u32::MAX);
+    }
+
+    /// 退避等待：2^n 放大、封顶 600 秒、基础间隔本身超上限时不再放大。
+    #[test]
+    fn backoff_wait_doubles_then_caps() {
+        let base = Duration::from_secs(120);
+        assert_eq!(backoff_wait(base, 0), base);
+        assert_eq!(backoff_wait(base, 1), Duration::from_secs(240));
+        assert_eq!(backoff_wait(base, 2), Duration::from_secs(480));
+        // 960 > 600 → 封顶
+        assert_eq!(backoff_wait(base, 3), Duration::from_secs(600));
+        assert_eq!(backoff_wait(base, 50), Duration::from_secs(600));
+        // 基础间隔本身超上限（如 device 的 2h）：放大结果不低于基础间隔
+        let huge = Duration::from_secs(7200);
+        assert_eq!(backoff_wait(huge, 1), huge);
+        assert_eq!(backoff_wait(huge, 30), huge);
+    }
+
+    /// 重型预算：许可计数守恒、占满后不发放、RAII 归还、停机放弃不耗许可。
+    #[test]
+    fn heavy_semaphore_permits_are_bounded_and_raii_released() {
+        let sem = Arc::new(HeavySemaphore::new(2));
+        let no_shutdown = AtomicBool::new(false);
+        let remaining = || *sem.remaining.lock().unwrap_or_else(|e| e.into_inner());
+        let p1 = sem.acquire_polling(&no_shutdown);
+        assert!(p1.is_some(), "空预算应可获取");
+        let p2 = sem.acquire_polling(&no_shutdown);
+        assert!(p2.is_some());
+        assert_eq!(remaining(), 0, "许可应全部在途");
+        // 占满 + 停机旗标：立即放弃，不发放也不消耗许可
+        assert!(sem.acquire_polling(&AtomicBool::new(true)).is_none());
+        assert_eq!(remaining(), 0, "停机放弃路径不得消耗许可");
+        drop(p1);
+        assert_eq!(remaining(), 1, "drop 应 RAII 归还许可");
+        let p3 = sem.acquire_polling(&no_shutdown);
+        assert!(p3.is_some(), "归还后应可再获取");
+        drop(p2);
+        drop(p3);
+        assert_eq!(remaining(), 2, "全部归还后计数守恒");
+    }
+
+    /// 重型预算：停机旗标置位时获取立即放弃（返回 None），不阻塞等待。
+    #[test]
+    fn heavy_semaphore_acquire_polls_shutdown_flag() {
+        let sem = Arc::new(HeavySemaphore::new(1));
+        let stopping = AtomicBool::new(true);
+        assert!(
+            sem.acquire_polling(&stopping).is_none(),
+            "停机旗标置位不得发放许可"
+        );
+    }
+
+    /// 重型预算：多线程并发下同时进临界区的线程数不得超过许可数。
+    #[test]
+    fn heavy_semaphore_never_exceeds_permit_count_across_threads() {
+        let sem = Arc::new(HeavySemaphore::new(4));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let no_shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let sem = sem.clone();
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            let no_shutdown = no_shutdown.clone();
+            handles.push(thread::spawn(move || {
+                if let Some(_p) = sem.acquire_polling(&no_shutdown) {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 4,
+            "并发进临界区数不得超过许可数: {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
+
+    /// 统计快照纯函数：age 用注入时刻计算；从未采集为 null；时钟回拨饱和为 0。
+    #[test]
+    fn monitor_stat_snapshot_is_pure_over_injected_now() {
+        let s = MonitorStatInner {
+            last_success_epoch: 1000,
+            last_duration_ms: 1500,
+            consecutive_slow: 2,
+        };
+        let snap = stat_snapshot("gpu", &s, 1060);
+        assert_eq!(snap.name, "gpu");
+        assert_eq!(snap.last_success_age_secs, Some(60));
+        assert_eq!(snap.last_duration_ms, 1500);
+        assert_eq!(snap.consecutive_slow, 2);
+        let fresh = MonitorStatInner::default();
+        assert_eq!(
+            stat_snapshot("x", &fresh, 999).last_success_age_secs,
+            None,
+            "从未成功采集应为 null 而非 0"
+        );
+        assert_eq!(
+            stat_snapshot("x", &s, 999).last_success_age_secs,
+            Some(0),
+            "时钟回拨时 age 饱和为 0 不下溢"
+        );
+    }
+
+    /// 统计记录：时刻由调用方注入；同监控器后写覆盖先写。
+    /// （全局表键名唯一，避免与其他测试并行互扰。）
+    #[test]
+    fn record_monitor_stat_uses_injected_epoch_and_overwrites() {
+        record_monitor_stat("t-record-unique", Duration::from_millis(700), 3, 5000);
+        record_monitor_stat("t-record-unique", Duration::from_millis(900), 0, 5100);
+        let inner = MONITOR_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("t-record-unique")
+            .copied()
+            .expect("记录后应有条目");
+        assert_eq!(inner.last_success_epoch, 5100, "后写覆盖先写");
+        assert_eq!(inner.last_duration_ms, 900);
+        assert_eq!(inner.consecutive_slow, 0);
+    }
+
+    /// 重型判定跟随注册表：PS 依赖监控器为真，Native 与未知 id 为假。
+    #[test]
+    fn is_heavy_monitor_follows_registry() {
+        assert!(is_heavy_monitor("gpu"));
+        assert!(is_heavy_monitor("windows_update"));
+        assert!(!is_heavy_monitor("window"));
+        assert!(!is_heavy_monitor("process"));
+        assert!(!is_heavy_monitor("keyboard_hook"));
+        assert!(!is_heavy_monitor("不存在的监控器"));
+    }
+
+    /// 默认 14 集合（12 轮询 + 2 Hook）全部 Native：重型预算只影响显式启用
+    /// PS 监控器的部署，默认集合行为不变。
+    #[test]
+    fn default_set_has_no_heavy_monitors() {
+        let set: std::collections::HashSet<String> = crate::registry::default_enabled_ids()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let monitors = create_monitors_for(&set);
+        assert!(
+            monitors.iter().all(|m| !is_heavy_monitor(m.name())),
+            "默认集合不得含重型（PS 依赖）监控器"
         );
     }
 }

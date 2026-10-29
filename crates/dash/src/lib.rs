@@ -704,6 +704,11 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         "actual_port": ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed),
         // 近 24h 看门狗告警（null = 无），面板顶部横幅消费
         "watchdog_alert": latest_watchdog_alert(conn),
+        // 监控器采集统计（性能治理）：每项含 name / last_success_age_secs /
+        // last_duration_ms / consecutive_slow，来源为 core 采集侧进程级静态量
+        // （kynoptic_core::collector::monitor_stats）。独立 serve 进程无采集器，
+        // 恒为空数组——与 db_degraded 的跨进程盲区同口径，前端按缺省容错。
+        "monitors": kynoptic_core::collector::monitor_stats(),
         "update_available": update_available,
         "build": {
             "git_hash": git_hash,
