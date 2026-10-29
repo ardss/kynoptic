@@ -20,6 +20,15 @@ pub const WRITE_FLUSH_INTERVAL_SECS: u64 = 30;
 /// 移入独立 worker、主线程只等这么久，超时弃拍（worker 后台跑完投递通道、
 /// 由下一轮 interval 补齐），退出路径有界。健康系统首拍 ~2-3s，10s 余量充足。
 pub const MONITOR_FIRST_COLLECT_DEADLINE_SECS: u64 = 10;
+/// 重型采集并发预算：Dep::PowerShell 监控器（每次 collect spawn/复用
+/// PowerShell 子进程）共享的许可数上限。多个 PS 监控器同时首采或同轮采集
+/// 时，超出预算的监控线程在许可等待上切片轮询停机旗标，削平启动尖峰与
+/// PS 子进程突发。默认启用集合全部为 Native 监控器，本预算只影响显式
+/// 启用 PS 监控器的部署。
+pub const HEAVY_COLLECT_MAX_CONCURRENT: usize = 4;
+/// 慢采集退避的等待上限（秒）：连续慢采集把采样间隔按 2^n 放大，放大结果
+/// 不超过本值；基础间隔本身已大于本值的监控器不再放大。
+pub const MONITOR_BACKOFF_MAX_WAIT_SECS: u64 = 600;
 
 // === 后台线程间隔 ===
 pub const MAINTENANCE_INTERVAL_SECS: u64 = 24 * 3600;

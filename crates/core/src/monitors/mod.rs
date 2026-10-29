@@ -14,11 +14,12 @@
 //! 事件驱动 Hook（2）：keyboard_hook / mouse_hook
 //!
 //! ## 已恢复、默认关闭（26）
-//! - 纯 windows-sys（W）：browser / clipboard / file_activity / media /
-//!   screen_capture / usb_device / bluetooth
+//! - 原生（零子进程）：browser / clipboard / file_activity / ime / media /
+//!   screen_capture / usb_device / bluetooth；location 为零采集占位
+//!   （不 spawn 子进程、不访问网络，同归原生类）
 //! - PS 子进程（默认关、待原生重写）：thermal / gpu / display /
-//!   external_display / audio_input / audio_output / ime / vpn / dns /
-//!   notification / calendar / location / print / firewall / security /
+//!   external_display / audio_input / audio_output / vpn / dns /
+//!   notification / calendar / print / firewall / security /
 //!   uac / windows_update / driver / stylus
 
 // ── 默认启用：轮询型监控器（原生）──
@@ -45,11 +46,13 @@ pub mod host;
 // ── 去重高水位持久化（平台审查 item 11：notification/calendar 跨进程去重基线）──
 pub mod dedup;
 
-// ── 已恢复、默认关闭：纯 windows-sys（原生，无子进程）──
+// ── 已恢复、默认关闭：原生采集（零子进程；location 为零采集占位）──
 pub mod bluetooth;
 pub mod browser;
 pub mod clipboard;
 pub mod file_activity;
+pub mod ime;
+pub mod location;
 pub mod media;
 pub mod screen_capture;
 pub mod usb_device;
@@ -64,8 +67,6 @@ pub mod driver;
 pub mod external_display;
 pub mod firewall;
 pub mod gpu;
-pub mod ime;
-pub mod location;
 pub mod notification;
 pub mod print;
 pub mod ps;

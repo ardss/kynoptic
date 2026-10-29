@@ -5,7 +5,9 @@
     "registry::config_template_matches_registry 测试保证两者逐项一致。",
     "默认启用 = v0.1 的 14 个（纯 windows-sys、零子进程）；",
     "恢复的 26 个默认关闭（R8 2级 中敏感 / 3级 高敏感或主题外）。",
-    "dep: native = 纯 windows-sys；powershell = PS 子进程（待原生重写）。"
+    "dep: native = 零子进程（原生 API 或零采集占位）；powershell = 经 ps.rs spawn PowerShell。",
+    "已知偏差（Dep 二分类表达不了，见 registry.rs 注册项注释）：network 兜底 spawn",
+    "netstat.exe；device 在 enable_disk_io=true 时走 PS；gpu 动态指标每拍 spawn nvidia-smi.exe。"
   ],
   "monitors": [
     {
@@ -162,13 +164,13 @@
       "id": "ime",
       "default_enabled": false,
       "sensitivity": "medium",
-      "dep": "powershell"
+      "dep": "native"
     },
     {
       "id": "location",
       "default_enabled": false,
       "sensitivity": "high",
-      "dep": "powershell"
+      "dep": "native"
     },
     {
       "id": "notification",
