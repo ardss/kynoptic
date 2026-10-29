@@ -2,6 +2,75 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-29（严格 TDD 深审修复轮：四路深审 → 逐条复核 → 机制化 RED/GREEN → 批A/B/C；不发版不安装）
+
+### 背景与流程
+
+- 用户指令：「更严格的并且去尝试优化性能或者检测用户有可能感知到但没做好的功能」。
+  动态工作流管线：四路并行深审 → 每条发现独立复核 → 规划批次 → 机制化 RED/GREEN
+  修复（测试先实测失败，live 真实树或临时副本历史证据）→ 全量门禁 → 独立复审。
+- 四路深审 13 条候选（UX 5 / 性能 0 / 缺陷 3 / 理念 5）；独立复核后 6 条确认入批修复。
+- 过程透明：工作流 RED 门禁脚本侧失效一次（在已实现的真实树上强求 exit≠0 与
+  「禁止回退实现」矛盾）→ 主会话裁决 historical RED 模式（临时副本重现桩态红）
+  并修订脚本缓存续接；既有断言契约更新（批A）经会话批准并留码内注释。
+
+### 批A：dash 用户可感知修复（PR #57，6719f6c，已合并 d7dd943）
+
+1. **异常页签红色角标自引入起永不显示**（high）：`badge.style.display=""` 只清
+   内联样式、回落样式表 `.tab-badge{display:none}`。现场实测 7 天 15 条 alert 级
+   异常页签零提示（读屏路径同死）。→ 显式 `inline-block`；4 条钉住测试。
+2. **输入页每日对比缺天不补零**（medium）：`/api/input?days=7` 无数据日缺行
+   （实测 5 行、10-25→10-28 跳变），与接口文档「缺天补零」不符（hourly_today
+   已是定长 24 补零，意图只做了一半）。→ `zero_fill_daily_series` 定长窗口；
+   3 条新测试。既有断言 `input_sql_aggregation_matches_row_semantics` 契约
+   1→7 行窗口+按日定位（15/4 值断言保留，突变实测可红）。
+
+### 批B：agg 混合分钟一致性（core 数据正确性，PR #58，d1fd609）
+
+- 同一本地分钟混合 raw 与 input_agg 两形态：增量走 MAX 快照、全量重建做两形态
+  SUM → 逐行分叉（探针实测增量 5 vs 重建 7），`agg_minute_actor` 证据可令
+  actor 五分类翻转（agent↔mixed）；分钟图/异常检测读缓存、今日按键 summary 读
+  events SUM，同分钟两读路数字不一致。→ 增量语义与重建对齐 + 边界等价性测试
+  `mixed_minute_parity` 钉住（既有等价测试两形态分放不同分钟，恰好漏掉边界）。
+- **独立复审 high 残留（记录，本轮不修）**：生产写路径 `execute_event` 对
+  input_agg 行恒返 rowid=0，`detect_mixed_minute` 首卫 `rowid<=0` 早退 →
+  混合分钟重算在生产暂不触发（recompute_* 生产为死代码；两条 parity 单测手工
+  喂真实 rowid，属假阳性覆盖）；更糟：连续会话下 heal 自愈核对口径
+  （日级 MAX(id) vs MAX(max_event_rowid)）漏报，分叉连自愈也不收敛。
+- 生产取证（只读）：当前库 0 混合分钟（12,434 键鼠事件全为 input_agg、raw 行 0），
+  风险为潜在（opt-in raw + 分钟中途切计数模式才触发），按 user_visible 门槛
+  本轮不接线。**下波**：events.rs rowid 贯通生产链路 + 自愈核对口径修正。
+
+### 批C：安装版识别 unins 通配 + lock 卫生（本批）
+
+- Inno 卸载器编号随重装递增（生产机实测仅 unins001.exe/unins001.dat），
+  cli 拒绝闸与 tray 分流三处字面 `unins000.exe` 探测全漏判 → `kynoptic update`
+  安装版拒绝闸失效、托盘一键更新误走便携自更新（卸载数据库与磁盘版本漂移）。
+  → `core::install::is_inno_installed_dir` 单一来源（`unins\d+\.exe` 通配、
+  仅 .dat 不构成证据、无卸载器判便携），cli/tray 共用，含测试
+  （unins000+递增编号、仅 dat/缺目录保持便携）。
+- Cargo.lock：v0.5.0 bump 后 main 未再生成（工作区包仍钉 0.4.0，
+  `--locked` 构建/打包校验会失败）→ 同步 0.5.0。
+
+### 记录不修（规划员裁定，含理由）
+
+- `redact_titles` 标题脱敏开关无任何路径可开启（medium，恒原文落库；面板各 GET
+  视图本就不返回原始标题，影响在 export/MCP 面）：接线属采集隐私语义变更
+  （ACCEPTED_SETTING_FIELDS 加字段+UI+默认值取向），待用户裁定后单独立项。
+- llms.txt「18 subcommands」实为 21（apps/topics/recompute-actors 未收录）、
+  APP.md CLI 表停在 v0.3.1：纯文档，随下次文档轮补齐。
+- low 级：报告页「专注时段」无在场块显示「暂无数据」、输入设备行 HID 重复计数/
+  触控板算 2 键/原始 VID 显示、presence raw 模式 capped/uncapped 对 mixed_minutes
+  0 vs 1（口径裁定）、README「纯 Win32 零子进程」过强（registry 已披露 netstat
+  兜底）、卸载默认保留数据零披露、update.rs:1008 与 main.rs:1470 子进程未过
+  `spawn::no_window()`。
+
+### 门禁
+
+- 每批独立 PR+CI（fmt / clippy -D warnings / test --workspace / dashboard JS 检查），
+  级联 update-branch 后的 CI 验证累计树。全量门禁在工作流内已先跑绿一遍。
+- 本轮不发版、不安装，等用户口令。
+
 ## 2026-10-29（v0.5.0 发版与双机安装轮：主会话，PR #51-#55 合并 → tag → 官方 Release → Du/A 升级）
 
 ### 合并与发版

@@ -288,7 +288,7 @@ impl TrayCtx {
                 let installed = std::env::current_exe()
                     .ok()
                     .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-                    .map(|d| d.join("unins000.exe").exists())
+                    .map(|d| kynoptic_core::install::is_inno_installed_dir(&d))
                     .unwrap_or(false);
                 let text: Vec<u16> = format!(
                     "{}\0",
@@ -412,7 +412,7 @@ impl TrayCtx {
                     .and_then(|e| e.parent().map(|p| p.to_path_buf()));
                 let installed = exe_dir
                     .as_ref()
-                    .map(|d| d.join("unins000.exe").exists())
+                    .map(|d| kynoptic_core::install::is_inno_installed_dir(d))
                     .unwrap_or(false);
                 if installed {
                     let url: Vec<u16> =
