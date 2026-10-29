@@ -349,3 +349,9 @@ PR #41 合并成功 + 官网 kynoptic.com 显示 v0.3.2 可访问并核实。未
 - A 机：唯一任务直启 watchdog（无包装）、schtasks 兜底与台式机相符；卸载双键维持已接受偏差。
 - **独立质量审查**：8467d2a..b97f106 全量对抗扫描，无 P0/P1；actor 缓存零读取系勘误 3 明文设计（写放大可忽略），SUM/MAX 契约与 normalize_topic 边界记技术债。
 - **裁定：不发 0.4.1**。验收报告：KY-DEV-ACCEPTANCE-20261029.md（CV/KY-convergence 目录）；结论已同步飞书主档。
+
+### 14:41 补充：B 看门狗电池友好修复完成（方案 B，用户批准 UAC）
+
+- Register-ScheduledTask 重注册成功：电池双限制 false/false + LogonTrigger + PT1M + PT10M + IgnoreNew（XML 实证），唯一任务，直启裸 exe（无 wscript）。
+- 真实恢复测试 PASS：14:39:13 kill 托盘 → 14:40:02 新任务首 tick 拉起（49 秒），心跳/8422/数据全绿；任务 XML 备份在位可回滚。
+- STATUS 偏差 #1 关闭；KY 双机全场景 PASS。wscript 包装文件物理保留（任务已不引用），K:\ops 登记摘除留运维会话。仍不发 0.4.1。
