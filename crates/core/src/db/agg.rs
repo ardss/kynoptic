@@ -59,9 +59,11 @@ ON CONFLICT(date, hour, minute, bucket_id) DO UPDATE SET
     WHERE excluded.max_event_rowid > COALESCE(agg_minute.max_event_rowid, 0)
 ";
 
-/// input_agg 专用：事件携带的是"本分钟累计快照"，同分钟桶必须覆盖而非累加。
+/// input_agg 专用：事件携带的是"本分钟累计快照"，纯形态分钟同桶覆盖而非累加。
 /// MAX 覆盖天然幂等（同 events 行原地 UPSERT，rowid 不变、值单调不减），
 /// max_event_rowid 仅作单调推进，不需要守卫。
+/// 混合分钟例外（同本地分钟已有先到 raw 行）：快照只覆盖本段、不构成完整
+/// 分钟，不走本语句——改由 recompute_minute_buckets 以事件 SUM 统一口径重算。
 const UPSERT_MINUTE_SNAPSHOT: &str = "
 INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -89,6 +91,8 @@ ON CONFLICT(date, bucket_id) DO UPDATE SET
 // - input_agg 行 → 快照 MAX 合并（UPSERT_ACTOR_SNAPSHOT，同 UPSERT_MINUTE_SNAPSHOT）
 // - raw press/click 行 → 守卫累加（UPSERT_ACTOR_ADD，同 UPSERT_MINUTE 的
 //   max_event_rowid WHERE 守卫：迟到重复投递整体跳过）
+// - 混合分钟（同分钟已有先到 raw 行）→ 不走快照合并，recompute_minute_actor
+//   以重建同款 SUM 重算
 // 一个 apply_event 事件只触达自己模态的列；其余列传 0（MAX/累加均无副作用）。
 const UPSERT_ACTOR_SNAPSHOT: &str = "
 INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
@@ -121,6 +125,44 @@ ON CONFLICT(date, hour, minute) DO UPDATE SET
     WHERE excluded.max_event_rowid > COALESCE(agg_minute_actor.max_event_rowid, 0)
 ";
 
+// ─── 分钟桶 count/辅助列表达式（全量重建 rebuild_all_inner、分块回填
+// backfill_chunk、混合分钟重算 recompute_minute_buckets 三处共用，禁各自
+// 内联漂移）────────────────────────────────────────────
+// 口径约束（与增量维护 apply_event 逐条语义一一对应）：
+// - raw press/click 按行 +1，input_agg 按 $.samples
+// - 注入 count 勿用 ckeys/cclicks 全量充当：raw 注入按行 +1、input_agg 注入
+//   按 $.samples（注入桶 count 与 sum 分口径）
+// - moves 桶 sum 是 $.move_distance_px、count 是 $.moves；window_switches
+//   仅 raw switch 行
+const CNT_DIST_EXPR: &str =
+    "SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+         THEN COALESCE(json_extract(event_data, '$.move_distance_px'), 0) ELSE 0 END)";
+const CNT_SAMPLES_KEYS_EXPR: &str =
+    "SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1 \
+         WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
+         THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END)";
+const CNT_SAMPLES_CLICKS_EXPR: &str =
+    "SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1 \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+         THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END)";
+const CNT_SAMPLES_INJ_KEYS_EXPR: &str =
+    "SUM(CASE WHEN event_type='keyboard' AND event_action='press' \
+         AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1 \
+         WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data) \
+         AND COALESCE(json_extract(event_data, '$.injected_keys'), 0) != 0 \
+         THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END)";
+const CNT_SAMPLES_INJ_CLICKS_EXPR: &str =
+    "SUM(CASE WHEN event_type='mouse' AND event_action='click' \
+         AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1 \
+         WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+         AND COALESCE(json_extract(event_data, '$.injected_clicks'), 0) != 0 \
+         THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END)";
+const CNT_MOVES_EXPR: &str =
+    "SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data) \
+         THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END)";
+const CNT_SWITCHES_EXPR: &str =
+    "SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END)";
+
 /// 单个事件对聚合缓存的增量贡献（本地时区分钟桶）。
 ///
 /// `rowid` = 该事件在 events 表的 rowid（落库时分配；未知传 0 → 增量行被
@@ -135,6 +177,11 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
     let hour = local.hour() as i64;
     let minute = local.minute() as i64;
 
+    // ─── 混合分钟探测（约束见 detect_mixed_minute）───
+    let agg_minute_bounds = detect_mixed_minute(conn, e, &ts, rowid);
+    // Some ⇔ 混合分钟命中（携带 UTC 分钟界供重算谓词）
+    let agg_raw_mixed = agg_minute_bounds.is_some();
+
     match (e.event_type, e.event_action) {
         (EventType::Keyboard, EventAction::InputAgg) => {
             let keys = json_counter(e, "keys");
@@ -145,27 +192,31 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
             } else {
                 json_counter(e, "samples")
             };
-            if keys > 0 {
-                conn.execute(
-                    UPSERT_MINUTE_SNAPSHOT,
-                    params![date, hour, minute, "input_keys", keys, samples, rowid],
-                )?;
-            }
             // 注入（自动化）拆桶：与 input_keys 同一快照语义（审查修复 2026-09）
             let inj_keys = json_counter(e, "injected_keys");
-            if inj_keys > 0 {
-                conn.execute(
-                    UPSERT_MINUTE_SNAPSHOT,
-                    params![
-                        date,
-                        hour,
-                        minute,
-                        "input_keys_injected",
-                        inj_keys,
-                        samples,
-                        rowid
-                    ],
-                )?;
+            // 混合分钟不在臂内写快照：统一由 apply_actor_event 之后的
+            // recompute_minute_buckets 以重建 SUM 口径重写整分钟
+            if (keys > 0 || inj_keys > 0) && !agg_raw_mixed {
+                if keys > 0 {
+                    conn.execute(
+                        UPSERT_MINUTE_SNAPSHOT,
+                        params![date, hour, minute, "input_keys", keys, samples, rowid],
+                    )?;
+                }
+                if inj_keys > 0 {
+                    conn.execute(
+                        UPSERT_MINUTE_SNAPSHOT,
+                        params![
+                            date,
+                            hour,
+                            minute,
+                            "input_keys_injected",
+                            inj_keys,
+                            samples,
+                            rowid
+                        ],
+                    )?;
+                }
             }
         }
         (EventType::Mouse, EventAction::InputAgg) => {
@@ -173,32 +224,35 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
             let moves = json_counter(e, "moves");
             let dist = json_counter(e, "move_distance_px");
             let samples = json_counter(e, "samples");
-            if clicks > 0 {
-                conn.execute(
-                    UPSERT_MINUTE_SNAPSHOT,
-                    params![date, hour, minute, "input_clicks", clicks, samples, rowid],
-                )?;
-            }
             let inj_clicks = json_counter(e, "injected_clicks");
-            if inj_clicks > 0 {
-                conn.execute(
-                    UPSERT_MINUTE_SNAPSHOT,
-                    params![
-                        date,
-                        hour,
-                        minute,
-                        "input_clicks_injected",
-                        inj_clicks,
-                        samples,
-                        rowid
-                    ],
-                )?;
-            }
-            if moves > 0 || dist > 0 {
-                conn.execute(
-                    UPSERT_MINUTE_SNAPSHOT,
-                    params![date, hour, minute, "input_moves", dist, moves, rowid],
-                )?;
+            // 混合分钟不在臂内写快照：同键盘臂，统一走事后重算
+            if (clicks > 0 || inj_clicks > 0 || moves > 0 || dist > 0) && !agg_raw_mixed {
+                if clicks > 0 {
+                    conn.execute(
+                        UPSERT_MINUTE_SNAPSHOT,
+                        params![date, hour, minute, "input_clicks", clicks, samples, rowid],
+                    )?;
+                }
+                if inj_clicks > 0 {
+                    conn.execute(
+                        UPSERT_MINUTE_SNAPSHOT,
+                        params![
+                            date,
+                            hour,
+                            minute,
+                            "input_clicks_injected",
+                            inj_clicks,
+                            samples,
+                            rowid
+                        ],
+                    )?;
+                }
+                if moves > 0 || dist > 0 {
+                    conn.execute(
+                        UPSERT_MINUTE_SNAPSHOT,
+                        params![date, hour, minute, "input_moves", dist, moves, rowid],
+                    )?;
+                }
             }
         }
         (EventType::Keyboard, EventAction::Press) => {
@@ -239,8 +293,25 @@ pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite:
     }
 
     // ─── actor 证据缓存（0.4.0 F1，0011）：与上方 agg_minute 写入同一事件
-    // 同一事务内维护，双路径（增量/重建）逐行同语义 ───
-    apply_actor_event(conn, e, &date, hour, minute, rowid)?;
+    // 同一事务内维护，双路径（增量/重建）逐行同语义；混合分钟在内部
+    // 改走重算（口径约束同上） ───
+    apply_actor_event(
+        conn,
+        e,
+        &date,
+        hour,
+        minute,
+        rowid,
+        agg_minute_bounds
+            .as_ref()
+            .map(|(a, b)| (a.as_str(), b.as_str())),
+    )?;
+
+    // 混合分钟：agg_minute 全部桶行以重建同款 SUM 重算（actor 证据行已在
+    // apply_actor_event 内重算；纯形态分钟不走此路径，维持原语义）
+    if let Some((ms, me)) = &agg_minute_bounds {
+        recompute_minute_buckets(conn, &date, hour, minute, ms, me)?;
+    }
 
     // ─── app 日桶（统一口径，联合审查 P1-1）───
     // 增量路径此前只认 (Window, Switch)，与 rebuild_all / backfill_chunk /
@@ -279,6 +350,10 @@ fn json_counter(e: &Event, key: &str) -> i64 {
 /// - (Keyboard, Press) / (Mouse, Click)：raw 行守卫累加（$.injected 拆注入列）
 /// - 其余事件（滚轮 raw 行、switch、系统等）：不写证据缓存（见迁移 0011 头注
 ///   与 queries::SCROLL_ROW_EXPR 口径说明）
+/// - 混合分钟例外（`mixed = Some((mstart, mend))`：同本地分钟已有先到 raw
+///   行，界为其 UTC 分钟范围）：快照只覆盖本段、不构成完整分钟，改走
+///   [`recompute_minute_actor`] 从 events 以重建同款 SUM 表达式重算本分钟
+///   证据行（与全量重建逐行一致）
 ///
 /// 失败向上传播由 [`apply_event`] 的调用方按条跳过并记日志（缓存可重建）。
 fn apply_actor_event(
@@ -288,16 +363,21 @@ fn apply_actor_event(
     hour: i64,
     minute: i64,
     rowid: i64,
+    mixed: Option<(&str, &str)>,
 ) -> rusqlite::Result<()> {
     match (e.event_type, e.event_action) {
         (EventType::Keyboard, EventAction::InputAgg) => {
             let keys = json_counter(e, "keys").max(0);
             let inj = json_counter(e, "injected_keys").max(0);
             if keys > 0 || inj > 0 {
-                conn.execute(
-                    UPSERT_ACTOR_SNAPSHOT,
-                    params![date, hour, minute, keys, inj, 0, 0, 0, 0, rowid],
-                )?;
+                if let Some((ms, me)) = mixed {
+                    recompute_minute_actor(conn, date, hour, minute, ms, me)?;
+                } else {
+                    conn.execute(
+                        UPSERT_ACTOR_SNAPSHOT,
+                        params![date, hour, minute, keys, inj, 0, 0, 0, 0, rowid],
+                    )?;
+                }
             }
         }
         (EventType::Mouse, EventAction::InputAgg) => {
@@ -306,12 +386,16 @@ fn apply_actor_event(
             let scroll = json_counter(e, "scroll_ticks").max(0);
             let inj_scroll = json_counter(e, "injected_scroll_ticks").max(0);
             if clicks > 0 || inj_clicks > 0 || scroll > 0 || inj_scroll > 0 {
-                conn.execute(
-                    UPSERT_ACTOR_SNAPSHOT,
-                    params![
-                        date, hour, minute, 0, 0, clicks, inj_clicks, scroll, inj_scroll, rowid
-                    ],
-                )?;
+                if let Some((ms, me)) = mixed {
+                    recompute_minute_actor(conn, date, hour, minute, ms, me)?;
+                } else {
+                    conn.execute(
+                        UPSERT_ACTOR_SNAPSHOT,
+                        params![
+                            date, hour, minute, 0, 0, clicks, inj_clicks, scroll, inj_scroll, rowid
+                        ],
+                    )?;
+                }
             }
         }
         (EventType::Keyboard, EventAction::Press) => {
@@ -333,7 +417,7 @@ fn apply_actor_event(
     Ok(())
 }
 
-/// 测试专用入口：按事件时间戳自行解析本地分钟桶后调用
+/// 测试专用入口：按事件时间戳自行解析本地分钟桶（含混合分钟探测）后调用
 /// [`apply_actor_event`]（与 apply_event 的桶计算同构）。生产路径不走这里——
 /// 增量写入统一在 [`apply_event`] 内部与 events 落库同事务完成。
 #[cfg(test)]
@@ -350,7 +434,16 @@ pub(crate) fn apply_actor_event_for_test(
     let date = local.format("%Y-%m-%d").to_string();
     let hour = local.hour() as i64;
     let minute = local.minute() as i64;
-    apply_actor_event(conn, e, &date, hour, minute, rowid)
+    let mixed = detect_mixed_minute(conn, e, &ts, rowid);
+    apply_actor_event(
+        conn,
+        e,
+        &date,
+        hour,
+        minute,
+        rowid,
+        mixed.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+    )
 }
 
 fn json_flag(e: &Event, key: &str) -> bool {
@@ -359,6 +452,209 @@ fn json_flag(e: &Event, key: &str) -> bool {
         .and_then(|v| v.get(key))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// 事件时刻所在 UTC 分钟的 [start, end) RFC3339 界。本地分钟桶与 UTC 分钟
+/// 界一一对应（真实时区偏移均为整分钟），界作 timestamp 字符串范围谓词供
+/// idx_events_timestamp 走索引（钟面函数谓词会全表扫描）。
+fn utc_minute_bounds(ts: &chrono::DateTime<chrono::FixedOffset>) -> (String, String) {
+    let start = ts.with_timezone(&Utc)
+        - chrono::Duration::seconds(i64::from(ts.second()))
+        - chrono::Duration::nanoseconds(i64::from(ts.nanosecond()));
+    let end = start + chrono::Duration::minutes(1);
+    (start.to_rfc3339(), end.to_rfc3339())
+}
+
+/// 混合分钟探测（增量入口共用）：同本地分钟内若已有先于本行的 raw
+/// press/click 行（tray 按 input_counts_only 中途切换重启采集器即产生），
+/// 本行快照只覆盖切换后本段、不构成完整分钟：MAX 覆盖会与全量重建
+/// （同桶 SUM 两形态）及今日按键读 events SUM 的消费面分叉。
+/// 返回 Some((mstart, mend)) = 命中混合（含该分钟 UTC 界供重算谓词）；
+/// None = 纯形态分钟（维持快照语义）。生产 writer 先落库后 apply_event
+/// （同事务成对，见 insert_events_with_agg_tx），本行 rowid 已分配；
+/// rowid=0（未知）探不出先到行。非 input_agg 输入行不探测。
+fn detect_mixed_minute(
+    conn: &Connection,
+    e: &Event,
+    ts: &chrono::DateTime<chrono::FixedOffset>,
+    rowid: i64,
+) -> Option<(String, String)> {
+    if rowid <= 0
+        || !matches!(e.event_action, EventAction::InputAgg)
+        || !matches!(e.event_type, EventType::Keyboard | EventType::Mouse)
+    {
+        return None;
+    }
+    let (ms, me) = utc_minute_bounds(ts);
+    if minute_has_raw_before(conn, &ms, &me, e.event_type.as_str(), rowid) {
+        Some((ms, me))
+    } else {
+        None
+    }
+}
+
+/// 重算类写路径的自持事务守卫：仅 autocommit 时 BEGIN IMMEDIATE 并在
+/// 结束时提交/回滚；调用方已有事务时不嵌套（原子性由外层负责）。
+fn with_self_tx<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let own_tx = conn.is_autocommit();
+    if own_tx {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    let r = f();
+    if own_tx {
+        match r {
+            Ok(_) => conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    r
+}
+
+/// 混合分钟探测：该本地分钟内是否存在先于 rowid 落库的 raw press/click 行。
+/// 只查 press/click——raw move/scroll/switch 行不参与 input_keys/input_clicks
+/// 桶的 SUM（moves 桶仅有 input_agg 贡献），不构成混合。
+fn minute_has_raw_before(
+    conn: &Connection,
+    mstart: &str,
+    mend: &str,
+    event_type: &str,
+    rowid: i64,
+) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_type = ?1 \
+         AND event_action IN ('press','click') \
+         AND timestamp >= ?2 AND timestamp < ?3 AND id < ?4)",
+        params![event_type, mstart, mend, rowid],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+/// 混合分钟重算（agg_minute）：以与 rebuild_all 逐字相同的 SUM 表达式从
+/// events 重写该本地分钟的全部桶行——统一口径为事件 SUM（raw 每行计数 +
+/// input_agg 快照同桶求和），与今日按键读 events SUM 的消费面一致；
+/// 纯形态分钟不走此路径（维持 MAX 覆盖/守卫累加的既有幂等语义）。
+/// 事务守卫见 with_self_tx（writer 同事务调用时不重复 BEGIN）。
+fn recompute_minute_buckets(
+    conn: &Connection,
+    date: &str,
+    hour: i64,
+    minute: i64,
+    mstart: &str,
+    mend: &str,
+) -> rusqlite::Result<()> {
+    with_self_tx(conn, || {
+        conn.execute(
+            "DELETE FROM agg_minute WHERE date = ?1 AND hour = ?2 AND minute = ?3",
+            params![date, hour, minute],
+        )?;
+        conn.execute_batch(&format!(
+            "INSERT INTO agg_minute (date, hour, minute, bucket_id, sum_value, count_value, max_event_rowid)
+             WITH m AS (
+               SELECT MAX(id) AS maxid,
+                      SUM({keys_row}) AS keys,
+                      SUM({clicks_row}) AS clicks,
+                      SUM({inj_keys_row}) AS ikeys,
+                      SUM({inj_clicks_row}) AS iclicks,
+                      {cnt_dist} AS dist,
+                      {cnt_samples_keys} AS ckeys,
+                      {cnt_samples_clicks} AS cclicks,
+                      {cnt_samples_inj_keys} AS cinkeys,
+                      {cnt_samples_inj_clicks} AS cinclks,
+                      {cnt_moves} AS cmoves,
+                      {cnt_switches} AS switches
+               FROM events
+               WHERE event_type IN ('keyboard','mouse','window')
+                 AND timestamp >= '{mstart}' AND timestamp < '{mend}'
+             ),
+             b AS (
+               SELECT 'input_keys' AS bk, keys AS s, ckeys AS c, maxid FROM m WHERE keys > 0
+               UNION ALL
+               SELECT 'input_clicks', clicks, cclicks, maxid FROM m WHERE clicks > 0
+               UNION ALL
+               SELECT 'input_moves', dist, cmoves, maxid FROM m WHERE dist > 0 OR cmoves > 0
+               UNION ALL
+               SELECT 'window_switches', switches, switches, maxid FROM m WHERE switches > 0
+               UNION ALL
+               SELECT 'input_keys_injected', ikeys, cinkeys, maxid FROM m WHERE ikeys > 0
+               UNION ALL
+               SELECT 'input_clicks_injected', iclicks, cinclks, maxid FROM m WHERE iclicks > 0
+             )
+             SELECT '{date}', {hour}, {minute}, bk, s, c, maxid FROM b;",
+            keys_row = crate::queries::KEYS_ROW_EXPR,
+            clicks_row = crate::queries::CLICKS_ROW_EXPR,
+            inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+            inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+            cnt_dist = CNT_DIST_EXPR,
+            cnt_samples_keys = CNT_SAMPLES_KEYS_EXPR,
+            cnt_samples_clicks = CNT_SAMPLES_CLICKS_EXPR,
+            cnt_samples_inj_keys = CNT_SAMPLES_INJ_KEYS_EXPR,
+            cnt_samples_inj_clicks = CNT_SAMPLES_INJ_CLICKS_EXPR,
+            cnt_moves = CNT_MOVES_EXPR,
+            cnt_switches = CNT_SWITCHES_EXPR,
+            mstart = mstart,
+            mend = mend,
+            date = date,
+            hour = hour,
+            minute = minute,
+        ))?;
+        Ok(())
+    })
+}
+
+/// 混合分钟重算（agg_minute_actor）：以与 rebuild_actor_cache 逐字相同的
+/// SUM 表达式从 events 重写该本地分钟的证据行（事务守卫见 with_self_tx）。
+fn recompute_minute_actor(
+    conn: &Connection,
+    date: &str,
+    hour: i64,
+    minute: i64,
+    mstart: &str,
+    mend: &str,
+) -> rusqlite::Result<()> {
+    with_self_tx(conn, || {
+        conn.execute(
+            "DELETE FROM agg_minute_actor WHERE date = ?1 AND hour = ?2 AND minute = ?3",
+            params![date, hour, minute],
+        )?;
+        conn.execute_batch(&format!(
+            "INSERT INTO agg_minute_actor (date, hour, minute, keys_total, keys_injected,
+                                          clicks_total, clicks_injected, scroll_total, scroll_injected,
+                                          max_event_rowid)
+             WITH m AS (
+               SELECT MAX(id) AS maxid,
+                      SUM({keys_row}) AS keys,
+                      SUM({clicks_row}) AS clicks,
+                      SUM({inj_keys_row}) AS ikeys,
+                      SUM({inj_clicks_row}) AS iclicks,
+                      SUM({scroll_row}) AS scroll,
+                      SUM({inj_scroll_row}) AS iscroll
+               FROM events
+               WHERE event_type IN ('keyboard','mouse')
+                 AND timestamp >= '{mstart}' AND timestamp < '{mend}'
+             )
+             SELECT '{date}', {hour}, {minute}, keys, ikeys, clicks, iclicks, scroll, iscroll, maxid FROM m
+             WHERE keys > 0 OR ikeys > 0 OR clicks > 0 OR iclicks > 0 OR scroll > 0 OR iscroll > 0;",
+            keys_row = crate::queries::KEYS_ROW_EXPR,
+            clicks_row = crate::queries::CLICKS_ROW_EXPR,
+            inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
+            inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+            scroll_row = crate::queries::SCROLL_ROW_EXPR,
+            inj_scroll_row = crate::queries::INJECTED_SCROLL_ROW_EXPR,
+            mstart = mstart,
+            mend = mend,
+            date = date,
+            hour = hour,
+            minute = minute,
+        ))?;
+        Ok(())
+    })
 }
 
 impl super::Database {
@@ -485,31 +781,13 @@ fn rebuild_all_inner(conn: &Connection, off: &str) -> crate::Result<usize> {
                   SUM({clicks_row}) AS clicks,
                   SUM({inj_keys_row}) AS ikeys,
                   SUM({inj_clicks_row}) AS iclicks,
-                  SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                           THEN COALESCE(json_extract(event_data, '$.move_distance_px'), 0) ELSE 0 END) AS dist,
-                  -- 以下五个 count 与增量维护 apply_event 逐条语义一一对应（perf3 对齐；
-                  -- 注入桶 count 同口径：raw 注入按行 +1，input_agg 注入按 $.samples，
-                  -- 勿用 ckeys/cclicks 全量充当注入 count——rebuild/backfill 与
-                  -- apply_event 会得到不同的 count_value，回归修复 2026-09）
-                  SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1
-                           WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
-                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS ckeys,
-                  SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1
-                           WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cclicks,
-                  SUM(CASE WHEN event_type='keyboard' AND event_action='press'
-                             AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
-                           WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
-                             AND COALESCE(json_extract(event_data, '$.injected_keys'), 0) != 0
-                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinkeys,
-                  SUM(CASE WHEN event_type='mouse' AND event_action='click'
-                             AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
-                           WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                             AND COALESCE(json_extract(event_data, '$.injected_clicks'), 0) != 0
-                           THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinclks,
-                  SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                           THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END) AS cmoves,
-                  SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches
+                  {cnt_dist} AS dist,
+                  {cnt_samples_keys} AS ckeys,
+                  {cnt_samples_clicks} AS cclicks,
+                  {cnt_samples_inj_keys} AS cinkeys,
+                  {cnt_samples_inj_clicks} AS cinclks,
+                  {cnt_moves} AS cmoves,
+                  {cnt_switches} AS switches
            FROM events
            WHERE event_type IN ('keyboard','mouse','window')
            GROUP BY d, h, mi
@@ -542,6 +820,13 @@ fn rebuild_all_inner(conn: &Connection, off: &str) -> crate::Result<usize> {
         clicks_row = crate::queries::CLICKS_ROW_EXPR,
         inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
         inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+        cnt_dist = CNT_DIST_EXPR,
+        cnt_samples_keys = CNT_SAMPLES_KEYS_EXPR,
+        cnt_samples_clicks = CNT_SAMPLES_CLICKS_EXPR,
+        cnt_samples_inj_keys = CNT_SAMPLES_INJ_KEYS_EXPR,
+        cnt_samples_inj_clicks = CNT_SAMPLES_INJ_CLICKS_EXPR,
+        cnt_moves = CNT_MOVES_EXPR,
+        cnt_switches = CNT_SWITCHES_EXPR,
     ))?;
 
     // actor 证据缓存重建：与 agg_minute 共享同一组表达式宏（keys/clicks/
@@ -889,30 +1174,13 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
                       SUM({clicks_row}) AS clicks,
                       SUM({inj_keys_row}) AS ikeys,
                       SUM({inj_clicks_row}) AS iclicks,
-                      SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                               THEN COALESCE(json_extract(event_data, '$.move_distance_px'), 0) ELSE 0 END) AS dist,
-                      -- 以下五个 count 与增量维护 apply_event 逐条语义一一对应（perf3 对齐；
-                      -- 注入桶 count 同口径：raw 注入按行 +1，input_agg 注入按 $.samples，
-                      -- 勿用 ckeys/cclicks 全量充当注入 count，回归修复 2026-09）
-                      SUM(CASE WHEN event_type='keyboard' AND event_action='press' THEN 1
-                               WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
-                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS ckeys,
-                      SUM(CASE WHEN event_type='mouse' AND event_action='click' THEN 1
-                               WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cclicks,
-                      SUM(CASE WHEN event_type='keyboard' AND event_action='press'
-                                 AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
-                               WHEN event_type='keyboard' AND event_action='input_agg' AND json_valid(event_data)
-                                 AND COALESCE(json_extract(event_data, '$.injected_keys'), 0) != 0
-                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinkeys,
-                      SUM(CASE WHEN event_type='mouse' AND event_action='click'
-                                 AND COALESCE(json_extract(event_data, '$.injected'), 0) != 0 THEN 1
-                               WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                                 AND COALESCE(json_extract(event_data, '$.injected_clicks'), 0) != 0
-                               THEN COALESCE(json_extract(event_data, '$.samples'), 0) ELSE 0 END) AS cinclks,
-                      SUM(CASE WHEN event_type='mouse' AND event_action='input_agg' AND json_valid(event_data)
-                               THEN COALESCE(json_extract(event_data, '$.moves'), 0) ELSE 0 END) AS cmoves,
-                      SUM(CASE WHEN event_type='window' AND event_action='switch' THEN 1 ELSE 0 END) AS switches
+                      {cnt_dist} AS dist,
+                      {cnt_samples_keys} AS ckeys,
+                      {cnt_samples_clicks} AS cclicks,
+                      {cnt_samples_inj_keys} AS cinkeys,
+                      {cnt_samples_inj_clicks} AS cinclks,
+                      {cnt_moves} AS cmoves,
+                      {cnt_switches} AS switches
                FROM events
                WHERE event_type IN ('keyboard','mouse','window')
                  AND timestamp >= '{start}' AND timestamp < '{end}'
@@ -937,6 +1205,13 @@ fn backfill_chunk(conn: &Connection, date: &str, hour: i64) -> crate::Result<()>
             clicks_row = crate::queries::CLICKS_ROW_EXPR,
             inj_keys_row = crate::queries::INJECTED_KEYS_ROW_EXPR,
             inj_clicks_row = crate::queries::INJECTED_CLICKS_ROW_EXPR,
+            cnt_dist = CNT_DIST_EXPR,
+            cnt_samples_keys = CNT_SAMPLES_KEYS_EXPR,
+            cnt_samples_clicks = CNT_SAMPLES_CLICKS_EXPR,
+            cnt_samples_inj_keys = CNT_SAMPLES_INJ_KEYS_EXPR,
+            cnt_samples_inj_clicks = CNT_SAMPLES_INJ_CLICKS_EXPR,
+            cnt_moves = CNT_MOVES_EXPR,
+            cnt_switches = CNT_SWITCHES_EXPR,
             start = start,
             end = end,
             date = date,
@@ -1702,6 +1977,65 @@ mod tests {
             "8 天前的欠聚合日期不应触发启动自愈（窗口 7 天）: {dates:?}"
         );
         assert_eq!(dates.len(), 1, "窗口内的今天仍应被核对出欠聚合: {dates:?}");
+    }
+
+    // === 混合分钟一致性：同一本地分钟混含 raw 与 input_agg 两形态 ===
+    // 触发面：tray 按 input_counts_only 切换重启采集器，分钟中途切换即产生
+    // 混合分钟。既有等价测试（incremental_update_matches_rebuild 等）把两形态
+    // 放在不同分钟，覆盖不到该边界；本模块专测同分钟混合。
+    mod mixed_minute_parity {
+        use super::*;
+
+        /// 契约（模块头「定位」：增量 apply_event 与全量 rebuild_all 必须逐行
+        /// 一致）在混合分钟上成立。统一口径为事件 SUM（与今日按键读 events
+        /// SUM 的消费面一致）：raw press 每行 1 + input_agg $.keys 快照同桶
+        /// 求和；MAX 快照式增量对同分钟两形态取 MAX 而非 SUM，必然分叉。
+        #[test]
+        fn input_keys_bucket_matches_rebuild_in_mixed_minute() {
+            let c = conn();
+            // 前半分钟：raw press 形态 5 行
+            let mut events: Vec<Event> = Vec::new();
+            for sec in [10u32, 15, 20, 25, 30] {
+                let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+                e.timestamp = format!("2026-06-15T02:30:{sec:02}+00:00");
+                events.push(e);
+            }
+            // 同分钟后半：采集器切到计数模式，input_agg 快照只覆盖本段 keys=2
+            let mut agg = Event::new(EventAction::InputAgg, EventType::Keyboard)
+                .data(serde_json::json!({"keys": 2, "samples": 2}));
+            agg.timestamp = "2026-06-15T02:30:50+00:00".into();
+            events.push(agg);
+
+            // 路径 A：增量——与生产 writer 同事务配对顺序一致
+            // （insert_events_with_agg_tx：先落库取 rowid，后 apply_event；
+            // 混合分钟重算依赖本行已入 events）
+            for (i, ev) in events.iter().enumerate() {
+                ins(
+                    &c,
+                    &ev.timestamp,
+                    ev.event_type.as_str(),
+                    ev.event_action.as_str(),
+                    ev.app_name.as_deref(),
+                    ev.event_data.as_ref().map(|v| v.to_string()).as_deref(),
+                );
+                apply_event(&c, ev, i as i64 + 1).unwrap();
+            }
+            let incremental = any_local_minute_row(&c, "input_keys");
+
+            // 路径 B：同库同数据全量重建
+            rebuild_all(&c).unwrap();
+            let rebuilt = any_local_minute_row(&c, "input_keys");
+            assert_eq!(
+                incremental, rebuilt,
+                "混合分钟（同分钟 raw+input_agg）增量必须与全量重建等价"
+            );
+            // 钉值：统一口径为事件 SUM = 5(raw) + 2(agg 快照) = 7；
+            // MAX 快照式增量给 MAX(5,2)=5，与消费面（events SUM）异数
+            assert_eq!(
+                rebuilt, 7,
+                "统一口径为事件 SUM：5 条 raw press + input_agg keys=2"
+            );
+        }
     }
 }
 

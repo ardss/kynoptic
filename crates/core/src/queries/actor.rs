@@ -973,4 +973,107 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
     }
+
+    // === 混合分钟一致性边界（同分钟 raw + input_agg 两形态）===
+    // 既有 rebuild_and_incremental_actor_cache_are_row_equal 把两形态放在不同
+    // 分钟，覆盖不到 tray input_counts_only 分钟中途切换产生的混合分钟。
+    mod mixed_minute_parity {
+        use super::*;
+
+        fn actor_rows(conn: &Connection) -> Vec<(i64, i64, i64, i64, i64, i64, i64)> {
+            conn.prepare("SELECT hour*60+minute, keys_total, keys_injected, clicks_total, clicks_injected, scroll_total, scroll_injected FROM agg_minute_actor ORDER BY 1")
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .map(|v| v.flatten().collect())
+                .unwrap()
+        }
+
+        /// 同一本地分钟混含 raw press（含 1 条注入）与 keyboard input_agg
+        /// 快照：增量（MAX 快照 + 守卫累加）与重建（SUM 两形态）必须逐行
+        /// 等价。分叉后果：keys_total 4↔7、keys_injected 1↔2，五分类证据
+        /// 失真可致 agent↔mixed 翻转。
+        #[test]
+        fn mixed_minute_actor_rows_equal_incremental_vs_rebuild() {
+            let conn = setup_conn();
+            // 同分钟 10:00：3 条 raw press（第 3 条注入）+ input_agg 快照
+            for (sec, injected) in [(10, "false"), (20, "false"), (30, "true")] {
+                conn.execute(
+                    "INSERT INTO events (timestamp, event_type, event_action, event_data) \
+                     VALUES (?1, 'keyboard', 'press', ?2)",
+                    params![
+                        format!("2026-10-24T10:00:{sec:02}Z"),
+                        format!("{{\"injected\": {injected}}}")
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data) \
+                 VALUES ('2026-10-24T10:00:40Z', 'keyboard', 'input_agg', \
+                         '{\"keys\":4,\"injected_keys\":1,\"samples\":4}')",
+                [],
+            )
+            .unwrap();
+
+            // 路径 A：全量重建
+            crate::db::agg::rebuild_actor_cache(&conn).unwrap();
+            let rebuilt = actor_rows(&conn);
+
+            // 路径 B：清空后按 events 逐条增量（与既有等价测试同法）
+            conn.execute("DELETE FROM agg_minute_actor", []).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, timestamp, event_type, event_action, event_data FROM events \
+                     WHERE event_type IN ('keyboard','mouse') ORDER BY id",
+                )
+                .unwrap();
+            let evs: Vec<(i64, String, String, String, Option<String>)> = stmt
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .map(|v| v.flatten().collect())
+                .unwrap();
+            drop(stmt);
+            let parse_type = |s: &str| match s {
+                "keyboard" => EventType::Keyboard,
+                "mouse" => EventType::Mouse,
+                other => panic!("测试未覆盖事件类型: {other}"),
+            };
+            let parse_action = |s: &str| match s {
+                "press" => EventAction::Press,
+                "click" => EventAction::Click,
+                "input_agg" => EventAction::InputAgg,
+                other => panic!("测试未覆盖事件动作: {other}"),
+            };
+            for (id, ts, ty, ac, data) in evs {
+                let e = Event {
+                    timestamp: ts,
+                    event_type: parse_type(&ty),
+                    event_action: parse_action(&ac),
+                    event_data: data.as_deref().map(|d| serde_json::from_str(d).unwrap()),
+                    app_name: None,
+                    window_title: None,
+                    session_id: None,
+                };
+                crate::db::agg::apply_actor_event_for_test(&conn, &e, id).unwrap();
+            }
+            let incremental = actor_rows(&conn);
+
+            assert_eq!(rebuilt.len(), incremental.len(), "行数一致");
+            assert_eq!(
+                rebuilt, incremental,
+                "混合分钟 actor 证据行：增量必须与重建逐行等价（五分类输入口径）"
+            );
+        }
+    }
 }
