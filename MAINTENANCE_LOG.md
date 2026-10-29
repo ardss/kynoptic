@@ -2,6 +2,96 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-29（性能治理轮：分支 perf/governance，四批落地 + 隔离基线实测）
+
+### 范围与纪律
+
+分支 `perf/governance`（基于 v0.4.0）。四批改动均未 commit/未 push/未 tag、未改
+版本号、未动 kynoptic.iss——版本与发版信息留待主会话。生产实例全程隔离：未读写
+安装目录 `C:\Users\13397\AppData\Local\Programs\Kynoptic` 下任何文件、未 kill
+kynoptic-tray/watchdog 进程、未动计划任务与注册表；所有测试经 `KYNOPTIC_DB` +
+`KYNOPTIC_MUTEX_SUFFIX` 隔离、不读真实时钟、未放水任何测试期望。
+
+### 四批内容
+
+1. **批1 PowerShell 持久宿主**（`crates/core/src/monitors/ps.rs`，+556/-39）：
+   修复 spawn-per-call 路径「先 try_wait 等退出再 read_to_end」的死锁（改 stdout
+   读线程 + deadline）；新增单实例常驻 PowerShell 宿主——脚本 base64 编码经 stdin
+   投递（生产脚本含中文匹配文本，stdin 直发原文会被控制台代码页按 GBK 解码破坏
+   语义），输出以每次调用唯一哨兵行定界，60s 截止；超时/失联 kill 收尸 + 惰性
+   重生，宿主启动失败置 permanent_fallback 永久回退单次 spawn（仅转换点 log 一次）。
+   `run_ps`/`run_ps_detailed` 签名与三态语义未动；10 个新测试全过。进程上界：
+   稳态 1 宿主，回退 1 瞬时子进程。
+2. **批2 采集治理**（`crates/core/src/collector.rs`、`crates/core/src/constants.rs`、
+   `crates/dash/src/lib.rs`、`crates/dash/src/dashboard.html`）：① 重型预算——
+   Dep::PowerShell 监控器并发采集限 4 许可（HeavySemaphore，首拍与循环段都限流；
+   停机旗标置位即弃拍交还，不破坏有界 join 口径），常量 `constants.rs:28`；
+   ② 慢采集退避——单次 collect 耗时超监控器自身 interval 判慢，interval×2^n
+   指数退避封顶 600s（`constants.rs:31`），一次正常即复位；③ 状态出口——
+   MONITOR_STATS 进程级快照（last_success_age / last_duration / consecutive_slow），
+   dashboard api_status 仅新增 "monitors" 字段（`dash/src/lib.rs:711`），面板仅在
+   有退避中监控器时多占一行，旧后端按空数组容错。默认 14 集合全 Native、不占
+   重型预算（新增测试锁定），健康监控器稳态节奏逐位不变，未改任何既有测试期望。
+3. **批3 Dep 错标修正**（`crates/core/src/registry.rs`、`crates/core/src/monitors/mod.rs`、
+   `crates/core/config/monitors.json`）：依基线普查逐文件复核后，ime/location 改
+   Dep::Native（ime 纯 windows-sys 注册表 API；location 为零采集占位，历史公网 IP
+   外呼此前已按隐私红线移除）；network/device/gpu 三处 Dep 二分类表达不了的已知
+   偏差以注册项注释披露（network 兜底 netstat.exe、gpu 每拍 nvidia-smi.exe、device
+   可选 PS 磁盘 I/O），枚举扩列留待下波；config_template_matches_registry 强制
+   逐项一致，测试全绿。
+4. **批4 文档**：本条 + BENCHMARKS.md 新增 §7「40-on 配置基线」（含方法与局限，
+   并预留「重构后对照」回填位）+ APP.md 子进程表述按实修正（ime/location 依赖列、
+   PS 脚注改写为常驻宿主 + 预算/退避 + 三处已知偏差）+ README/README.zh-CN 核对
+   （默认 14「零子进程」表述对新实现仍成立，未动）。
+
+### 基线数字（重构前实测，托盘级隔离测量）
+
+2026-10-29 以 `cargo build --release -p kynoptic-tray` 构建在仓库外 cfg14/cfg40
+双目录隔离实测（`KYNOPTIC_DB` + `KYNOPTIC_MUTEX_SUFFIX`，每 5s 采样 207/208s +
+每配置 88s 直接子进程普查按 ParentProcessId 实测归属；生产 settings.json 在禁读
+的安装目录内无法照抄，字段基线用代码默认值并显式钉死 enabled_monitors / 端口 /
+autostart 三项；tray.log 确认加载 12+2 / 38+2）：
+
+| 指标 | 默认 14 | 全 40 |
+|---|---|---|
+| tray CPU% 稳态平均（≥60s） | 0.320% | 1.870% |
+| tray CPU% 峰值（5s 差分） | 1.240% | 3.528% |
+| 子进程 churn 下界 | ≈0 个/分钟 | 10.2 个/分钟（并发峰值 6） |
+
+结论：全 40 的增量成本主要来自 19 个 PS 依赖监控器的周期 spawn（多数 60s/次，
+gpu 10s/次）；默认 14 零 spawn、稳态 ≈0.3%。环境底噪（常驻 powershell 8-9 个、
+底噪 churn ≈6.4/分钟）已用 cfg14 窗口对照扣减。方法与局限全文：
+`K:\AIControl\CV-KY-convergence-20261028\work\baseline\RESULTS.md`（原始 CSV 同
+目录）；BENCHMARKS.md §7 已收录并预留「重构后对照」回填位。
+
+### 门禁（各批次实跑汇报；批4 为纯文档批，未复跑全量）
+
+- 批2/批3 各自实跑四项门禁全绿：`cargo fmt --all --check`、
+  `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`
+  （批2 汇报 767 passed / 0 failed；批3 复跑 782 passed + 1 doc-test ignored）、
+  `node scripts/check-js.mjs`。
+- 批1 实跑：`cargo fmt --all --check`、clippy -D warnings、
+  `cargo test -p kynoptic-core --lib`（227 passed，含 10 个 ps 测试）。
+- 环境注意：门禁若带 `KYNOPTIC_MUTEX_SUFFIX` 环境变量，会复现批2 记录的 1 例
+  失败（cli skill_install_refuses_junction_target——隔离变量令 skill 目录改名，
+  与该测试预置 junction 的前提冲突，非实现缺陷）；跑全量门禁时不带该变量即可。
+- 批4 编辑后实跑 `node scripts/check-doc-version.mjs`（文档版本行一致性）：
+  exit 0，15 项 ok（含 README/README.zh-CN/APP.md 状态行与 skill 副本一致）。
+
+### 遗留与下一步
+
+1. 「重构后对照」数字待本分支安装后按与基线完全相同的方法回填 BENCHMARKS.md §7；
+   未回填前不得引用任何重构后数字。
+2. 已知代价与约束（详见各批记录）：宿主模式 19 个 PS 监控器经同一 Mutex 串行，
+   单次挂满 60s 时后续 PS 采集最坏排队 ≈ 许可数×截止时长（重型预算 4 许可 →
+   至多约 4 个截止周期，有界不挂死；独立审查 low 级发现，主会话已核并修正本行
+   此前「最多延后一个周期」的低估表述）；宿主协议约束脚本不得自行读
+   stdin、不得调 exit（18 个生产脚本已核对无此形态，新增脚本需遵守）；允许在途
+   collect 无限持有许可的残留与既有 join 口径一致，未新增熔断。
+3. 版本号、CHANGELOG、发版波次由主会话决定，本日志不预设。
+
+---
+
 ## 2026-10-28（KY 责任归位核verify轮：WinB ZCode/KY 19:28–19:5x）
 
 ### 背景与职责边界（用户 2026-10-28 纠偏）
