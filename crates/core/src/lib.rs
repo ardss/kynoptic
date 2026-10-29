@@ -9,6 +9,7 @@ pub mod error;
 pub mod heatmap;
 pub mod input_agg;
 pub mod insights;
+pub mod install;
 pub mod json_util;
 pub mod keyboard_layout;
 pub mod monitors;

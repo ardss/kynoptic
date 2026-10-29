@@ -711,13 +711,14 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         )));
     }
     // 安装版（Inno Setup）自更新会造成版本漂移：卸载数据库记录与磁盘不一致。
-    // 有 unins000.exe 即认定安装版，指引重跑 Setup（新版发布后 Setup 可覆盖装）。
+    // 有 Inno 卸载器（unins*.exe，编号随重装递增）即认定安装版，指引重跑
+    // Setup（新版发布后 Setup 可覆盖装）；谓词单一来源见 kynoptic_core::install。
     let exe_path = std::path::PathBuf::from(&exe);
     let dir = exe_path
         .parent()
         .ok_or_else(|| crate::Error::InvalidData("无法定位安装目录".to_string()))?
         .to_path_buf();
-    if dir.join("unins000.exe").exists() {
+    if kynoptic_core::install::is_inno_installed_dir(&dir) {
         return Err(crate::Error::InvalidData(
             "检测到本程序为安装版。请重新下载并运行 Kynoptic-Setup 完成升级（自更新仅适用于便携版）".to_string(),
         ));
@@ -1320,5 +1321,44 @@ mod tests {
             ".bak 应保持原位"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // === 安装版识别 unins 通配（cli 拒绝闸 + tray 一键更新分流的共享谓词）===
+    // 约束：整批测试须可用单一过滤词选中，故归入本模块。
+    mod unins_wildcard {
+        fn temp_dir(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "kynoptic-unins-cli-test-{}-{n}-{tag}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        /// cmd_update 的安装版拒绝闸（update.rs 探测点）与 tray 一键更新分流
+        /// 统一走 kynoptic_core::install 的共享谓词——Inno 卸载器编号随重装
+        /// 递增（本生产机实测仅 unins001.exe/unins001.dat），闸的谓词依赖在
+        /// 递增编号下不得漏判；仅 unins*.dat 无配套 exe 仍判便携。
+        #[test]
+        fn gate_predicate_handles_incremented_unins_number() {
+            let dir = temp_dir("inc1");
+            std::fs::write(dir.join("unins001.exe"), b"").unwrap();
+            assert!(
+                kynoptic_core::install::is_inno_installed_dir(&dir),
+                "unins001.exe 须判安装版（字面只认 unins000.exe 即闸失效、托盘走便携自更新）"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let dat_only = temp_dir("dat");
+            std::fs::write(dat_only.join("unins001.dat"), b"").unwrap();
+            assert!(
+                !kynoptic_core::install::is_inno_installed_dir(&dat_only),
+                "仅 unins*.dat 无配套 exe 不构成安装版证据（便携行为不变）"
+            );
+            let _ = std::fs::remove_dir_all(&dat_only);
+        }
     }
 }
