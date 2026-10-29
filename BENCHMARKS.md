@@ -324,3 +324,72 @@ move 行计入 agg_minute 的 count_value（samples），而增量 `apply_event`
 导致 0002 起所有迁移在每次 open 时静默失败（schema_version 卡住、agg 表
 建不出来、迁移相关测试全红）。修复为「CREATE TABLE IF NOT EXISTS 兜底 +
 无条件 RENAME」，语义不变（pet 表永不 DROP，只改名归档）。
+
+## 7. 40-on 配置基线（PERF-GOVERNANCE，2026-10-29，重构前实测）
+
+> 本节数字**不来自**上方 perf-* harness，而是对真实 `kynoptic-tray` release
+> 进程的托盘级实测（分支 perf/governance，v0.4.0 代码，四批性能治理改动落地
+> **之前**的构建——PowerShell 路径仍是"每次采集 spawn 一个子进程"的旧行为）。
+> 目的：为 PowerShell 持久宿主、重型预算限流、慢采集退避的重构提供对照基线。
+> 完整方法、隔离证据与原始 CSV 在仓库外测量报告
+> `K:\AIControl\CV-KY-convergence-20261028\work\baseline\RESULTS.md`。
+
+### 方法
+
+- 隔离：两实例置于仓库外 cfg14/cfg40 目录，`KYNOPTIC_DB` + `KYNOPTIC_MUTEX_SUFFIX`
+  双环境变量隔离，`--minimized --no-update-check` 启动；settings.json 用
+  `AppSettings` 代码默认值，仅钉死三项——enabled_monitors（默认 14 / 全 40）、
+  dashboard_port（18431/18432）、autostart=false。生产实例与安装目录零触碰，
+  计划任务与注册表零改动。
+- 采样：每配置 207/208s 主窗（每 5s 一拍，TotalProcessorTime 相邻差分算 CPU%）
+  + 60s 环境底噪窗；另每配置 88s「直接子进程普查」，每 2s 按
+  `Win32_Process.ParentProcessId` 实测归属托盘 spawn——"powershell/nvidia-smi
+  是托盘拉起的"由推断升级为实测归属。
+- 口径：单进程 CPU 100% = 一核占满；churn = 观测窗 distinct 子进程 PID 数/分钟，
+  为采样**下界**（间隔内生灭的短命子进程漏计）。
+
+### 实测
+
+| 指标 | 默认 14（全原生） | 全 40 |
+|---|---|---|
+| tray CPU% 全程平均（207/208s） | 0.302% | 1.885% |
+| tray CPU% 稳态平均（≥60s） | 0.320% | **1.870%** |
+| tray CPU% 峰值（5s 差分） | 1.240% | 3.528%（普查窗含启动峰 6.944%） |
+| 运行期 CPU 时间增量 | 0.625s/207s | 3.922s/208s |
+| 子进程 churn 下界（88s 普查实测归属） | ≈0 个/分钟 | **10.2 个/分钟**（13 powershell + 1 nvidia-smi + 1 常驻 conhost） |
+| 并发子进程峰值 | 1 | 6（5 powershell + 1 conhost） |
+
+- 成本来源：19 个 Dep=powershell 监控器的周期 spawn（多数 60s/次，gpu 10s/次，
+  见 `crates/core/config/monitors.json`）。gpu 首采超 10s 截止被跳过，
+  nvidia-smi 多数在普查间隔内生灭，故 churn 是下界。
+- 交叉印证：主 210s 运行按底噪扣减后增量 ≈8.9 个/分钟，与普查一致（两法互证）。
+- 对照读法：全 40 相对默认 14 的增量 ≈1.55 个百分点 CPU 与 ≈10 个 spawn/分钟；
+  默认 14 的 0.3% / 零 spawn 与 §1 harness 数字（0.41%）同量级，互为佐证。
+
+### 局限
+
+- 生产 settings.json 位于禁读的安装目录内无法照抄，字段基线用 `AppSettings`
+  代码默认值（enabled_monitors / dashboard_port / autostart 三项显式钉死）。
+- churn 为采样下界，真实 spawn 频率更高。
+- 环境底噪显著（本机常驻 powershell 8-9 个、底噪 churn ≈6.4/分钟），已用
+  cfg14 窗口作环境对照并扣减但无法根除；两窗口时段不同未配平，对比以扣底噪
+  差值为准。
+- 仅测空载：键鼠 hook 在真实输入下的成本未单独建模；dashboard 浏览器轮询
+  压测未做。
+
+### 重构后对照（待安装后实测回填）
+
+> 占位：本分支四批改动（持久宿主、4 许可重型预算、慢采集退避、Dep 修正）
+> **尚未安装实测**。须以与基线完全相同的方法（同隔离变量、同采样口径、
+> 同 40-on 配置）在安装后的真机上重测后回填下表；回填之前，任何"重构后"
+> 数字一律不存在、不得引用。
+
+| 指标 | 基线（本节上表） | 重构后 |
+|---|---|---|
+| tray CPU% 稳态平均 | 1.870% | 待实测回填 |
+| tray CPU% 峰值（5s 差分） | 3.528% | 待实测回填 |
+| 子进程 churn | 10.2 个/分钟（下界） | 待实测回填 |
+| 常驻子进程数 | 1（conhost） | 待实测回填 |
+
+设计预期（非实测，出自实现约束）：重构后进程上界为稳态 1 个常驻 PowerShell
+宿主；宿主不可用时永久回退为单次瞬时 spawn；重型监控器并发采集不超过 4。

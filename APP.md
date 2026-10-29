@@ -44,8 +44,8 @@ Kynoptic 的本机感知层（采集器 + CLI + MCP 工具面）Rust workspace�
 | `external_display` | 中 | PS* | 外接显示器插拔 |
 | `audio_input` | 中 | PS* | 音频输入设备插拔 |
 | `audio_output` | 中 | PS* | 音频输出设备插拔 |
-| `ime` | 中 | PS* | 输入法切换 |
-| `location` | 高 | PS* | 位置快照（IP 粗定位） |
+| `ime` | 中 | 原生 | 输入法切换（windows-sys 注册表 API） |
+| `location` | 高 | 原生 | 占位监控（不采集任何数据；历史公网 IP 外呼已按隐私红线移除） |
 | `notification` | 高 | PS* | Windows 通知中心 |
 | `calendar` | 高 | PS* | 日历事件（Outlook） |
 | `dns` | 高 | PS* | DNS 查询记录 |
@@ -60,7 +60,7 @@ Kynoptic 的本机感知层（采集器 + CLI + MCP 工具面）Rust workspace�
 | `thermal` | 高 | PS* | 温度传感器 |
 | `gpu` | 高 | PS* | GPU 状态快照 |
 
-\* PS = 每次采集 spawn 一个 PowerShell 子进程，默认一律关闭，代码标注"PS 子进程，待原生重写"。另外 `device`（默认启用）的磁盘 I/O 速率子功能同为 PS 依赖，默认关闭、仅显式开启后采集（容量/内存字段不受影响）。
+\* PS = 经 `crates/core/src/monitors/ps.rs` 的 `run_ps` 执行 PowerShell 采集，默认一律关闭。PowerShell 路径为单实例常驻宿主：脚本 base64 编码后经 stdin 逐条投递（避免按控制台代码页误解码中文匹配文本），输出以哨兵行定界，每次调用 60s 截止；超时/失联时收尸并惰性重生，宿主启动失败则永久回退为单次 spawn。脚本不得自行读 stdin、不得调 `exit`（分别会吃掉后续投递/杀死宿主）。重型（Dep::PowerShell）监控器的并发采集受 4 许可预算限流（`crates/core/src/constants.rs` HEAVY_COLLECT_MAX_CONCURRENT），跟不上自身采样间隔的慢采集按间隔指数退避、封顶 600 秒（MONITOR_BACKOFF_MAX_WAIT_SECS）。已知偏差（Dep 二分类表达不了，见 registry.rs 注册项注释）：`network`（默认启用）主路径原生（GetIfTable2）、失败兜底 spawn netstat.exe；`gpu` 静态走 PowerShell、动态指标每拍 spawn nvidia-smi.exe（均有界等待）。另外 `device`（默认启用）的磁盘 I/O 速率子功能同为 PS 依赖，默认关闭、仅显式开启后采集（容量/内存字段不受影响）。
 
 ## 构建
 
