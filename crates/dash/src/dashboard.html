@@ -260,6 +260,7 @@
   <!-- 看门狗告警横幅（修复：落库的 notification 系统事件此前无任何 UI 消费方） -->
   <div id="watchdog-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #8a6d1f;border-radius:6px;background:#332a14;color:#f2ddaa;font-size:13px"></div>
   <div id="db-degraded-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #a33;border-radius:6px;background:#3a2020;color:#fdd;font-size:13px"></div>
+  <div id="monitor-stats-line" role="status" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #8a6d1f;border-radius:6px;background:#332a14;color:#f2ddaa;font-size:13px"></div>
   <!-- ARIA APG tabs 键盘契约：活动 tab tabindex=0 其余 -1，方向键/Home/End
        移动并激活（JS 末尾 tablist keydown）；aria-controls/aria-labelledby 双向关联 -->
   <div class="tabs" role="tablist">
@@ -828,6 +829,26 @@ async function loadStatus() {
   if (el) el.style.color = "";
   // 页脚鉴权声明跟随服务端实际状态（令牌已启用时不宣称"无需鉴权"）
   setFooterAuth(!!s.token_required);
+  // 监控器采集诊断（性能治理）：s.monitors 每项含 name / last_success_age_secs
+  // / last_duration_ms / consecutive_slow。旧后端缺字段按空数组容错；只在有
+  // 监控器处于退避（连续慢采集）时占一行，正常时静默，不给状态行加噪音。
+  const msLine = document.getElementById("monitor-stats-line");
+  if (msLine) {
+    const ms = Array.isArray(s.monitors) ? s.monitors : [];
+    const backing = ms.filter(function (m) { return m.consecutive_slow > 0; });
+    if (backing.length > 0) {
+      const zhMs = document.documentElement.lang === "zh";
+      const detail = backing.map(function (m) {
+        return m.name + " x" + m.consecutive_slow + " (" + (m.last_duration_ms ?? "?") + "ms)";
+      }).join(", ");
+      msLine.style.display = "";
+      msLine.textContent = zhMs
+        ? "采集诊断：以下监控器连续慢采集已退避 —— " + detail
+        : "collector diagnostics: monitors in slow-collect backoff — " + detail;
+    } else {
+      msLine.style.display = "none";
+    }
+  }
   if (!s.last_event_ts) {
     const txt = s.today + " · " + t("lastEvent") + " " + t("noEventsYet") + " · " + t("readOnly") + " · " + dbStatusText(s);
     // aria-live 区：文本没变就不重写，30s 轮询不会反复触发读屏播报
