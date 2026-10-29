@@ -1337,6 +1337,30 @@ fn latest_device_snapshot(conn: &Connection) -> serde_json::Value {
     serde_json::from_str(&data.unwrap_or_default()).unwrap_or_else(|_| json!({}))
 }
 
+/// 每日对比序列补零：输出必须恰好覆盖 [today - days + 1, today] 每一天，
+/// 按日升序；已有天保留原 keys/clicks，缺天记 0（与 heatmap 逐日
+/// unwrap_or(0) 契约、本函数 hourly_today 定长 24 先例同一口径）。
+/// today 由调用方注入，禁止读真实时钟。
+fn zero_fill_daily_series(
+    series: &std::collections::BTreeMap<String, (u64, u64)>,
+    today: chrono::NaiveDate,
+    days: u32,
+) -> Vec<Value> {
+    // 逐日出窗：窗口内每天恰好一行，命中已有天取原值，缺天记 (0,0)；
+    // 窗口之外的天不输出（series 源头即按窗口下界起查）。
+    // 日计数为 Copy 元组，get 只读借用即可，不整表克隆
+    let since = today - chrono::Duration::days(i64::from(days) - 1);
+    (0..days)
+        .map(|i| {
+            let key = (since + chrono::Duration::days(i64::from(i)))
+                .format("%Y-%m-%d")
+                .to_string();
+            let (keys, clicks) = series.get(&key).copied().unwrap_or((0, 0));
+            json!({"date": key, "keys": keys, "clicks": clicks})
+        })
+        .collect()
+}
+
 /// GET /api/input?days=&date= — 输入统计聚合（近 `days` 天，含今日）。
 ///
 /// 数据源是 input_agg 分钟计数行（keyboard 行含 per-key 频次 `vk` map，
@@ -1600,10 +1624,8 @@ pub fn api_input_at(
         }
     }
 
-    let days_out: Vec<Value> = series
-        .iter()
-        .map(|(d, (keys, clicks))| json!({"date": d, "keys": keys, "clicks": clicks}))
-        .collect();
+    // series 输出前按窗口补零：每日对比在窗口内不允许缺行
+    let days_out = zero_fill_daily_series(&series, today, days);
     // 最近一次输入设备拓扑快照（device_snapshot.input_devices，仅拓扑变化时写入）
     let input_devices: Vec<Value> = conn
         .query_row(

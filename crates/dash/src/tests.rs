@@ -2176,9 +2176,16 @@ fn input_sql_aggregation_matches_row_semantics() {
     if hour == 8 {
         assert_eq!(v["hourly_today"][8], json!(10));
     }
-    assert_eq!(v["series"].as_array().unwrap().len(), 1);
-    assert_eq!(v["series"][0]["keys"], json!(15));
-    assert_eq!(v["series"][0]["clicks"], json!(4));
+    // 经批准的既有断言契约更新（本轮补零修复引入）：7 天窗口必 7 行补零；
+    // 旧行为为缺行不补（仅当日有数时 series 只剩 1 行）。值断言 15/4 保留。
+    let arr = v["series"].as_array().unwrap();
+    assert_eq!(arr.len(), 7, "7 天窗口须 7 行（缺天补零）");
+    let today_row = arr
+        .iter()
+        .find(|x| x["date"] == json!(today.format("%Y-%m-%d").to_string()))
+        .expect("补零窗口须含今日行");
+    assert_eq!(today_row["keys"], json!(15));
+    assert_eq!(today_row["clicks"], json!(4));
 }
 
 /// 发现 ①-7：report 的 data_since 取本地日口径（UTC+8 下不早一天）。
@@ -2494,4 +2501,151 @@ fn ignored_params_cover_all_get_endpoints_and_bare_params() {
     let (_, _, body) = route_req(&conn, "GET", "/api/trends", "", db);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert!(v.get("ignored_params").is_none(), "got: {body}");
+}
+
+// === 每日对比补零 + 异常页签角标可见性 ===
+// 约束：整批测试须可用单一过滤词选中（libtest 多过滤词须经 "--" 传入，
+// 单 TESTNAME 直传会拒参），故归入本模块；断言与期望保持原样。
+mod input_series_badge_fix {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// 固定日期构造：测试时刻一律注入，不读真实时钟。
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// 补零契约（纯函数）：窗口 [today-days+1, today] 每天恰好一行、升序；
+    /// 已有天保留原 keys/clicks，缺天记 0。today 注入，不读真实时钟。
+    #[test]
+    fn input_series_zero_fill_pads_missing_days() {
+        let today = d(2026, 10, 30);
+        let mut series = BTreeMap::new();
+        series.insert("2026-10-25".to_string(), (15u64, 4u64));
+        series.insert("2026-10-28".to_string(), (3u64, 9u64));
+        let out = zero_fill_daily_series(&series, today, 7);
+        let dates: Vec<&str> = out.iter().map(|x| x["date"].as_str().unwrap()).collect();
+        assert_eq!(
+            dates,
+            [
+                "2026-10-24",
+                "2026-10-25",
+                "2026-10-26",
+                "2026-10-27",
+                "2026-10-28",
+                "2026-10-29",
+                "2026-10-30",
+            ],
+            "7 天窗口须连续 7 行（缺天补零行，不允许 10-25 直接跳 10-28）"
+        );
+        assert_eq!(out[1]["keys"], json!(15), "已有天保值");
+        assert_eq!(out[1]["clicks"], json!(4), "已有天保值");
+        assert_eq!(out[4]["keys"], json!(3), "已有天保值");
+        assert_eq!(out[4]["clicks"], json!(9), "已有天保值");
+        assert_eq!(out[0]["keys"], json!(0), "缺天 10-24 须补零");
+        assert_eq!(out[0]["clicks"], json!(0), "缺天 10-24 须补零");
+        assert_eq!(out[3]["keys"], json!(0), "缺天 10-27 须补零");
+        assert_eq!(out[5]["clicks"], json!(0), "缺天 10-29 须补零");
+    }
+
+    /// 空序列也须补出全零窗口行：窗口语义不依赖数据存在（新装机/断采数日）。
+    #[test]
+    fn input_series_zero_fill_covers_empty_series() {
+        let today = d(2026, 10, 30);
+        let series = BTreeMap::new();
+        let out = zero_fill_daily_series(&series, today, 3);
+        assert_eq!(out.len(), 3, "空序列须补满 3 天");
+        assert_eq!(out[0]["date"], json!("2026-10-28"));
+        assert_eq!(out[2]["date"], json!("2026-10-30"));
+        assert_eq!(out[0]["keys"], json!(0));
+        assert_eq!(out[0]["clicks"], json!(0));
+    }
+
+    /// 端到端：GET /api/input?days=7 的 series 必须覆盖整个 7 天窗口，
+    /// 缺数日补零行（输入页「每日对比」随之不缺行）。today 注入。
+    #[test]
+    fn api_input_series_covers_full_window() {
+        let conn = mem_conn();
+        let today = d(2026, 10, 30);
+        let ins = |date: chrono::NaiveDate, data: &str| {
+            let naive = date.and_hms_opt(8, 1, 0).unwrap();
+            use chrono::TimeZone;
+            let ts = Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+                .to_rfc3339();
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) VALUES (?1,?2,'input_agg',?3,NULL,NULL,NULL)",
+                params![ts, "keyboard", data],
+            )
+            .unwrap();
+        };
+        ins(d(2026, 10, 25), r#"{"keys":10}"#);
+        ins(d(2026, 10, 28), r#"{"keys":3}"#);
+        let v = api_input_at(&conn, 7, today, today).unwrap();
+        let arr = v["series"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            7,
+            "7 天窗口须 7 行（缺天补零），实测 {} 行: {arr:?}",
+            arr.len()
+        );
+        assert_eq!(arr[0]["date"], json!("2026-10-24"));
+        assert_eq!(arr[6]["date"], json!("2026-10-30"));
+        let by_date: BTreeMap<&str, &Value> = arr
+            .iter()
+            .map(|x| (x["date"].as_str().unwrap(), x))
+            .collect();
+        assert_eq!(by_date["2026-10-25"]["keys"], json!(10), "已有天保值");
+        assert_eq!(by_date["2026-10-28"]["keys"], json!(3), "已有天保值");
+        assert_eq!(by_date["2026-10-24"]["keys"], json!(0), "缺天补零");
+        assert_eq!(by_date["2026-10-29"]["clicks"], json!(0), "缺天补零");
+    }
+
+    /// 角标可见性契约：alerts>0 分支必须显式设可见 display 值（如
+    /// "inline-block"），禁止空串——空串只清内联样式，回落样式表
+    /// .tab-badge { display:none }，角标永不显示（aria-live 同死）。
+    /// 为零时保持 "none" 隐藏；CSS 默认隐藏保留为初始态；
+    /// 赋值与其三元须留在同一行内供本契约校验。
+    #[test]
+    fn tab_badge_alert_display_is_explicitly_visible() {
+        assert!(
+            DASHBOARD_HTML.contains(".tab-badge { display: none"),
+            "样式表默认隐藏须保留为初始态，可见性交由 JS 显式控制"
+        );
+        let line = DASHBOARD_HTML
+            .lines()
+            .find(|l| l.contains("badge.style.display"))
+            .expect("dashboard.html 须含 badge.style.display 赋值（异常页签角标）");
+        let ternary = line
+            .split('?')
+            .nth(1)
+            .expect("badge.style.display 应为三元表达式");
+        let truthy = ternary
+            .split(':')
+            .next()
+            .unwrap()
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        let falsy = ternary
+            .split(':')
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        assert_ne!(
+            truthy, "\"\"",
+            "alerts>0 分支不得设空串：空串回落样式表 display:none，角标永不显示"
+        );
+        assert_ne!(
+            truthy.to_ascii_lowercase(),
+            "\"none\"",
+            "alerts>0 分支不得设为隐藏值"
+        );
+        assert_eq!(falsy, "\"none\"", "alerts==0 分支应保持 \"none\" 隐藏");
+    }
 }

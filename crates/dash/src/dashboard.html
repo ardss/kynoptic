@@ -1918,7 +1918,9 @@ async function loadAnomalies() {
   if (badge) {
     const alerts = (a.anomalies || []).filter(x => x.severity === "alert").length;
     badge.textContent = alerts > 99 ? "99+" : String(alerts);
-    badge.style.display = alerts > 0 ? "" : "none";
+    // 有 alert 须显式设可见 display（inline-block）：空串只清内联样式，
+    // 会回落样式表 .tab-badge 的 display:none，角标永不显示
+    badge.style.display = alerts > 0 ? "inline-block" : "none";
   }
   if (!a.anomalies.length) {
     // 空态分流：基线未建立（近 7 天有数据的天数 < 3）≠ "已检查、一切正常"，
