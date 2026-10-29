@@ -2,6 +2,64 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-29（v0.5.0 发版与双机安装轮：主会话，PR #51-#55 合并 → tag → 官方 Release → Du/A 升级）
+
+### 合并与发版
+
+- PR #51（f5dd9dc ps.rs 持久宿主+死锁修复）、#52（61e54c0 采集预算+退避+诊断字段）、
+  #53（2da3aeb 注册表元数据普查修正）、#54（bc34123 40-on 基线+治理日志）、
+  #55（95cb367 bump 0.5.0 + CHANGELOG 定版 + SECURITY 支持线）全部 squash 合并；
+  每批独立 CI（fmt/clippy -D warnings/test --workspace/JS 检查）通过后才合并，
+  级联 Update-branch 后的 CI 等于验证了累计树。
+- tag `v0.5.0`（95cb367）→ 官方 release.yml 6m20s 构建成功，Release 10 资产齐全
+  （Setup/Portable/散 exe×4/SHA256SUMS/SKILL.md/zip），draft=false。
+- 发版授权：用户 2026-10-29 指令「进行完整的重构然后发版然后最后就是安装」。
+
+### Du（B 机）安装与验证
+
+- 安装器 SHA256 与官方 SHA256SUMS 逐字节一致（1e8209d6…）；/VERYSILENT 安装 exit=0；
+  4 个 exe 哈希与官方 4/4 一致；`kynoptic 0.5.0`。
+- **已知安装交互**：CloseApplications 强关托盘时托盘按优雅退出写入 tray-exit.flag，
+  看门狗 20:42 忠实遵守标记拒绝拉起（设计行为，日志留痕并给出处置指引）；删除
+  误置标记后 4 秒内拉起（PID 50900）、心跳 1 分钟恢复——v0.5.0 看门狗→托盘恢复链
+  实测通过。
+- 验证：数据连续（660,088→660,283+ 持续增长）；settings 保留（40 监控器/8422）；
+  /api/status 新增 monitors 字段生效（38 项上报、0 退避，audio_input 首采 14.3s
+  与重型预算串行化一致）；常驻 PowerShell 宿主 1 个自 20:44:03 起未重生；
+  托盘直接子进程 churn 2.5 个/分钟（基线 10.2 下界，↓约 4 倍）、tray CPU 1.47%
+  （基线 1.87%）——同口径隔离重测见 BENCHMARKS §7 回填。
+
+### A 机（DESKTOP-CD2C03F）升级与验证
+
+- 首次静默安装 exit=5：`D:\Kynoptic\kynoptic-tray.exe` 被占用（RestartManager
+  报「Kynoptic tray shell」，强关未生效），安装器**回滚干净且补偿恢复看门狗任务**
+  （日志留痕）。处置：SSH 手工禁看门狗任务→停托盘（实为普通用户进程，非提权）→
+  重跑安装 exit=0。
+- 验证：0.5.0、4 exe 哈希与官方一致、托盘拉起（PID 53184）、8422=200、心跳
+  stalled=false/unwritable=false、任务直启无包装且**非电池限制**（COM 注册路径
+  在 A 成功——佐证 Du 的失败是管理员属主任务覆盖被拒后走了 schtasks 兜底）。
+
+### 发现的真实缺陷：安装器看门狗重建的兜底路径会静默降级好状态（P1，下版收口）
+
+- **现象**：Du 升级后看门狗任务被重注册为 `DisallowStartIfOnBatteries=true /
+  StopIfGoingOnBatteries=true`、仅 TimeTrigger 无 LogonTrigger（20:41:03，
+  schtasks 兜底签名：无 ExecutionTimeLimit）。今早管理员重建的电池友好任务被覆盖。
+- **根因**：iss 的 COM 注册路径本身正确（电池 False + LogonTrigger + PT10M），
+  但对管理员属主的既有任务 `RegisterTaskDefinition TASK_CREATE_OR_UPDATE` 被拒
+  → 异常进兜底 `schtasks /Create`，而兜底注释自认「电池限制仍在」——
+  **COM 失败时把好状态静默降级**。A 机任务为普通用户注册，COM 成功即无此问题。
+- **修复方向（v0.5.1 收口）**：兜底路径在「已存在同名任务」时不得用 schtasks
+  覆盖（保留现状并高声留痕），仅全新安装才允许兜底创建；或兜底改走
+  Register-ScheduledTask 同用户路径。
+- **临时处置**：Du 以方案 B 管理员脚本重注册恢复电池友好形态——**待用户批准 UAC**
+  （本会话两次弹窗被取消，未再连续打扰；当前插电运行看门狗正常，拔电即停摆直至
+  批准）。
+
+### 遗留
+
+- BENCHMARKS §7「重构后对照」以同方法同口径隔离重测回填（本次轮内完成）。
+- 真实长时间 CPU 对照与多天稳定性观察留作日常运行继续积累。
+
 ## 2026-10-29（性能治理轮：分支 perf/governance，四批落地 + 隔离基线实测）
 
 ### 范围与纪律
