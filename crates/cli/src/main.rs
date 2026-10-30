@@ -1467,14 +1467,15 @@ fn cmd_migrate(args: &[String]) -> Result<()> {
         cmd_args.push(resolve_db().display().to_string());
     }
 
-    let status = std::process::Command::new("python")
-        .args(&cmd_args)
-        .status()
-        .map_err(|e| {
-            Error::InvalidData(format!(
-                "无法启动 python（迁移脚本依赖 Python 解释器）: {e}"
-            ))
-        })?;
+    // 创建旗标统一走 spawn::no_window（单一收口；此前裸 spawn 漏旗标，
+    // 由 core/tests/spawn_no_window_scan.rs 防漏闸钉住）
+    let mut cmd = std::process::Command::new("python");
+    kynoptic_core::spawn::no_window(&mut cmd);
+    let status = cmd.args(&cmd_args).status().map_err(|e| {
+        Error::InvalidData(format!(
+            "无法启动 python（迁移脚本依赖 Python 解释器）: {e}"
+        ))
+    })?;
     if !status.success() {
         return Err(Error::InvalidData(format!(
             "迁移脚本退出码: {}",
@@ -2109,6 +2110,8 @@ fn cmd_collect(args: &[String]) -> Result<()> {
     // 读取——旧实现 ..default() 恒 false，用户开「低配模式」后 CLI collect
     // 仍全速轮询（tray 侧已透传，三方字段集漂移）。
     let low_power = crate::settings::load(std::path::Path::new(&db_path)).low_power;
+    // 标题脱敏（R3 接线）：与 low_power 同模式读取，杜绝三方字段集再次漂移
+    let redact_titles = crate::settings::load(std::path::Path::new(&db_path)).redact_titles;
     let csettings = collector::CollectorSettings {
         input_granularity: if input_counts_only {
             collector::InputGranularity::Minute
@@ -2119,6 +2122,9 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         vk_frequency_enabled,
         // 低配模式：settings.json → CollectorSettings → monitors::set_low_power_mode
         low_power,
+        // 标题脱敏（隐私 opt-in，默认关）：settings.json → CollectorSettings
+        // → title_privacy::set_redact_titles
+        redact_titles,
         ..collector::CollectorSettings::default()
     };
     let mut c = collector::start_collection_custom(&enabled, csettings, &db_path);
@@ -3778,8 +3784,9 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                                         cmd.stdout(Stdio::null());
                                         cmd.stderr(Stdio::null());
                                         // 创建旗标统一走 spawn::no_window（原
-                                        // DETACHED_PROCESS：托盘为 GUI 子系统，
-                                        // 关键契约是「任何拉起路径都不开控制台」）
+                                        // DETACHED_PROCESS：托盘为控制台子系统
+                                        // （无 windows_subsystem 属性），关键契约
+                                        // 是「任何拉起路径都不开控制台」）
                                         kynoptic_core::spawn::no_window(&mut cmd);
                                         match cmd.spawn() {
                                             Ok(_) => {

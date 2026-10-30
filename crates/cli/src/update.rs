@@ -1006,10 +1006,11 @@ pub fn cmd_update(_args: &[String]) -> crate::Result<()> {
         let _ = std::fs::write(exit_flag_for(&dir), "updating\n");
         kill_process("kynoptic-tray.exe", &dir);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        match std::process::Command::new(dir.join("kynoptic-tray.exe"))
-            .arg("--minimized")
-            .spawn()
-        {
+        // 创建旗标统一走 spawn::no_window（单一收口；此前裸 spawn 漏旗标，
+        // 由 core/tests/spawn_no_window_scan.rs 防漏闸钉住）
+        let mut cmd = std::process::Command::new(dir.join("kynoptic-tray.exe"));
+        kynoptic_core::spawn::no_window(&mut cmd);
+        match cmd.arg("--minimized").spawn() {
             Ok(_) => {
                 let _ = std::fs::remove_file(exit_flag_for(&dir));
                 eprintln!("托盘已随更新自动重启");
