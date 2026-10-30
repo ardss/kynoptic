@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-30
+
+### Added
+
+- Dash (settings): `redact_titles` privacy switch, default off (opt-in).
+  When enabled, URL query strings are stripped from window/tab titles
+  before they are persisted, so token/session ids no longer land in the
+  database. The wiring spans AppSettings -> tray/CLI CollectorSettings ->
+  collector -> `title_privacy::set_redact_titles`; it affects new writes
+  only, historical rows are untouched.
+- Dash (API): `/api/report` gains `presence_minutes` (human presence
+  minutes before the 20-minute threshold filter), letting the report page
+  distinguish "no presence data in the baseline window" from "presence
+  data but no 20-minute focused block" instead of rendering the same
+  empty state for both.
+- Core (input devices): raw-input collections are merged into physical
+  devices with a device category; the input page aggregates per physical
+  device and no longer shows raw vendor codes for unknown vendors.
+- CI (docs): `check-doc-version.mjs` now anchors code-derived facts
+  (the CLI subcommand list) against the docs to stop transcription drift.
+- Core (tests): a new `spawn_no_window_scan` test locks the invariant
+  that every product-side `Command::new` goes through
+  `spawn::no_window()`.
+
+### Changed
+
+- Docs: the CLI surface is corrected to 21 subcommands in `llms.txt` and
+  APP.md (`apps`, `topics`, `recompute-actors` had been missing since
+  v0.4.0); the "pure Win32 APIs, zero subprocesses" claim is toned down
+  to the accurate statement (the network monitor may fall back to
+  spawning `netstat.exe` when the native path is unavailable, bounded at
+  3 s); the uninstall-keeps-data behavior is now disclosed in both
+  READMEs, APP.md, `llms.txt` and the bundled SKILL.md.
+
+### Fixed
+
+- Core (db): mixed minutes (raw and input_agg events inside the same
+  local minute) aggregated inconsistently - the incremental cache took a
+  MAX snapshot while the full rebuild sums both forms (probed 5 vs 7
+  keys), the production write path could never trigger the recompute
+  because input_agg rows report rowid 0 to the agg layer, and the daily
+  heal check could miss a diverged day in continuous sessions. The
+  rowid/aggregate/heal contracts are now unified end to end: incremental
+  and rebuild agree row-for-row in mixed minutes and the heal check can
+  no longer miss a diverged day. The external contract (input_agg rows
+  always report rowid 0) is preserved and pinned by tests.
+- Core (queries): presence in raw mode - the two authoritative paths
+  (`collect_day_hits` and the capped branch) now agree on mixed minutes
+  (human raw activity constitutes presence; injected-only minutes do
+  not).
+- Dash: the anomalies tab red badge was never visible since its
+  introduction - assigning `display=""` only cleared the inline style and
+  fell back to the stylesheet's `display:none`; the visible branch now
+  sets `inline-block` explicitly.
+- Dash (API): `/api/input` daily-compare series now zero-fills missing
+  days to the requested window length (a 7-day window could previously
+  return 5 rows with date gaps), matching the documented contract.
+- Update: installed-form detection now matches any `unins\d+\.exe`. Inno
+  Setup increments the uninstaller number on reinstall, so machines with
+  only `unins001.exe` were misdetected as portable - which disabled the
+  `kynoptic update` refuse-gate for installed form and made the tray's
+  one-click update take the portable in-place path. Detection now lives
+  in one place (`kynoptic_core::install`) shared by CLI and tray.
+- Update/CLI: two remaining raw `Command::new` call sites go through
+  `spawn::no_window()`; the tray `pick_free_port` test race (flaky under
+  parallel port pressure) is fixed while keeping its cross-range retry
+  semantics.
+- Build: Cargo.lock regenerated after the 0.5.0 version bump - workspace
+  members were still pinned at 0.4.0, breaking `--locked` builds.
+
 ## [0.5.0] - 2026-10-29
 
 ### Changed
@@ -1062,7 +1132,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ardss/kynoptic/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ardss/kynoptic/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ardss/kynoptic/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ardss/kynoptic/compare/v0.3.1...v0.3.2
