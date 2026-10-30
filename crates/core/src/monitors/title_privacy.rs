@@ -1,12 +1,12 @@
-//! 窗口/标签页标题脱敏（预留的全局开关，**尚未接线**）
+//! 窗口/标签页标题脱敏（全局开关，默认关，隐私 opt-in）
 //!
 //! 默认关闭：标题原文落库（本地数据完整优先，与既有行为契约一致）。
-//! 设计路径（**目前没有任何调用方**——dash 设置项、tray、CLI 均未接入，
-//! 开关恒为 false，行为与未引入本模块前完全一致）：settings
-//! `redact_titles` → `CollectorSettings::redact_titles` →
+//! 接线路径：dash 设置 `redact_titles`（AppSettings，设置页开关 + POST 落盘）
+//! → tray / CLI 构造 `CollectorSettings::redact_titles` →
 //! [`set_redact_titles`]（collector 启动时接线，与 `vk_frequency_enabled`
-//! 同模式）。接入后，采集侧把标题中出现的 URL 剥掉查询串（? 及之后），
-//! 网址参数（token、session id 等）不再随 window/tab_change 落库。
+//! 同模式）。开启后，采集侧把标题中出现的 URL 剥掉查询串（? 及之后），
+//! 网址参数（token、session id 等）不再随 window/tab_change 落库；
+//! 只拦新写入，不清洗历史数据。
 //! 导出侧 `--redact` 是独立实现，语义与本模块一致，但不受本开关控制。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,7 +89,17 @@ fn is_scheme_char(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    /// 开关是进程级全局态，libtest 默认多线程并行：未加锁时
+    /// `off_by_default_keeps_original` 的 `set_redact_titles(false)` 会与任一
+    /// `with_redact(true)` 组测试竞态把开关打回 false，redact 断言偶发失败
+    /// （实测全量 core lib 10 连跑约 1 次触发，单测隔离恒过）。所有触碰
+    /// 开关的测试必须持锁串行；各测试期望值零改动。
+    static REDACT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_redact(on: bool, f: impl FnOnce()) {
+        let _g = REDACT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_redact_titles(on);
         f();
         set_redact_titles(false);
@@ -97,6 +107,9 @@ mod tests {
 
     #[test]
     fn off_by_default_keeps_original() {
+        let _g = REDACT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_redact_titles(false);
         assert_eq!(
             redact_title("登录 - https://example.com/login?token=abc"),
