@@ -3,9 +3,9 @@
     "Kynoptic 监控器默认配置模板（40 个）。",
     "本文件是 crates/core/src/registry.rs MONITOR_REGISTRY 的镜像，",
     "registry::config_template_matches_registry 测试保证两者逐项一致。",
-    "默认启用 = v0.1 的 14 个（纯 windows-sys、零子进程）；",
+    "默认启用 = v0.1 的 14 个（采集主路径均为原生 windows-sys API）；",
     "恢复的 26 个默认关闭（R8 2级 中敏感 / 3级 高敏感或主题外）。",
-    "dep: native = 零子进程（原生 API 或零采集占位）；powershell = 经 ps.rs spawn PowerShell。",
+    "dep: native = 默认采集路径原生（原生 API 或零采集占位；不代表全程零子进程，例外见下方偏差）；powershell = 经 ps.rs spawn PowerShell。",
     "已知偏差（Dep 二分类表达不了，见 registry.rs 注册项注释）：network 兜底 spawn",
     "netstat.exe；device 在 enable_disk_io=true 时走 PS；gpu 动态指标每拍 spawn nvidia-smi.exe。"
   ],

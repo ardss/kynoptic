@@ -18,11 +18,14 @@
 > 关闭**，默认启用集合精确等于 v0.1 的 14 个（= **12 个轮询 monitor + 2 个底层
 > 输入 hook**，下文"12 monitor + 2 hook"与 README 的"默认启用 14 个"是同一口径，
 > 见 CODE_NOTES.md §9），因此本文件
-> 所有数字的前提（默认监控集 + 默认集内零子进程）不变。
+> 所有数字的前提（默认监控集不变；默认集采集主路径均为原生 Win32 API）不变。
+> 注意：默认集并非零子进程——network 在原生路径不可用时会兜底 spawn
+> netstat.exe（3s 有界，见 APP.md「已知偏差」）。
 >
 > 注（WiFi/电源原生化，2026-09 P0 修复）：`wifi` 与 `power_plan` 两个默认
 > 启用的 monitor 已改为原生采集（原生 WiFi API + PowerGetActiveScheme），
-> 不再 spawn netsh/powercfg 子进程——默认集"零子进程"成立。下文数字为
+> 不再 spawn netsh/powercfg 子进程。该修复不改变上一条结论：默认集仍非
+> 零子进程（network 兜底 netstat.exe）。下文数字为
 > 子进程时代实测，原生化后只会更优（偏保守），待重测更新。
 
 ## 复现命令

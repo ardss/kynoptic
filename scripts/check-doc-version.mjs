@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 // ci 修复（Wave46）：文档版本行一致性断言。版本一致性工具 bump-version.mjs
 // 曾只护七处中的六处，漏 llms.txt——0.3.1 发版时其状态行漂移在 v0.3.0，
-// 事后人肉补正（CHANGELOG.md:269-272 有同型事故记录）。本脚本只锚定
-// 头部/状态行模式，不做全文件扫描：APP.md:103/111 的「截至 v0.3.1」
-// 历史正文属有意不动，全文件扫描会误报。
+// 事后人肉补正（CHANGELOG.md:269-272 有同型事故记录）。版本一致性部分
+// 只锚定头部/状态行模式，不做全文件扫描。
 // 断言：llms.txt / index.html / README / README.zh-CN / APP.md 的
 // 状态行与 CHANGELOG.md 顶部版本段均须与 Cargo.toml 当前版本一致
 // （头部/状态行各只含一个版本 token，一致即旧版不残留）。
+// CLI 子命令枚举断言（R4）：0.4.0 新增 apps/topics/recompute-actors 时只
+// 同步了二进制内 USAGE，llms.txt 的「18 subcommands」与 APP.md CLI 表穿过
+// 0.4.0/0.5.0 两个发版周期未更新——门禁此前只锚版本 token，PR 期 ci.yml
+// 不碰文档，两轮全绿放行（机制级根因：命令枚举不变量此前不在任何门禁内）。
+// 现自 crates/cli/src/main.rs 的 USAGE Subcommands 块解析子命令全集，断言
+// llms.txt 的计数与 crates/cli 段枚举、APP.md「## CLI」节内表对全集全覆盖。
+// APP.md 的 CLI 节按「随版本同步」的活面维护（不再是冻结历史正文），故可
+// 全量断言；其余文件仍只锚头部/状态行。
 // 调用方：scripts/release-gate.ps1 G4 门（发布日本地）与
 // .github/workflows/release.yml 构建前步骤；不一致 exit 1 终止。
 // 断言清单第 10 项（W47）：SECURITY.md 支持表须含当前 minor 线——此前版本
@@ -132,6 +139,100 @@ requireContains("APP.md", `# Kynoptic App (v${ver})`, "标题行");
       failed = true;
     } else {
       console.log(`[doc-version] ok: SECURITY.md 支持线 ${minor}.x`);
+    }
+  }
+}
+
+// CLI 子命令枚举断言（R4）：解析规则见上方头注释。
+{
+  const usage = readFileSync(join(root, "crates", "cli", "src", "main.rs"), "utf8");
+  const start = usage.indexOf("Subcommands:");
+  const end = usage.indexOf("Global options");
+  if (start < 0 || end < 0 || end < start) {
+    console.error(
+      "[doc-version] main.rs USAGE 结构变化：找不到 Subcommands:/Global options 锚点，枚举断言需随格式更新",
+    );
+    failed = true;
+  } else {
+    // 子命令行 = 恰好两空格缩进开头的首个 token；--version 是标志不是子命令
+    // （USAGE 内的说明续行缩进远大于两空格，不会误入）
+    const cmds = new Set(
+      usage
+        .slice(start, end)
+        .split(/\r?\n/)
+        .map((l) => (l.match(/^ {2}(\S+)/) || [])[1])
+        .filter((t) => t && !t.startsWith("-")),
+    );
+    if (cmds.size === 0) {
+      console.error(
+        "[doc-version] main.rs USAGE 解析出 0 个子命令——解析规则需随格式更新",
+      );
+      failed = true;
+    } else {
+      // llms.txt：计数断言 + crates/cli 段内枚举全覆盖
+      const llms = readFileSync(join(root, "llms.txt"), "utf8");
+      const countM = llms.match(/with\s+(\d+)\s+subcommands/);
+      if (!countM || Number(countM[1]) !== cmds.size) {
+        console.error(
+          `[doc-version] llms.txt 子命令计数须为 ${cmds.size}（自 main.rs USAGE 解析），实际 '${
+            countM ? countM[1] : '(未找到 "with N subcommands")'
+          }'`,
+        );
+        failed = true;
+      } else {
+        console.log(`[doc-version] ok: llms.txt 子命令计数 ${cmds.size}`);
+      }
+      const b0 = llms.indexOf("- `crates/cli`");
+      const b1 = llms.indexOf("- `crates/dash`");
+      const bullet = b0 >= 0 && b1 > b0 ? llms.slice(b0, b1) : "";
+      const llmsTokens = new Set(
+        [...bullet.matchAll(/`([^`]+)`/g)].map((m) => m[1].split(/\s/)[0]),
+      );
+      const llmsMissing = [...cmds].filter((c) => !llmsTokens.has(c));
+      if (!bullet || llmsMissing.length > 0) {
+        console.error(
+          `[doc-version] llms.txt crates/cli 段枚举缺子命令：${
+            bullet ? llmsMissing.join(", ") : "（crates/cli 段定位失败）"
+          }`,
+        );
+        failed = true;
+      } else {
+        console.log(`[doc-version] ok: llms.txt CLI 枚举全覆盖（${cmds.size}）`);
+      }
+      // APP.md：「## CLI」节（截到首个 h3/h2 标题）内表格首列反引号 token
+      // 的首词须覆盖全集（捆绑行各反引号组逐个计入）
+      const app = readFileSync(join(root, "APP.md"), "utf8");
+      const s0 = app.search(/^## CLI/m);
+      let sec = "";
+      if (s0 >= 0) {
+        const after = app.slice(s0 + 1);
+        const h3 = after.search(/\n### /);
+        const h2 = after.search(/\n##(?!#)/);
+        const hits = [h3, h2].filter((h) => h >= 0);
+        const cut = hits.length > 0 ? Math.min(...hits) : -1;
+        sec = cut < 0 ? app.slice(s0) : app.slice(s0, s0 + 1 + cut);
+      }
+      const appTokens = new Set();
+      for (const line of sec.split(/\r?\n/)) {
+        if (!line.startsWith("|")) continue;
+        // 按未转义竖线切列：单元格内的 markdown 转义 `\|`（如 apps 的
+        // --actor 取值列表）不产生假列边界
+        const cell1 = line.split(/(?<!\\)\|/)[1] || "";
+        for (const m of cell1.matchAll(/`([^`]+)`/g)) {
+          appTokens.add(m[1].split(/\s/)[0]);
+        }
+      }
+      const appMissing = [...cmds].filter((c) => !appTokens.has(c));
+      if (!sec || appMissing.length > 0) {
+        console.error(
+          `[doc-version] APP.md CLI 表缺子命令：${
+            sec ? appMissing.join(", ") : "（## CLI 节定位失败）"
+          }`,
+        );
+        failed = true;
+      } else {
+        console.log(`[doc-version] ok: APP.md CLI 表全覆盖（${cmds.size}）`);
+      }
     }
   }
 }
