@@ -33,10 +33,13 @@
 //!    独立维护入口（测试/兼容路径）。
 //! 2. 懒回填：[`Database::open`] 时若 agg 全空而 events 非空 → [`backfill_if_needed`]
 //!    （存量库首开自动补齐；选此方案而非 CLI 命令，见 CODE_NOTES.md §8）。
-//! 3. 欠聚合自愈：[`under_agg_dates`] 廉价核对（events 中应有聚合贡献的原始行
-//!    最大 id 与该日 agg_minute 已记录 max_event_rowid 对比），不一致日期由
-//!    [`Database::open`] 后台与每日 maintenance 调 [`heal_under_agg`] 重算——
-//!    兜底覆盖事务化之前遗留的欠聚合存量数据。
+//! 3. 欠聚合自愈：[`under_agg_dates`] 廉价核对（自愈窗口内逐本地日核对
+//!    agg_minute 各输入桶 SUM 与 events SUM 是否相等——KEYS/CLICKS_ROW_EXPR
+//!    同款表达式；旧口径按日级 MAX(events.id) 对比 MAX(max_event_rowid)，
+//!    混合分钟快照 MAX 吞掉 raw 段的按分钟洞会被同日后续事件把两侧日 MAX
+//!    追平而永久漏报），不一致日期由 [`Database::open`] 后台与每日
+//!    maintenance 调 [`heal_under_agg`] 重算——兜底覆盖事务化之前遗留的
+//!    欠聚合存量数据与历史版本写链的分叉。
 
 use chrono::{Local, Timelike, Utc};
 use rusqlite::{params, Connection};
@@ -165,8 +168,12 @@ const CNT_SWITCHES_EXPR: &str =
 
 /// 单个事件对聚合缓存的增量贡献（本地时区分钟桶）。
 ///
-/// `rowid` = 该事件在 events 表的 rowid（落库时分配；未知传 0 → 增量行被
-/// 守卫跳过，快照行仅更新计数快照）。
+/// `rowid` = 该事件在 events 表的**真实** rowid（落库时分配，混合分钟探测
+/// 与 max_event_rowid 守卫都以它为准）。input_agg 行由生产写路径按部分唯一
+/// 索引键回查真实 id（见 db::events::execute_event_rowids——禁用
+/// last_insert_rowid：UPSERT 的 DO UPDATE 路径返残留脏值）；未知传 0 →
+/// 混合分钟探不出、增量行被守卫跳过（历史维护入口 [`update_agg`] 的调用方
+/// 可能传 0，见其 doc 口径说明）。
 pub(crate) fn apply_event(conn: &Connection, e: &Event, rowid: i64) -> rusqlite::Result<()> {
     let ts = match chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
         Ok(t) => t,
@@ -471,8 +478,12 @@ fn utc_minute_bounds(ts: &chrono::DateTime<chrono::FixedOffset>) -> (String, Str
 /// （同桶 SUM 两形态）及今日按键读 events SUM 的消费面分叉。
 /// 返回 Some((mstart, mend)) = 命中混合（含该分钟 UTC 界供重算谓词）；
 /// None = 纯形态分钟（维持快照语义）。生产 writer 先落库后 apply_event
-/// （同事务成对，见 insert_events_with_agg_tx），本行 rowid 已分配；
-/// rowid=0（未知）探不出先到行。非 input_agg 输入行不探测。
+/// （同事务成对，见 insert_events_with_agg_tx），传给本函数的是**真实
+/// rowid**——input_agg 行由 db::events::execute_event_rowids 按部分唯一
+/// 索引键回查（rowid/聚合契约统一批；此前写链传 0，rowid<=0 早退使混合
+/// 分钟重算生产为死代码，agg 与 events SUM 分叉）。rowid=0（未知，
+/// update_agg 维护入口的调用方可能传 0）探不出先到行，按纯形态处理。
+/// 非 input_agg 输入行不探测。
 fn detect_mixed_minute(
     conn: &Connection,
     e: &Event,
@@ -660,10 +671,15 @@ fn recompute_minute_actor(
 impl super::Database {
     /// 增量维护聚合缓存：对一批刚落库的事件做 agg_minute / agg_daily UPSERT。
     ///
-    /// `rowids` 与 `events` 一一对应（由 [`super::Database::insert_events`]
-    /// 返回的 events 表 rowid；写入失败的行为 0）。rowid 用于 agg_minute 行的
-    /// max_event_rowid 幂等防护：同事件重复投递（如分块回填重算后迟到的增量）
-    /// 不会重复累计。
+    /// `rowids` 与 `events` 一一对应（events 表真实 rowid；0 = 未知/写失败）。
+    /// rowid 用于 agg_minute 行的 max_event_rowid 幂等防护：同事件重复投递
+    /// （如分块回填重算后迟到的增量）不会重复累计。
+    ///
+    /// rowid 口径（rowid/聚合契约统一批）：要混合分钟探测命中必须传**真实
+    /// id**——生产写路径（insert_events_with_agg_tx）对 input_agg 行按部分
+    /// 唯一索引键回查后传入。经 [`super::Database::insert_events`] 返回值
+    /// （对外契约 input_agg 行恒 0）直接喂本函数时，input_agg 行不探测混合
+    /// 分钟（rowid=0 按纯形态快照处理，历史维护入口口径，调用方知悉）。
     ///
     /// 由 writer 线程在每次 flush 后调用。失败仅 log（缓存可由 backfill 重建，
     /// 不影响原始写入）。
@@ -866,49 +882,106 @@ fn rebuild_all_inner(conn: &Connection, off: &str) -> crate::Result<usize> {
     Ok(n)
 }
 
-/// 欠聚合廉价核对（P1 自愈门槛，两条聚合查询）：返回本地日期列表——该日
-/// events 中"应有聚合贡献"的原始行（press/click/switch/input_agg）最大 id
-/// 大于该日 agg_minute 已记录的 MAX(max_event_rowid)（含该日完全没有聚合行
-/// 的情况）。
+/// 欠聚合廉价核对（P1 自愈门槛）：返回本地日期列表——自愈窗口内该日
+/// agg_minute 各输入桶 SUM 与 events 同款表达式 SUM 不相等的日期（含该日
+/// 完全没有聚合行的情况）。与消费面（今日按键读 events SUM）和 heal 重算
+/// 同口径，收敛性由 backfill_chunk 重算幂等保证。
 ///
-/// 审查 33-F5：核对口径加入 input_agg 行。默认 Minute 粒度下输入只以
-/// event_action='input_agg' 落库，旧口径（仅 press/click/switch）对
-/// input_agg-only 日永远检不出欠聚合——不回填也不重算；若该日还残留部分
-/// 旧聚合行，has_minute_for_date=true 会让图表走缓存读路径直接漏算。
-/// 收敛性：重算路径写入桶内 MAX(id)（含 input_agg 行）；input_agg 行是
-/// UPSERT（同分钟同类型不改 id），只有新分钟才产生更大 id——新分钟会再次
-/// 触发当日核对并由下次自愈收敛，不会产生历史日的持续误报。
+/// rowid/聚合契约统一批（探针D）改口径：旧实现核对「该日 events 应有聚合
+/// 贡献行的 MAX(id) 对比该日 agg_minute 的 MAX(max_event_rowid)」，有两大
+/// 漏报形态——
+/// ① **后续事件锁闭日级 MAX**：混合分钟分叉（快照 MAX 覆盖吞掉 raw 段计数，
+///    洞落在该日的某个分钟）后，同日任何后续合格事件的增量写入会把自身
+///    rowid 写进别的分钟桶，agg 侧日 MAX 追平 events 侧日 MAX，判据 <
+///    永假——一次锁闭即永久报「已收敛」，分叉永不收敛；
+/// ② **水位写入谓词与核对谓词不同构**：重算/回填写 max_event_rowid=
+///    MAX(id) 时无 action 过滤（backfill_chunk 的 maxid 取块内全部行），
+///    未计数的 raw move 行凭更大 id 也能单独关闭判据。
+/// 改为逐日 SUM 等价核对后两形态都按实际分叉报出（探针D 测试钉住①）。
+/// 按分钟洞不再被日级聚合掩蔽，且核对、消费面、重算三方同口径。
+///
+/// 审查 33-F5（历史）：核对口径含 input_agg 行（KEYS/CLICKS_ROW_EXPR 认
+/// input_agg 快照），默认 Minute 粒度的 input_agg-only 日不再漏检。
 ///
 /// **启动延迟（交叉审查 P3）**：本函数在 `Database::open` 主线程同步调用。
 /// 无下界时是 events 全表 GROUP BY 扫描（362 万行库上秒级启动回归）。这里加
-/// `timestamp >= cutoff` 的**日期下界**（自愈窗口 7 天）：谓词可走
-/// idx_events_timestamp 索引区间，只核对最近 7 天，启动核对降到毫秒级。
+/// `timestamp >= cutoff` 的**日期下界**（自愈窗口 7 天，下界对齐本地日零点，
+/// 见实现注释）：谓词走 idx_events_timestamp 索引区间，只核对最近 7~8 个
+/// 本地日，启动核对降到毫秒级。
 /// **取舍（文档化）**：7 天前的欠聚合日期不再被启动/维护自愈——这类日期只能
 /// 来自事务化之前的历史遗留 kill，且日常使用中不会再看；需要修复历史数据时
 /// 显式调用 `rebuild_agg`（或删掉 agg_minute 触发懒回填）即可全量重建。
 pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
+    under_agg_dates_at(conn, Utc::now())
+}
+
+/// [`under_agg_dates`] 的时钟注入版（测试走这里注入窗口基准；生产包装传
+/// `Utc::now()`。签名不变式：db/mod.rs open 路径直调 [`under_agg_dates`]，
+/// 故核对口径的时钟基准必须可注入而公开签名不动）。
+fn under_agg_dates_at(conn: &Connection, now: chrono::DateTime<Utc>) -> Vec<String> {
     let off = crate::queries::LOCAL_MODIFIER_AT_EVENT;
-    // 只核对最近 7 天（见上方取舍说明）；cutoff 用 UTC RFC3339 与 timestamp 列同构比较。
-    let cutoff = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
-    // agg 侧改为**按候选日**取 MAX(max_event_rowid)：旧实现
-    // `SELECT date, MAX(...) FROM agg_minute GROUP BY date` 是 agg_minute 全表
-    // 扫描，成本随库龄线性增长（24 万行实测 1.3s，每次开库 + 每日维护各一次）。
-    // 现按 (date,hour,minute,bucket_id) 主键索引对窗口内候选日（至多 8 个）
-    // 做索引区间查询，成本只随 7 天窗口的聚合行数走、与库龄无关。
+    // 7 天自愈窗口（取舍说明见上方 doc）。下界对齐到 cutoff 时刻所在的
+    // **本地日历日零点**：候选日按本地日分组、agg_minute.date 也是整日本地
+    // 日——窗口若停在日中，截断日的 events 半日 SUM 与已聚合的整日 SUM
+    // 永久不等，SUM 核对会每次开库假阳性触发自愈。对齐后窗口为 7~8 个本地
+    // 日，谓词仍是常量下界的 timestamp 区间（idx_events_timestamp）。
+    let cutoff_date = (now - chrono::Duration::days(7))
+        .with_timezone(&Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    let cutoff = crate::queries::local_day_range(&cutoff_date)
+        .map(|(s, _)| s)
+        .unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339());
+    // 逐本地日 SUM 等价核对（与消费面「今日按键读 events SUM」和 heal 重算
+    // 同口径，收敛性由 backfill_chunk 重算幂等保证）：
+    // - events 侧表达式与 rebuild_all/backfill_chunk/recompute_minute_buckets
+    //   逐字同款（KEYS/CLICKS_ROW_EXPR + CNT_SWITCHES_EXPR），无 action 过滤
+    //   （CASE 内自零——未计数的 raw move 行不再能凭更大 id 关闭判据，
+    //   旧 MAX 水位口径的漏报形态之一）；
+    // - agg 侧按 bucket_id 归并 sum_value（对窗口内候选日走 (date,...) 主键
+    //   前缀索引区间，成本只随窗口聚合行数走、与库龄无关）；
+    // - 只核对 keys/clicks/switches：三者均整数值（按行 +1 或 json 计数），
+    //   REAL 存列上比较精确；input_moves 的 move_distance_px 是浮点，累加
+    //   顺序不同舍入即可能差 1 ulp，进核对会假阳性触发自愈，故排除
+    //   （moves 分叉会被同分钟 keys/clicks 分叉连带报出；纯 moves 漂移由
+    //   显式 rebuild 全量重建兜底）。注入桶（*_injected）与母桶同源写入，
+    //   母桶相等时不单独核对。
+    // 旧口径（日级 MAX(events.id) 对比日级 MAX(max_event_rowid)）的两个
+    // 漏报形态见函数 doc。
     let sql = format!(
-        "SELECT e.d FROM (
-           SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d, MAX(id) AS maxid
+        "WITH win AS (
+           SELECT substr(datetime(timestamp, '{off}'), 1, 10) AS d,
+                  SUM({keys_row}) AS keys_e,
+                  SUM({clicks_row}) AS clicks_e,
+                  {cnt_switches} AS sw_e
            FROM events
            WHERE event_type IN ('keyboard','mouse','window')
-             AND event_action IN ('press','click','switch','input_agg')
              AND timestamp >= '{cutoff}'
            GROUP BY d
-         ) e
-         WHERE COALESCE((SELECT MAX(COALESCE(max_event_rowid, 0))
-                         FROM agg_minute WHERE date = e.d), 0) < e.maxid
-         ORDER BY e.d",
+         ),
+         agg AS (
+           SELECT date AS d,
+                  COALESCE(SUM(CASE WHEN bucket_id = 'input_keys'
+                                    THEN COALESCE(sum_value, 0) END), 0) AS keys_a,
+                  COALESCE(SUM(CASE WHEN bucket_id = 'input_clicks'
+                                    THEN COALESCE(sum_value, 0) END), 0) AS clicks_a,
+                  COALESCE(SUM(CASE WHEN bucket_id = 'window_switches'
+                                    THEN COALESCE(sum_value, 0) END), 0) AS sw_a
+           FROM agg_minute
+           WHERE date IN (SELECT d FROM win)
+           GROUP BY date
+         )
+         SELECT win.d FROM win
+         LEFT JOIN agg ON agg.d = win.d
+         WHERE win.keys_e != COALESCE(agg.keys_a, 0)
+            OR win.clicks_e != COALESCE(agg.clicks_a, 0)
+            OR win.sw_e != COALESCE(agg.sw_a, 0)
+         ORDER BY win.d",
         off = off,
         cutoff = cutoff,
+        keys_row = crate::queries::KEYS_ROW_EXPR,
+        clicks_row = crate::queries::CLICKS_ROW_EXPR,
+        cnt_switches = CNT_SWITCHES_EXPR,
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -931,7 +1004,13 @@ pub fn under_agg_dates(conn: &Connection) -> Vec<String> {
 /// [`backfill_chunk`]（幂等：DELETE 该块聚合行 + 从 events 重算，小时块无事件
 /// 时廉价跳过）。返回自愈的日期数。
 pub fn heal_under_agg(conn: &Connection) -> crate::Result<usize> {
-    let dates = under_agg_dates(conn);
+    heal_under_agg_at(conn, Utc::now())
+}
+
+/// [`heal_under_agg`] 的时钟注入版（测试走这里注入窗口基准；生产包装传
+/// `Utc::now()`）。
+fn heal_under_agg_at(conn: &Connection, now: chrono::DateTime<Utc>) -> crate::Result<usize> {
+    let dates = under_agg_dates_at(conn, now);
     for date in &dates {
         for h in 0..24i64 {
             backfill_chunk(conn, date, h)?;
@@ -1977,6 +2056,150 @@ mod tests {
             "8 天前的欠聚合日期不应触发启动自愈（窗口 7 天）: {dates:?}"
         );
         assert_eq!(dates.len(), 1, "窗口内的今天仍应被核对出欠聚合: {dates:?}");
+    }
+
+    /// 欠聚合核对必须在「后续事件锁闭日级 MAX」的分叉日上报（探针D 序列，
+    /// rowid/聚合契约统一批）。此前核对口径是**日级** MAX(events.id)（限
+    /// press/click/switch/input_agg）对比**日级** MAX(agg_minute.max_event_rowid)：
+    /// 混合分钟快照 MAX 覆盖吞掉 raw 段计数产生按分钟洞后，同日任何后续合格
+    /// 事件的增量写入会把自身 rowid 写进别的分钟桶，agg 侧日 MAX 追平 events
+    /// 侧日 MAX，判据 < 永假——一次锁闭即永久报「已收敛」，分叉永不收敛。
+    /// 本测试钉住：核对必须按日核对 agg 桶 SUM 与 events SUM 等价（消费面与
+    /// heal 重算同口径），锁闭形态下必须报出，且 heal 幂等收敛。
+    /// 序列（日期全注入，禁真实时钟；7 天窗口基准时刻为注入的 now）：
+    /// ① 生产入口 insert_events_with_agg：同分钟 raw press ×2 + input_agg
+    ///    快照 keys=3→5（分钟起点时间戳，UPSERT 同一行）；
+    /// ② 同日后续 raw press（+2 分钟）——旧日级 MAX 判据即被它锁闭；
+    /// ③ 注入按分钟洞（UPDATE agg_minute sum_value-2，模拟快照 MAX 吞计数
+    ///    的分叉形态：修复后写链不再产生它，但存量库分叉仍在，核对必须报出；
+    ///    只改派生缓存，events 不动）；
+    /// ④ under_agg_dates 必须报出该日；heal 重算后 SUM 相等、核对安静、
+    ///    再 heal 为 0（幂等收敛）。
+    #[test]
+    fn contractpin_d_under_agg_dates_reports_locked_mixed_minute_day() {
+        // 注入的窗口基准时刻（测试全程不读真实时钟：heal/核对走 *_at 注入版）
+        let now: chrono::DateTime<Utc> = "2026-06-15T12:00:00+00:00".parse().unwrap();
+        let mstart = (now - chrono::Duration::hours(1))
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap();
+        let day = mstart.with_timezone(&Local).format("%Y-%m-%d").to_string();
+
+        // 临时库目录（红线：不读真实时钟）：纯 pid+seq（AtomicUsize 计数），
+        // 上次运行遗留同名目录（panic 跳过清理）则递增 seq 取空名
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = loop {
+            let d =
+                std::env::temp_dir().join(format!("kyn-aggt-probed-{}-{seq}", std::process::id()));
+            if !d.exists() {
+                break d;
+            }
+            seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Database::open(dir.join("probed.db").to_str().unwrap()).unwrap();
+
+        // ① flush1：同分钟 raw press ×2（真实 id 1,2）
+        let mut flush1: Vec<Event> = Vec::new();
+        for sec in [10i64, 20] {
+            let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+            e.timestamp = (mstart + chrono::Duration::seconds(sec)).to_rfc3339();
+            flush1.push(e);
+        }
+        let (rowids1, failed1) = db.insert_events_with_agg(&flush1);
+        assert!(!failed1);
+        assert_eq!(rowids1, vec![1, 2]);
+
+        // ① flush2/flush3：同分钟 input_agg 累计快照 keys=3→5（生产形态
+        // 分钟起点时间戳；对外 rowid 恒 [0]，真实 id=3 由写路径回查）
+        let mk_agg = |keys: i64| {
+            let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard)
+                .data(serde_json::json!({ "keys": keys, "samples": keys }))
+                .app("", "");
+            e.timestamp = mstart.to_rfc3339();
+            e
+        };
+        let (rowids2, failed2) = db.insert_events_with_agg(&[mk_agg(3)]);
+        assert!(!failed2);
+        assert_eq!(rowids2, vec![0], "对外契约：input_agg 行恒 0（不得改动）");
+        let (rowids3, failed3) = db.insert_events_with_agg(&[mk_agg(5)]);
+        assert!(!failed3);
+        assert_eq!(rowids3, vec![0]);
+
+        // ② 同日后续 raw press（+2 分钟，id 4）：旧口径下 agg 侧日 MAX 被
+        // 它追平 events 侧日 MAX，核对即被锁闭
+        let mut late = Event::new(EventAction::Press, EventType::Keyboard);
+        late.timestamp = (mstart + chrono::Duration::minutes(2)).to_rfc3339();
+        let (rowids4, failed4) = db.insert_events_with_agg(std::slice::from_ref(&late));
+        assert!(!failed4);
+        // 锁闭形态前提 = 后续 raw 行 id 更大；不钉具体值——AUTOINCREMENT
+        // 高水位可能被 input_agg UPSERT 的插入尝试消耗（部分唯一索引每撞
+        // 一次耗损一个序列位，见 input_agg.rs 节流注释）
+        assert!(
+            rowids4[0] > rowids1[1],
+            "后续 raw 行真实 id 必须更大: rowids={rowids4:?}"
+        );
+
+        // ③ 注入按分钟洞（模拟快照 MAX 吞掉 raw 段计数的存量分叉；
+        // events 表不动——原始数据铁律）
+        db.with_writer(
+            |c| {
+                c.execute(
+                    "UPDATE agg_minute SET sum_value = sum_value - 2 \
+                     WHERE bucket_id = 'input_keys'",
+                    [],
+                )
+                .unwrap();
+            },
+            || (),
+        );
+
+        // ④ 核对必须报出该日（锁闭形态下不得漏报）
+        let dates = db.with_writer(|c| under_agg_dates_at(c, now), Vec::new);
+        assert!(
+            dates.contains(&day),
+            "后续事件锁闭日级 MAX 的分叉日必须被核对报出（探针D）: dates={dates:?}, day={day}"
+        );
+
+        // heal 重算收敛：该日 agg 桶 SUM 与 events SUM 相等
+        let healed = db.with_writer(|c| heal_under_agg_at(c, now).unwrap(), || 0usize);
+        assert_eq!(healed, 1, "恰好该分叉日被自愈重算");
+        let reader = db.reader();
+        let events_keys: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT CAST(COALESCE(SUM({}),0) AS INTEGER) FROM events \
+                     WHERE event_type IN ('keyboard','mouse','window')",
+                    crate::queries::KEYS_ROW_EXPR
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let agg_keys: i64 = reader
+            .query_row(
+                "SELECT CAST(COALESCE(SUM(sum_value),0) AS INTEGER) FROM agg_minute \
+                 WHERE bucket_id='input_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(agg_keys, events_keys, "自愈后 agg 与 events SUM 必须相等");
+
+        // 幂等收敛：核对安静、再 heal 为 0
+        let dates2 = db.with_writer(|c| under_agg_dates_at(c, now), Vec::new);
+        assert!(
+            !dates2.contains(&day),
+            "收敛后核对必须安静: dates={dates2:?}, day={day}"
+        );
+        let healed2 = db.with_writer(|c| heal_under_agg_at(c, now).unwrap(), || 0usize);
+        assert_eq!(healed2, 0, "自愈必须幂等（无分叉日时不再重算）");
+
+        drop(reader);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // === 混合分钟一致性：同一本地分钟混含 raw 与 input_agg 两形态 ===

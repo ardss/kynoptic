@@ -31,6 +31,15 @@ ON CONFLICT(timestamp, event_type) WHERE event_action = 'input_agg'
 DO UPDATE SET event_data = excluded.event_data
 ";
 
+/// input_agg 行的 agg 维护 rowid 回查：按部分唯一索引键（timestamp,
+/// event_type；谓词 event_action='input_agg'，migration 0005
+/// ux_input_agg_minute）取真实 events.id。execute 刚成功，行必在
+/// （INSERT 新行或 DO UPDATE 覆盖原行），回查不会落空。
+const INPUT_AGG_ROWID_SQL: &str = "
+SELECT id FROM events
+WHERE timestamp = ?1 AND event_type = ?2 AND event_action = 'input_agg'
+";
+
 /// 写失败计数（P0，「批」口径）：磁盘写满/写失败时旧实现只 log::warn（且"降级逐条→跳过"
 /// 后无任何聚合观测），告警看门狗只看通道满载计数，写失败完全静默。各整批失败点
 /// （整批尝试失败、重试失败）每批只累加一次；降级逐条路径的**行级**失败数不进此
@@ -66,8 +75,30 @@ fn normalize_timestamp(ts: &str) -> String {
 }
 
 /// 单条事件落库（input_agg 行走 UPSERT，其余 INSERT）。返回该行的 events
-/// rowid（input_agg 聚合行无稳定新 rowid，返回 0，与旧 insert_events 语义一致）。
+/// rowid（input_agg 聚合行无稳定新 rowid，返回 0，与旧 insert_events 语义
+/// 一致——对外契约，见 [`execute_event_rowids`] 返回值 .0）。
 fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
+    execute_event_rowids(tx, e, false).map(|(rowid, _)| rowid)
+}
+
+/// 单条事件落库 + rowid 双语义拆分（rowid/聚合契约统一批）。返回
+/// `(对外 rowid, agg 维护 rowid)`：
+///
+/// - **对外 rowid**（.0）：既有契约不变——input_agg 行恒 0。消费方锚点：
+///   collector 失败行判据（「r==0 且 action!=InputAgg」才逐条重试）、
+///   all_failed（全零即整批失败）、vec![0] 契约测试（all_failed_flag_
+///   is_explicit_for_pure_input_agg_batch 等）。
+/// - **agg 维护 rowid**（.1）：传给 `agg::apply_event` 的**真实** events.id，
+///   供混合分钟探测与 max_event_rowid 守卫使用。input_agg 行按部分唯一索引
+///   键回查（[`INPUT_AGG_ROWID_SQL`]）——**禁用 last_insert_rowid**：UPSERT
+///   的 DO UPDATE 路径不更新该值，会返回上一条 INSERT 路径的残留 id（实测
+///   返无关行的残留值），喂给聚合维护即探测/守卫全错。raw 行两值相同。
+///   `with_agg_id=false` 时不回查（`insert_events` 无聚合维护路径零开销）。
+fn execute_event_rowids(
+    tx: &Connection,
+    e: &Event,
+    with_agg_id: bool,
+) -> rusqlite::Result<(i64, i64)> {
     let data_str = e.event_data.as_ref().map(|v| v.to_string());
     // 审查 HIGH：写库统一规范化时间戳（见 normalize_timestamp），
     // 保证字符串范围谓词（timestamp >= ?1 AND < ?2）语义正确
@@ -89,7 +120,17 @@ fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
         e.window_title,
         e.session_id,
     ])?;
-    Ok(if is_agg { 0 } else { tx.last_insert_rowid() })
+    let external = if is_agg { 0 } else { tx.last_insert_rowid() };
+    let agg_rowid = if is_agg && with_agg_id {
+        tx.query_row(
+            INPUT_AGG_ROWID_SQL,
+            params![ts, e.event_type.as_str()],
+            |r| r.get(0),
+        )?
+    } else {
+        external
+    };
+    Ok((external, agg_rowid))
 }
 
 impl Database {
@@ -205,10 +246,14 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
         for e in events {
-            let rowid = execute_event(&tx, e)?;
+            // rowid 双语义（混合分钟契约统一批）：对外返回值保持 input_agg→0
+            // 契约，聚合维护拿真实 id（input_agg 行按部分唯一索引键回查）——
+            // 此前传 0 使 detect_mixed_minute 生产永不命中，混合分钟重算为
+            // 死代码（快照 MAX 吞 raw 段计数，agg 与 events SUM 分叉）。
+            let (rowid, agg_rowid) = execute_event_rowids(&tx, e, true)?;
             // 聚合增量与事件写入同事务：max_event_rowid 守卫保留作为幂等兜底
             // （事务化后"回填重算与增量并发"的交错窗口消失，重复投递仍被跳过）
-            super::agg::apply_event(&tx, e, rowid)?;
+            super::agg::apply_event(&tx, e, agg_rowid)?;
             rowids.push(rowid);
         }
         // 同事务推进 events 水位（WAL 静默蒸发防护，见 db::persist_events_
@@ -293,9 +338,11 @@ impl Database {
         let tx = conn.unchecked_transaction().ok()?;
         let mut ids = Vec::with_capacity(chunk.len());
         for e in chunk {
-            let rowid = execute_event(&tx, e).ok()?;
+            // rowid 双语义同整批路径（见 execute_event_rowids）：对外 push
+            // input_agg→0 契约值，聚合维护拿回查后的真实 id
+            let (rowid, agg_rowid) = execute_event_rowids(&tx, e, with_agg).ok()?;
             if with_agg {
-                super::agg::apply_event(&tx, e, rowid).ok()?;
+                super::agg::apply_event(&tx, e, agg_rowid).ok()?;
             }
             ids.push(rowid);
         }
@@ -329,11 +376,12 @@ impl Database {
             return 0;
         };
         // 降级路径 input_agg 行同样必须走 UPSERT（裸 INSERT 撞部分唯一
-        // 索引会静默丢行，且关停 flush 无自愈）
+        // 索引会静默丢行，且关停 flush 无自愈）。rowid 双语义同整批路径
+        // （见 execute_event_rowids）
         let result = (|| -> rusqlite::Result<i64> {
-            let rowid = execute_event(&tx, e)?;
+            let (rowid, agg_rowid) = execute_event_rowids(&tx, e, with_agg)?;
             if with_agg {
-                super::agg::apply_event(&tx, e, rowid)?;
+                super::agg::apply_event(&tx, e, agg_rowid)?;
             }
             Ok(rowid)
         })();
@@ -665,5 +713,121 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ok_dir);
         let _ = std::fs::remove_dir_all(&bad_dir);
+    }
+
+    /// agg_minute + agg_minute_actor 全行指纹（含 max_event_rowid），供
+    /// 「增量与重建逐行一致」的 parity 断言。
+    fn agg_fingerprint(db: &Database) -> String {
+        let reader = db.reader();
+        let mut out = String::new();
+        for sql in [
+            "SELECT date||'|'||hour||'|'||minute||'|'||bucket_id||'|'\
+             ||COALESCE(sum_value,0)||'|'||COALESCE(count_value,0)||'|'\
+             ||COALESCE(max_event_rowid,0) \
+             FROM agg_minute ORDER BY date, hour, minute, bucket_id",
+            "SELECT date||'|'||hour||'|'||minute||'|'\
+             ||COALESCE(keys_total,0)||'|'||COALESCE(keys_injected,0)||'|'\
+             ||COALESCE(clicks_total,0)||'|'||COALESCE(clicks_injected,0)||'|'\
+             ||COALESCE(scroll_total,0)||'|'||COALESCE(scroll_injected,0)||'|'\
+             ||COALESCE(max_event_rowid,0) \
+             FROM agg_minute_actor ORDER BY date, hour, minute",
+        ] {
+            let mut stmt = reader.prepare(sql).unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            for row in rows.flatten() {
+                out.push_str(&row);
+                out.push(';');
+            }
+        }
+        out
+    }
+
+    /// 混合分钟 parity 走生产入口（探针A 序列，rowid/聚合契约统一批）。
+    /// collector 真实 flush 形态：flush1 raw press ×5，flush2/flush3 同分钟
+    /// input_agg 累计快照 keys=2→4（时间戳取分钟起点，命中部分唯一索引
+    /// UPSERT 同一行）。此前生产写链 execute_event 对 input_agg 行恒返 0，
+    /// apply_event 拿 rowid=0 → detect_mixed_minute 永不命中（首卫
+    /// rowid<=0 早退）→ 快照 MAX 覆盖吞掉 raw 段计数（agg=MAX(5,4)=5 vs
+    /// events SUM=9），混合分钟重算生产为死代码。本测试钉住：
+    /// ① 对外 rowid 契约不变（input_agg 行恒 [0]，既有锚点口径）；
+    /// ② agg_minute 增量结果与 events SUM 直读（消费面口径）相等；
+    /// ③ agg_minute 与 agg_minute_actor 增量结果与 rebuild 逐行一致
+    ///    （含 max_event_rowid 与 count 列）。
+    /// 日期注入（禁真实时钟）：固定 2026-06-15T02:30 UTC 整分钟。
+    #[test]
+    fn contractpin_a_mixed_minute_parity_via_insert_events_with_agg() {
+        let dir = tmp_dir("probea");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.join("probea.db").to_str().unwrap()).unwrap();
+
+        // flush1：前半分钟 5 条 raw press（一批，raw 行对外 rowid 为真实 id）
+        const MIN: &str = "2026-06-15T02:30";
+        let mut flush1: Vec<Event> = Vec::new();
+        for sec in [10u32, 15, 20, 25, 30] {
+            let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+            e.timestamp = format!("{MIN}:{sec:02}+00:00");
+            flush1.push(e);
+        }
+        let (rowids1, failed1) = db.insert_events_with_agg(&flush1);
+        assert!(!failed1);
+        assert_eq!(rowids1, vec![1, 2, 3, 4, 5], "raw 行对外 rowid 为真实 id");
+
+        // flush2/flush3：采集器中途切计数模式，同分钟 input_agg 累计快照
+        // keys=2 → keys=4（同分钟同类型 UPSERT 覆盖同一行；生产形态时间戳
+        // 取分钟起点）。第二次写走 UPSERT 的 DO UPDATE 路径。
+        let mk_agg = |keys: i64| {
+            let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard)
+                .data(serde_json::json!({ "keys": keys, "samples": keys }))
+                .app("", "");
+            e.timestamp = format!("{MIN}:00+00:00");
+            e
+        };
+        let (rowids2, failed2) = db.insert_events_with_agg(&[mk_agg(2)]);
+        assert!(!failed2);
+        assert_eq!(rowids2, vec![0], "对外契约：input_agg 行恒 0（不得改动）");
+        let (rowids3, failed3) = db.insert_events_with_agg(&[mk_agg(4)]);
+        assert!(!failed3);
+        assert_eq!(rowids3, vec![0], "对外契约：input_agg 行恒 0（不得改动）");
+
+        // 消费面口径：agg_minute 增量结果必须等于 events SUM 直读
+        // （统一口径 = 事件 SUM：5 raw + input_agg 终值快照 keys=4 = 9；
+        // 快照 MAX 覆盖给 MAX(5,4)=5，即探针A 的 5 vs 9 分叉）
+        let reader = db.reader();
+        let events_keys: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT CAST(COALESCE(SUM({}),0) AS INTEGER) FROM events \
+                     WHERE event_type IN ('keyboard','mouse','window')",
+                    crate::queries::KEYS_ROW_EXPR
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_keys, 9, "5 条 raw press + input_agg 终值 keys=4");
+        let incremental_keys: i64 = reader
+            .query_row(
+                "SELECT CAST(COALESCE(SUM(sum_value),0) AS INTEGER) FROM agg_minute \
+                 WHERE bucket_id='input_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            incremental_keys, events_keys,
+            "混合分钟增量必须与 events SUM 直读（消费面）一致"
+        );
+
+        // parity：增量指纹与 rebuild 逐行一致（两套聚合缓存全行，含
+        // max_event_rowid）
+        let incremental_fp = agg_fingerprint(&db);
+        db.rebuild_agg();
+        assert_eq!(
+            incremental_fp,
+            agg_fingerprint(&db),
+            "混合分钟（生产入口写序）增量与全量重建必须逐行一致"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
