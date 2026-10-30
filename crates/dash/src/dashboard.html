@@ -563,6 +563,11 @@
     <label for="set-lowpower"><span class="l en">low-spec mode: sample less often, for weaker machines (applies at the next collector restart, which happens automatically after saving)</span>
     <span class="l zh">低配模式：降低采样频率，适合配置较低的电脑（保存后下一次采集重启自动生效）</span></label>
   </div>
+  <div class="mon-row">
+    <input type="checkbox" id="set-redact">
+    <label for="set-redact"><span class="l en">redact window/tab titles: strip URL query strings (tokens, session ids) from titles before they are stored. applies to new records only; existing data is kept as-is.</span>
+    <span class="l zh">窗口/标签页标题脱敏：落库前剥掉标题中网址的查询串（token、session id 等）。仅对新记录生效，已存数据保持原样。</span></label>
+  </div>
   <div class="muted"><span class="l en">takes effect automatically after save.</span><span class="l zh">保存后自动生效。</span></div>
 </section>
 <section>
@@ -588,9 +593,9 @@
 </div>
 <footer>
   <span class="l en">All data is local. This page reads your kynoptic.db on this machine only.<br>
-  Server binds 127.0.0.1 (localhost-only, not exposed to the network; <span class="footer-auth">no auth needed</span>). Read-only: the dashboard never writes to your events. License: Apache-2.0.</span>
+  Server binds 127.0.0.1 (localhost-only, not exposed to the network; <span class="footer-auth">no auth needed</span>). Read-only: the dashboard never writes to your events. Uninstalling keeps your data by default: the uninstaller's delete prompt defaults to No; only an explicit Yes deletes the data directory. License: Apache-2.0.</span>
   <span class="l zh">所有数据均在本地。本页只读取本机的 kynoptic.db。<br>
-  服务仅绑定 127.0.0.1（只监听本机回环，不暴露到网络，<span class="footer-auth">无需鉴权</span>）。只读：面板绝不写入事件数据。许可证：Apache-2.0。</span>
+  服务仅绑定 127.0.0.1（只监听本机回环，不暴露到网络，<span class="footer-auth">无需鉴权</span>）。只读：面板绝不写入事件数据。卸载默认保留数据：卸载询问的默认项是「否」；仅显式选「是」才删除数据目录。许可证：Apache-2.0。</span>
 </footer>
 
 <script nonce="__KYN_NONCE__">
@@ -625,7 +630,7 @@ const T = {
   en: { noEvents: "no events in the selected range.", noAnomalies: "no anomalies detected.",
         noSession: "not running", noData: "no data", saved: "saved. changes take effect in a few seconds.",
         saveFailed: "save failed: ", moves: "moves", scrollTicks: "scroll ticks",
-        kbDev: "Keyboard", msDev: "Mouse", keysCount: "keys", btns: "buttons",
+        kbDev: "Keyboard", msDev: "Mouse", touchpad: "Touchpad", keysCount: "keys", btns: "buttons",
         withSide: "with side buttons", noDevice: "device topology not yet recorded — updates on change",
         unattr: "{n} clicks from earlier versions predate per-button detail (rolls out of the 7-day window).",
         restoredHint: "reset to defaults on screen — click save to apply.",
@@ -635,6 +640,7 @@ const T = {
         noEventsYet: "(no events yet)", lastEvent: "last event:", readOnly: "read-only",
         hourIdle: "idle (no events)",
         focusOmitted: "blocks over 4h omitted — they may include away/idle periods (see timeline)",
+        focusNoBlock: "presence recorded for this day, but no continuous block of 20 minutes or more.",
         disconnected: "disconnected — retrying…",
         needToken: "access token required", enterToken: "enter token",
         authNeeded: "access token required (data\\dashboard-token.txt)",
@@ -654,7 +660,7 @@ const T = {
   zh: { noEvents: "所选范围内没有事件。", noAnomalies: "未检测到异常。",
         noSession: "未在运行", noData: "暂无数据", saved: "已保存，几秒内自动生效。",
         saveFailed: "保存失败：", moves: "移动次数", scrollTicks: "滚轮刻度",
-        kbDev: "键盘", msDev: "鼠标", keysCount: "键", btns: "个按键",
+        kbDev: "键盘", msDev: "鼠标", touchpad: "触摸板", keysCount: "键", btns: "个按键",
         withSide: "含侧键", noDevice: "尚未记录设备拓扑（变化时自动记录）",
         unattr: "另有 {n} 次点击来自旧版本，早于分键明细（随 7 天窗口滚动消失）。",
         restoredHint: "已在本页恢复默认勾选——点保存设置才会生效。",
@@ -664,6 +670,7 @@ const T = {
         noEventsYet: "（尚无事件）", lastEvent: "最近事件：", readOnly: "只读",
         hourIdle: "空闲（无事件）",
         focusOmitted: "存在超长块，可能包含离开/挂机时段（详见时间线）",
+        focusNoBlock: "当天有键鼠在场记录，但没有连续 20 分钟以上的专注块。",
         disconnected: "连接断开，正在重试…",
         needToken: "需要访问令牌", enterToken: "输入令牌",
         authNeeded: "需要访问令牌（data\\dashboard-token.txt）",
@@ -1550,7 +1557,11 @@ async function loadReport() {
       (focusOmitted
         ? '<div class="muted" style="font-size:12px;margin-top:6px">' + esc(t("focusOmitted")) + " (" + focusOmitted + ")</div>"
         : "")
-    : t("noData");
+    // 两种空态区分（R5）：presence_minutes 是 ≥20 分钟过滤前的在场分钟数，
+    // 0 = 基线窗口内真无数据（沿用 noData）；>0 = 有在场但无连续块，如实说明
+    : ((d.presence_minutes || 0) > 0
+      ? '<span class="muted">' + esc(t("focusNoBlock")) + "</span>"
+      : t("noData"));
   const st = await jget("/api/settings");
   if (seq !== REPORT_SEQ) return;
   const tr = await jget("/api/trends");
@@ -1735,9 +1746,49 @@ const USB_VENDORS = { "046d":"Logitech", "1532":"Razer", "045e":"Microsoft", "10
   "1b1c":"Corsair", "04d9":"Holtek", "1c4f":"SiGma", "25a7":"Areson", "391d":"391D", "3837":"3837",
   "04f2":"Chicony", "04ca":"Liteon", "062a":"2.4G/赛睿兼容", "093a":"Pixart", "1ea7":"SHARKOON",
   "05ac":"Apple", "17ef":"Lenovo", "413c":"Dell", "03f0":"HP", "1043":"ASUS", "145f":"Trust",
-  "0458":"Genius", "06cb":"Synaptics", "04f3":"Elan", "04b3":"IBM", "056a":"Wacom", "256c":"Huion" };
+  "0458":"Genius", "06cb":"Synaptics", "04f3":"Elan", "04b3":"IBM", "056a":"Wacom", "256c":"Huion",
+  "048d":"ITE", "0461":"Primax", "0c45":"Sonix", "1bcf":"Sunplus", "0e8f":"GreenAsia", "2516":"Cooler Master" };
 function vendorName(vid) {
-  return (vid && USB_VENDORS[vid.toLowerCase()]) || (vid ? "VID_" + vid.toUpperCase() : null);
+  // 未知 VID 与 vid 缺失统一语义：都返回 null，调用方以 "HID" 回退；
+  // 不再把 VID_xxxx 这类原始编号当厂商名显示
+  return (vid && USB_VENDORS[vid.toLowerCase()]) || null;
+}
+// 物理设备标识（与 core::raw_input_devices::physical_device_path 同一规则）：
+// 去掉 #{接口GUID} 尾巴、&MI_nn/&Colnn 集合标记、实例尾部 4 位集合序号，
+// 余下路径前缀即物理设备标识。
+function devPhysicalKey(x) {
+  const p = x.device_path || "";
+  const cut = p.indexOf("#{");
+  let base = cut >= 0 ? p.slice(0, cut) : p;
+  base = base.replace(/&mi_[0-9a-f]+|&col[0-9]+/gi, "");
+  base = base.replace(/&[0-9a-f]{4}$/i, "");
+  return (x.kind || "?") + "|" + base;
+}
+// 按物理设备归并输入设备条目：同 kind 同标识合并，能力取各条目最大值。
+// 历史快照按集合落库（旧格式），在此归并即可正确渲染，数据不迁移；
+// 无 device_path 的条目不参与归并（与 core 口径一致）。
+function mergeInputDevices(devs) {
+  const merged = new Map();
+  const solo = [];
+  (devs || []).forEach(x => {
+    if (!x.device_path) { solo.push(x); return; }
+    const k = devPhysicalKey(x);
+    const cur = merged.get(k);
+    if (!cur) { merged.set(k, Object.assign({}, x)); return; }
+    const maxOf = (a, b) => (a == null && b == null ? null : Math.max(a || 0, b || 0));
+    cur.buttons = maxOf(cur.buttons, x.buttons);
+    cur.keys_total = maxOf(cur.keys_total, x.keys_total);
+    cur.function_keys = maxOf(cur.function_keys, x.function_keys);
+    if (x.has_h_wheel === true || cur.has_h_wheel === true) cur.has_h_wheel = true;
+    else if (x.has_h_wheel === false || cur.has_h_wheel === false) cur.has_h_wheel = false;
+    if (x.is_touchpad === true || cur.is_touchpad === true) cur.is_touchpad = true;
+    else if (x.is_touchpad === false || cur.is_touchpad === false) cur.is_touchpad = false;
+  });
+  const out = Array.from(merged.values()).concat(solo);
+  out.sort((a, b) =>
+    ((a.kind || "").localeCompare(b.kind || "")) ||
+    ((a.device_path || "").localeCompare(b.device_path || "")));
+  return out;
 }
 function renderMouse(d) {
   const svg = document.getElementById("mouse-svg");
@@ -1755,8 +1806,9 @@ function renderMouse(d) {
   emptyHint.style.display = noInput ? "" : "none";
   wrap.style.display = noInput ? "none" : "";
   if (noInput) { svg.innerHTML = ""; return; }
-  // 真实硬件拓扑：任一鼠标报告按键数 >= 5 才画侧键（物理建模，不画不存在的键）
-  const mice = (d.input_devices || []).filter(x => x.kind === "mouse");
+  // 真实硬件拓扑：任一鼠标报告按键数 >= 5 才画侧键（物理建模，不画不存在的键）。
+  // 先按物理设备归并（同设备多集合不重复计数），触控板条目一并计入其鼠标集合
+  const mice = mergeInputDevices(d.input_devices).filter(x => x.kind === "mouse");
   const maxButtons = Math.max(0, ...mice.map(m => m.buttons || 0));
   const hasSide = maxButtons >= 5;
   const parts = MOUSE_PARTS.filter(p => hasSide || !p[0].startsWith("clicks_side"));
@@ -1824,19 +1876,23 @@ async function loadInput() {
   document.getElementById("mouse-extra").textContent =
     t("moves") + ": " + (d.moves || 0).toLocaleString() + "  ·  " +
     t("scrollTicks") + ": " + (d.scroll_ticks || 0).toLocaleString();
-  // 设备型号行（Raw Input 枚举：仅硬件能力元数据）
-  const devs = d.input_devices || [];
+  // 设备型号行（Raw Input 枚举：仅硬件能力元数据）。
+  // 按物理设备归并后再渲染：同一设备的多个集合（&Colnn/&MI_nn 变体）只占一行。
+  // 取代旧的整行字符串 Set 去重——字符串相等会漏掉能力数字不同的真实集合，
+  // 也会把两台同型号物理设备的相同文本误并为一条。
+  const devs = mergeInputDevices(d.input_devices);
   const kbDevs = devs.filter(x => x.kind === "keyboard");
   const msDevs = devs.filter(x => x.kind === "mouse");
   const devTxt = []
     .concat(kbDevs.map(x => t("kbDev") + " " + (vendorName(x.vid) || "HID") +
       (x.keys_total ? " (" + x.keys_total + " " + t("keysCount") + ")" : "")))
-    .concat(msDevs.map(x => t("msDev") + " " + (vendorName(x.vid) || "HID") +
-      (x.buttons ? " (" + x.buttons + " " + t("btns") +
-        ((x.buttons >= 5 ? ", " + t("withSide") : "")) + ")" : "")))
+    .concat(msDevs.map(x => x.is_touchpad === true
+      ? t("touchpad") + (vendorName(x.vid) ? " " + vendorName(x.vid) : "")
+      : t("msDev") + " " + (vendorName(x.vid) || "HID") +
+        (x.buttons ? " (" + x.buttons + " " + t("btns") +
+          ((x.buttons >= 5 ? ", " + t("withSide") : "")) + ")" : "")))
     .join("  ·  ");
-  document.getElementById("device-line").textContent =
-    [...new Set(devTxt.split("  ·  "))].join("  ·  ") || t("noDevice");
+  document.getElementById("device-line").textContent = devTxt || t("noDevice");
   // 旧版行没有分键字段：总额超出按键明细之和时如实提示（随 7 天窗口滚动自愈）
   const attr = (d.clicks_left || 0) + (d.clicks_right || 0) + (d.clicks_middle || 0)
     + (d.clicks_side1 || 0) + (d.clicks_side2 || 0);
@@ -2098,6 +2154,8 @@ async function loadSettings() {
   // 旧后端/旧文件缺字段时按默认回填（update_check 默认开、low_power 默认关）
   document.getElementById("set-updatecheck").checked = s.update_check !== false;
   document.getElementById("set-lowpower").checked = !!s.low_power;
+  // 标题脱敏（隐私 opt-in，默认关）：旧后端缺字段时按默认关回填
+  document.getElementById("set-redact").checked = !!s.redact_titles;
   settingsMsg("", true);
 }
 /* 诊断信息（发现 ①-4）：首次展开时拉 /api/diagnostics，展示各留档日志的
@@ -2184,7 +2242,9 @@ async function saveSettings() {
       // 审查：端口 0 会落库出"面板打不开"的设置，前端先夹到 1-65535（后端同样校验）
       dashboard_port: Math.max(1, Math.min(65535, num("set-port", oldPort, 8422))),
       update_check: document.getElementById("set-updatecheck").checked,
-      low_power: document.getElementById("set-lowpower").checked
+      low_power: document.getElementById("set-lowpower").checked,
+      // 标题脱敏（隐私 opt-in，默认关）：采集侧剥 URL 查询串，仅拦新写入
+      redact_titles: document.getElementById("set-redact").checked
     };
     const r = await fetch("/api/settings", {
       method: "POST",

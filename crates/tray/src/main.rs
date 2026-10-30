@@ -809,6 +809,9 @@ fn main() {
                             // 低配模式（perf 发现）：设置页开关 → collector 的
                             // 轮询间隔放档 + BELOW_NORMAL 线程优先级
                             low_power: app_settings.low_power,
+                            // 标题脱敏（隐私 opt-in，默认关）：settings.json →
+                            // CollectorSettings → title_privacy::set_redact_titles
+                            redact_titles: app_settings.redact_titles,
                             ..kynoptic_core::collector::CollectorSettings::default()
                         };
                         let db_str = owner_db.to_string_lossy().into_owned();
