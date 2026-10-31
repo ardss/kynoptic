@@ -16,7 +16,7 @@
 - Raw events are stored untouched in SQLite. Aggregate tables are
   derived read caches only; the raw layer is append-only and is never
   truncated or cleaned up automatically.
-- Status: v0.5.0, active development. Language: Rust. License:
+- Status: v0.6.0, active development. Language: Rust. License:
   Apache-2.0.
 
 ## Privacy boundary
