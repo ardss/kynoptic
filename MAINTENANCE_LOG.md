@@ -2,6 +2,62 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-31（v0.6.0 发版与双机安装轮：口令「发」授权；含补合并事故的完整留痕）
+
+### 发版
+
+- PR #62 bump 0.5.0→0.6.0（bump-version.mjs 全源含 Cargo.lock/SECURITY 支持线）
+  + CHANGELOG [0.6.0] 定版（Added 5/Changed 1/Fixed 7，覆盖 #57-#61），
+  7da70fc，CI 绿后合并（61fbaa3）。
+- tag v0.6.0 → release.yml 构建 → 10 资产（Setup/Portable/散 exe×4/SHA256SUMS/
+  SKILL.md/zip）。
+
+### 补合并事故（如实留痕）
+
+- **根因**：推送通道多次故障后 `gh pr create` 在远端旧分支（仅含批1）上创建了
+  PR #61——PR diff 为空、CI 绿无意义；squash 出的 b6e7b49 无实质内容，而
+  v0.6.0 tag 恰指向它 → **首个 v0.6.0 Release 缺批2-5**。
+- **发现**：Du 升级后 GET /api/settings 无 redact_titles 字段（批3 内容缺失），
+  顺藤核实 b6e7b49 stat 为空。
+- **修复**：从 a79d54c 找回批2-5（rebase 后 6645c25/0c8c3e9/0b4abb9/a79d54c）
+  → PR #63 补合并（第一次仍被旧分支坑：强推三次被 lease 拒后 PR 基于旧 tip
+  再建；改用 ls-remote 取远端 tip 做 --force-with-lease 精确强推，并以
+  `gh pr diff --name-only`=25 文件为准而非 CI 绿）→ 与 #62 的 bump 合并解决
+  版本行（check-doc-version 全 ok）→ 真实 CI 绿（41172661886）→ 合并 35427c7。
+- **Release 重建**：删首个 v0.6.0 release+tag → 重建 tag 于 35427c7 →
+  release.yml 重构建 → 10 资产（draft=false）。
+- **教训**：①推送被拒后不得信 `gh pr create` 的产物，必须 `gh pr diff --name-only`
+  核实内容；②squash 合并后必须 `git grep` 抽验合并提交确含实质改动；③CI 绿
+  只证明「跑过的树」，不证明「PR 里该有的东西都在」。
+
+### Du（B 机=本机）安装
+
+- 首次 Inno 静默安装挂死在关闭应用阶段（.tmp 提权实例 20+ 分钟无日志无进展，
+  两次复现；期间看门狗任务周期拉起托盘反复抢锁——用户目视「终端一直在启动」）。
+  解卡：杀安装器对、Disable 看门狗任务（PowerShell 引号修正后成功）→
+  改用**手工替换**（Release 散 exe 哈希 4/4 对 SHA256SUMS → 旧版备份 bak-0.5.0/
+  → 替换 → 注册表 DisplayVersion→0.6.0 → Enable+Start-ScheduledTask）。
+- 验证：kynoptic 0.6.0、build=35427c7、托盘拉起、事件流新鲜、enabled_monitors=40
+  保留、GET /api/settings 新增 redact_titles:false（批3 生效、默认关）。
+- 看门狗任务未动定义（方案 B 的电池友好形态保持）。
+- 另发现三个「Kynoptic 0.3.1」陈旧卸载注册表残留项（未动，归卸载残留清理待办）。
+
+### A 机（DESKTOP-CD2C03F）
+
+- **注意**：A 的实际安装目录是 **D:\Kynoptic**（非 LOCALAPPDATA）——第一轮
+  替换错树后由托盘 build=95cb367（v0.5.0）识破，补替换真身后 build=35427c7。
+- 流程同 Du（Disable 任务→Stop 进程→备份→替换→注册表 0.5.0→0.6.0→Enable+
+  Start）。验证：0.6.0、build=35427c7、事件流新鲜、enabled=40、redact_titles:false、
+  托盘 D:\Kynoptic\kynoptic-tray.exe。
+- 已知遗留：安装器看门狗兜底降级 P1（v0.5.1 收口项）不在本版范围；本次双机均走
+  手工替换，任务定义未被动过，无降级发生。
+
+### 采集与巡检
+
+- 双机 enabled_monitors=40（尽量全开），采集连续。
+- 每日巡检定时任务规格已备（work\kynoptic-daily-inspection-prompt.md），
+  待普通会话一句话创建。
+
 ## 2026-10-30（根治全量修复轮：10 问题 × 根源分析 × 架构裁定 × 6 批 TDD；不发版不安装）
 
 ### 背景与流程
