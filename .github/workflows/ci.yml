@@ -29,3 +29,8 @@ jobs:
       - name: Dashboard JS syntax check
         shell: bash
         run: node scripts/check-js.mjs
+      # 工程规范 R3.1：文档版本一致性随每个 PR 校验（bump/CHANGELOG/文档漂移
+      # 在合并前拦截，不等到发版）。本机 skill 副本检查在 CI 上自动跳过。
+      - name: Doc version consistency
+        shell: bash
+        run: node scripts/check-doc-version.mjs
