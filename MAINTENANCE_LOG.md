@@ -1,6 +1,44 @@
 # MAINTENANCE_LOG
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
+
+## 2026-10-31（体系落地轮 + v0.7.0 发版与双机升级：用户「建完所有机制、待办清零、全套升级」授权）
+
+### 体系落地（动态工作流 dwfrun-b8d61b06 → PR #66，main=15336d3）
+
+- ci.yml：main push 空提交拒绝闸（限定 push 事件）+ fetch-depth: 0 + Doc version consistency 步骤。
+- release.yml：Reject empty tag commit 闸 + **checkout fetch-depth: 0**。
+- .github/PULL_REQUEST_TEMPLATE.md：四节模板（含预期文件集）。
+- ENGINEERING.md §7 机械闸清单真实收口（merge queue API 两次 422 无法程序化启用→单人维护期不启用，main push 空闸兜底，启用条件=多人协作或合并竞争出现）。
+- kynoptic.iss：schtasks 兜底改为先 /Query 查询，存在即跳过并高声留痕（`existing task kept, NOT overwritten by schtasks fallback`），仅不存在才创建；COM 主路径不动。
+- **独立复审高危发现（工作流修复轮闭环）**：空提交闸最初未配 fetch-depth: 0——浅克隆下父对象缺失，`git diff-tree` 恒输出 0 行，会把每次正常 tag 误判为空 squash 并终止发版。复审以 `git clone --depth 1` 实测复现（同一 HEAD：浅克隆 n=0、完整克隆 n=3）。教训：任何依赖提交历史的闸必须同时审 checkout 深度；「全绿」不覆盖只在打 tag 时触发、本地门禁跑不到的路径。
+
+### 发版 v0.7.0（PR #67 → tag c83c74cd → Release 全 10 资产）
+
+- bump-version.mjs 全源（Cargo.toml/Cargo.lock/index.html×4/README/README.zh-CN/APP.md/llms.txt/SECURITY.md）+ CHANGELOG 0.7.0 段 + [Unreleased] 基线 v0.7.0。本地五项门禁全绿（fmt/clippy -D warnings/test 23 套件 0 失败/check-js/doc-version）。
+- Cargo.lock EOL 教训第三次触发改根治性手法：autocrlf=true 在 `git add` 时强转、cargo 运行会重写工作盘文件——最终以父提交 blob 字节级替换 4 行版本号 + `git hash-object --no-filters` 直接入索引，diff 恒为 4/4 行。
+- 推送通道：github.com:443 全程 Connection reset，两分支（chore/system-landing、chore/release-0.7.0）均经 api.github.com blob→tree→commit→ref 兜底链重建，主会话以远端 commit 文件集/blob SHA 逐一比对本地提交（MATCH×7、MATCH×9）后才建 PR；`gh pr diff --name-only` 均恰等于预期文件集。
+- CI：PR #67 首跑 `ghost::tests::restart_leaves_at_most_one_open_session` 偶发红（已知 flake），rerun --failed 即绿；未改测试期望。
+- 新闸首战全过：release.yml 浅克隆修正下 fetch-depth: 0 生效，Reject empty tag commit 实测 `tag commit touches N files` 非零通过；版本校验/文档终检/装后二进制版本断言全绿。
+
+### 双机升级与装后字段级验证（新安装器，静默 3 秒完成，未再挂死）
+
+- 运行口径：停看门狗任务（Disable）→ 杀托盘 → `/VERYSILENT /NORESTART /LOG` → 装完 Enable。两次均 exit=0 秒级完成；此前 20+ 分钟挂死不再复现（预停任务切断「安装器关应用 ↔ 任务拉托盘」抢锁）。
+- iss 兜底新逻辑实战留痕：setup-du.log 出现既有任务查询记录；既有任务被保留未覆盖。
+- Du：kynoptic --version=0.7.0、任务 46516965 Ready、/api/status build.git_hash=c83c74cd（=tag=main 三链一致）、enabled_monitors=40/40、redact_titles=False（opt-in 默认关）、心跳新鲜。
+- A：同链一致（build=c83c74cd）、任务 F5383F50 Ready、卸载键随新安装器更新为「Kynoptic 0.7.0 @ D:\Kynoptic\」、enabled_monitors=40/40、redact_titles=False。
+- A 托盘被 ssh 会话关闭带杀后，看门狗下一周期（~70 秒）自动拉起，心跳/面板/采集全恢复——自启保护闭环无人值守实战验证。
+
+### 机器侧清零（用户「旧的都移除了」）
+
+- Du：3 个指向已消失 Temp 测试路径的死卸载键（sbox42/sbox43/Kynoptic_is1 残留）、bak-0.5.0、5 个 .bak 旧版 exe、duplicate-start.log 删除；剩余唯一键为现役安装入口。
+- A：0.1.0 陈旧卸载键+unins000 卸载器、Kynoptic-Setup-0.1.0.exe、bak-0.5.0（删前核验内容确为旧版）、duplicate-start.log 删除；现役 unins001 键保留。
+- 两机 data/ 用户数据未触碰。
+
+### 遗留
+
+- 每日巡检定时任务（cron `10 9 * * *`）：定时会话链内宿主拒绝创建，需用户在普通会话创建；完整规格：K:\AIControl\CV-KY-convergence-20261028\work\kynoptic-daily-inspection-prompt.md。
+
 ## 2026-10-31（v0.6.0 发版与双机安装轮：口令「发」授权；含补合并事故的完整留痕）
 
 ### 发版
