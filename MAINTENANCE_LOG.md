@@ -37,7 +37,7 @@
 
 ### 遗留
 
-- 每日巡检定时任务（cron `10 9 * * *`）：定时会话链内宿主拒绝创建，需用户在普通会话创建；完整规格：K:\AIControl\CV-KY-convergence-20261028\work\kynoptic-daily-inspection-prompt.md。
+- ~~每日巡检定时任务（cron `10 9 * * *`）~~ **已收口（22:50 追加）**：ZCode cron 在定时会话链内被宿主三次确定性拒绝、ZCode 桌面版无独立 headless CLI，改以 **Windows 任务计划程序**落地——任务 `Kynoptic Daily Inspection 0910`（每天 09:10），执行 `K:\AIControl\CV-KY-convergence-20261028\work\ky-daily-inspection.ps1`。脚本按原规程四节实现：kynoptic stats+面板 API+sqlite readonly 24h 空档分析、40 采集器自动恢复（唯一授权写）、A 机 ssh 只读快检、日报 daily/ 与 monitor.log 留底。已实测：直跑 OK；计划任务调度路径两次触发成功（LastTaskResult=0、日志正常追加）。调试修复四处自伤缺陷：last_event_ts 时区（AssumeUniversal 必须配 AdjustToUniversal，否则双重换算差 8h）、watchdog 为分钟级 --once 任务非常驻进程、A 机 ssh 嵌套引号（改 curl 直查）、PS5 需 UTF-8 BOM 脚本。目标达成：每日巡检不再依赖 ZCode 会话存在。
 
 ## 2026-10-31（v0.6.0 发版与双机安装轮：口令「发」授权；含补合并事故的完整留痕）
 
