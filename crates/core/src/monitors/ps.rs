@@ -1,8 +1,13 @@
 //! PowerShell 命令执行辅助（持久宿主 + 单次 spawn 回退，待原生 API 重写）
 //!
-//! 进程上界约束：稳态下至多 1 个常驻宿主进程；回退模式下至多 1 个瞬时
-//! 单次子进程。宿主通过全局互斥锁串行化所有调用（单进程的 stdin/stdout
-//! 不允许并发写入交错），锁同时保护宿主状态。
+//! 进程上界约束：稳态下至多 1 个常驻宿主进程 + 至多 [`PS_SPAWN_LANE_MAX`]
+//! 个瞬时单次子进程。宿主通过全局互斥锁串行化宿主路径调用（单进程的
+//! stdin/stdout 不允许并发写入交错），锁同时保护宿主状态。
+//!
+//! 双车道（40 项全开排队饥饿根治，KY-PERF-20261031）：宿主锁空闲时走宿主
+//! 车道（零额外进程）；锁被占用（上一条脚本执行中/挂死）时立即改走有界
+//! 并发 spawn 道独立执行，不再在引擎锁上排队——排队等待曾是首拍 10s 截止
+//! 失守与 60s 超时连锁的直接根因（17 个 PS 采集器共享单通道完全串行）。
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout};
@@ -14,6 +19,47 @@ use std::time::{Duration, Instant};
 /// 单次 PS 采集的截止时限：WMI/Winmgmt 卡死或宿主挂死时不能让采集线程
 /// 连同子进程与管道句柄无限期滞留（超时后 kill 并按无数据处理）。
 const PS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// spawn 道并发上界（瞬时单次子进程数）。宿主忙时最多再有 3 个脚本并发
+/// 直跑；许可耗尽时回退为在宿主锁上排队（绝不拒绝调用，最坏退化为旧行为）。
+const PS_SPAWN_LANE_MAX: usize = 3;
+
+/// 计数信号量（spawn 道许可）。RAII 许可：guard drop 即释放。
+struct LaneSemaphore {
+    remaining: Mutex<usize>,
+}
+impl LaneSemaphore {
+    const fn new(n: usize) -> Self {
+        LaneSemaphore {
+            remaining: Mutex::new(n),
+        }
+    }
+    /// 取许可；耗尽返回 None（调用方回退宿主锁排队）。
+    fn clone_try_acquire(self: &std::sync::Arc<Self>) -> Option<LanePermit> {
+        let mut g = self.remaining.lock().unwrap_or_else(|p| p.into_inner());
+        if *g == 0 {
+            return None;
+        }
+        *g -= 1;
+        Some(LanePermit { sem: self.clone() })
+    }
+}
+/// RAII 许可。Arc 共享便于测试持有多个许可。
+#[derive(Clone)]
+struct LanePermit {
+    sem: std::sync::Arc<LaneSemaphore>,
+}
+impl Drop for LanePermit {
+    fn drop(&mut self) {
+        let mut g = self.sem.remaining.lock().unwrap_or_else(|p| p.into_inner());
+        *g += 1;
+    }
+}
+
+static SPAWN_LANE: std::sync::OnceLock<std::sync::Arc<LaneSemaphore>> = std::sync::OnceLock::new();
+fn spawn_lane() -> &'static std::sync::Arc<LaneSemaphore> {
+    SPAWN_LANE.get_or_init(|| std::sync::Arc::new(LaneSemaphore::new(PS_SPAWN_LANE_MAX)))
+}
 
 /// run_ps 三态结果（monitor 级降级信号，审查：PS 依赖监控器在
 /// powershell.exe 被杀软/WDAC 拦截后永远静默无数据，设置页仍显示已启用，
@@ -66,14 +112,31 @@ pub fn run_ps(script: &str) -> Option<String> {
 fn run_ps_inner(script: &str) -> Result<Option<String>, String> {
     // 输出编码必须是脚本的第一条语句（对后续管道生效）
     let prefixed = format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {script}");
-    // 锁持有方 panic 不能拖死所有监控线程：毒锁原地取回数据继续
-    let mut guard = ENGINE.lock().unwrap_or_else(|p| p.into_inner());
-    // 回退模式只借锁读标记，单次 spawn 在锁外跑（回退子进程彼此独立，可并发）
-    if guard.permanent_fallback {
-        drop(guard);
-        return spawn_ps_once("powershell", &prefixed, PS_TIMEOUT);
+    // 回退模式只借锁读标记，单次 spawn 经有界 spawn 道跑（并发上界）
+    if let Ok(mut guard) = ENGINE.try_lock() {
+        if guard.permanent_fallback {
+            // 测试注入点：回退可执行名借锁读出后锁外执行
+            let prog = guard.fallback_program().to_string();
+            drop(guard);
+            return run_in_spawn_lane(&prog, &prefixed);
+        }
+        return guard.execute(&prefixed, PS_TIMEOUT);
     }
-    guard.execute(&prefixed, PS_TIMEOUT)
+    // 宿主锁被占（上一条脚本执行中/挂死）：不再排队，改走有界 spawn 道独立
+    // 执行——单通道串行曾让队尾等待本身超首拍截止并触发 60s 连锁超时
+    run_in_spawn_lane("powershell", &prefixed)
+}
+
+/// 有界 spawn 道执行：拿到许可直跑；许可耗尽回退宿主锁排队（绝不拒绝）。
+fn run_in_spawn_lane(program: &str, prefixed: &str) -> Result<Option<String>, String> {
+    let permit = spawn_lane().clone_try_acquire();
+    match permit {
+        Some(_p) => spawn_ps_once(program, prefixed, PS_TIMEOUT),
+        None => {
+            let mut guard = ENGINE.lock().unwrap_or_else(|p| p.into_inner());
+            guard.execute(prefixed, PS_TIMEOUT)
+        }
+    }
 }
 
 /// 宿主单次执行失败的分类。
@@ -446,6 +509,48 @@ mod tests {
     /// 生产同款前缀：强制 UTF-8 输出编码（与 run_ps_inner 注入一致）。
     fn utf8_prefixed(script: &str) -> String {
         format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {script}")
+    }
+
+    /// RED：宿主锁被他人持有时，run_ps 必须经有界并发 spawn 道返回数据，
+    /// 而不是在引擎锁上排队到对方放锁（旧实现串行排队，本测试会超时失败）。
+    #[cfg(windows)]
+    #[test]
+    fn busy_host_calls_take_spawn_lane_and_return_data() {
+        // guard 留主线程持锁 8s（MutexGuard 非 Send 不跨线程）；run_ps 在
+        // worker 线程执行，必须在锁释放前（<5s）经 spawn 道拿到数据
+        let g = ENGINE.lock().unwrap();
+        let worker = std::thread::spawn(|| {
+            let start = std::time::Instant::now();
+            let out = run_ps_detailed("Write-Output 'lane-data'");
+            (out, start.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        drop(g);
+        let (out, elapsed) = worker.join().unwrap();
+        match out {
+            PsOutcome::Data(s) => assert!(s.contains("lane-data")),
+            other => panic!("spawn 道必须返回数据，实际 {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "宿主被占时必须走 spawn 道立即执行（实测 {elapsed:?}，旧实现会排队 8s+）"
+        );
+    }
+
+    /// RED：spawn 道信号量有界——3 许可全占用时 acquire 必须阻塞，
+    /// release 后必须唤醒（有界性的单元验证）。
+    #[test]
+    fn lane_semaphore_is_bounded_and_wakes_on_release() {
+        let sem = std::sync::Arc::new(LaneSemaphore::new(2));
+        let a = sem.clone_try_acquire();
+        let b = sem.clone_try_acquire();
+        assert!(a.is_some() && b.is_some(), "两个许可必须立即可取");
+        assert!(sem.clone_try_acquire().is_none(), "许可耗尽后不可再取");
+        drop(a);
+        assert!(
+            sem.clone_try_acquire().is_some(),
+            "release 后许可必须可再取"
+        );
     }
 
     /// 公共 API 全链路：200KB 大输出必须返回 Data 而非超时（>64KB 管道缓冲，
