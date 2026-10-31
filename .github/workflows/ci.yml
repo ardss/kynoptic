@@ -13,11 +13,30 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
+      # 完整历史：push 路径的空提交拒绝需要 HEAD 的父提交做 diff-tree（浅克隆下父对象缺失会误报）
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # 空提交拒绝（兜底闸）：2026-10-31 v0.6.0 缺料事故——空 squash 混进 main 后
+      # tag 恰指向它，首发 Release 缺四个批次。release.yml「Reject empty tag commit」
+      # 只拦发版路径，直推 main 零文件变更同样危险，此处同型兜底。
+      # 仅限 push 事件（PR 路径的 diff 由 GitHub 保证非空，不重复检查）。
+      # 注：本仓库 main 一律 squash 合并，无 merge commit；diff-tree 对 merge commit
+      # 默认输出为空，若将来引入真合并需改用 -m/-c。
+      - name: Reject empty commit on main push
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          n=$(git diff-tree --no-commit-id --name-only -r HEAD | wc -l)
+          echo "push commit touches $n files"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::main push 提交相对父提交零文件变更（疑似空提交），失败"
+            exit 1
+          fi
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

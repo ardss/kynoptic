@@ -90,4 +90,6 @@
 | tag↔Cargo.toml 版本 | release.yml | 错 tag 构建 |
 | 空提交拒绝（diff-tree 计数>0） | release.yml | 空 squash 缺料发版（本次新增） |
 | 装后字段级验证 | 发版 runbook | 内容缺失的最后防线（人工，固定步骤） |
-| merge queue / PR 模板 | 待办 | 合并竞争与文件集声明 |
+| merge queue | 已关闭：GitHub API 两次 422 无法程序化启用，需 UI 管理员手动设置；单人维护期不启用；启用条件=多人协作或合并竞争实测出现 | 合并竞争（当前无替代闸，单人串行提交） |
+| PR 模板（预期文件集/根因批次/TDD 轨迹/亲验凭证） | .github/PULL_REQUEST_TEMPLATE.md（已落地） | PR 缺文件集声明与亲验凭证（人工核对，非机械强制） |
+| 空提交拒绝（main push，diff-tree 计数>0） | ci.yml（本次新增，仅 push 事件） | 直推 main 的空提交——release.yml tag 闸覆盖不到的路径，兜底 |
