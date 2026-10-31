@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-31
+
+### Changed
+
+- Release pipeline: `release.yml` checkout now uses `fetch-depth: 0` so
+  the empty-tag-commit gate can see the parent commit (a shallow clone
+  made `git diff-tree` report 0 files for every tag and would have
+  failed every future release). Removed a duplicated doc-version step.
+- CI: the empty-commit guard on main pushes is now scoped to `push`
+  events only, and the doc-version consistency gate runs there too.
+- Installer (`kynoptic.iss`): the `schtasks` fallback for the watchdog
+  scheduled task now queries first, keeps an existing task untouched
+  (with a loud log line `existing task kept, NOT overwritten`), and only
+  creates the task when it does not exist. The COM registration path is
+  unchanged.
+
+### Added
+
+- `.github/PULL_REQUEST_TEMPLATE.md`: four-section template, including
+  the expected file set of the change.
+- `ENGINEERING.md` §7: mechanical-gate inventory with real close-out
+  notes (merge-queue remains off during single-maintainer phase; the
+  main-push empty-commit gate is the interim guard).
+
+### Fixed
+
+- `Cargo.lock`: workspace member versions synced to 0.6.0 (lock had
+  drifted behind the manifests).
+
 ## [0.6.0] - 2026-10-30
 
 ### Added
@@ -1132,7 +1161,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ardss/kynoptic/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ardss/kynoptic/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ardss/kynoptic/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ardss/kynoptic/compare/v0.3.2...v0.4.0
