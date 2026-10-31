@@ -75,6 +75,13 @@ CloseApplications=force
 ; RM 强制关闭应用后默认会弹"是否重新启动应用"确认框；/SUPPRESSMSGBOXES 下该
 ; 框被折叠成默认值 Abort，导致静默升级 exit=5 回滚。显式关闭重启动提示。
 RestartApplications=no
+; 静默升级挂死缓解（2026-10-31 两次 /VERYSILENT 卡在"正在关闭应用"20+ 分钟，
+; .tmp 实例无日志无进展）：挂死点在 Restart Manager 关闭阶段，位于
+; PrepareToInstall 的 KillLockedApps 自杀循环之前，安装器代码救不了。
+; 保持 force（无可视窗口托盘收不到 WM_CLOSE，改 no 会回退交互修复，且 mcp/CLI
+; 持 kynoptic.exe 时复制期撞文件占用）。受支持的静默升级方式与手工 runbook
+; 固定写在 APP.md「升级」一节：升级前先停托盘/看门狗进程（此时 RM 无对象可
+; 关，自然不挂），再执行 /VERYSILENT /SUPPRESSMSGBOXES /NORESTART。
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -893,6 +900,8 @@ end;
 //    否则裸 exe + watchdog --once（WorkingDirectory 空 = 系统默认）。
 // 2) COM 注册（电池友好 + LogonTrigger）失败时兜底退回 schtasks /Create
 //    三次重试（老行为保底：电池限制仍在，但任务至少存在，日志留痕）。
+//    兜底创建前先 /Query 同名任务，已存在（典型为管理员重建的电池友好
+//    任务）则跳过创建不覆盖——/Create /F 静默降级修复 2026-10-31。
 //    /TR 内层路径用 \" 双引号转义（GPT 发版终审 2026-10-26：Windows 命令
 //    行不以单引号为引号转义，Chr(39) 包路径在含空格目录下启动失败）。
 // 任何失败都留日志，不再无声吞掉。
@@ -913,6 +922,19 @@ begin
     Result := True;
   end else begin
     Log('watchdog task: COM registration failed, falling back to schtasks /Create');
+    // P1 兜底降级修复（2026-10-31）：管理员属主的既有任务让 COM
+    // RegisterTaskDefinition 被拒后，/Create /F 会把管理员重建的电池友好
+    // 任务（无电池限制 + LogonTrigger）静默覆盖成电池限制 + 无 LogonTrigger
+    // 的降级形态。兜底创建前先 /Query 同名任务：已存在则跳过创建并高声
+    // 留痕（形态摘要走 LogWatchdogTaskStateFor 的状态/指向回读），只有
+    // 确认不存在才允许兜底创建。COM 路径本身不变（TASK_CREATE_OR_UPDATE
+    // 的原子覆盖语义保留）。
+    if TaskNameExists(WatchdogTaskName()) then begin
+      Log('watchdog task: existing task kept, NOT overwritten by schtasks fallback ' +
+        '(likely admin-rebuilt battery-friendly form); rebuild reported as failed');
+      LogWatchdogTaskStateFor(WatchdogTaskName());
+      Exit;
+    end;
     for I := 1 to 3 do begin
       if RunHidden('schtasks', '/Create /F /SC MINUTE /MO 1 /TN "' + WatchdogTaskName() +
         '" /TR "\"' + UseCmd + '\" ' + UseArgs + '"') then begin
