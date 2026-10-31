@@ -1,25 +1,22 @@
-## Summary
+## 预期文件集
 
-<!-- What does this PR do, in one or two sentences? -->
-
-## Changes
+<!-- 逐个列出本 PR 应改动的文件。合并前以 `gh pr diff --name-only` 核对：多一个、少一个都要在这里说明原因。 -->
 
 -
 
-## Testing
+## 根因/批次
 
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] New/changed behavior covered by tests or a benchmark
+<!-- 本 PR 属于哪个批次、修复哪个根因；无归属时写 non-batch 并说明来源。 -->
 
-## Privacy checklist
+## TDD 轨迹或 non-cargo 说明
 
-- [ ] No network calls added; local surfaces still bind to 127.0.0.1
-- [ ] Raw event layer stays append-only (no truncation/re-keying)
-- [ ] Input data remains per-minute counts by default
+<!-- cargo 侧改动：先写失败的测试再实现，列出新增/变更的测试名。非 cargo 改动（文档/脚本/CI）：说明为什么不需要测试。 -->
 
-## Docs
+## 亲验凭证
 
-- [ ] `CHANGELOG.md` (Unreleased) updated if user-visible
-- [ ] `BENCHMARKS.md` / `APP.md` updated if numbers or behavior changed
+<!-- 合并前实际跑过的命令与关键输出摘要；没跑的检查如实标明未跑，不填"通过"。 -->
+
+- [ ] `cargo fmt --all --check`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace`
+- [ ] `gh pr diff --name-only` 与「预期文件集」一致

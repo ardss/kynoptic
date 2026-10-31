@@ -12,6 +12,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 空提交闸的 diff-tree 需要父提交对象；默认浅克隆（fetch-depth=1）
+          # 下父对象缺失，diff-tree 恒输出 0 行，会把每次正常 tag 误判为空
+          # squash 并终止发版（复审实测：--depth 1 克隆中同一 HEAD n=0，
+          # 完整克隆 n=3；ci.yml 同因已配 fetch-depth: 0）
+          fetch-depth: 0
       # W48 清洁清单：发版前确认工作区无 tmp_* 等临时文件残留
       #（历史教训：时钟铁律收口的临时复核测试残留工作区使整套件变红）
       - name: Reject leftover temporary files
@@ -38,10 +44,11 @@ jobs:
             Write-Error "tag v$tagVer 与 Cargo.toml 版本 $cargoVer 不一致，终止发版"
             exit 1
           }
+          Write-Host "version check ok: v$tagVer == $cargoVer"
       # 工程规范 R1.3：拒绝空 squash 提交——2026-10-31 事故：推送通道故障后
       # 基于旧分支创建了空 PR，squash 出零文件变更的合并提交，v0.6.0 首个
       # tag 恰指向它，首发 Release 缺四个批次。tag 提交相对父提交必须有
-      # 实质文件变更。
+      # 实质文件变更。（本次新增，独立步骤，置于版本校验之后）
       - name: Reject empty tag commit
         shell: bash
         run: |
@@ -51,11 +58,6 @@ jobs:
             echo "::error::tag 指向的提交相对父提交零文件变更（疑似空 squash），终止发版"
             exit 1
           fi
-      # 工程规范 R3.1：发版前文档版本一致性终检（CHANGELOG 顶段=tag 版本等）
-      - name: Doc version consistency
-        shell: bash
-        run: node scripts/check-doc-version.mjs
-          Write-Host "version check ok: v$tagVer == $cargoVer"
       # ci 修复（Wave46）：文档版本行一致性门禁——llms.txt / index.html /
       # README / README.zh-CN / APP.md 的状态行与 CHANGELOG 顶部段必须
       # 与 tag 版本一致（tag 已在上一步与 Cargo.toml 校验；只锚定头部/

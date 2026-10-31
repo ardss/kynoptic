@@ -73,6 +73,23 @@ cargo clippy --workspace --all-targets   # 零警告（workspace 级 deny warnin
 
 Windows 专用（依赖 windows-sys）；需要 MSVC 工具链。
 
+## 升级
+
+覆盖安装（双击安装包，一路下一步）是受支持的常规升级方式；数据目录自动保留。
+
+静默升级（/VERYSILENT）受支持的参数组合与前置步骤（2026-10-31 两次静默升级
+卡在"正在关闭应用"阶段 20 分钟以上：安装器委托 Windows 重启管理器关闭托盘，
+托盘被占用时重启管理器会反复等待；升级前手动停掉托盘与看门狗后，重启管理器
+没有可关闭的对象，不再出现该阶段挂起）：
+
+1. 结束进程：任务管理器结束 `kynoptic-tray.exe` 与 `kynoptic-watchdog.exe`
+   （或 PowerShell：`Stop-Process -Name kynoptic-tray,kynoptic-watchdog -Force`）。
+2. 执行 `Kynoptic-Setup-<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`。
+
+若未做前置步骤且安装超过 2 分钟停在"正在关闭应用"：结束挂起的安装临时进程
+（任务管理器里的 `Kynoptic-Setup` / `_iu14D2N.tmp` 一类临时名），停掉托盘与
+看门狗后重跑步骤 2。数据不受影响（SQLite WAL 模式，任意时刻终止都安全）。
+
 ## 数据库
 
 SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（事务执行，幂等）。
