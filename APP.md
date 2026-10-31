@@ -5,8 +5,9 @@
 > with numbered-SQL migrations, `cli`, and an `mcp` server; the dashboard and
 > tray shell live in their own crates). 40 monitors cover the system, 14 are
 > enabled by default (12 polling
-> monitors + 2 low-level input hooks; pure Win32, zero subprocesses —
-> wifi/power_plan use native APIs). Input is recorded as per-minute counts only —
+> monitors + 2 low-level input hooks; native Win32 APIs on their main
+> collection paths — the network monitor falls back to a bounded netstat.exe
+> call, 3-second timeout, when its native path is unavailable). Input is recorded as per-minute counts only —
 > never key contents — with injected (LLKHF_INJECTED) events separated from
 > human presence, and the raw event log is append-only: cleanup is opt-in and
 > aggregates are rebuildable derived caches. The dashboard exposes a
@@ -27,7 +28,7 @@ Kynoptic 的本机感知层（采集器 + CLI + MCP 工具面）Rust workspace�
 | `crates/mcp` (`kynoptic-mcp`) | MCP server（stdio JSON-RPC 2.0）：`get_current_status` / `get_summary` / `get_timeline` / `get_top_apps` / `get_anomalies` / `wait_for` |
 | `crates/tray` (`kynoptic-tray`) | 托盘壳（纯 Win32，宿主采集器与本地面板） |
 
-监控器全集 40 个（注册表：`crates/core/src/registry.rs`；配置模板：`crates/core/config/monitors.json`）。**默认启用 14 个**（纯 windows-sys、零子进程，与 v0.1 相同）：`system` `window` `keyboard_hook` `mouse_hook` `idle` `session` `battery` `network` `device` `process` `audio` `brightness` `wifi` `power_plan`。
+监控器全集 40 个（注册表：`crates/core/src/registry.rs`；配置模板：`crates/core/config/monitors.json`）。**默认启用 14 个**（采集主路径均为原生 windows-sys API；network 在原生路径不可用时有界兜底 spawn netstat.exe，3 秒超时，见下方依赖备注；默认集合与 v0.1 相同）：`system` `window` `keyboard_hook` `mouse_hook` `idle` `session` `battery` `network` `device` `process` `audio` `brightness` `wifi` `power_plan`。
 
 恢复自上游、**默认关闭**的 26 个：
 
@@ -79,6 +80,8 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 
 原始事件默认永久保留（无自动清理；`db cleanup` 需显式 `--yes` 且 N ≥ 30）。实测约 750 事件/小时时磁盘净增约 92 MB/天（含 WAL），请预留空间或定期手动清理。
 
+安装版卸载默认保留数据目录（exe 同级 `data\`）：卸载询问的默认项是「否」（保留），静默卸载不询问、直接保留；仅显式选「是」才删除（删除前有不可逆警告），保留时卸载完成页会显示数据所在位置。
+
 ### event_type/action → event_data JSON 键（采集器写入的主要负载）
 
 事件行主列为 `timestamp / event_type / event_action / app_name / window_title`，结构化负载在 `event_data` JSON 中（键随采集器版本演进，以代码为准）。高频 action 一览：
@@ -102,23 +105,26 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 
 数据库路径解析：环境变量 `KYNOPTIC_DB` > exe 同级 `data/kynoptic.db` > cwd 候选。
 
-## CLI（实际可用面，截至 v0.3.1）
+## CLI（实际可用面，随版本同步）
 
-两个 bin 同源：`kynoptic`（网站 MCP 配置示例的 command）与 `kynoptic-ctl`（别名）。
+两个 bin 同源：`kynoptic`（网站 MCP 配置示例的 command）与 `kynoptic-ctl`（别名）。本表随版本与二进制内 USAGE 同步（scripts/check-doc-version.mjs 断言全覆盖）；要看本机二进制的准确选项，以 `kynoptic --help` 为准。
 
 | 子命令 | 状态 | 说明 |
 |--------|------|------|
-| `stats` / `export` / `report` / `db` / `analyze` / `ghost` / `autostart` / `migrate` | ✅ | 同上一版（v0.1 起可用） |
-| `now [--json]` | ✅ | 当前机器状态紧凑视图（cpu/mem/前台应用/idle/APM/电量），与 MCP `get_current_status` 同数据面 |
-| `query --from T --to T --bucket B --limit N --json` | ✅（营销口径的子集） | 时间范围事件查询。`--from/--to` 接受 `today`/`yesterday`/`YYYY-MM-DD`/RFC3339；`--bucket` 接受 bucket id（`activity/keys`、`activity/mouse`、`app/window`、`system/*`、`network/*`、`session/*`、`device/*`）或裸 event_type。网站的 `--metric gpu` / `--join window` 依赖 GPU/窗口聚合层，**至今未落地**（截至 v0.3.1 仍报"未知选项"；`current_state`/`agg_*` 表已建，采集器未写入） |
-| `mcp` | ✅ | 启动 MCP server（stdio，阻塞到 stdin 关闭） |
-| `collect` | ✅ | 前台运行采集器，Ctrl+C 优雅停止（`--db PATH` / `--all` 覆盖 settings） |
-| `dashboard [--port N] [--db PATH]` | ✅ | 仅本机可访问的网页面板（127.0.0.1）；活动数据只读，设置项仅可通过 `POST /api/settings` 写入 |
-| `presence [--days N]` | ✅ | 三指标日报（presence/automation/foreground + mixed），与 dashboard overview 同一权威实现 |
-| `skill install` | ✅ | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
-| `probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]` | ✅ | 逐监控器硬件实测探针（0 = 自动推导首次采集等待上限，仍受 420s 上限约束） |
-| `watchdog [--db PATH] [--once]` | ✅ | 看门狗心跳（供计划任务调用，确保托盘存活） |
-| `update [--check]` | ✅ | 自更新（GitHub releases，SHA256 校验 + 五件套 .bak 备份 + 失败回滚）；`--check` 只查不装：stdout 输出 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`，退出码 0；退出码 1 的三种失败文案见 skill.md「退出码契约」 |
+| `stats` / `export` / `report` / `db` / `analyze` / `ghost` / `autostart` / `migrate` | 可用 | 同上一版（v0.1 起可用） |
+| `now [--json]` | 可用 | 当前机器状态紧凑视图（cpu/mem/前台应用/idle/APM/电量），与 MCP `get_current_status` 同数据面 |
+| `query --from T --to T --bucket B --limit N --json` | 可用（营销口径的子集） | 时间范围事件查询。`--from/--to` 接受 `today`/`yesterday`/`YYYY-MM-DD`/RFC3339；`--bucket` 接受 bucket id（`activity/keys`、`activity/mouse`、`app/window`、`system/*`、`network/*`、`session/*`、`device/*`）或裸 event_type。网站的 `--metric gpu` / `--join window` 依赖 GPU/窗口聚合层，**至今未落地**（传这两个选项仍报"未知选项"；`current_state`/`agg_*` 表已建，采集器未写入） |
+| `mcp` | 可用 | 启动 MCP server（stdio，阻塞到 stdin 关闭） |
+| `collect` | 可用 | 前台运行采集器，Ctrl+C 优雅停止（`--db PATH` / `--all` 覆盖 settings） |
+| `dashboard [--port N] [--db PATH]` | 可用 | 仅本机可访问的网页面板（127.0.0.1）；活动数据只读，设置项仅可通过 `POST /api/settings` 写入 |
+| `presence [--days N]` | 可用 | 三指标日报（presence/automation/foreground + mixed），与 dashboard overview 同一权威实现 |
+| `apps [--days N] [--actor user\|agent\|unattended\|mixed\|unknown\|all] [--json]` | 可用 | 按应用的 actor 驻留估算（0.4.0 起；估算性拆分，证据缓存由 `recompute-actors` 重建） |
+| `topics [--days N] [--raw] [--json]` | 可用 | 窗口标题主题聚合（0.4.0 起；默认脱敏，`--raw` 不脱敏） |
+| `recompute-actors [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run]` | 可用 | 重建 actor 证据缓存（仅派生缓存；原始事件不动） |
+| `skill install` | 可用 | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
+| `probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]` | 可用 | 逐监控器硬件实测探针（0 = 自动推导首次采集等待上限，仍受 420s 上限约束） |
+| `watchdog [--db PATH] [--once]` | 可用 | 看门狗心跳（供计划任务调用，确保托盘存活） |
+| `update [--check]` | 可用 | 自更新（GitHub releases，SHA256 校验 + 五件套 .bak 备份 + 失败回滚）；`--check` 只查不装：stdout 输出 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`，退出码 0；退出码 1 的三种失败文案见 skill.md「退出码契约」 |
 
 ### 用脚本写设置（POST /api/settings）
 

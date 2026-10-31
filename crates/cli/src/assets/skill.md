@@ -18,7 +18,7 @@ Kynoptic 的核心模型：**电脑活动 ≠ 人的活动**。三个权威指�
 2. `kynoptic` 在 PATH（0.3.x 起安装器会把安装目录写入用户 PATH；旧版本安装的用户需升级安装一次或自配 PATH）
 3. 便携版=解压/拷贝目录下的 kynoptic.exe（与 kynoptic-tray.exe 同目录，data\ 就在其旁）
 
-**两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。数据一律在 exe 同级 data\kynoptic.db（安装与便携相同），dashboard 实际端口看 data\dashboard-port.txt。
+**两种形态的区别**：安装版=Setup.exe 装的，带计划任务看门狗+自启，卸载走 unins000（卸载默认保留 data\，询问选「是」才删除）；便携版=直接拷三个 exe（kynoptic.exe/kynoptic-tray.exe/kynoptic-watchdog.exe）+ data\ 目录，没有计划任务，要自启需手动。数据一律在 exe 同级 data\kynoptic.db（安装与便携相同），dashboard 实际端口看 data\dashboard-port.txt。
 
 数据约定：db 与 settings.json 在**运行目录的 data\ 下**（如 `D:\Kynoptic\data\kynoptic.db`；便携版=exe 旁）。
 CLI 解析顺序：`--db <PATH>` 全局参数 > `KYNOPTIC_DB` 环境变量 > exe 同级 data\（`--db` 可写在子命令后任意位置，成对消费）。

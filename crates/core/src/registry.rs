@@ -6,8 +6,9 @@
 //! 恢复的 26 个全部默认关闭，可通过 [`MonitorOverrides`] 按需启用。
 //!
 //! 依赖类别与实际实现的对照约定：
-//! - [`Dep::Native`]：采集路径零子进程。涵盖纯原生 Win32/windows-sys 采集，
-//!   也涵盖零采集占位（location）。
+//! - [`Dep::Native`]：默认采集路径原生。涵盖纯原生 Win32/windows-sys 采集
+//!   与零采集占位（location）；不代表全程零子进程，偏差见下方清单与
+//!   各注册项注释。
 //! - [`Dep::PowerShell`]：采集路径经 monitors/ps.rs 的 run_ps spawn
 //!   PowerShell 子进程，默认一律关闭。
 //!
@@ -26,7 +27,8 @@ use std::collections::HashSet;
 /// 监控器实现依赖类别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dep {
-    /// 纯 windows-sys 原生 API，零子进程
+    /// 默认采集路径原生（纯 windows-sys API 或零采集占位；个别注册项有
+    /// 兜底 spawn 偏差，见模块文档）
     Native,
     /// 通过 monitors/ps.rs spawn PowerShell 子进程（WMI/CIM/事件日志）
     PowerShell,

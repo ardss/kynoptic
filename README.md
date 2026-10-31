@@ -52,7 +52,9 @@ there? The overview card does exactly that arithmetic:
 - **40 monitors** cover the system: foreground window and app switches,
   keyboard/mouse activity counts, idle time, battery, network interfaces,
   devices, processes, audio, brightness, Wi-Fi and more. **14 are enabled by
-  default** (pure Win32 APIs, zero subprocesses); 26 more (browser tabs,
+  default** (native Win32 APIs on their main collection paths; the network
+  monitor falls back to a bounded `netstat.exe` call, 3-second timeout, when
+  its native path is unavailable); 26 more (browser tabs,
   clipboard, Bluetooth, and others) ship in the binary and are opt-in.
 - **Raw events are stored untouched** in SQLite on your machine. Aggregate
   tables (per-minute/per-day buckets) exist only as derived read caches for
@@ -268,6 +270,11 @@ dates).
 - Aggregates are derived caches; the raw event log is append-only.
 - Deleting anything is opt-in and off by default; schema migrations archive
   tables by renaming instead of dropping.
+- **Uninstalling keeps your data by default.** The uninstaller asks whether
+  to delete the data directory (`<install dir>\data`); the default answer is
+  No (keep), and a silent uninstall keeps it without asking. Only an explicit
+  Yes, confirmed after an irreversible-delete warning, deletes it. If kept,
+  the uninstall completion page shows where the data was left.
 
 The trade-off is deliberate: Kynoptic is useful precisely because the data is
 complete, and it is trustworthy precisely because it is local.

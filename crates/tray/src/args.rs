@@ -183,24 +183,54 @@ mod tests {
         // 模拟保留区/占用：把第一段候选全部占住或不可 bind（excluded 范围
         // bind 会报 10013——同样是"不可用"），pick 必须跨 +10000 大步长落到
         // 第二段（旧实现 11 连号全失败返回 None → 面板静默死亡的路径）。
+        //
+        // 竞态修正（2026-10-30 全量门禁实测 picked=2038、复现 8 跑 1 败）：
+        // 旧写法先 drop keeper 再逐个 bind 首段，并把「bind 失败」当成
+        // 「永久不可用」；同二进制内并行兄弟测试（pick_free_port_skips_*
+        // / probe_bind_*）也在 bind(0)，会短暂持有刚释放的 base 后再释放，
+        // 首段封锁到 pick 时刻已不成立，pick 合法落回首段末位（本机 TCP
+        // 动态端口范围实测 1024-15000，bind(0) 会发 ~2038 这类低端口，
+        // picked=2038 恰为首段末位 base+10）。改为 keeper 全程持有 base、
+        // 首段其余 10 个端口全部由本测试自己 bind 成功（拿不齐整段就释放
+        // 换新 base 重试）——首段在 pick 时刻的占用由本测试持有的 listener
+        // 自证，不再依赖「失败即永久不可用」假设。
+        //
         // 选一个满足 base+10010 <= u16::MAX 的空闲 preferred（跨段断言需要
         // 第二段存在;临时端口 49152-65535 里高段不够跨步）
-        let (base, _keeper) = loop {
-            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            if p as u32 + 10_000 + u32::from(CANDIDATES_PER_BLOCK) - 1 <= u32::from(u16::MAX) {
-                break (p, l);
+        let (base, picked) = 'outer: {
+            for _attempt in 0..8 {
+                let (base, keeper) = loop {
+                    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                    let p = l.local_addr().unwrap().port();
+                    if p as u32 + 10_000 + u32::from(CANDIDATES_PER_BLOCK) - 1
+                        <= u32::from(u16::MAX)
+                    {
+                        break (p, l);
+                    }
+                };
+                // 首段其余 10 个全部 bind 成功才算封锁成立；bind 失败说明
+                // 该端口此刻被别人持有，我们无法保证 pick 时刻它仍被占——
+                // 释放本次全部 listener，换新 base 重试
+                let mut blockers: Vec<std::net::TcpListener> = Vec::new();
+                let mut held_all = true;
+                for p in (base + 1..base + CANDIDATES_PER_BLOCK).rev() {
+                    match std::net::TcpListener::bind(("127.0.0.1", p)) {
+                        Ok(l) => blockers.push(l),
+                        Err(_) => {
+                            held_all = false;
+                            break;
+                        }
+                    }
+                }
+                if held_all {
+                    let picked = pick_free_port(base).expect("第一段全占时必须跨段重试");
+                    break 'outer (base, picked); // keeper/blockers 块尾统一释放
+                }
+                drop(blockers);
+                drop(keeper);
             }
+            panic!("8 次都没拿到完整首段封锁：并行测试互抢端口，实验环境不可用");
         };
-        drop(_keeper);
-        // 逐个封死第一段:bind 成功就持有（占用）,失败也视为不可用（保留区）
-        let mut blockers: Vec<std::net::TcpListener> = Vec::new();
-        for p in (base..base + CANDIDATES_PER_BLOCK).rev() {
-            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", p)) {
-                blockers.push(l);
-            }
-        }
-        let picked = pick_free_port(base).expect("第一段全占时必须跨段重试");
         // 不写死第二段首位:真机探针(netsh excludedportrange)显示 Hyper-V/WSL
         // 可能把第二段也整个保留（本机 12410-12509 覆盖 12417-12427），生产
         // 代码正确继续跨到第三段。只断言必须跨过 +10000 大步长落到后续段。

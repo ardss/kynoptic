@@ -2150,6 +2150,10 @@ pub fn api_report_at(
         "segments": segments,
         "categories": categories,
         "focus": focus,
+        // R5：≥20 分钟阈值过滤前的人在场分钟数——区分「基线窗口内无在场
+        // 数据」（0）与「有在场但无 ≥20 分钟连续块」（>0 且 focus 为空）
+        // 两种空态，前端不再一律渲染「暂无数据」
+        "presence_minutes": human_minutes.len(),
         "focus_criterion": "presence_focus",
         "fg_dwell_method": queries::FG_DWELL_METHOD,
         "data_since": data_since,
@@ -2385,7 +2389,7 @@ pub fn api_settings(db_path: &Path) -> Value {
 /// 里回显 null）+ 加一处 `req.get` 接受站点（否则该字段会被列进 ignored）；
 /// tests.rs 有回归测试固化「常量全集均被接受、落盘且不出现在 ignored」。
 /// 响应专用键 `monitors` 不属于本集——请求若误带它，按未知字段列进 ignored。
-const ACCEPTED_SETTING_FIELDS: [&str; 10] = [
+const ACCEPTED_SETTING_FIELDS: [&str; 11] = [
     "enabled_monitors",
     "input_counts_only",
     "vk_frequency_enabled",
@@ -2396,6 +2400,7 @@ const ACCEPTED_SETTING_FIELDS: [&str; 10] = [
     "dashboard_port",
     "update_check",
     "low_power",
+    "redact_titles",
 ];
 
 /// [`ACCEPTED_SETTING_FIELDS`] 各字段在响应侧的取值（响应键 = 常量条目）。
@@ -2411,6 +2416,7 @@ fn setting_field_value(s: &AppSettings, field: &str) -> Value {
         "dashboard_port" => json!(s.dashboard_port),
         "update_check" => json!(s.update_check),
         "low_power" => json!(s.low_power),
+        "redact_titles" => json!(s.redact_titles),
         // 不可达：settings_payload 只按常量条目迭代；加常量条目后须补上臂。
         _ => Value::Null,
     }
@@ -2439,7 +2445,7 @@ fn settings_payload(s: &AppSettings) -> Value {
     payload
 }
 
-/// POST /api/settings — 接受 [`ACCEPTED_SETTING_FIELDS`]（10 字段）任一子集；
+/// POST /api/settings — 接受 [`ACCEPTED_SETTING_FIELDS`]（11 字段）任一子集；
 /// 监控器 id 必须全部在注册表内，否则 400。写盘后返回新设置；实际变更
 /// 追加审计行到 settings-audit.log。
 pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
@@ -2496,6 +2502,11 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     }
     if let Some(v) = req.get("low_power") {
         next.low_power = v.as_bool().ok_or("low_power 应为布尔值")?;
+    }
+    // 标题脱敏（隐私 opt-in，默认关）：true 时 collector 启动接线
+    // title_privacy::set_redact_titles，采集侧剥 URL 查询串，只拦新写入
+    if let Some(v) = req.get("redact_titles") {
+        next.redact_titles = v.as_bool().ok_or("redact_titles 应为布尔值")?;
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;

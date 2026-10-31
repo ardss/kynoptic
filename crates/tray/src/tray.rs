@@ -443,8 +443,9 @@ impl TrayCtx {
                             let errlog = open()
                                 .or_else(|| std::fs::File::create(db_dir.join("update.log")).ok());
                             // 创建旗标统一走 spawn::no_window（原 DETACHED_PROCESS：
-                            // 托盘为 GUI 子系统，关键契约是「任何拉起路径都不开
-                            // 控制台」，kynoptic.exe 是控制台程序，必须显式压制）
+                            // 托盘为控制台子系统（全 crate 无 windows_subsystem
+                            // 属性），关键契约是「任何拉起路径都不开控制台」，
+                            // kynoptic.exe 是控制台程序，必须显式压制）
                             let spawn_res = match errlog {
                                 Some(f) => {
                                     let mut cmd =

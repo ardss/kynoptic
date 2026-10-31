@@ -942,8 +942,11 @@ fn settings_post_reports_ignored_unknown_fields() {
 }
 
 /// Wave46 回归：接受字段集 = 单一权威源 ACCEPTED_SETTING_FIELDS（请求接受/
-/// 响应键/ignored 判定三处共用）。10 个字段全发必须 200 且逐一生效落盘、
+/// 响应键/ignored 判定三处共用）。字段全集全发必须 200 且逐一生效落盘、
 /// 不出现 ignored（旧 KNOWN 表曾漏 update_check/low_power）。
+/// 既有期望修改（10→11 字段）：本轮 R3 把隐私开关 redact_titles 纳入设置
+/// 契约（AppSettings + 常量 + req.get 接受站点三处同改），字段集随之扩一，
+/// 非回退。
 #[test]
 fn settings_post_full_accepted_set_never_ignored_and_persisted() {
     let dir = tmpdir("accepted-set");
@@ -958,7 +961,8 @@ fn settings_post_full_accepted_set_never_ignored_and_persisted() {
         "categories": [],
         "dashboard_port": 8422,
         "update_check": false,
-        "low_power": true
+        "low_power": true,
+        "redact_titles": true
     });
     let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &body.to_string(), &db);
     assert_eq!(code, 200, "接受字段全集必须 200: {out}");
@@ -980,6 +984,66 @@ fn settings_post_full_accepted_set_never_ignored_and_persisted() {
     for field in ACCEPTED_SETTING_FIELDS {
         assert_eq!(g[field], body[field], "字段 {field} 须落盘: {out2}");
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ─── 批次「dash 设置与报告契约面」新契约（TDD：测试先于实现钉住缺口） ──────
+// R3：redact_titles 上游设置面缺失（core 侧开关恒 false、无任何路径置 true）
+// R5：report 页 focus 空态二义（载荷缺「当日是否有在场」信号，两种空态都渲染
+//     同一句「暂无数据」）
+
+/// R3：AppSettings.redact_titles 存在且默认 false（隐私 opt-in 铁律）；
+/// 手改 settings.json 塞 {"redact_titles": true} 必须能被读入——此前
+/// AppSettings 无该字段且 derive 无 deny_unknown_fields，键被 serde 静默
+/// 丢弃，文件级旁路也不存在。
+#[test]
+fn wiring_redact_titles_default_off_and_file_opt_in() {
+    let s = settings::AppSettings::default();
+    assert!(!s.redact_titles, "标题脱敏默认必须关闭（opt-in 铁律）");
+    let dir = tmpdir("redact-optin");
+    let db = dir.join("kyn.db");
+    std::fs::write(settings::settings_path(&db), r#"{"redact_titles": true}"#).unwrap();
+    let s2 = settings::load(&db);
+    assert!(
+        s2.redact_titles,
+        "手改 settings.json 塞 redact_titles 必须生效，不得被 serde 静默丢弃"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// R3：redact_titles 是设置 API 的接受字段——POST 生效落盘、响应回显、
+/// 不被列进 ignored（此前 ACCEPTED_SETTING_FIELDS 不含它、POST 侧无
+/// req.get 接受站点，请求会被列进 ignored 且不落盘）。
+#[test]
+fn wiring_redact_titles_accepted_by_settings_api() {
+    let dir = tmpdir("redact-api");
+    let db = dir.join("kyn.db");
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"redact_titles": true}"#,
+        &db,
+    );
+    assert_eq!(code, 200, "redact_titles 应为接受字段: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["redact_titles"],
+        json!(true),
+        "POST 响应须回显 true: {out}"
+    );
+    assert!(
+        v.get("ignored").is_none(),
+        "redact_titles 不得列进 ignored: {out}"
+    );
+    // 落盘复核：GET 重读 settings.json 须回 true
+    let (_, _, out2) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let g: Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(
+        g["redact_titles"],
+        json!(true),
+        "须落盘并在 GET 回显: {out2}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2281,6 +2345,55 @@ fn report_data_since_mixed_encodings_uses_earliest_local_date() {
         Some(expect.as_str()),
         "混合编码下 data_since 必须取最早事件的本地日，不得被字典序较小的时间戳推晚"
     );
+}
+
+/// R5：report 页两种 focus 空态必须可区分——载荷新增 presence_minutes
+/// （≥20 分钟阈值过滤**前**的人在场分钟数）：无在场数据 = 0；有在场但无
+/// 连续块 = >0 且 focus 仍为空。此前两种空态在契约上不可区分，前端只能
+/// 同渲染「暂无数据」。日期经参数注入（local_ts 固定钟面），不读真实时钟。
+#[test]
+fn wiring_report_focus_empty_states_distinguishable() {
+    let s = settings::AppSettings::default();
+    // 空态一：基线窗口内完全没有在场数据（真无数据）
+    let conn = mem_conn();
+    let v = api_report_at(&conn, "2026-09-09", &s).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        v["presence_minutes"],
+        json!(0),
+        "无任何输入事件时在场分钟应为 0"
+    );
+    assert_eq!(v["focus"], json!([]), "无在场数据时 focus 为空");
+
+    // 空态二：有在场分钟但无 ≥20 分钟连续块
+    let conn2 = mem_conn();
+    insert_input_agg(&conn2, &local_ts(0, 10, 5), r#"{"keys": 3}"#);
+    let v2 = api_report_at(&conn2, "2026-09-09", &s).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        v2["presence_minutes"],
+        json!(1),
+        "1 分钟真实键鼠在场必须进载荷，presence_minutes 不得为 0"
+    );
+    assert_eq!(
+        v2["focus"],
+        json!([]),
+        "单个分钟不成 ≥20 分钟块，focus 仍为空"
+    );
+}
+
+/// R5：presence_minutes 是阈值过滤前的完整在场分钟数——成块用例下
+/// focus 出块且在场分钟数不被 ≥20 过滤吞掉。
+#[test]
+fn wiring_report_focus_block_reports_full_presence_minutes() {
+    let conn = mem_conn();
+    let s = settings::AppSettings::default();
+    for m in 0..20 {
+        insert_input_agg(&conn, &local_ts(0, 10, m), r#"{"keys": 1}"#);
+    }
+    let v = api_report_at(&conn, "2026-09-09", &s).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(v["presence_minutes"], json!(20), "在场分钟数为过滤前总数");
+    let focus = v["focus"].as_array().unwrap();
+    assert_eq!(focus.len(), 1, "连续 20 分钟恰好成 1 个专注块");
+    assert_eq!(focus[0]["minutes"], json!(20));
 }
 
 // ─── 本轮修复回归（日期边界 / 空参数 / 幻影日 / 安全头 / host 尾点） ────────

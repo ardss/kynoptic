@@ -186,6 +186,13 @@ pub struct AppSettings {
     /// 适合低配设备。只降采集频率，不改变落库数据口径。
     #[serde(default)]
     pub low_power: bool,
+    /// 窗口/标签页标题脱敏（默认关，隐私 opt-in）：true = 采集侧把标题中的
+    /// URL 剥掉查询串（? 及之后），token/session id 等不再随 window/
+    /// tab_change 落库。只拦新写入，不清洗历史数据。
+    /// 接线路径：tray / CLI 构造 CollectorSettings 时映射本字段 →
+    /// collector 启动时调 title_privacy::set_redact_titles。
+    #[serde(default)]
+    pub redact_titles: bool,
 }
 
 fn default_update_check() -> bool {
@@ -232,6 +239,7 @@ impl Default for AppSettings {
             categories: default_categories(),
             update_check: true,
             low_power: false,
+            redact_titles: false,
         }
     }
 }

@@ -2,6 +2,66 @@
 
 > Kynoptic 每日维护轮记录。新记录追加在顶部。
 
+## 2026-10-30（根治全量修复轮：10 问题 × 根源分析 × 架构裁定 × 6 批 TDD；不发版不安装）
+
+### 背景与流程
+
+- 用户指令：所有发现的问题都要修复、发现问题后从根源上做分析（判定是否架构问题，
+  架构级则整体重构）、不留下一波；每天定时任务分析过去 24 小时数据评估系统健康；
+  尽量所有采集器都开。
+- 动态工作流（三次续跑完成）：10 路并行只读根源分析 → 架构裁定与批次规划 →
+  机制化 RED/GREEN（live 真实树或临时副本 historical）→ 批内 fmt/clippy →
+  全量门禁 → 独立复审冷读全部 diff → high/medium 再独立复核。
+- **架构裁定总表：10 项中 9 项判架构级**（R1-R9），R10 实例 minimal 但类级补防漏闸。
+  判据=「修一处还会在别处复发」：矛盾语义契约交汇（R1）、核对与写语义不同构（R2）、
+  字段集多路径漂移已复发过（R3）、代码事实手抄文档无门禁且已是第三次（R4）、
+  判别信号缺契约层（R5）、数据模型缺设备身份概念（R6）、双权威定义无共享不变量（R7）、
+  不变量只在自由文本（R8）、生命周期事实缺平行披露（R9）。
+
+### 六批修复（分支 fix/deep-rootcause，全部经脚本实测红→绿或独立复审实证）
+
+1. **R1+R2 core 数据库 rowid/聚合/核对三方口径统一（架构重构，high）**：
+   events.rs 对 input_agg 行新增内部真实 rowid 通道（对外 rowid 契约「input_agg 恒 0」
+   不回退，锚点测试保持），detect/recompute 在生产写路径真正生效；heal 自愈核对口径
+   修正（日级水位与分桶谓词同构），连续会话混合分钟可收敛。contractpin 钉住两契约。
+2. **R7 presence mixed 分钟口径统一**：collect_day_hits 与 capped 截断分支共用交集
+   语义（真人 raw 与注入同分钟时两权威路径不再 0 vs 1）；顺手修 title_privacy 测试
+   竞态。RED：旧 uncapped 路径 e.2 计数器 raw 模式恒 0。
+3. **R3+R5+R6 dash/采集设置与展示契约面**：redact_titles 标题脱敏全链路接线
+   （AppSettings 默认 false 只 opt-in → tray/CLI 映射 → collector 落库前剥 URL 查询串
+   → dash 设置页开关；只拦新写入不清洗历史）；/api/report 补 presence_minutes 区分
+   两种空态；输入设备归并物理设备+厂商面修正（raw_input_devices 数据契约）。
+4. **R10 子进程 no_window 收口+防漏闸**：update.rs:1008 与 main.rs:1470 过
+   spawn::no_window()；新增 spawn_no_window_scan 扫描测试锁「产品代码全部
+   Command::new 必须收口」的类级不变量；顺手修 tray/args.rs pick_free_port 竞态
+   （全量门禁实测 8 跑 1 败，跨段重试语义保留，理由注释在 diff 内——独立复审核验
+   正当合规，唯批次摘要漏报此文件）。
+5. **R4+R8+R9 文档面口径收敛+文档门禁**：llms.txt CLI 面 18→21（补
+   apps/topics/recompute-actors）；APP.md CLI 表更新；README 双语「纯 Win32 零子进程」
+   收敛为准确表述（network 兜底 netstat 披露，registry.rs/monitors.json 注释同步）；
+   卸载默认保留 data\ 五处文档平行披露（README×2/APP.md/llms.txt/skill.md）；
+   check-doc-version.mjs 扩展文档门禁（代码派生事实锚定断言，堵「手抄漂移」类根因）。
+
+### 全量门禁与复审
+
+- fmt / clippy -D warnings / test --workspace / check-js 全绿；无版本号改动、
+  无 emoji、新测试零真实时钟、既有断言改动均带 diff 内理由注释。
+- 独立复审冷读全部 diff：唯一保留发现=low 账面（args.rs 顺手修未在批次摘要声明，
+  内容正当已核验）。
+- 过程透明：RED 门禁对「已实现批」确立不了红的问题在 R1/R7 上两次发生——以独立
+  复审实证（门禁亲跑、契约锚定、可确立红的代码级论证）作为通过态入册；脚本侧把
+  枚举字段改为布尔+证据字段后 R6/R3+R5/R10 三批全部正常走通。
+
+### 运维侧（同日）
+
+- 采集器全开：本机（Du）40/40 已开且 38 项上报全健康；A 机（.64）从默认 14 项
+  经面板鉴权 API 全量开启到 40（POST /api/settings 三重头+会话令牌），回读验证。
+- 每日巡检定时任务规格已备（本会话属定时任务链被宿主禁建，待普通会话一句话创建：
+  K:\AIControl\CV-KY-convergence-20261028\work\kynoptic-daily-inspection-prompt.md，
+  每天 09:10 分析过去 24 小时数据+采集器/进程健康+A 机快检，日报落
+  work\daily\）。
+- 本轮不发版、不安装，等用户口令。
+
 ## 2026-10-29（严格 TDD 深审修复轮：四路深审 → 逐条复核 → 机制化 RED/GREEN → 批A/B/C；不发版不安装）
 
 ### 背景与流程

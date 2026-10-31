@@ -488,11 +488,10 @@ pub struct CollectorSettings {
     /// 窗口/标签页标题脱敏开关（默认 false：标题原文落库，本地数据完整优先；
     /// 开启后采集侧把标题中 URL 的查询串剥掉，见 monitors::title_privacy）。
     ///
-    /// **尚未接线（待办）**：设计接线点与 `vk_frequency_enabled` 同模式——
-    /// dash 设置项 `redact_titles` 读写此字段，经 `CollectorSettings` 传入
-    /// `start_collection_with` / `start_collection_custom` 即生效——但 dash
-    /// settings、tray、CLI 目前均未读写该字段，当前没有任何路径能把它置
-    /// true，实际行为恒为「标题原文落库」。
+    /// 接线路径（已接）：dash 设置项 `redact_titles`（AppSettings，默认 false）
+    /// → tray / CLI 构造 `CollectorSettings` 时映射本字段 →
+    /// `start_collection_custom` 内 [`monitors::title_privacy::set_redact_titles`]
+    /// 即生效。
     pub redact_titles: bool,
 }
 

@@ -10,7 +10,9 @@
 - 40 system monitors (foreground window/app switches, keyboard/mouse
   activity counts, idle time, battery, network, devices, processes,
   audio, brightness, Wi-Fi, and more). 14 are enabled by default
-  (pure Win32 APIs, zero subprocesses); 26 more are opt-in.
+  (native Win32 APIs on their main collection paths; the network
+  monitor falls back to a bounded netstat.exe call, 3-second timeout,
+  when its native path is unavailable); 26 more are opt-in.
 - Raw events are stored untouched in SQLite. Aggregate tables are
   derived read caches only; the raw layer is append-only and is never
   truncated or cleaned up automatically.
@@ -29,6 +31,11 @@
 - The dashboard HTTP server binds to 127.0.0.1 only. The MCP server is
   a stdio process (JSON-RPC over stdin/stdout) and has no network
   socket of any kind.
+- Uninstalling keeps your data by default: the uninstaller's delete
+  prompt defaults to No, and a silent uninstall keeps the data
+  directory (`<install dir>\data`) without asking. Only an explicit
+  Yes, confirmed after an irreversible-delete warning, deletes it; if
+  kept, the uninstaller shows where the data was left.
 
 ## Architecture (four crates, plus a tray shell)
 
@@ -36,14 +43,14 @@
   (numbered migrations), queries, monitor registry
   (`crates/core/src/registry.rs` is the single source of truth for
   what is enabled by default).
-- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary with 18
-  subcommands: `now`, `query`, `stats`, `collect`, `dashboard`, `probe`,
-  `mcp`, `export`, `report`, `db`, `analyze`, `ghost`, `autostart`,
-  `migrate`, `skill`, `update`, `watchdog`, `presence`. Includes a
-  local-only web dashboard (read-only for activity data; settings are
-  writable via `POST /api/settings`). Full command reference: APP.md
-  (a version snapshot - it reflects the released CLI; run
-  `kynoptic --help` for the current option set).
+- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary with 21
+  subcommands: `analyze`, `apps`, `autostart`, `collect`, `dashboard`,
+  `db`, `export`, `ghost`, `mcp`, `migrate`, `now`, `presence`, `probe`,
+  `query`, `recompute-actors`, `report`, `skill`, `stats`, `topics`,
+  `update`, `watchdog`. Includes a local-only web dashboard (read-only
+  for activity data; settings are writable via `POST /api/settings`).
+  Full command reference: APP.md (kept in sync with the released CLI;
+  run `kynoptic --help` for the exact option set of the local binary).
 - `crates/dash` - dashboard service and pages (shared by CLI and tray).
 - `crates/mcp` - MCP server over stdio JSON-RPC 2.0.
 - `crates/tray` - pure Win32 tray shell hosting the collector and

@@ -4,6 +4,8 @@
 //! - human（人在场）= 真实键鼠：`keys - injected_keys + clicks - injected_clicks > 0`；
 //! - auto（自动化）= 注入输入：`injected_keys + injected_clicks > 0`；
 //! - 混合分钟两者同时为真，**同时计入** presence 与 automation（mixed 单独返回）；
+//!   mixed_minutes 全管线唯一权威定义 = 去重后 human∩automation 交集，单一实现
+//!   （cap 截断与不截断同口径；raw 模式同分钟的真人 + 注入行同走此交集）；
 //! - 人在场输入含滚轮滚动（Wave21 定案：滚轮=人在主动阅读，属"真实键鼠"；
 //!   注入滚轮 `$.injected_scroll_ticks` 不计入 human、计入 auto）；
 //! - 相邻在场分钟间隙 <= bridge 分钟按"无输入阅读"桥接（读 settings 的
@@ -222,14 +224,17 @@ fn raw_flag_minutes_window(conn: &Connection, start: &str, end: &str, injected: 
 }
 
 /// 按本地日分桶的共用取数核心：对给定日期列表**一次**扫描整窗（分钟 SQL +
-/// raw SQL 各一条），返回 每日 → (human 纪元分钟, auto 纪元分钟, mixed 分钟数)，
-/// 均未排序去重。语义与逐日调用旧 `collect_minute_hits` 完全一致——分钟
+/// raw SQL 各一条），返回 每日 → (human 纪元分钟, auto 纪元分钟)，均未排序
+/// 去重。语义与逐日调用旧 `collect_minute_hits` 完全一致——分钟
 /// 归属按纪元分钟的本地日期判定，与旧实现按日 `[start, end)` 过滤等价。
+/// mixed 不在此维护（R7 口径统一）：由 [`classify_minutes_multi_capped`]
+/// 对去重后两桶取交集统一计算——独立计数器只由分钟 SQL（input_agg）分支
+/// 累加，raw 模式无 input_agg 行会恒 0，与两桶事实不符。
 fn collect_day_hits(
     conn: &Connection,
     local_days: &[String],
-) -> std::collections::HashMap<String, (Vec<i64>, Vec<i64>, i64)> {
-    let mut out: std::collections::HashMap<String, (Vec<i64>, Vec<i64>, i64)> =
+) -> std::collections::HashMap<String, (Vec<i64>, Vec<i64>)> {
+    let mut out: std::collections::HashMap<String, (Vec<i64>, Vec<i64>)> =
         std::collections::HashMap::new();
     // 整窗边界 = 各日范围的 min/max；全部不可解析时不发查询
     let mut wstart: Option<String> = None;
@@ -255,9 +260,6 @@ fn collect_day_hits(
             e.0.push(mepoch);
         }
         if auto_hit {
-            if human_hit {
-                e.2 += 1;
-            }
             e.1.push(mepoch);
         }
     }
@@ -267,8 +269,9 @@ fn collect_day_hits(
         }
     }
     // 联合审查（raw 自动化桶）：注入行单独计入自动化——纯注入分钟不再
-    // 失明。raw 模式的混合分钟（同人同机）两桶都进：与 minute 模式的
-    // human∩auto 双计语义对齐（e.2 mixed 计数仍只由分钟 SQL 分支维护）。
+    // 失明。同分钟的真人 + 注入两桶都进，mixed 由 classify_minutes_multi_capped
+    // 对去重后两桶取交集统一得出（R7 口径统一：本函数不再维护独立 mixed
+    // 计数器——它只由分钟 SQL 分支累加，raw 模式无 input_agg 行恒 0）。
     for mepoch in raw_auto_minutes_window(conn, &wstart, &wend) {
         if let Some(day) = bucket(mepoch) {
             out.entry(day).or_default().1.push(mepoch);
@@ -352,10 +355,10 @@ pub fn classify_minutes_multi_capped(
                 Some(Some(u)) => Some(u),
                 _ => None,
             };
-            let (mut human, mut automation, mixed) = hits
+            let (mut human, mut automation) = hits
                 .get(day)
                 .cloned()
-                .unwrap_or_else(|| (Vec::new(), Vec::new(), 0));
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
             if let Some(until) = until {
                 human.retain(|&m| m < until);
                 automation.retain(|&m| m < until);
@@ -364,14 +367,14 @@ pub fn classify_minutes_multi_capped(
             human.dedup();
             automation.sort_unstable();
             automation.dedup();
-            // 审查修复：mixed 必须与 human/automation 同口径——截断后从两列
-            // 交集重算，否则昨日 23 点的混合分钟会混进「昨日同时段」基线。
-            let mixed = if until.is_some() {
-                let mut h: std::collections::HashSet<_> = human.iter().collect();
-                automation.iter().filter(|m| h.remove(*m)).count() as i64
-            } else {
-                mixed
-            };
+            // mixed 口径统一（R7）：无条件从去重后 human∩automation 交集重算，
+            // 截断与不截断同口径。原实现不截断路径沿用 collect_day_hits 的独立
+            // 计数器——它只由分钟 SQL（input_agg）分支累加，raw 模式恒 0，与
+            // 截断分支（恒交集重算）自相矛盾；交集即模块头的混合分钟定义。
+            // 保留原审查修复语义：截断后从两列重算，昨日 23 点的混合分钟不会
+            // 混进「昨日同时段」基线。
+            let mut h: std::collections::HashSet<_> = human.iter().collect();
+            let mixed = automation.iter().filter(|m| h.remove(*m)).count() as i64;
             let presence = bridge_count(&human, bridge);
             // 首末人在场：取人侧最小/最大纪元分钟，格式化回本地 "HH:MM"。
             let first_activity = human.first().copied().and_then(fmt_epoch_hm);
@@ -685,5 +688,77 @@ mod tests {
         assert!(capped.1.is_some());
         // 截断可用性契约：返回 None 仅当「要求截断且起点解析失败」，
         // 调用方（dash api_overview）据此回退全天口径并标注，禁止拿 Some 假基线。
+    }
+
+    /// R7 口径统一回归：raw 模式同一本地分钟同时落真人 press（injected=false）
+    /// 与注入 press（injected=true）时，mixed_minutes 在 uncapped 与 capped
+    /// 两条路径必须同值（= 去重后 human∩automation 交集）。旧实现 uncapped
+    /// 沿用 collect_day_hits 的 e.2 计数器——该计数器只由分钟 SQL
+    /// （event_action='input_agg'）分支维护，raw 模式不写 input_agg 行恒为 0，
+    /// 与 capped 路径的交集重算自相矛盾：同一数据两个答案。
+    /// uncapped 期望 0→1 属语义修复（模块头口径：混合分钟 = human 与 auto
+    /// 同时为真），非既有测试期望的回退。三分钟布局把「交集」钉死：纯注入
+    /// 分钟与纯真人分钟都不是混合分钟，mixed 必须恰为 1。
+    #[test]
+    fn raw_mixed_minutes_intersection_agree() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::SCHEMA).unwrap();
+        // 日期注入：固定本地钟面 10/12/14 时（+08:00 写入，=02/04/06Z），不读
+        // 真实时钟；本地日由该时刻按机器时区推导（任意时区均落当地午后，
+        // 远离午夜与夏令时边界）。
+        let ts_of = |h: u32| format!("2026-06-15T{h:02}:00:00+08:00");
+        let day = chrono::DateTime::parse_from_rfc3339(&ts_of(10))
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        // raw 模式逐键落库形态（keyboard_hook.rs 把 LLKHF_INJECTED 写进
+        // event_data "injected"）：A 分钟真人+注入同分钟，B 纯注入，C 纯真人。
+        let ins = |ts: &str, injected: bool| {
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, event_action, event_data) \
+                 VALUES (?1, 'keyboard', 'press', ?2)",
+                params![ts, &format!("{{\"injected\": {injected}}}")],
+            )
+            .unwrap();
+        };
+        ins(&ts_of(10), false);
+        ins(&ts_of(10), true);
+        ins(&ts_of(12), true);
+        ins(&ts_of(14), false);
+        let uncapped = classify_minutes(&conn, &day, 2);
+        assert_eq!(
+            uncapped.presence_minutes, 2,
+            "真人分钟 A/C 计入在场（相距 4 小时，桥接阈值 2 分钟不生效）"
+        );
+        assert_eq!(uncapped.automation_minutes, 2, "注入分钟 A/B 计入自动化");
+        assert_eq!(
+            uncapped.mixed_minutes, 1,
+            "混合分钟 = human∩automation 交集恰为 1（旧实现 uncapped 沿用 e.2 计数器恒 0，语义修复）"
+        );
+        // 截断口径（cap=全天 1440 分钟）必须与 uncapped 同值
+        let capped = &classify_minutes_multi_capped(
+            &conn,
+            std::slice::from_ref(&day.to_string()),
+            2,
+            Some(24 * 60),
+        )[0];
+        let capped = capped.1.as_ref().expect("正常日期截断必须可用");
+        assert_eq!(
+            capped.mixed_minutes, uncapped.mixed_minutes,
+            "uncapped 与 capped 的 mixed_minutes 必须同一口径"
+        );
+        assert_eq!(capped.presence_minutes, 2);
+        assert_eq!(capped.automation_minutes, 2);
+        assert_eq!(capped.mixed_minutes, 1);
+        // cap=None 契约：与 classify_minutes 完全一致
+        let nocap =
+            &classify_minutes_multi_capped(&conn, std::slice::from_ref(&day.to_string()), 2, None)
+                [0];
+        assert_eq!(
+            nocap.1.as_ref().unwrap(),
+            &uncapped,
+            "cap=None 必须与 classify_minutes 完全等价"
+        );
     }
 }
