@@ -14,12 +14,18 @@ use std::time::Duration;
 
 pub struct ClipboardMonitor {
     last_digest: Cell<Option<[u8; 16]>>,
+    /// 剪贴板序号门（KY-PERF-20261031）：序号未变时内容必然未变，跳过
+    /// GetClipboardData——延迟渲染的属主应用（隔离实测 ClipVault 持有场景）
+    /// 会让该调用阻塞到 Win32 内部约 30s 超时，采集线程每轮撞 30s 并触发
+    /// 采样间隔放大。GetClipboardSequenceNumber 非阻塞，零成本短路稳态轮询。
+    last_seq: Cell<u32>,
 }
 
 impl Default for ClipboardMonitor {
     fn default() -> Self {
         Self {
             last_digest: Cell::new(None),
+            last_seq: Cell::new(0),
         }
     }
 }
@@ -34,6 +40,12 @@ impl Monitor for ClipboardMonitor {
 
     fn collect(&self, tx: &crossbeam_channel::Sender<Event>) {
         let prev = self.last_digest.get();
+        // 序号门：已建基线且序号未变 → 内容必未变，跳过（含延迟渲染阻塞）。
+        // 首轮（prev=None）与序号 0（尚无剪贴板内容）不短路。
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        if prev.is_some() && seq != 0 && seq == self.last_seq.get() {
+            return;
+        }
         // 审查 P2：读不到剪贴板（OpenClipboard 被其他进程占用等）时保持上次
         // 状态原样返回——旔回退 ("empty", 全零 digest) 会造成 digest 翻转，
         // 产生幻影 Change 事件。
@@ -44,12 +56,14 @@ impl Monitor for ClipboardMonitor {
         // "翻转"，无条件发一条"剪贴板变化"是幻影事件）
         if prev.is_none() {
             self.last_digest.set(Some(digest));
+            self.last_seq.set(seq);
             return;
         }
         if prev == Some(digest) {
             return;
         }
         self.last_digest.set(Some(digest));
+        self.last_seq.set(seq);
 
         // 只记元数据：digest 前 8 hex + 内容字节数，不写内容本身
         let digest_hex = hex8(&digest);
@@ -119,6 +133,7 @@ fn read_clipboard_hash() -> Option<(String, [u8; 16], usize)> {
 }
 
 extern "system" {
+    fn GetClipboardSequenceNumber() -> u32;
     fn OpenClipboard(hWndNewOwner: isize) -> i32;
     fn CloseClipboard() -> i32;
     fn IsClipboardFormatAvailable(format: u32) -> i32;
