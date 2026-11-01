@@ -644,10 +644,13 @@ fn latest_watchdog_alert_at(conn: &Connection, now: chrono::DateTime<Utc>) -> Op
     // watchdog_alert 的载荷一致，message_en 为同义英文版，供英文界面选用；
     // at 为事件 UTC 时刻，前端据此显示解除时间），不回显完整 event_data，
     // 避免未来字段变化把内部结构漏进 UI。
+    // S0.2 追加 loss_count：collector 落库的 collection_dropped / write_failed
+    // 带量化载荷，横幅显示丢弃/失败行数；旧事件无该字段 → null。
     Some(json!({
         "kind": kind,
         "message": v.get("message").and_then(|x| x.as_str()).unwrap_or(""),
         "message_en": v.get("message_en").and_then(|x| x.as_str()).unwrap_or(""),
+        "loss_count": v.get("loss_count").cloned().unwrap_or(serde_json::Value::Null),
         "recovered": recovered,
         "at": ts.unwrap_or_default(),
     }))
@@ -691,6 +694,17 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
             .parent()
             .map(|d| d.join("paused.flag").exists())
             .unwrap_or(false),
+        // 磁盘空间不足写入暂停旗标（S0.3：core write_batch 进入低盘暂停时写
+        // disk-paused.flag、恢复/重启清除，tray 黄标同源）：按存在性读取，
+        // 跨进程可见（进程内访问器 disk_write_paused 只覆盖同进程场景）。
+        // 面板据此显示黄标横幅，磁盘将满不再只有看门狗日志一个用户可见面
+        "disk_write_paused": db_path
+            .parent()
+            .map(|d| d.join(kynoptic_core::collector::DISK_PAUSE_FLAG).exists())
+            .unwrap_or(false),
+        // 暂停期间被跳过落库的事件累计（进程级访问器；独立 serve 进程无
+        // 采集器读数恒 0，跨进程口径与 monitors 同款，旗标横幅为主信号）
+        "disk_paused_events": kynoptic_core::collector::disk_paused_events(),
         "db_path": db_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

@@ -807,6 +807,12 @@ impl Database {
         std::fs::metadata(&p).ok().map(|m| m.len())
     }
 
+    /// 库文件路径（S0.3：collector 磁盘暂停旗标文件写 db 同目录用；只读
+    /// 访问器，不暴露可变句柄）。
+    pub fn path_str(&self) -> &str {
+        &self.db_path
+    }
+
     /// 库所在卷的剩余空间（字节）——写路径磁盘将满预检（ENOSPC 主动防护）
     /// 的唯一探测点，供 collector::write_batch 每次落库前读取：低于
     /// constants::DB_FREE_SPACE_PAUSE_BYTES 即暂停写入（本批保留待重试）。
