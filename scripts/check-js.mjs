@@ -67,3 +67,46 @@ const rowOk = sandbox.netSectionRow(
 assert(rowOk.includes("q-confirmed") && !rowOk.includes("q-gray"), "confirmed 行不灰显");
 assert(rowOk.includes("3,000 B"), "字节值须本地化格式化");
 console.log("M3.4 badge logic OK (badge + section row assertions)");
+
+// ── M4.3 扩展：三视图渲染逻辑断言（系统总览卡 / 资源排行行 / 时间线行） ──
+const sandbox43 = {};
+vm.createContext(sandbox43);
+new vm.Script(
+  extractFn("esc") + "\n" + extractFn("netQualityBadge") + "\n" +
+  extractFn("sysCard") + "\n" + extractFn("resourceTopRow") + "\n" + extractFn("diagTimelineRow"),
+  { filename: `${htmlPath}#m43` },
+).runInContext(sandbox43);
+const assert43 = (cond, msg) => {
+  if (!cond) {
+    console.error(`M4.3 assert FAILED: ${msg}`);
+    process.exit(1);
+  }
+};
+const card = sandbox43.sysCard(
+  { label_en: "cpu", label_zh: "处理器", quality: "unavailable", value: null,
+    note: "无持久化数据源；未采不伪造" }, "zh");
+assert43(card.includes("q-unavailable") && card.includes("q-gray"), "unavailable 卡必须灰显");
+assert43(card.includes("未采不伪造"), "unavailable 卡必须带原因文案");
+const cardOk = sandbox43.sysCard(
+  { label_en: "network", label_zh: "网络", quality: "confirmed", value: 4200, unit: "bytes", note: null }, "en");
+assert43(cardOk.includes("q-confirmed") && cardOk.includes("4,200 B"), "confirmed 卡带数值");
+const rrow = sandbox43.resourceTopRow(
+  { pid: 9, name: null, total: 5000, quality: "confirmed" }, "zh");
+assert43(rrow.includes("pid 9") && rrow.includes("5,000 B"), "排行行须显示 pid 与字节（无名不伪造）");
+const rrowNamed = sandbox43.resourceTopRow(
+  { pid: 7, name: "alpha.exe", total: 3100, quality: "incomplete" }, "en");
+assert43(rrowNamed.includes("alpha.exe") && rrowNamed.includes("q-incomplete"), "有名行显示进程名与徽标");
+// 时间线关联字段渲染：时间/类型/动作/应用 + 目的地址 unavailable 原因
+const trow = sandbox43.diagTimelineRow(
+  { timestamp: "2026-11-02T10:00:00+00:00", type: "window", action: "switch", app: "editor.exe" },
+  "zh");
+assert43(trow.includes("2026-11-02T10:00:00+00:00"), "时间线行必须渲染时间");
+assert43(trow.includes("switch") && trow.includes("editor.exe"), "时间线行必须渲染动作与应用");
+const trowDest = sandbox43.diagTimelineRow(
+  { timestamp: "2026-11-02T10:00:00+00:00", type: "system", action: "heartbeat", app: null,
+    dest: { quality: "unavailable", reason: "ETW 分钟聚合不含远端地址，未采不伪造" } }, "zh");
+assert43(trowDest.includes("未采不伪造"), "时间线行的目的地址不可用须渲染原因");
+assert43(!sandbox43.diagTimelineRow(
+  { timestamp: "t", type: "s", action: "a", app: null, dest: null }, "zh").includes("undefined"),
+  "缺字段不得泄漏 undefined");
+console.log("M4.3 view logic OK (sys card + resource row + timeline row assertions)");

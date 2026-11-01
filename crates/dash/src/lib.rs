@@ -687,6 +687,226 @@ fn api_net_derived_with(
     })
 }
 
+// ─── M4.3 三视图（系统总览 / 资源排行 / 诊断时间线） ───
+// 口径（诚实优先，与 M3.3/M3.4 同法）：只有持久化数据源存在的维度才出
+// Confirmed/Incomplete 数值；无持久化按进程源的维度（CPU/内存/磁盘/进程树/
+// 远端地址）显式 Unavailable + 原因，未采不伪造。`now_ms`/`at_ms` 注入
+// （禁真实时钟）；进程名解析由调用方注入（路由侧实时 Toolhelp，测试侧闭包）。
+
+/// 最新一条指定 (event_type, event_action) 事件的 event_data（无则 None）。
+fn m43_latest_event_data(conn: &Connection, t: &str, a: &str) -> Option<Value> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT event_data FROM events WHERE event_type = ?1 AND event_action = ?2 \
+             ORDER BY id DESC LIMIT 1",
+            params![t, a],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// GET /api/sys-overview — 系统总览快照：
+/// - cpu_memory：最新 system heartbeat 事件（SystemMonitor 落库的
+///   cpu_percent/memory 键形，单一来源见 core MemoryInfo::as_json）；
+/// - gpu：最新 gpu_snapshot 事件；
+/// - network：M2.4 net_process_minute 近 60 分钟进出合计（有丢失/不完整
+///   行即 Incomplete，空窗口 Unavailable）；
+/// - anomalies：与 /api/anomalies 同一检测入口（今日，top5）；
+/// - monitor_health：看门狗告警 + 启用监控器数（settings 单一来源）。
+pub fn api_sys_overview_at(conn: &Connection, db_path: &Path, now_ms: i64) -> Value {
+    // CPU/内存：最新心跳事件直读
+    let (cm_quality, cpu_memory) = match m43_latest_event_data(conn, "system", "heartbeat") {
+        Some(d) => {
+            let q = if d.get("cpu_percent").is_some() || d.get("memory").is_some() {
+                "confirmed"
+            } else {
+                "incomplete"
+            };
+            (q, d)
+        }
+        None => ("unavailable", json!({})),
+    };
+    // GPU：最新快照事件
+    let (gpu_quality, gpu_data) = match m43_latest_event_data(conn, "system", "gpu_snapshot") {
+        Some(d) => ("confirmed".to_string(), d),
+        None => ("unavailable".to_string(), Value::Null),
+    };
+    // 网络：近 60 分钟分钟桶合计
+    let rows = kynoptic_core::db::net_metrics::query_net_process_minute(conn, 60, now_ms);
+    let (mut bin, mut bout, mut any_loss, mut pids) =
+        (0i64, 0i64, false, std::collections::BTreeSet::new());
+    for r in &rows {
+        if r.metric_id == kynoptic_core::monitors::net_etw::METRIC_NET_PROCESS_BYTES_IN {
+            bin += r.bytes;
+        } else {
+            bout += r.bytes;
+        }
+        if r.loss_count.unwrap_or(0) > 0 || r.quality == "incomplete" {
+            any_loss = true;
+        }
+        pids.insert(r.pid);
+    }
+    let net_quality = if rows.is_empty() {
+        "unavailable"
+    } else if any_loss {
+        "incomplete"
+    } else {
+        "confirmed"
+    };
+    // 关键异常：今日（与 /api/anomalies 同入口同口径）
+    let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
+    let today = queries::today_local_str();
+    let mut anomaly_count = 0usize;
+    let mut anomaly_top: Vec<Value> = Vec::new();
+    for (_date, list) in kynoptic_core::anomaly::detect_all_days_with_bridge(conn, &[today], bridge)
+        .unwrap_or_default()
+    {
+        for a in list {
+            anomaly_count += 1;
+            if anomaly_top.len() < 5 {
+                anomaly_top.push(json!({
+                    "kind": a.kind, "severity": a.severity,
+                    "message": a.message, "at": a.at,
+                }));
+            }
+        }
+    }
+    let s = settings::load(db_path);
+    json!({
+        "now_ms": now_ms,
+        "cpu_memory": {"quality": cm_quality, "cpu_percent": cpu_memory.get("cpu_percent").cloned().unwrap_or(Value::Null),
+                       "memory": cpu_memory.get("memory").cloned().unwrap_or(Value::Null)},
+        "gpu": {"quality": gpu_quality, "data": gpu_data},
+        "network": {"minutes": 60, "bytes_in": bin, "bytes_out": bout,
+                    "pids": pids.len(), "quality": net_quality},
+        "anomalies": {"count": anomaly_count, "top": anomaly_top},
+        "monitor_health": {"watchdog_alert": latest_watchdog_alert(conn),
+                           "enabled_monitors": s.enabled_monitors.len()},
+    })
+}
+
+/// 资源排行无源维度统一原因（M2/M3 持久化面只覆盖网络维度）。
+const M43_NO_PER_PROC_REASON: &str = "无按进程持久化数据源（M2/M3 覆盖网络维度）；未采不伪造";
+
+/// GET /api/resource-top?minutes= — 资源排行：
+/// - 网络：net_process_minute 近 `minutes` 桶按 pid 合计（in/out/total 降序
+///   top20）；任一行丢失/不完整即该行 Incomplete；进程名由注入的
+///   `name_of` 解析（解析不到保持 null，不伪造）；
+/// - dimensions.cpu/memory/disk/tree：无持久化按进程源 → 显式 Unavailable。
+pub fn api_resource_top_at(
+    conn: &Connection,
+    minutes: u32,
+    now_ms: i64,
+    name_of: &dyn Fn(u32) -> Option<String>,
+) -> Value {
+    let rows = kynoptic_core::db::net_metrics::query_net_process_minute(conn, minutes, now_ms);
+    // pid → (in, out, worst_incomplete)
+    let mut agg: std::collections::BTreeMap<u32, (i64, i64, bool)> = Default::default();
+    for r in &rows {
+        let e = agg.entry(r.pid).or_insert((0, 0, false));
+        if r.metric_id == kynoptic_core::monitors::net_etw::METRIC_NET_PROCESS_BYTES_IN {
+            e.0 += r.bytes;
+        } else {
+            e.1 += r.bytes;
+        }
+        if r.loss_count.unwrap_or(0) > 0 || r.quality == "incomplete" {
+            e.2 = true;
+        }
+    }
+    let mut items: Vec<_> = agg.into_iter().collect();
+    items.sort_by_key(|a| std::cmp::Reverse(a.1 .0 + a.1 .1));
+    let out_rows: Vec<Value> = items
+        .into_iter()
+        .take(20)
+        .map(|(pid, (i, o, inc))| {
+            json!({
+                "pid": pid,
+                "name": name_of(pid),
+                "bytes_in": i, "bytes_out": o, "total": i + o,
+                "quality": if inc { "incomplete" } else { "confirmed" },
+            })
+        })
+        .collect();
+    let dim = || json!({"quality": "unavailable", "reason": M43_NO_PER_PROC_REASON});
+    json!({
+        "minutes": minutes,
+        "rows": out_rows,
+        "dimensions": {"cpu": dim(), "memory": dim(), "disk": dim(), "tree": dim()},
+    })
+}
+
+/// GET /api/diag-timeline?at=&window= — 诊断时间线（锚点诊断）：
+/// - window_events：锚点 ± window/2 内的原始事件（时间/类型/动作/应用，
+///   升序，不含 event_data 正文——隐私面最小化）；
+/// - resource_change：net_process_minute 锚点前/后分钟桶进出合计（资源变化）；
+/// - dest：远端地址恒 Unavailable（ETW 分钟聚合无远端五元组，未采不伪造）；
+/// - related：关联计数。
+pub fn api_diag_timeline_at(conn: &Connection, at_ms: i64, window_min: u32) -> Value {
+    let half = (window_min as i64) * 60_000 / 2;
+    let lo = at_ms - half;
+    let hi = at_ms + half;
+    let lo_s = chrono::DateTime::from_timestamp_millis(lo)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let hi_s = chrono::DateTime::from_timestamp_millis(hi)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let mut window_events: Vec<Value> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT timestamp, event_type, event_action, app_name FROM events \
+         WHERE timestamp >= ?1 AND timestamp <= ?2 ORDER BY timestamp, id LIMIT 100",
+    ) {
+        if let Ok(rows) = stmt.query_map(params![&lo_s, &hi_s], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        }) {
+            for r in rows.flatten() {
+                window_events.push(json!({
+                    "timestamp": r.0, "type": r.1, "action": r.2, "app": r.3,
+                }));
+            }
+        }
+    }
+    // 资源变化：窗口内网络桶按锚点前后分合计
+    let rows = kynoptic_core::db::net_metrics::query_net_process_minute(conn, window_min, hi);
+    let lo_bucket = lo.div_euclid(60_000);
+    let hi_bucket = hi.div_euclid(60_000);
+    let anchor_bucket = at_ms.div_euclid(60_000);
+    let (mut before, mut after) = (0i64, 0i64);
+    for r in &rows {
+        if r.minute_bucket < lo_bucket || r.minute_bucket > hi_bucket {
+            continue;
+        }
+        if r.minute_bucket < anchor_bucket {
+            before += r.bytes;
+        } else {
+            after += r.bytes;
+        }
+    }
+    let rc_quality = if rows.is_empty() {
+        "unavailable"
+    } else {
+        "confirmed"
+    };
+    json!({
+        "at_ms": at_ms,
+        "window_min": window_min,
+        "window_events": window_events,
+        "resource_change": {"before_bytes": before, "after_bytes": after,
+                            "quality": rc_quality,
+                            "note": "网络分钟桶锚点前/后合计（无源维度见 dest 口径）"},
+        "dest": {"quality": "unavailable",
+                 "reason": "ETW 分钟聚合不含远端地址，未采不伪造"},
+        "related": {"event_count": window_events.len()},
+    })
+}
+
 /// 路由侧实时 M3.1 证据：监听端口表（无需管理员）+ 进程名模式匹配 →
 /// 代理核心 pid 集；枚举失败 → (空, false) 显式降级（绝不伪造证据）。
 fn live_proxy_evidence() -> (Vec<u32>, bool) {
@@ -3134,6 +3354,50 @@ pub fn route_req(
             let (pids, avail) = live_proxy_evidence();
             let mut v = api_net_derived_with(conn, minutes_req, chrono::Utc::now().timestamp_millis(), &pids, avail);
             add_ignored(&mut v, ignored_params(&["minutes"]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/sys-overview") => {
+            let v = api_sys_overview_at(conn, db_path, chrono::Utc::now().timestamp_millis());
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/resource-top") => {
+            let minutes = match qnum("minutes", 1, 1440) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 60,
+                Ok(Some(m)) => m,
+            };
+            // 进程名解析：实时 Toolhelp 快照（与 live_proxy_evidence 同法，
+            // 无需管理员；解析不到的 pid 保持 null）
+            use kynoptic_core::monitors::net_etw::{ProcessIdentityCache, RealProcSource};
+            let mut cache = ProcessIdentityCache::default();
+            let mut proc_src = RealProcSource::new();
+            let now_s = chrono::Utc::now().timestamp() as u64;
+            cache.refresh(&mut proc_src, now_s);
+            let now_s_i = now_s as i64;
+            let name_of = move |pid: u32| -> Option<String> {
+                cache.resolve(pid, now_s_i).map(|(n, _)| n.to_string())
+            };
+            let mut v = api_resource_top_at(conn, minutes, chrono::Utc::now().timestamp_millis(), &name_of);
+            add_ignored(&mut v, ignored_params(&["minutes"]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/diag-timeline") => {
+            // at：epoch 毫秒锚点（必填）；window：± 窗口分钟（1-120，默认 10）
+            let at = match first_val("at") {
+                None => return (400, "application/json", err_json("at 不应为空（epoch 毫秒锚点）")),
+                Some("") => return (400, "application/json", err_json("at 不应为空（epoch 毫秒锚点）")),
+                Some(v) => match v.parse::<i64>() {
+                    Ok(n) if n > 0 => n,
+                    _ => return (400, "application/json", err_json("at 应为正整数 epoch 毫秒")),
+                },
+            };
+            let window = match qnum("window", 1, 120) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 10,
+                Ok(Some(w)) => w,
+            };
+            let mut v = api_diag_timeline_at(conn, at, window);
+            add_ignored(&mut v, ignored_params(&["at", "window"]));
             (200, "application/json", v.to_string())
         }
         ("GET", "/api/overview") => {
