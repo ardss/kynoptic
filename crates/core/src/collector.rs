@@ -392,6 +392,10 @@ pub struct MonitorStatSnapshot {
     pub last_duration_ms: u64,
     /// 连续慢采集次数（0 = 正常；>0 即处于退避状态）
     pub consecutive_slow: u32,
+    /// 进程级监控器降级事件计数（MONITOR_DEGRADED 快照，单调只增）。
+    /// 每个监控器条目都带同一进程级值（S0.1：让 note_degraded 的降级
+    /// 留痕经 /api/status 透出，前端诊断卡据此提示）。
+    pub degraded_count: u64,
 }
 
 /// 键为监控器名（= 注册表 id），BTreeMap 保证快照按名稳定排序。
@@ -421,14 +425,21 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 快照组装（纯函数）：age 由注入的 now 计算，测试用固定时刻断言。
-fn stat_snapshot(name: &str, s: &MonitorStatInner, now_epoch: u64) -> MonitorStatSnapshot {
+/// 快照组装（纯函数）：age 由注入的 now 计算、降级计数由调用方注入的
+/// degraded 传入，测试用固定值断言（本函数不读时钟也不读原子量）。
+fn stat_snapshot(
+    name: &str,
+    s: &MonitorStatInner,
+    now_epoch: u64,
+    degraded: u64,
+) -> MonitorStatSnapshot {
     MonitorStatSnapshot {
         name: name.to_string(),
         last_success_age_secs: (s.last_success_epoch > 0)
             .then(|| now_epoch.saturating_sub(s.last_success_epoch)),
         last_duration_ms: s.last_duration_ms,
         consecutive_slow: s.consecutive_slow,
+        degraded_count: degraded,
     }
 }
 
@@ -437,7 +448,10 @@ fn stat_snapshot(name: &str, s: &MonitorStatInner, now_epoch: u64) -> MonitorSta
 pub fn monitor_stats() -> Vec<MonitorStatSnapshot> {
     let map = MONITOR_STATS.lock().unwrap_or_else(|e| e.into_inner());
     let now = now_unix_secs();
-    map.iter().map(|(n, s)| stat_snapshot(n, s, now)).collect()
+    let degraded = crate::monitors::MONITOR_DEGRADED.load(std::sync::atomic::Ordering::Relaxed);
+    map.iter()
+        .map(|(n, s)| stat_snapshot(n, s, now, degraded))
+        .collect()
 }
 
 // ─── 采集器设置 ───────────────────────────────────────────────────────────────
@@ -2051,22 +2065,47 @@ mod tests {
             last_duration_ms: 1500,
             consecutive_slow: 2,
         };
-        let snap = stat_snapshot("gpu", &s, 1060);
+        let snap = stat_snapshot("gpu", &s, 1060, 0);
         assert_eq!(snap.name, "gpu");
         assert_eq!(snap.last_success_age_secs, Some(60));
         assert_eq!(snap.last_duration_ms, 1500);
         assert_eq!(snap.consecutive_slow, 2);
         let fresh = MonitorStatInner::default();
         assert_eq!(
-            stat_snapshot("x", &fresh, 999).last_success_age_secs,
+            stat_snapshot("x", &fresh, 999, 0).last_success_age_secs,
             None,
             "从未成功采集应为 null 而非 0"
         );
         assert_eq!(
-            stat_snapshot("x", &s, 999).last_success_age_secs,
+            stat_snapshot("x", &s, 999, 0).last_success_age_secs,
             Some(0),
             "时钟回拨时 age 饱和为 0 不下溢"
         );
+    }
+
+    /// S0.1：note_degraded 之后的 monitor_stats() 快照必须带非零
+    /// degraded_count（进程级 MONITOR_DEGRADED 经 /api/status 透出，
+    /// 前端诊断卡据此提示）。条目键名唯一避免与其他测试并行互扰；
+    /// 只断言 degraded_count 与条目存在，不碰快照里的 age（age 依赖
+    /// 真实时钟，测试铁律禁止读真实时钟）。
+    #[test]
+    fn monitor_stats_carries_nonzero_degraded_count_after_note_degraded() {
+        use std::sync::atomic::Ordering;
+        // 基线：先记一条统计，未降级时快照 degraded_count 与全局计数一致
+        record_monitor_stat("t-degraded-obs-s0", Duration::from_millis(10), 0, 1000);
+        let before = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+        crate::monitors::note_degraded("t-degraded-obs-s0 依赖故障（S0.1 测试注入）");
+        let snaps = monitor_stats();
+        let snap = snaps
+            .iter()
+            .find(|s| s.name == "t-degraded-obs-s0")
+            .expect("记录过的监控器必须出现在快照里");
+        assert_eq!(
+            snap.degraded_count,
+            before + 1,
+            "note_degraded 一次后 degraded_count 必须恰好 +1"
+        );
+        assert!(snap.degraded_count > 0, "degraded_count 必须非零");
     }
 
     /// 统计记录：时刻由调用方注入；同监控器后写覆盖先写。

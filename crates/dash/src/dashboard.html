@@ -837,23 +837,36 @@ async function loadStatus() {
   // 页脚鉴权声明跟随服务端实际状态（令牌已启用时不宣称"无需鉴权"）
   setFooterAuth(!!s.token_required);
   // 监控器采集诊断（性能治理）：s.monitors 每项含 name / last_success_age_secs
-  // / last_duration_ms / consecutive_slow。旧后端缺字段按空数组容错；只在有
-  // 监控器处于退避（连续慢采集）时占一行，正常时静默，不给状态行加噪音。
+  // / last_duration_ms / consecutive_slow / degraded_count。旧后端缺字段按空
+  // 数组容错；有监控器退避或进程内有降级事件时占一行，正常时静默，不给状态
+  // 行加噪音。monitors 为空（独立 serve 进程无采集器，跨进程透出另见 S2.3）
+  // 时显示"诊断不可用"提示而非静默——静默会让用户把盲区当健康。
   const msLine = document.getElementById("monitor-stats-line");
   if (msLine) {
+    const zhMs = document.documentElement.lang === "zh";
     const ms = Array.isArray(s.monitors) ? s.monitors : [];
-    const backing = ms.filter(function (m) { return m.consecutive_slow > 0; });
-    if (backing.length > 0) {
-      const zhMs = document.documentElement.lang === "zh";
-      const detail = backing.map(function (m) {
-        return m.name + " x" + m.consecutive_slow + " (" + (m.last_duration_ms ?? "?") + "ms)";
-      }).join(", ");
+    if (ms.length === 0) {
       msLine.style.display = "";
       msLine.textContent = zhMs
-        ? "采集诊断：以下监控器连续慢采集已退避 —— " + detail
-        : "collector diagnostics: monitors in slow-collect backoff — " + detail;
+        ? "采集诊断不可用：此服务进程内无采集器（跨进程透出待后续切片）"
+        : "collector diagnostics unavailable: no collector in this serve process (cross-process passthrough pending)";
     } else {
-      msLine.style.display = "none";
+      const degraded = ms.length > 0 ? (ms[0].degraded_count ?? 0) : 0;
+      const backing = ms.filter(function (m) { return m.consecutive_slow > 0; });
+      if (backing.length > 0 || degraded > 0) {
+        const detail = backing.map(function (m) {
+          return m.name + " x" + m.consecutive_slow + " (" + (m.last_duration_ms ?? "?") + "ms)";
+        }).join(", ");
+        const degTxt = degraded > 0
+          ? (zhMs ? " · 降级事件 " + degraded + " 次" : " · " + degraded + " degraded event(s)")
+          : "";
+        msLine.style.display = "";
+        msLine.textContent = zhMs
+          ? "采集诊断：" + (backing.length > 0 ? "以下监控器连续慢采集已退避 —— " + detail : "监控器运行中") + degTxt
+          : "collector diagnostics: " + (backing.length > 0 ? "monitors in slow-collect backoff — " + detail : "monitors running") + degTxt;
+      } else {
+        msLine.style.display = "none";
+      }
     }
   }
   if (!s.last_event_ts) {

@@ -264,6 +264,30 @@ fn status_reflects_last_event_ts() {
     );
 }
 
+/// S0.1：api_status 的 monitors 必须是 core monitor_stats() 的原样透传
+/// （serde 直出，含 degraded_count 等全部字段）；独立 serve 测试进程无
+/// 采集器，恒为空数组——跨进程透出另见 S2.3。条目内字段（含
+/// note_degraded 后 degraded_count 非零）由 core 侧
+/// monitor_stats_carries_nonzero_degraded_count_after_note_degraded 覆盖。
+#[test]
+fn status_monitors_is_passthrough_array() {
+    let conn = mem_conn();
+    let v = api_status(&conn, Path::new("/tmp/x.db"));
+    assert!(
+        v["monitors"].is_array(),
+        "monitors 必须是数组: {}",
+        v["monitors"]
+    );
+    assert!(
+        v["monitors"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        "测试进程无采集器，monitors 应为空数组: {}",
+        v["monitors"]
+    );
+}
+
 // === watchdog 告警/恢复配对（修复：告警只有「发生」没有「解除」，采集
 // 恢复后横幅最长滞留 24h） ===
 
