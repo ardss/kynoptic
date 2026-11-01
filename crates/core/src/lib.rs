@@ -5,6 +5,7 @@ pub mod config;
 pub mod constants;
 pub mod daily_agg;
 pub mod db;
+pub mod diag_mode;
 pub mod error;
 pub mod heatmap;
 pub mod input_agg;

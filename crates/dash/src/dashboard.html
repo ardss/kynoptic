@@ -561,6 +561,11 @@
     <span class="muted" id="set-port-actual" style="font-size:11px"></span>
   </div>
   <div class="mon-row">
+    <span class="muted" style="font-size:12px"><span class="l en">diagnostic mode</span><span class="l zh">诊断模式</span>:</span>
+    <span id="set-diag-mode" class="badge">–</span>
+    <span class="muted" id="set-diag-remaining" style="font-size:11px"></span>
+  </div>
+  <div class="mon-row">
     <input type="checkbox" id="set-counts" checked>
     <label for="set-counts"><span class="l en">store keyboard/mouse as per-minute counts only (recommended). UNCHECKING switches to raw per-keystroke logging — full key content is recorded.</span>
     <span class="l zh">仅按分钟计数保存键盘/鼠标输入（推荐）。取消勾选将切换为逐键原始记录——记录完整按键内容，请谨慎关闭。</span></label>
@@ -845,6 +850,25 @@ function toggleLang() {
    切换中/英——Overview 卡片与 24h 时间线图例应立即变为目标语言，无需等 30 秒
    轮询；3) 切到"报告"页重复一次，热力图悬浮单位（min/分钟）应同步切换。 */
 /* ─── 状态行 / Overview ─── */
+async function updateDiagFields(diag) {
+  // M4.2 诊断模式设置页字段回填（当前模式 + 剩余时长；默认 basic/关）
+  const modeEl = document.getElementById("set-diag-mode");
+  const remEl = document.getElementById("set-diag-remaining");
+  if (!modeEl) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  const diagOn = diag.mode === "diagnostic";
+  modeEl.textContent = diagOn ? (lang === "zh" ? "诊断中" : "diagnostic")
+                              : (lang === "zh" ? "关（基础模式）" : "off (basic)");
+  modeEl.className = "badge " + (diagOn ? "q-confirmed" : "q-unavailable");
+  if (remEl) {
+    if (diagOn && diag.remaining_ms > 0) {
+      remEl.textContent = (lang === "zh" ? "剩余 " : "remaining ") +
+        Math.ceil(diag.remaining_ms / 60000) + (lang === "zh" ? " 分钟（到时自动恢复基础模式）" : " min (auto-reverts to basic)");
+    } else {
+      remEl.textContent = "";
+    }
+  }
+}
 async function loadStatus() {
   const s = await jget("/api/status");
   const el = document.getElementById("status-line");
@@ -853,6 +877,8 @@ async function loadStatus() {
   if (el) el.style.color = "";
   // 页脚鉴权声明跟随服务端实际状态（令牌已启用时不宣称"无需鉴权"）
   setFooterAuth(!!s.token_required);
+  // M4.2 诊断模式设置页字段（diag 块缺省容错：旧后端无此字段时静默）
+  if (s.diag) updateDiagFields(s.diag);
   // 监控器采集诊断（性能治理）：s.monitors 每项含 name / last_success_age_secs
   // / last_duration_ms / consecutive_slow / degraded_count。旧后端缺字段按空
   // 数组容错；有监控器退避或进程内有降级事件时占一行，正常时静默，不给状态

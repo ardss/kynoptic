@@ -734,6 +734,30 @@ static ACCESS_TOKEN_ENABLED: std::sync::atomic::AtomicBool =
 ///（此前配置值 8422 与实际回退端口在 UI 上无从对照）。
 static ACTUAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
+/// M4.2 诊断模式控制器（serve 进程视角；采集进程的控制器经后续切片接线，
+/// 独立 serve 进程恒 Basic——与 monitors 统计的跨进程盲区同口径，前端容错）。
+static DIAG_CONTROLLER: std::sync::LazyLock<
+    std::sync::Mutex<kynoptic_core::diag_mode::DiagnosticController>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(kynoptic_core::diag_mode::DiagnosticController::new())
+});
+
+/// 诊断模式当前状态块（设置页消费；now 由调用方注入）。
+fn diag_status_json(now_ms: i64) -> Value {
+    let c = DIAG_CONTROLLER.lock().unwrap();
+    json!({
+        "mode": match c.state {
+            kynoptic_core::diag_mode::DiagState::Basic => "basic",
+            kynoptic_core::diag_mode::DiagState::Diagnostic => "diagnostic",
+        },
+        "remaining_ms": c.remaining_ms(now_ms),
+        "budget_cpu_percent_single_core": kynoptic_core::diag_mode::DIAG_BUDGET_CPU_PERCENT_SINGLE_CORE,
+        "budget_rss_mib": kynoptic_core::diag_mode::DIAG_BUDGET_RSS_MIB,
+        "hard_max_duration_ms": kynoptic_core::diag_mode::DIAG_HARD_MAX_DURATION_MS,
+        "last_forced_reason": c.last_forced_reason,
+    })
+}
+
 /// 实际监听端口（0 = 未知，调用方自行判空）。
 pub fn actual_port() -> u16 {
     ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed)
@@ -842,6 +866,8 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         "actual_port": ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed),
         // 近 24h 看门狗告警（null = 无），面板顶部横幅消费
         "watchdog_alert": latest_watchdog_alert(conn),
+        // M4.2 诊断模式（默认关 basic；设置页展示当前模式与剩余时长）
+        "diag": diag_status_json(chrono::Utc::now().timestamp_millis()),
         // 监控器采集统计（性能治理）：每项含 name / last_success_age_secs /
         // last_duration_ms / consecutive_slow，来源为 core 采集侧进程级静态量
         // （kynoptic_core::collector::monitor_stats）。独立 serve 进程无采集器，

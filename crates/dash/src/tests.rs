@@ -2972,3 +2972,36 @@ fn net_derived_endpoint_route_and_bad_minutes() {
     let (code, _, _) = route_req(&conn, "GET", "/api/net-derived?minutes=0", "", &db);
     assert_eq!(code, 400);
 }
+
+// === M4.2: 诊断模式（设置页字段 + /api/status diag 块） ===
+
+#[test]
+fn diag_mode_status_fields_and_settings_page() {
+    // /api/status 回 diag 块：默认 basic（诊断模式默认关）、剩余 0、
+    // 深诊档资源预算上限随块下发（设置页展示契约）
+    let conn = mem_conn();
+    let dir = tmpdir("diagmode");
+    let db = dir.join("kyn.db");
+    let (code, _, body) = route_req(&conn, "GET", "/api/status", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["diag"]["mode"], json!("basic"), "诊断模式必须默认关");
+    assert_eq!(v["diag"]["remaining_ms"], json!(0));
+    assert_eq!(
+        v["diag"]["budget_cpu_percent_single_core"],
+        json!(kynoptic_core::diag_mode::DIAG_BUDGET_CPU_PERCENT_SINGLE_CORE)
+    );
+    assert_eq!(
+        v["diag"]["budget_rss_mib"],
+        json!(kynoptic_core::diag_mode::DIAG_BUDGET_RSS_MIB)
+    );
+    // 设置页字段：当前模式 + 剩余时长（id 契约，前端 JS 回填）
+    assert!(
+        DASHBOARD_HTML.contains("set-diag-mode"),
+        "设置页须有诊断模式字段"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("set-diag-remaining"),
+        "设置页须有剩余时长字段"
+    );
+}
