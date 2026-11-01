@@ -829,11 +829,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-core"
-<<<<<<< HEAD
-version = "0.7.0"
-=======
-version = "0.6.0"
->>>>>>> origin/main
+version = "0.8.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -849,11 +845,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-dash"
-<<<<<<< HEAD
-version = "0.7.0"
-=======
-version = "0.6.0"
->>>>>>> origin/main
+version = "0.8.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
@@ -867,11 +859,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-mcp"
-<<<<<<< HEAD
-version = "0.7.0"
-=======
-version = "0.6.0"
->>>>>>> origin/main
+version = "0.8.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
@@ -883,11 +871,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-tray"
-<<<<<<< HEAD
-version = "0.7.0"
-=======
-version = "0.6.0"
->>>>>>> origin/main
+version = "0.8.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
