@@ -30,6 +30,7 @@ pub mod device;
 pub mod idle;
 pub mod net_etw;
 pub mod network;
+pub mod plan_probe;
 pub mod power_plan;
 pub mod process;
 pub mod proxy_link;
