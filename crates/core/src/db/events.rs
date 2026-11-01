@@ -31,11 +31,14 @@ ON CONFLICT(timestamp, event_type) WHERE event_action = 'input_agg'
 DO UPDATE SET event_data = excluded.event_data
 ";
 
-/// input_agg 行的 agg 维护 rowid 回查：按部分唯一索引键（timestamp,
-/// event_type；谓词 event_action='input_agg'，migration 0005
-/// ux_input_agg_minute）取真实 events.id。execute 刚成功，行必在
-/// （INSERT 新行或 DO UPDATE 覆盖原行），回查不会落空。
-const INPUT_AGG_ROWID_SQL: &str = "
+/// input_agg 行的部分唯一索引键预查（migration 0005 ux_input_agg_minute）：
+/// UPSERT **前**判定该键是否已存在——存在则本次走 DO UPDATE 覆盖（行数 +0），
+/// 不存在则 INSERT 分支新插入（行数 +1，且 last_insert_rowid 此时有效——旧
+/// 实现在 UPSERT **后**回查正是为了避开 DO UPDATE 路径的 last_insert_rowid
+/// 残留，S1.2 起预查一并替代该回查：命中即得真实 id，未命中由 INSERT 分支的
+/// last_insert_rowid 取新 id，两者皆精确）。O(log N) 索引命中，供水位增量
+/// 判定与聚合维护 id 双用。
+const INPUT_AGG_EXISTENCE_SQL: &str = "
 SELECT id FROM events
 WHERE timestamp = ?1 AND event_type = ?2 AND event_action = 'input_agg'
 ";
@@ -77,12 +80,8 @@ fn normalize_timestamp(ts: &str) -> String {
 /// 单条事件落库（input_agg 行走 UPSERT，其余 INSERT）。返回该行的 events
 /// rowid（input_agg 聚合行无稳定新 rowid，返回 0，与旧 insert_events 语义
 /// 一致——对外契约，见 [`execute_event_rowids`] 返回值 .0）。
-fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
-    execute_event_rowids(tx, e, false).map(|(rowid, _)| rowid)
-}
-
-/// 单条事件落库 + rowid 双语义拆分（rowid/聚合契约统一批）。返回
-/// `(对外 rowid, agg 维护 rowid)`：
+/// 单条事件落库 + rowid 双语义拆分 + 新行判定（rowid/聚合/水位增量契约统一
+/// 批）。返回 `(对外 rowid, agg 维护 rowid, 新增行数)`：
 ///
 /// - **对外 rowid**（.0）：既有契约不变——input_agg 行恒 0。消费方锚点：
 ///   collector 失败行判据（「r==0 且 action!=InputAgg」才逐条重试）、
@@ -90,27 +89,63 @@ fn execute_event(tx: &Connection, e: &Event) -> rusqlite::Result<i64> {
 ///   is_explicit_for_pure_input_agg_batch 等）。
 /// - **agg 维护 rowid**（.1）：传给 `agg::apply_event` 的**真实** events.id，
 ///   供混合分钟探测与 max_event_rowid 守卫使用。input_agg 行按部分唯一索引
-///   键回查（[`INPUT_AGG_ROWID_SQL`]）——**禁用 last_insert_rowid**：UPSERT
-///   的 DO UPDATE 路径不更新该值，会返回上一条 INSERT 路径的残留 id（实测
-///   返无关行的残留值），喂给聚合维护即探测/守卫全错。raw 行两值相同。
-///   `with_agg_id=false` 时不回查（`insert_events` 无聚合维护路径零开销）。
+///   预查取 id（[`INPUT_AGG_EXISTENCE_SQL`]，S1.2 起预查在 UPSERT 前执行，
+///   命中即得原行 id；未命中走 INSERT 分支后 last_insert_rowid 有效——
+///   **禁用 UPSERT 后的 last_insert_rowid**：DO UPDATE 路径不更新该值，会
+///   返回上一条 INSERT 路径的残留 id，喂给聚合维护即探测/守卫全错）。
+///   raw 行两值相同。`with_agg_id=false` 时 input_agg 行 agg rowid 记 0
+///   （`insert_events` 无聚合维护路径）。
+/// - **新增行数**（.2，S1.2）：本行对 events 行数的净贡献——raw 行成功 +1、
+///   失败不计；input_agg 行 INSERT 分支 +1、DO UPDATE 覆盖 +0。批量路径把
+///   各行贡献求和喂给 [`super::bump_events_watermark`]（O(1) 增量水位，
+///   替代每批 O(N) COUNT(*)），其口径一致性由
+///   incremental_watermark_matches_count_over_random_insert_delete_sequence
+///   钉住。
 fn execute_event_rowids(
     tx: &Connection,
     e: &Event,
     with_agg_id: bool,
-) -> rusqlite::Result<(i64, i64)> {
+) -> rusqlite::Result<(i64, i64, i64)> {
     let data_str = e.event_data.as_ref().map(|v| v.to_string());
     // 审查 HIGH：写库统一规范化时间戳（见 normalize_timestamp），
     // 保证字符串范围谓词（timestamp >= ?1 AND < ?2）语义正确
     let ts = normalize_timestamp(&e.timestamp);
     // input_agg 聚合行走 UPSERT（同分钟同类型覆盖），其余照旧 INSERT
     let is_agg = e.event_action == crate::types::EventAction::InputAgg;
-    // prepare_cached 复用 prepared statement 计划，避免每行重新 prepare/finalize
-    let mut stmt = tx.prepare_cached(if is_agg {
-        UPSERT_INPUT_AGG_SQL
-    } else {
-        INSERT_SQL
-    })?;
+    if is_agg {
+        // 预查（O(log N) 部分唯一索引）：既判新行供水位增量，又取真实 id
+        let existed: Option<i64> = tx
+            .query_row(
+                INPUT_AGG_EXISTENCE_SQL,
+                params![ts, e.event_type.as_str()],
+                |r| r.get(0),
+            )
+            .ok();
+        // prepare_cached 复用 prepared statement 计划，避免每行重新 prepare/finalize
+        let mut stmt = tx.prepare_cached(UPSERT_INPUT_AGG_SQL)?;
+        stmt.execute(params![
+            ts,
+            e.event_type.as_str(),
+            e.event_action.as_str(),
+            data_str,
+            e.app_name,
+            e.window_title,
+            e.session_id,
+        ])?;
+        let agg_rowid = match existed {
+            Some(id) => id, // DO UPDATE 覆盖：行数 +0，id 不变
+            None => {
+                // INSERT 分支：行数 +1；此时 last_insert_rowid 即新行 id
+                if with_agg_id {
+                    tx.last_insert_rowid()
+                } else {
+                    0
+                }
+            }
+        };
+        return Ok((0, agg_rowid, if existed.is_none() { 1 } else { 0 }));
+    }
+    let mut stmt = tx.prepare_cached(INSERT_SQL)?;
     stmt.execute(params![
         ts,
         e.event_type.as_str(),
@@ -120,17 +155,8 @@ fn execute_event_rowids(
         e.window_title,
         e.session_id,
     ])?;
-    let external = if is_agg { 0 } else { tx.last_insert_rowid() };
-    let agg_rowid = if is_agg && with_agg_id {
-        tx.query_row(
-            INPUT_AGG_ROWID_SQL,
-            params![ts, e.event_type.as_str()],
-            |r| r.get(0),
-        )?
-    } else {
-        external
-    };
-    Ok((external, agg_rowid))
+    let external = tx.last_insert_rowid();
+    Ok((external, external, 1))
 }
 
 impl Database {
@@ -228,13 +254,21 @@ impl Database {
         };
         let tx = conn.unchecked_transaction()?;
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
+        // S1.2 增量水位：累计本批真实新增行数（raw 成功 +1；input_agg 预检
+        // INSERT 分支 +1、DO UPDATE 覆盖 +0），事务内 O(1) 累加进水位——
+        // 取代每批 SELECT COUNT(*) 的 O(N) 全索引扫描（写锁持有时间不再随
+        // 库行数增长）。批回滚时累加随事务一并回滚。
+        let mut new_rows = 0i64;
         for e in events {
-            rowids.push(execute_event(&tx, e)?);
+            let (rowid, _, added) = execute_event_rowids(&tx, e, false)?;
+            new_rows += added;
+            rowids.push(rowid);
         }
         // 与事件写入同事务推进 events 水位（WAL 静默蒸发防护，见
-        // db::persist_events_watermark；W33-F2 起水位为 COUNT(*) 口径）：本批
-        // 提交后把行数一并刷新，回滚时水位随之回滚，不会留下「水位超前数据」。
-        super::persist_events_watermark(&tx);
+        // db::persist_events_watermark；W33-F2 起水位为行数口径，S1.2 起
+        // 批路径 O(1) 增量累加）：本批提交后水位即含本批，回滚时水位随之
+        // 回滚，不会留下「水位超前数据」。
+        super::bump_events_watermark(&tx, new_rows);
         tx.commit()?;
         Ok(rowids)
     }
@@ -245,21 +279,28 @@ impl Database {
         };
         let tx = conn.unchecked_transaction()?;
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
+        // S1.2 增量水位（同 insert_events_tx）：按行精确累计真实新增行数，
+        // 事务内 O(1) 累加，取代每批 O(N) COUNT(*)（口径一致性见
+        // incremental_watermark_matches_count_over_random_insert_delete_sequence）
+        let mut new_rows = 0i64;
         for e in events {
             // rowid 双语义（混合分钟契约统一批）：对外返回值保持 input_agg→0
-            // 契约，聚合维护拿真实 id（input_agg 行按部分唯一索引键回查）——
-            // 此前传 0 使 detect_mixed_minute 生产永不命中，混合分钟重算为
-            // 死代码（快照 MAX 吞 raw 段计数，agg 与 events SUM 分叉）。
-            let (rowid, agg_rowid) = execute_event_rowids(&tx, e, true)?;
+            // 契约，聚合维护拿真实 id（input_agg 行按部分唯一索引预查/INSERT
+            // 分支 last_insert_rowid 取得）——此前传 0 使 detect_mixed_minute
+            // 生产永不命中，混合分钟重算为死代码（快照 MAX 吞 raw 段计数，
+            // agg 与 events SUM 分叉）。
+            let (rowid, agg_rowid, added) = execute_event_rowids(&tx, e, true)?;
+            new_rows += added;
             // 聚合增量与事件写入同事务：max_event_rowid 守卫保留作为幂等兜底
             // （事务化后"回填重算与增量并发"的交错窗口消失，重复投递仍被跳过）
             super::agg::apply_event(&tx, e, agg_rowid)?;
             rowids.push(rowid);
         }
         // 同事务推进 events 水位（WAL 静默蒸发防护，见 db::persist_events_
-        // watermark）：events+agg+水位同生共死，回滚时一并回滚。纯 input_agg
-        // 批无新行时行数不变，重写同值无害；同分钟首写新增一行则计入。
-        super::persist_events_watermark(&tx);
+        // watermark；W33-F2 起行数口径，S1.2 起批路径 O(1) 增量）：events+
+        // agg+水位同生共死，回滚时一并回滚。纯 input_agg 覆盖批无新行时
+        // delta=0 跳过写；同分钟首写新增一行则计入。
+        super::bump_events_watermark(&tx, new_rows);
         tx.commit()?;
         Ok(rowids)
     }
@@ -288,21 +329,29 @@ impl Database {
         let mut rowids: Vec<i64> = Vec::with_capacity(events.len());
         let mut failed_rows = 0usize;
         let mut first_error: Option<String> = None;
+        // S1.2 增量水位：只累计**已提交**子批/单条的真实新增行数，收尾一次
+        // O(1) 累加（回滚的子批不计——与旧行为「收尾按 COUNT(*) 刷新」对
+        // 已提交内容的口径等价）
+        let mut committed_new_rows = 0i64;
 
         for chunk in events.chunks(Self::FALLBACK_CHUNK_SIZE) {
             match self.write_chunk_tx(chunk, with_agg) {
-                Some(ids) => rowids.extend(ids),
+                Some((ids, added)) => {
+                    committed_new_rows += added;
+                    rowids.extend(ids);
+                }
                 // 子批级失败（写连接/事务创建失败，或行级冲突触发回滚）：退回
                 // 逐条重试（保持旧「每条独立取锁」语义），短暂锁竞争不会整
                 // 子批跳过。
                 None => {
                     for e in chunk {
-                        let id = self.write_row_degraded(
+                        let (id, added) = self.write_row_degraded(
                             e,
                             with_agg,
                             &mut failed_rows,
                             &mut first_error,
                         );
+                        committed_new_rows += added;
                         rowids.push(id);
                     }
                 }
@@ -319,11 +368,12 @@ impl Database {
             );
         }
 
-        // 降级路径收尾：整批处理完（无论逐条成败）统一推进一次 events 水位，
-        // 覆盖本批已提交行；写连接不可用时 with_writer 自动跳过。
+        // 降级路径收尾：整批处理完（无论逐条成败）统一推进一次 events 水位
+        // （S1.2 起 O(1) 增量累加已提交新增行数），写连接不可用时 with_writer
+        // 自动跳过。
         self.with_writer(
             |conn| {
-                super::persist_events_watermark(conn);
+                super::bump_events_watermark(conn, committed_new_rows);
             },
             || (),
         );
@@ -333,34 +383,38 @@ impl Database {
     /// 子批事务：单事务写一个子批（with_agg 时聚合维护同事务，与整批路径
     /// 同语义），全行成功才提交；任一行级冲突或提交失败即回滚返回 None
     /// （事务随 tx 丢弃而回滚），由调用方把该子批退回逐条。
-    fn write_chunk_tx(&self, chunk: &[Event], with_agg: bool) -> Option<Vec<i64>> {
+    fn write_chunk_tx(&self, chunk: &[Event], with_agg: bool) -> Option<(Vec<i64>, i64)> {
         let conn = lock_writer(&self.writer, &self.db_path)?;
         let tx = conn.unchecked_transaction().ok()?;
         let mut ids = Vec::with_capacity(chunk.len());
+        let mut new_rows = 0i64;
         for e in chunk {
             // rowid 双语义同整批路径（见 execute_event_rowids）：对外 push
-            // input_agg→0 契约值，聚合维护拿回查后的真实 id
-            let (rowid, agg_rowid) = execute_event_rowids(&tx, e, with_agg).ok()?;
+            // input_agg→0 契约值，聚合维护拿回查后的真实 id；added 为本行
+            // 对行数的净贡献（S1.2 增量水位）
+            let (rowid, agg_rowid, added) = execute_event_rowids(&tx, e, with_agg).ok()?;
+            new_rows += added;
             if with_agg {
                 super::agg::apply_event(&tx, e, agg_rowid).ok()?;
             }
             ids.push(rowid);
         }
         tx.commit().ok()?;
-        Some(ids)
+        Some((ids, new_rows))
     }
 
     /// 逐条降级写（子批级失败后的兜底，即旧逐条路径主体）：独立取锁 + 独立
-    /// 事务。失败记一行计数并返回 0（rowid 0 被 agg 维护的 max_event_rowid
-    /// 守卫跳过，不重复累计）；只保留首条错误供批末汇总日志——逐条日志/
-    /// 计数禁止（洪水 + 虚高，见 insert_one_by_one_impl 限流说明）。
+    /// 事务。失败记一行计数并返回 (0, 0)（rowid 0 被 agg 维护的 max_event_
+    /// rowid 守卫跳过，不重复累计；S1.2 新增行数 0 同样不进水位增量）；只
+    /// 保留首条错误供批末汇总日志——逐条日志/计数禁止（洪水 + 虚高，见
+    /// insert_one_by_one_impl 限流说明）。返回 (对外 rowid, 新增行数)。
     fn write_row_degraded(
         &self,
         e: &Event,
         with_agg: bool,
         failed_rows: &mut usize,
         first_error: &mut Option<String>,
-    ) -> i64 {
+    ) -> (i64, i64) {
         let mut record_fail = |err: String| {
             *failed_rows += 1;
             if first_error.is_none() {
@@ -369,33 +423,33 @@ impl Database {
         };
         let Some(conn) = lock_writer(&self.writer, &self.db_path) else {
             record_fail("写连接不可用".to_string());
-            return 0;
+            return (0, 0);
         };
         let Ok(tx) = conn.unchecked_transaction() else {
             record_fail("事务创建失败".to_string());
-            return 0;
+            return (0, 0);
         };
         // 降级路径 input_agg 行同样必须走 UPSERT（裸 INSERT 撞部分唯一
         // 索引会静默丢行，且关停 flush 无自愈）。rowid 双语义同整批路径
         // （见 execute_event_rowids）
-        let result = (|| -> rusqlite::Result<i64> {
-            let (rowid, agg_rowid) = execute_event_rowids(&tx, e, with_agg)?;
+        let result = (|| -> rusqlite::Result<(i64, i64)> {
+            let (rowid, agg_rowid, added) = execute_event_rowids(&tx, e, with_agg)?;
             if with_agg {
                 super::agg::apply_event(&tx, e, agg_rowid)?;
             }
-            Ok(rowid)
+            Ok((rowid, added))
         })();
         match result {
-            Ok(rowid) => match tx.commit() {
-                Ok(()) => rowid,
+            Ok((rowid, added)) => match tx.commit() {
+                Ok(()) => (rowid, added),
                 Err(c) => {
                     record_fail(format!("单条提交失败: {c}"));
-                    0
+                    (0, 0)
                 }
             },
             Err(err) => {
                 record_fail(format!("单条事件写入失败: {err}"));
-                0
+                (0, 0)
             }
         }
     }
@@ -601,8 +655,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 结构性修复（WAL 静默蒸发防护 2026-09；W33-F2 起水位改 COUNT(*) 口径）：
-    /// 每次批量事件落库后把 events 水位（行数）与写入同事务推进持久化——
+    /// 结构性修复（WAL 静默蒸发防护 2026-09；W33-F2 起水位改行数口径，
+    /// S1.2 起批路径按行增量累加）：每次批量事件落库后把 events 水位与写入
+    /// 同事务推进持久化——
     /// 此前水位只在正常停机写一次，「停机后写入再丢失」整段不可检测。
     /// 此测试锚定新行为：批量提交后 metadata 水位即等于当前 COUNT(*)，
     /// input_agg 批首写新增一行时行数随之推进。
