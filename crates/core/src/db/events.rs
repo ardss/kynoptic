@@ -433,6 +433,14 @@ impl Database {
                     let deleted = conn.execute("DELETE FROM events WHERE timestamp < ?1", [&cutoff_str]);
                     let daily = conn.execute("DELETE FROM daily_agg WHERE date < ?1", [&cutoff_date]);
                     let minute = conn.execute("DELETE FROM agg_minute WHERE date < ?1", [&cutoff_date]);
+                    // S1.1：actor 证据缓存（0.4.0 F1）此前是清理盲区——agg_minute
+                    // 被清而 agg_minute_actor 留下孤儿行，表只增不减。与下面
+                    // agg_daily 同界同事务（不变量见测试
+                    // raw_and_agg_minute_actor_cleanup_are_synchronized）。
+                    let minute_actor = conn.execute(
+                        "DELETE FROM agg_minute_actor WHERE date < ?1",
+                        [&cutoff_date],
+                    );
                     let app = conn.execute(
                         "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
                         [&cutoff_date],
@@ -445,7 +453,7 @@ impl Database {
                     // 水位 upsert 之间被强杀/断电时，持久化水位仍停在清理前
                     // 行数 → 下次 open 假报「回退」。移进同事务后删行与水位
                     // 推进随 COMMIT 原子落库，事务失败回滚时水位也一并还原。
-                    let deleted = (deleted?, daily?, minute?, app?);
+                    let deleted = (deleted?, daily?, minute?, minute_actor?, app?);
                     if deleted.0 > 0 {
                         super::persist_events_watermark(conn);
                     }
@@ -740,6 +748,155 @@ mod tests {
             }
         }
         out
+    }
+
+    /// S1.1 测试注入：retention_days 是 db 模块私有字段（生产默认 0 = 永不
+    /// 删除），同模块测试可直接写值；不新增公开 setter（避免生产 API 面
+    /// 扩大）。
+    fn set_retention_days(db: &mut Database, days: i64) {
+        db.retention_days = days;
+    }
+
+    /// 造两条跨保留期边界的事件（raw + with_agg 同事务，agg_minute 与
+    /// agg_minute_actor 各两行）：`old_ts` 在保留期外，`recent_ts` 在保留期内。
+    /// 时间全部相对 now 计算（过期/存留分界由 60d vs 30d vs 1h 的余量保证，
+    /// 不依赖真实时钟的绝对值）。
+    fn seed_across_retention_boundary(db: &Database) {
+        let fmt =
+            |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+        let old = fmt(chrono::Utc::now() - chrono::Duration::days(60));
+        let recent = fmt(chrono::Utc::now() - chrono::Duration::hours(1));
+        for ts in [old, recent] {
+            let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+            e.timestamp = ts;
+            let (rowids, failed) = db.insert_events_with_agg(std::slice::from_ref(&e));
+            assert!(!failed, "正常写入不得失败");
+            assert!(
+                rowids.iter().any(|&r| r != 0),
+                "raw 行必须有真实 rowid（写入成功前置）"
+            );
+        }
+    }
+
+    fn count(db: &Database, sql: &str) -> i64 {
+        db.reader().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// S1.1：设置 retention 后，过期的 agg_minute_actor 行必须被一并清理，
+    /// 保留期内的 actor 行不得误删（actor 证据缓存此前是清理盲区——
+    /// 删了 events/agg_minute 留下 actor 孤儿行，表只增不减）。
+    #[test]
+    fn retention_cleanup_clears_expired_agg_minute_actor_rows() {
+        let dir = tmp_dir("s11actor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Database::open(dir.join("s11actor.db").to_str().unwrap()).unwrap();
+        seed_across_retention_boundary(&db);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM agg_minute_actor"),
+            2,
+            "前置：新旧两个日历日各一条 actor 行"
+        );
+
+        set_retention_days(&mut db, 30);
+        let deleted = db.cleanup_old_events();
+        assert_eq!(deleted, 1, "只应删除保留期外的原始事件（60 天前那条）");
+
+        // 过期 actor 行被清、存留 actor 行保留
+        let remaining: i64 = count(&db, "SELECT COUNT(*) FROM agg_minute_actor");
+        assert_eq!(remaining, 1, "过期 actor 行必须被清理，存留行不得误删");
+
+        // 与生产清理同口径的边界（本地日历日字符串比较）：残留 actor 行的
+        // date 必须全部 >= cutoff_date
+        let cutoff_date = (chrono::Utc::now() - chrono::Duration::days(30))
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        let reader = db.reader();
+        let mut stmt = reader
+            .prepare("SELECT date FROM agg_minute_actor ORDER BY date")
+            .unwrap();
+        let dates: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!dates.is_empty());
+        for d in &dates {
+            assert!(
+                d.as_str() >= cutoff_date.as_str(),
+                "残留 actor 行日期 {d} 必须不早于清理边界 {cutoff_date}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// events.rs「原始与聚合必须同事务一并清理」不变量测试化（S1.1 扩展到
+    /// agg_minute_actor）：清理后 actor 表的日期覆盖必须与存活原始事件的
+    /// 本地日历日覆盖**完全一致**——不留孤儿 actor 行（展示已清理日期），
+    /// 也不误删仍在保留期内的 actor 行（与 raw 视图对不上）。
+    #[test]
+    fn raw_and_agg_minute_actor_cleanup_are_synchronized() {
+        let dir = tmp_dir("s11sync");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Database::open(dir.join("s11sync.db").to_str().unwrap()).unwrap();
+
+        // 三档日期：60d（过期删）、10d（保留期内留）、当天（留）
+        let fmt =
+            |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+        for offset in [-60i64, -10, 0] {
+            let ts = fmt(chrono::Utc::now()
+                + chrono::Duration::days(offset)
+                + chrono::Duration::hours(12));
+            let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+            e.timestamp = ts;
+            let (rowids, failed) = db.insert_events_with_agg(std::slice::from_ref(&e));
+            assert!(!failed);
+            assert!(rowids.iter().any(|&r| r != 0));
+        }
+
+        set_retention_days(&mut db, 30);
+        let deleted = db.cleanup_old_events();
+        assert_eq!(deleted, 1, "只有 60 天前那条过期");
+
+        // 存活原始事件的本地日历日集合
+        let reader = db.reader();
+        let mut stmt = reader.prepare("SELECT timestamp FROM events").unwrap();
+        let surviving_days: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, rusqlite::Error>>()
+            .unwrap()
+            .iter()
+            .map(|ts| {
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(surviving_days.len(), 2, "应剩 10 天前 + 当天两行");
+
+        // actor 表日期集合
+        let mut stmt = reader
+            .prepare("SELECT DISTINCT date FROM agg_minute_actor ORDER BY date")
+            .unwrap();
+        let actor_days: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let mut raw_set = surviving_days.clone();
+        raw_set.sort();
+        raw_set.dedup();
+        assert_eq!(
+            actor_days, raw_set,
+            "actor 日期覆盖必须与存活原始事件的日历日覆盖一致（无孤儿行、无误删行）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 混合分钟 parity 走生产入口（探针A 序列，rowid/聚合契约统一批）。
