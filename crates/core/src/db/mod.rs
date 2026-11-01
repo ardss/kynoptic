@@ -1386,11 +1386,14 @@ mod tests {
         t0.elapsed().as_secs_f64() * 1000.0 / batches as f64
     }
 
-    /// S1.2 验收②（计时断言近似）：千万行级模拟库下，每批 flush 的写锁
-    /// 持有时间不得随行数增长。对照法：同一批大小分别打 1 千行库与
-    /// 1 千万行库，修复前大库每批都要 SELECT COUNT(*) 全索引扫描
-    /// （O(N)），单批耗时远高于小库；修复后水位增量为 O(1)，两者应
-    /// 同量级（阈值放宽到 5 倍以容忍索引插入与缓存暖机的正常差异）。
+    /// S1.2 验收②（计时断言近似，R2.3 时钟复核修订）：千万行级模拟库下，
+    /// 每批 flush 的写锁持有时间不得随行数增长。判据为**机器自适应的相对
+    /// 界**：大库单批 flush 平均耗时不得高于同库一次裸 `SELECT COUNT(*)`
+    /// （修复前每批 flush ≈ COUNT(*) + 插入成本，必然高于裸 COUNT；
+    /// 修复后水位增量为 O(1)，flush ≈ 纯插入成本，显著低于 COUNT）——
+    /// 机器慢时两者同步变慢，阈值不随机器漂移（固定 3x 比率阈值在慢机器
+    /// 上会误伤，已废弃）。实测校准：修复前 212-270ms vs COUNT 157ms（判负）；
+    /// 修复后 112.58ms vs 157ms（通过，余量 ~28%）。千行库对照仅作诊断输出。
     #[test]
     fn batch_flush_write_lock_time_does_not_scale_with_row_count() {
         const N: i64 = 10_000_000;
@@ -1403,15 +1406,19 @@ mod tests {
         let _ = s12_avg_flush_ms(&big_db, 2);
         let small_ms = s12_avg_flush_ms(&small_db, 10);
         let big_ms = s12_avg_flush_ms(&big_db, 10);
+        let count_ms = {
+            let t = std::time::Instant::now();
+            let _ = s12_count(&big_db);
+            t.elapsed().as_secs_f64() * 1000.0
+        };
         println!(
-            "[S12] 千行库 {small_ms:.2}ms/批，千万行库 {big_ms:.2}ms/批，比率 {:.2}x",
-            big_ms / small_ms
+            "[S12] 千行库 {small_ms:.2}ms/批，千万行库 {big_ms:.2}ms/批，\
+             同库裸 COUNT {count_ms:.2}ms"
         );
         assert!(
-            big_ms <= small_ms * 3.0,
-            "千万行库单批 flush 平均 {big_ms:.2}ms vs 千行库 {small_ms:.2}ms：\
-             写锁持有时间不得随行数增长（O(N) COUNT 回归；实测校准：修复前比率 \
-             ≈4.5x，COUNT(10M)≈157ms 主导；修复后 ≈1x）"
+            big_ms < count_ms,
+            "千万行库单批 flush 平均 {big_ms:.2}ms 不得高于同库裸 COUNT(*) \
+             {count_ms:.2}ms（若高于即每批在做 O(N) 全表扫描，O(N) COUNT 回归）"
         );
 
         small_db.mark_stopping();
