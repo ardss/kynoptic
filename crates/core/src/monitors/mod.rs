@@ -32,6 +32,7 @@ pub mod net_etw;
 pub mod network;
 pub mod power_plan;
 pub mod process;
+pub mod proxy_link;
 pub mod session;
 pub mod system;
 pub mod wifi;

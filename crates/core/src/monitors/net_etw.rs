@@ -1273,7 +1273,9 @@ pub struct ProcessIdentityCache {
 }
 
 impl ProcessIdentityCache {
-    pub fn refresh<S: ProcSnapshotSource>(&mut self, source: &mut S, now_epoch_s: u64) {
+    /// 接受 `&mut dyn`（M3.1 proxy_link 以 trait object 注入；泛型调用点
+    /// 传具体类型自动 unsize 强转，兼容不变）。
+    pub fn refresh(&mut self, source: &mut dyn ProcSnapshotSource, now_epoch_s: u64) {
         let snap = source.snapshot();
         let seen: std::collections::HashSet<u32> = snap.iter().map(|e| e.pid).collect();
         // 本轮消失的：收口存活区间
