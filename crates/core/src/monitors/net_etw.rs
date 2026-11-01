@@ -8,12 +8,15 @@
 //!
 //! 状态机：`Idle → Running → Stopped → Recover`——
 //! - 启动前检测同名残留会话（异常退出恢复路径）并 stop（Recover 经历标记）；
-//! - stop/Drop 保证 CloseTrace + StopTrace 资源释放（Drop 在 Running 态兜底）；
+//! - 启动链中途失败（enable/start_consumer）显式 stop_session 收口，不留内核
+//!   孤儿会话；stop 的 StopTrace 失败置重试旗标，stop/Drop 重试直至收口；
+//! - stop/Drop 保证 CloseTrace + StopTrace 资源释放（Drop 在 Running/重试态兜底）；
 //! - 权限不足（非管理员 ETW 限制）→ quality=Unavailable + note_degraded
 //!   显式留痕，不静默返回零。
 //!
 //! 消费专职线程：回调把记录推进通道，消费线程按 [`ETW_SINK_BATCH_MAX`]
-//! 批量出站（[`chunk_records`] 纯函数，测试钉住保序与边界）。
+//! 手写批量循环出站（64 条/100ms 窗口整批；[`chunk_records`] 为独立纯函数，
+//! 测试钉住保序与边界，供离线分片复用）。
 //! M2.2：内核网络清单 V0 负载手写解析（[`parse_kernel_network_event`]）+
 //! 分钟桶聚合（[`MinuteAggregator`]）产出 M1 [`crate::metrics::MetricPoint`]
 //! （source=Etw，质量口径沿用 [`crate::metrics::MetricQuality`]；传输层字节
@@ -94,6 +97,9 @@ pub struct NetEtwMonitor<B: EtwBackend> {
     quality: MetricQuality,
     recovered_residual: bool,
     handles: Option<(u64, u64)>, // (session, consumer)
+    /// StopTrace 曾失败（消费端已关、内核会话可能仍在）：stop/Drop 须重试
+    /// stop_session 直至收口（start 失败路径的收口失败同样置位）。
+    stop_retry: bool,
     backend: B,
 }
 
@@ -104,6 +110,7 @@ impl<B: EtwBackend> NetEtwMonitor<B> {
             quality: MetricQuality::Unavailable,
             recovered_residual: false,
             handles: None,
+            stop_retry: false,
             backend,
         }
     }
@@ -149,32 +156,69 @@ impl<B: EtwBackend> NetEtwMonitor<B> {
             }
             Err(e) => return Err(e),
         };
-        self.backend.enable_provider(session)?;
-        let consumer = self.backend.start_consumer(session, sink)?;
+        // 启动链中途失败显式收口：此刻内核里已存在（已启用的）真实会话，
+        // 不能只靠「下次 start 的 Recover」或进程退出收口——本调用内直接停。
+        if let Err(e) = self.backend.enable_provider(session) {
+            self.close_kernel_session();
+            return Err(e);
+        }
+        let consumer = match self.backend.start_consumer(session, sink) {
+            Ok(c) => c,
+            Err(e) => {
+                self.close_kernel_session();
+                return Err(e);
+            }
+        };
         self.handles = Some((session, consumer));
         self.state = EtwState::Running;
         self.quality = MetricQuality::Confirmed;
         Ok(())
     }
 
-    /// 停止：Running → Stopped（CloseTrace + StopTrace）；非 Running 幂等 no-op。
+    /// 内核会话收口（启动链失败路径 / stop / Drop 重试共用）：失败置
+    /// stop_retry，由 Drop 兜底再试（StopTrace 失败不声明已停止）。
+    fn close_kernel_session(&mut self) {
+        if let Err(_e) = self.backend.stop_session() {
+            self.stop_retry = true;
+            log::warn!(
+                "ETW 会话 {} 收口失败（已置重试旗标，Drop 将再试）",
+                ETW_SESSION_NAME
+            );
+        } else {
+            self.stop_retry = false;
+        }
+    }
+
+    /// 停止：Running → Stopped（CloseTrace + StopTrace）；无活句柄且无重试
+    /// 旗标时幂等 no-op。StopTrace 失败：不置 Stopped、置重试旗标，Err 上抛
+    /// （Drop 会再收口一次）。
     pub fn stop(&mut self) -> Result<(), EtwError> {
-        let Some((_session, consumer)) = self.handles.take() else {
+        if let Some((_session, consumer)) = self.handles.take() {
+            // 先关消费端（CloseTrace 使 ProcessTrace 退出）再停会话
+            self.backend.close_consumer(consumer);
+        } else if !self.stop_retry {
             return Ok(()); // 幂等：没有活的会话/消费端就无事可做
-        };
-        // 先关消费端（CloseTrace 使 ProcessTrace 退出）再停会话
-        self.backend.close_consumer(consumer);
-        let r = self.backend.stop_session();
-        self.state = EtwState::Stopped;
-        r
+        }
+        match self.backend.stop_session() {
+            Ok(()) => {
+                self.stop_retry = false;
+                self.state = EtwState::Stopped;
+                Ok(())
+            }
+            Err(e) => {
+                self.stop_retry = true;
+                Err(e)
+            }
+        }
     }
 }
 
 impl<B: EtwBackend> Drop for NetEtwMonitor<B> {
-    /// Drop 兜底：Running 态直接 drop（进程退出路径）也必须 CloseTrace +
-    /// StopTrace，不留孤儿会话（下次 start 走 Recover 恢复）。
+    /// Drop 兜底：Running 态直接 drop（进程退出路径）或存在未收口会话
+    /// （stop_retry）也必须 CloseTrace + StopTrace，不留孤儿会话（实在
+    /// 收口失败由下次 start 走 Recover 恢复）。
     fn drop(&mut self) {
-        if self.state == EtwState::Running {
+        if self.state == EtwState::Running || self.stop_retry {
             let _ = self.stop();
         }
     }
@@ -193,17 +237,30 @@ pub fn chunk_records(records: Vec<NetFlowRecord>, max: usize) -> Vec<Vec<NetFlow
 
 /// 丢事件观测（ETW 回调/会话统计 → loss_count/coverage 的数据源）。
 /// seen=已交付解析的记录数；lost=会话报告的缓冲丢失事件数
-/// （EVENT_TRACE_PROPERTIES.EventsLost，stop 时收口）。
+/// （EVENT_TRACE_PROPERTIES.EventsLost，运行中经 QUERY 增量收口、
+/// stop 时终局收口——EventsLost 为会话累计值，fold 按上次查询水位取差）。
 #[derive(Default)]
 pub struct LossStats {
     pub seen: std::sync::atomic::AtomicU64,
     pub lost: std::sync::atomic::AtomicU64,
+    /// 上次 QUERY 读到的 EventsLost 累计水位（差量折叠，防重复累计）。
+    last_queried_lost: std::sync::atomic::AtomicU64,
 }
 
 impl LossStats {
     pub fn counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (self.seen.load(Relaxed), self.lost.load(Relaxed))
+    }
+
+    /// 折叠一次会话累计 EventsLost 读数：只累计自上次读数以来的增量
+    /// （QUERY 与 STOP 两条读数路径共用，防同段丢失双计）。
+    fn fold_lost_total(&self, total: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prev = self.last_queried_lost.swap(total, Relaxed);
+        if total > prev {
+            self.lost.fetch_add(total - prev, Relaxed);
+        }
     }
 }
 
@@ -252,8 +309,12 @@ impl Default for RealEtw {
 
 impl RealEtw {
     /// (seen, lost) 快照——供 MinuteAggregator::drain_metric_points 填
-    /// loss_count/coverage。
+    /// loss_count/coverage。Windows 上先经 EVENT_TRACE_CONTROL_QUERY 读
+    /// 会话累计 EventsLost 增量折叠：长会话运行期间的中间 drain 不再把
+    /// 已发生的丢失低报至停机（R3 复核）。
     pub fn loss_stats(&self) -> (u64, u64) {
+        #[cfg(windows)]
+        self.refresh_loss_from_query();
         self.stats.counts()
     }
 }
@@ -261,7 +322,7 @@ impl RealEtw {
 #[cfg(windows)]
 mod real {
     use super::*;
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_SUCCESS};
     use windows_sys::Win32::System::Diagnostics::Etw::{
         CloseTrace, ControlTraceW, EnableTraceEx, OpenTraceW, ProcessTrace, StartTraceW,
         CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
@@ -362,6 +423,25 @@ mod real {
         fn query_residual_real(&self) -> bool {
             matches!(query_session(&self.session_name), Ok(true))
         }
+
+        /// QUERY 同名会话的累计 EventsLost 并增量折叠进 loss 统计
+        /// （长会话运行中的中间收口；会话不存在时静默跳过）。
+        pub fn refresh_loss_from_query(&self) {
+            let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
+            let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
+            let code = unsafe {
+                ControlTraceW(
+                    CONTROLTRACE_HANDLE { Value: 0 },
+                    wide(&self.session_name).as_ptr(),
+                    props,
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            };
+            if code == ERROR_SUCCESS {
+                let lost = unsafe { (*props).EventsLost } as u64;
+                self.stats.fold_lost_total(lost);
+            }
+        }
     }
 
     impl EtwBackend for RealEtw {
@@ -383,15 +463,11 @@ mod real {
             match code {
                 ERROR_SUCCESS | ERROR_WMI_INSTANCE_NOT_FOUND => {
                     // 会话已不存在（对端刚退出）即达成目的。
-                    // STOP 后属性块带回终局统计：缓冲丢失事件数收口进
-                    // loss_count/coverage 管道（残段会话的丢失同样计入，
-                    // 同名会话同管道）。
+                    // STOP 后属性块带回终局统计：缓冲丢失事件数按增量折叠进
+                    // loss_count/coverage 管道（运行中 QUERY 可能已折叠部分，
+                    // fold_lost_total 取差防双计；残段会话的丢失同样计入）。
                     let lost = unsafe { (*props).EventsLost } as u64;
-                    if lost > 0 {
-                        self.stats
-                            .lost
-                            .fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    self.stats.fold_lost_total(lost);
                     Ok(())
                 }
                 c => Err(to_err(c)),
@@ -494,7 +570,21 @@ mod real {
             logfile.Anonymous2.EventRecordCallback = Some(on_event);
             let consumer = unsafe { OpenTraceW(&mut logfile) };
             if consumer.Value == INVALID_PROCESSTRACE_HANDLE {
-                return Err(EtwError::Win32(ERROR_ACCESS_DENIED));
+                // 失败路径自清理：此刻 batcher 线程/通道/停机旗标已建立且
+                // 写入 self——必须关停（置旗标+断通道+join）并回收 ConsumerCtx，
+                // 否则线程存活到 RealEtw drop、ctx 永不回收（R3 复核）。
+                // 错误码取 GetLastError 真实值（OpenTraceW 失败未必是 5）。
+                let code = unsafe { GetLastError() };
+                if let Some(f) = &self.stop_flag {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.tx = None;
+                if let Some(t) = self.batcher_thread.take() {
+                    let _ = t.join();
+                }
+                self.stop_flag = None;
+                drop(unsafe { Arc::from_raw(ctx) });
+                return Err(to_err(if code == 0 { ERROR_ACCESS_DENIED } else { code }));
             }
             let h = consumer;
             std::thread::spawn(move || unsafe {
@@ -572,6 +662,12 @@ mod tests {
         counters: Counters,
         residual: bool,
         fail_start: Option<EtwError>,
+        /// enable_provider 注入失败（启动链中途失败路径）。
+        fail_enable: Option<EtwError>,
+        /// start_consumer 注入失败（启动链中途失败路径）。
+        fail_consumer: Option<EtwError>,
+        /// stop_session 注入失败的剩余次数（0 = 恒成功；>0 每调一次减一）。
+        fail_stop_remaining: u32,
     }
 
     impl MockBackend {
@@ -582,6 +678,9 @@ mod tests {
                     counters: counters.clone(),
                     residual,
                     fail_start: None,
+                    fail_enable: None,
+                    fail_consumer: None,
+                    fail_stop_remaining: 0,
                 },
                 counters,
             )
@@ -598,6 +697,10 @@ mod tests {
             c.sessions_stopped += 1;
             c.residual_stops += 1;
             self.residual = false;
+            if self.fail_stop_remaining > 0 {
+                self.fail_stop_remaining -= 1;
+                return Err(EtwError::Win32(1));
+            }
             Ok(())
         }
         fn start_session(&mut self) -> Result<u64, EtwError> {
@@ -609,10 +712,16 @@ mod tests {
             }
         }
         fn enable_provider(&mut self, _session: u64) -> Result<(), EtwError> {
+            if let Some(e) = &self.fail_enable {
+                return Err(e.clone());
+            }
             self.counters.0.lock().unwrap().provider_enabled = true;
             Ok(())
         }
         fn start_consumer(&mut self, _session: u64, sink: EventSink) -> Result<u64, EtwError> {
+            if let Some(e) = &self.fail_consumer {
+                return Err(e.clone());
+            }
             let mut c = self.counters.0.lock().unwrap();
             c.consumers_opened += 1;
             c.records.push(NetFlowRecord {
@@ -768,6 +877,82 @@ mod tests {
         let c = counters.get();
         assert_eq!(c.sessions_stopped, 1, "Drop 必须停会话（StopTrace）");
         assert_eq!(c.consumers_closed, 1, "Drop 必须关消费端（CloseTrace）");
+    }
+
+    #[test]
+    fn start_enable_failure_closes_kernel_session_inline() {
+        // R 复核[blocking]：start_session 成功后 enable_provider 失败，内核里
+        // 已存在的真实会话必须由本次调用显式收口——不能置 Stopped、不能留
+        // handles，也不能等下次 start 的 Recover 或进程退出兜底
+        let counters;
+        {
+            let (mut backend, c) = MockBackend::new(false);
+            backend.fail_enable = Some(EtwError::Win32(87));
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            let r = m.start(noop_sink());
+            assert!(r.is_err(), "启用失败必须上抛");
+            assert_eq!(m.state(), EtwState::Idle, "失败路径不得声明已停止");
+            assert_ne!(m.state(), EtwState::Running);
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_started, 1);
+        assert_eq!(
+            c.sessions_stopped, 1,
+            "启用失败路径必须立即 StopTrace 收口内核会话"
+        );
+        assert_eq!(c.consumers_closed, 0, "消费端尚未打开，不得误关");
+    }
+
+    #[test]
+    fn start_consumer_failure_closes_kernel_session_inline() {
+        // 同上：start_consumer 失败（此刻供应商已启用）也必须当场收口
+        let counters;
+        {
+            let (mut backend, c) = MockBackend::new(false);
+            backend.fail_consumer = Some(EtwError::Win32(2));
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            assert!(m.start(noop_sink()).is_err());
+            assert_eq!(m.state(), EtwState::Idle);
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 1, "消费端启动失败必须收口内核会话");
+        assert_eq!(c.consumers_closed, 0, "无 consumer 句柄不得误调 CloseTrace");
+    }
+
+    #[test]
+    fn stop_failure_defers_stopped_and_drop_retries() {
+        // R 复核[blocking]：StopTrace 失败不得声明 Stopped，须置重试旗标，
+        // 由 Drop 兜底重试直至收口成功
+        let counters;
+        {
+            let (mut backend, c) = MockBackend::new(false);
+            backend.fail_stop_remaining = 1; // 首次 stop 失败，重试成功
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            m.start(noop_sink()).unwrap();
+            assert!(m.stop().is_err(), "StopTrace 失败必须上抛，不得静默成功");
+            assert_ne!(m.state(), EtwState::Stopped, "收口失败不得声明已停止");
+            // 无显式处理，直接 drop：Drop 必须再试一次并收口成功
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 2, "Drop 必须重试 StopTrace（共 2 次）");
+    }
+
+    #[test]
+    fn loss_stats_fold_is_incremental_across_reads() {
+        // R 复核：EventsLost 是会话累计值——QUERY 与 STOP 两条读数路径共用
+        // 差量折叠，同段丢失不得双计
+        let stats = LossStats::default();
+        stats.fold_lost_total(5);
+        assert_eq!(stats.counts().1, 5);
+        stats.fold_lost_total(5); // 无新增：不得重复累计
+        assert_eq!(stats.counts().1, 5, "同水位重复读数不得双计");
+        stats.fold_lost_total(8); // 新增 3
+        assert_eq!(stats.counts().1, 8);
+        stats.fold_lost_total(2); // 回退读数（理论上不应出现）：按 0 增量处理
+        assert_eq!(stats.counts().1, 8, "读数回退不得产生负增量");
     }
 
     #[test]

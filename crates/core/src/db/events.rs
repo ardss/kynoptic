@@ -462,14 +462,23 @@ impl Database {
         self.insert_one_by_one_impl(events, true)
     }
 
-    /// 清理超过保留天数的事件
+    /// 清理超过保留天数的事件（生产入口：真实时钟 → 注入式收口）。
     pub fn cleanup_old_events(&self) -> usize {
+        self.cleanup_old_events_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    /// 注入时钟版清理（`now_ms` = UTC epoch 毫秒）：测试零真实时钟依赖
+    /// （红线「测试不得读真实时钟」），生产行为与 [`Self::cleanup_old_events`]
+    /// 完全一致。
+    pub fn cleanup_old_events_at(&self, now_ms: i64) -> usize {
         if self.retention_days <= 0 {
             return 0; // 0 = 永不删除（默认）。铁律：原始数据只能显式 opt-in 才清理。
         }
         self.with_writer(
             |conn| {
-                let cutoff = chrono::Utc::now() - chrono::Duration::days(self.retention_days);
+                let cutoff = chrono::DateTime::from_timestamp_millis(now_ms)
+                    .unwrap_or_else(chrono::Utc::now)
+                    - chrono::Duration::days(self.retention_days);
                 let cutoff_str = cutoff.to_rfc3339();
                 // agg 三表的 date 一律为**本地时区**日历日 "YYYY-MM-DD"（db/agg.rs
                 // apply_event 用 Local.format("%Y-%m-%d")，update_agg 用

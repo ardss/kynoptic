@@ -230,20 +230,24 @@ mod tests {
 
     #[test]
     fn m24_retention_on_clears_expired_off_is_noop() {
-        // 开启（retention=30）：旧桶清、新桶留。cleanup 内部以真实 now 定
-        // 截止桶，桶号必须相对 now 注入（数据侧相对注入，断言不依赖墙钟值）
-        let now_bucket = chrono::Utc::now().timestamp_millis().div_euclid(60_000);
+        // 开启（retention=30）：旧桶清、新桶留。经 cleanup_old_events_at
+        // 注入固定时钟（红线「测试不得读真实时钟」），桶号相对固定 now 生成，
+        // 断言全程不依赖墙钟值。
+        const NOW_MS: i64 = 1_800_000_000_000; // 固定 epoch（约 2027-01-15）
+        let now_bucket = NOW_MS.div_euclid(60_000);
         let dir = tmp_dir("m24ret");
         std::fs::create_dir_all(&dir).unwrap();
         let mut db = Database::open(dir.join("on.db").to_str().unwrap()).unwrap();
-        let old_bucket = now_bucket - 60 * 24 * 40; // 40 天前
+        let old_bucket = now_bucket - 60 * 24 * 40; // 40 天前（过期）
         let new_bucket = now_bucket - 10; // 10 分钟前（保留期内）
         db.insert_net_process_minute_points(&[
             point(old_bucket, 7, "net.process.bytes_in", 1, None),
             point(new_bucket, 7, "net.process.bytes_in", 2, None),
         ]);
         db.retention_days = 30; // 测试注入：db 模块私有字段（同模块子模块可写）
-        db.cleanup_old_events();
+                                // 注：返回值只计 events 表行数（本测试只播种净指标行，故为 0）；
+                                // 净指标清理验收以查询结果为准
+        let _ = db.cleanup_old_events_at(NOW_MS);
         let rows = query_net_process_minute(&db.reader(), 100_000, new_bucket * 60_000);
         assert_eq!(rows.len(), 1, "过期桶必须被清");
         assert_eq!(rows[0].minute_bucket, new_bucket);
@@ -264,7 +268,7 @@ mod tests {
             ),
             point(now_bucket - 10, 7, "net.process.bytes_in", 2, None),
         ]);
-        let deleted = db.cleanup_old_events();
+        let deleted = db.cleanup_old_events_at(NOW_MS);
         assert_eq!(deleted, 0, "retention=0 时 cleanup 不得删任何行");
         assert_eq!(net_rows(&db), 2, "retention=0 净指标表零清理");
         db.mark_stopping();
