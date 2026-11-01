@@ -60,6 +60,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0011_actor_evidence",
         include_str!("migrations/0011_actor_evidence.sql"),
     ),
+    (
+        "0012_net_process_minute",
+        include_str!("migrations/0012_net_process_minute.sql"),
+    ),
 ];
 
 /// 0001 的内容单独导出：供 CLI 等外部工具对裸库做幂等初始化。

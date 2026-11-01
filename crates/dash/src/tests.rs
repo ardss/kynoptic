@@ -2846,3 +2846,32 @@ mod input_series_badge_fix {
         assert_eq!(falsy, "\"none\"", "alerts==0 分支应保持 \"none\" 隐藏");
     }
 }
+
+// === M2.4: /api/net-process ===
+
+#[test]
+fn net_process_endpoint_returns_rows_and_rejects_bad_minutes() {
+    let conn = mem_conn();
+    // 桶取相对当前时刻（端点窗口以 now 为基准；只对齐窗口，不断言墙钟值）
+    let now_bucket = chrono::Utc::now().timestamp_millis() / 60_000;
+    conn.execute(
+        "INSERT INTO net_process_minute (minute_bucket,pid,metric_id,bytes,loss_count,coverage,quality) VALUES (?1,7,'net.process.bytes_in',600,NULL,NULL,'confirmed')",
+        params![now_bucket - 5],
+    )
+    .unwrap();
+    let dir = tmpdir("netproc");
+    let db = dir.join("kyn.db");
+    let (code, ctype, body) = route_req(&conn, "GET", "/api/net-process?minutes=60", "", &db);
+    assert_eq!(code, 200);
+    assert_eq!(ctype, "application/json");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let rows = v["rows"].as_array().expect("必须返回 rows 数组");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["pid"], json!(7));
+    assert_eq!(rows[0]["bytes"], json!(600));
+    assert_eq!(rows[0]["metric_id"], json!("net.process.bytes_in"));
+    assert_eq!(rows[0]["quality"], json!("confirmed"));
+    // minutes=0 → 400（数值参数政策同既有端点）
+    let (code, _, _) = route_req(&conn, "GET", "/api/net-process?minutes=0", "", &db);
+    assert_eq!(code, 400);
+}

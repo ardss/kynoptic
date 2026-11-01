@@ -22,6 +22,7 @@ use crate::constants;
 pub mod agg;
 pub mod events;
 pub mod metadata;
+pub mod net_metrics;
 pub mod schema;
 pub mod sessions;
 

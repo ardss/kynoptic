@@ -499,6 +499,12 @@ impl Database {
                         "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
                         [&cutoff_date],
                     );
+                    // M2.4：净指标分钟桶表同事务清理（桶口径=UTC epoch 分钟，
+                    // 与本函数 cutoff 同源换算；默认 retention=0 时整段不可达）
+                    let net_minute = conn.execute(
+                        "DELETE FROM net_process_minute WHERE minute_bucket < ?1",
+                        [cutoff.timestamp_millis().div_euclid(60_000)],
+                    );
                     // 水位自 W33-F2 起是行数口径（COUNT(*)）：显式 opt-in 保留期
                     // 清理删行后必须在**同一事务内（COMMIT 之前）**推进水位——
                     // 否则下次 open 的对账会把合法的「清理后减少」误判为数据
@@ -507,7 +513,8 @@ impl Database {
                     // 水位 upsert 之间被强杀/断电时，持久化水位仍停在清理前
                     // 行数 → 下次 open 假报「回退」。移进同事务后删行与水位
                     // 推进随 COMMIT 原子落库，事务失败回滚时水位也一并还原。
-                    let deleted = (deleted?, daily?, minute?, minute_actor?, app?);
+                    let deleted =
+                        (deleted?, daily?, minute?, minute_actor?, app?, net_minute?);
                     if deleted.0 > 0 {
                         super::persist_events_watermark(conn);
                     }

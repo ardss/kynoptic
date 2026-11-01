@@ -1,8 +1,9 @@
-//! 清理铁律测试（审查清单 A2）——五表版（S1.1 起 agg_minute_actor 计入守卫）。
+//! 清理铁律测试（审查清单 A2）——六表版（S1.1 起 agg_minute_actor、M2.4 起
+//! net_process_minute 计入守卫）。
 //!
 //! 铁律：retention = 0（默认）时，`cleanup_old_events` / `maintenance()` 后
-//! **events、agg_minute、agg_minute_actor、agg_daily、sessions 五张表行数
-//! 全部不变**。旧测试只数 events；聚合缓存与 session 历史同样是用户数据，
+//! **events、agg_minute、agg_minute_actor、agg_daily、sessions、
+//! net_process_minute 六张表行数全部不变**。旧测试只数 events；聚合缓存与 session 历史同样是用户数据，
 //! 被维护路径误清同样违反"原始/派生数据只增不删"契约。
 
 use kynoptic_core::db::Database;
@@ -17,8 +18,8 @@ fn cleanup_files(path: &str) {
     let _ = std::fs::remove_file(format!("{path}-shm"));
 }
 
-/// 五表行数快照（铁律的度量对象）
-fn four_table_counts(db: &Database) -> (i64, i64, i64, i64, i64) {
+/// 六表行数快照（铁律的度量对象；M2.4 起 net_process_minute 计入）
+fn four_table_counts(db: &Database) -> (i64, i64, i64, i64, i64, i64) {
     let conn = db.reader();
     let c = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     (
@@ -27,6 +28,7 @@ fn four_table_counts(db: &Database) -> (i64, i64, i64, i64, i64) {
         c("SELECT COUNT(*) FROM agg_minute_actor"),
         c("SELECT COUNT(*) FROM agg_daily"),
         c("SELECT COUNT(*) FROM sessions"),
+        c("SELECT COUNT(*) FROM net_process_minute"),
     )
 }
 

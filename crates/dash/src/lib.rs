@@ -20,6 +20,8 @@
 //! - `/api/anomalies?days=`          与 MCP `get_anomalies` 同一异常检测
 //!   （marathon 桥接阈值读 settings 的 presence_bridge_minutes）
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
+//! - `/api/net-process?minutes=`     近 N 分钟净指标分钟桶（M2.4，ETW 内核
+//!   网络 MetricPoint 持久化，只读）
 //! - `/api/overview`                 本次会话 uptime / 今日事件数 / 启用监控器数 /
 //!   DB 大小 / CPU / 内存 / 前台应用（复用 MCP `get_current_status` 同一数据面）
 //! - `/api/heatmap?weeks=`           按本地日聚合的活跃度 `[{date,value}]`，缺数天补零
@@ -594,6 +596,20 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
         }
     }
     json!({"anomalies": out, "truncated": false, "baseline_days": baseline_days})
+}
+
+/// GET /api/net-process — 近 N 分钟净指标分钟桶（M2.4）。
+/// 只读：net_process_minute 表（ETW 内核网络 MetricPoint 持久化）。
+/// now 由调用点取当前 UTC（查询窗口基准；core 查询函数注入式设计，
+/// 单测在 core 侧以注入 now 验证）。
+fn api_net_process(conn: &Connection, minutes: u32) -> Value {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let rows = kynoptic_core::db::net_metrics::query_net_process_minute(conn, minutes, now_ms);
+    json!({
+        "minutes": minutes,
+        "count": rows.len(),
+        "rows": rows,
+    })
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
@@ -2958,6 +2974,21 @@ pub fn route_req(
         ("GET", "/api/status") => {
             let mut v = api_status(conn, db_path);
             add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/net-process") => {
+            let minutes_req = match qnum("minutes", 1, 1440) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 60,
+                Ok(Some(m)) => m,
+            };
+            let mut v = api_net_process(conn, minutes_req);
+            if minutes_req > 1440 {
+                if let Some(obj) = v.as_object_mut() {
+                    cap_note(obj, "minutes", minutes_req, 1440);
+                }
+            }
+            add_ignored(&mut v, ignored_params(&["minutes"]));
             (200, "application/json", v.to_string())
         }
         ("GET", "/api/overview") => {
