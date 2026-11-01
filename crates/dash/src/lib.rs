@@ -20,6 +20,7 @@
 //! - `/api/anomalies?days=`          与 MCP `get_anomalies` 同一异常检测
 //!   （marathon 桥接阈值读 settings 的 presence_bridge_minutes）
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
+//! - `/api/net-derived?minutes=`     网络归因五分区（M3.4，含 quality 标注）
 //! - `/api/net-process?minutes=`     近 N 分钟净指标分钟桶（M2.4，ETW 内核
 //!   网络 MetricPoint 持久化，只读）
 //! - `/api/overview`                 本次会话 uptime / 今日事件数 / 启用监控器数 /
@@ -610,6 +611,113 @@ fn api_net_process(conn: &Connection, minutes: u32) -> Value {
         "count": rows.len(),
         "rows": rows,
     })
+}
+
+/// GET /api/net-derived — 网络归因五分区（M3.4）。口径（诚实优先）：
+/// - proxy_outer：M2.4 分钟桶中 pid ∈ 代理证据集的进出合计（Confirmed；
+///   分钟聚合按 PID 归属，含代理进程环回，见 note）；
+/// - direct / via_proxy：分钟聚合无远端地址/端口，流级拆分需 M3.2 ETW
+///   派生全量接线（后续切片）——本切片显式 Unavailable + 原因，不硬拆；
+/// - fuzzy：非代理进程行合计（Incomplete：直连/代理相关拆分不可判）；
+/// - plan：套餐用量（M3.3 审计结论：本机无可信计量面）恒 Unavailable + 原因。
+///
+/// `now_ms`/`proxy_pids`/`port_evidence_available` 注入（测试零真实时钟、
+/// 零环境依赖）；路由侧实时取 M3.1 证据（GetExtendedTcpTable 无需管理员）。
+fn api_net_derived_with(
+    conn: &Connection,
+    minutes: u32,
+    now_ms: i64,
+    proxy_pids: &[u32],
+    port_evidence_available: bool,
+) -> Value {
+    use std::collections::HashSet as StdHashSet;
+    let rows = kynoptic_core::db::net_metrics::query_net_process_minute(conn, minutes, now_ms);
+    let pids: StdHashSet<u32> = proxy_pids.iter().copied().collect();
+    let (mut outer, mut fuzzy): (i64, i64) = (0, 0);
+    let mut any_row = false;
+    for r in &rows {
+        any_row = true;
+        if pids.contains(&r.pid) {
+            outer += r.bytes;
+        } else {
+            fuzzy += r.bytes;
+        }
+    }
+    let plan_note = "本机无可信套餐计量面（M3.3 审计：核心数据口非 HTTP 面、配置加密、本地库无用量表；订阅端点 subscription-userinfo 为后续接入候选）";
+    let split_note =
+        "分钟聚合不含远端地址/端口，流级直连/代理相关拆分需 M3.2 ETW 派生全量接线（后续切片）";
+    let sections = vec![
+        json!({"key":"direct","label_en":"direct traffic","label_zh":"直连流量",
+               "bytes":Value::Null,"quality":"unavailable","note":split_note}),
+        json!({"key":"via_proxy","label_en":"via proxy (loopback to proxy port)","label_zh":"代理相关流量（环回代理端口）",
+               "bytes":Value::Null,"quality":"unavailable","note":split_note}),
+        if port_evidence_available {
+            if outer > 0 || pids.iter().any(|p| rows.iter().any(|r| r.pid == *p)) {
+                json!({"key":"proxy_outer","label_en":"proxy outer traffic","label_zh":"代理外层流量",
+                       "bytes":outer,"quality":"confirmed",
+                       "note":"按 PID 归属（分钟聚合口径，含代理进程自身环回）"})
+            } else {
+                json!({"key":"proxy_outer","label_en":"proxy outer traffic","label_zh":"代理外层流量",
+                       "bytes":if any_row { Value::from(0) } else { Value::Null },
+                       "quality":"confirmed",
+                       "note":"窗口内无代理进程流量样本（无匹配行）"})
+            }
+        } else {
+            json!({"key":"proxy_outer","label_en":"proxy outer traffic","label_zh":"代理外层流量",
+                   "bytes":Value::Null,"quality":"unavailable",
+                   "note":"代理端口/进程枚举不可用（M3.1 证据缺失）"})
+        },
+        if port_evidence_available {
+            json!({"key":"fuzzy","label_en":"fuzzy attribution","label_zh":"口径模糊流量",
+                   "bytes":fuzzy,"quality":"incomplete",
+                   "note":"分钟聚合无远端归属，直连/代理相关拆分不可判（不硬拆）"})
+        } else {
+            json!({"key":"fuzzy","label_en":"fuzzy attribution","label_zh":"口径模糊流量",
+                   "bytes":Value::Null,"quality":"unavailable",
+                   "note":"代理端口/进程枚举不可用（M3.1 证据缺失），归属不可判"})
+        },
+        json!({"key":"plan","label_en":"plan usage (provider)","label_zh":"套餐用量（服务商）",
+               "bytes":Value::Null,"quality":"unavailable","note":plan_note}),
+    ];
+    json!({
+        "minutes": minutes,
+        "evidence_available": port_evidence_available,
+        "proxy_pids": proxy_pids,
+        "sections": sections,
+    })
+}
+
+/// 路由侧实时 M3.1 证据：监听端口表（无需管理员）+ 进程名模式匹配 →
+/// 代理核心 pid 集；枚举失败 → (空, false) 显式降级（绝不伪造证据）。
+fn live_proxy_evidence() -> (Vec<u32>, bool) {
+    use kynoptic_core::monitors::net_etw::{ProcessIdentityCache, RealProcSource};
+    use kynoptic_core::monitors::proxy_link::{name_matches, PortTableSource, RealPortTableSource};
+    let patterns: Vec<String> = kynoptic_core::monitors::proxy_link::DEFAULT_PROXY_NAME_PATTERNS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut port_src = RealPortTableSource::new();
+    let port_rows = match port_src.collect() {
+        Ok(r) => r,
+        Err(_) => return (Vec::new(), false),
+    };
+    let mut cache = ProcessIdentityCache::default();
+    let mut proc_src = RealProcSource::new();
+    let now_s = chrono::Utc::now().timestamp() as u64;
+    cache.refresh(&mut proc_src, now_s);
+    let mut pids: Vec<u32> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, row) in port_rows {
+        if !seen.insert(row.pid) {
+            continue;
+        }
+        if let Some((name, _)) = cache.resolve(row.pid, now_s as i64) {
+            if name_matches(name, &patterns) && !pids.contains(&row.pid) {
+                pids.push(row.pid);
+            }
+        }
+    }
+    (pids, true)
 }
 
 /// GET /api/status — 今日日期 + 最新事件时间戳（采集器存活的保守代理）。
@@ -2988,6 +3096,17 @@ pub fn route_req(
                     cap_note(obj, "minutes", minutes_req, 1440);
                 }
             }
+            add_ignored(&mut v, ignored_params(&["minutes"]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/net-derived") => {
+            let minutes_req = match qnum("minutes", 1, 1440) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 60,
+                Ok(Some(m)) => m,
+            };
+            let (pids, avail) = live_proxy_evidence();
+            let mut v = api_net_derived_with(conn, minutes_req, chrono::Utc::now().timestamp_millis(), &pids, avail);
             add_ignored(&mut v, ignored_params(&["minutes"]));
             (200, "application/json", v.to_string())
         }

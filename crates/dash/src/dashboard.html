@@ -184,6 +184,14 @@
   .kb g:hover rect, .kb rect:hover { stroke: var(--brand); stroke-width: 2; }
   .badge { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px;
            padding: 0 7px; color: var(--warn); background: rgba(245,180,84,0.08); }
+  /* M3.4 网络归因可信度徽标（Confirmed 绿 / Estimated 琥珀 / Incomplete 蓝灰 / Unavailable 灰显） */
+  .q-badge { display:inline-block; font-size:10.5px; border:1px solid currentColor;
+    border-radius:999px; padding:0 7px; margin-left:6px; vertical-align:middle; }
+  .q-confirmed { color: var(--ok); }
+  .q-estimated { color: var(--warn); }
+  .q-incomplete { color: var(--dim); }
+  .q-unavailable { color: var(--faint); background: rgba(128,128,128,.08); }
+  .q-gray { opacity:.55; }
   /* 页签红色角标（异常页：未读 alert 级异常数） */
   .tab-badge { display: none; margin-left: 6px; padding: 0 6px; border-radius: 999px;
                background: var(--bad); color: #fff; font-size: 10.5px; font-weight: 700; }
@@ -318,6 +326,12 @@
 
 <!-- 后端口径说明（overview.metrics_note，双语已由后端给出），防御性渲染 -->
 <div id="overview-note" class="muted" style="font-size:12px;margin:4px 0 0"></div>
+
+<section>
+  <h2><span class="l en">network attribution — last hour (direct / via proxy / proxy outer / plan)</span><span class="l zh">网络归因 — 近 1 小时（直连 / 代理相关 / 代理外层 / 套餐）</span></h2>
+  <div id="net-attribution" class="muted">loading…</div>
+  <div id="net-top" class="muted" style="margin-top:8px;font-size:12px"></div>
+</section>
 
 <section>
   <h2><span class="l en">timeline — last 24 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 24 小时（在场 / 自动化 / 无输入）</span></h2>
@@ -2441,11 +2455,56 @@ function showView(name, fromHistory) {
   if (name === "settings" && SETTINGS_LOADED) return;
   refreshView(name).catch(e => showViewError(name, e.message));
 }
+/* ─── M3.4 网络归因卡（/api/net-derived + /api/net-process；可信度徽标） ─── */
+// 纯函数：quality → 徽标样式与文案（未知值一律按 unavailable 灰显；
+// check-js.mjs M3.4 扩展阶段对本函数跑断言）。
+function netQualityBadge(quality) {
+  switch (quality) {
+    case "confirmed": return { cls: "q-confirmed", en: "confirmed", zh: "实测" };
+    case "estimated": return { cls: "q-estimated", en: "estimated", zh: "估算" };
+    case "incomplete": return { cls: "q-incomplete", en: "incomplete", zh: "不完整" };
+    default: return { cls: "q-unavailable", en: "unavailable", zh: "不可用" };
+  }
+}
+// 纯函数：分区 JSON → 行 HTML（lang 显式入参，无 DOM 依赖；unavailable 整行灰显 + 原因文案）
+function netSectionRow(s, lang) {
+  const b = netQualityBadge(s.quality);
+  const gray = s.quality === "unavailable" ? " q-gray" : "";
+  const bytes = s.bytes == null ? "–" : Number(s.bytes).toLocaleString() + " B";
+  const label = lang === "zh" ? s.label_zh : s.label_en;
+  const note = s.note ? '<div style="font-size:11px;opacity:.75">' + esc(s.note) + "</div>" : "";
+  return '<div class="net-row' + gray + '" style="margin:4px 0">' +
+    '<span>' + esc(String(label)) + "</span>" +
+    '<span class="q-badge ' + b.cls + '">' + (lang === "zh" ? b.zh : b.en) + "</span>" +
+    ' <span>' + bytes + "</span>" + note + "</div>";
+}
+async function loadNetAttribution() {
+  const el = document.getElementById("net-attribution");
+  if (!el) return;
+  try {
+    const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+    const d = await jget("/api/net-derived?minutes=60");
+    el.innerHTML = d.sections.map(s => netSectionRow(s, lang)).join("");
+    const top = document.getElementById("net-top");
+    const p = await jget("/api/net-process?minutes=60");
+    if (p.rows && p.rows.length) {
+      const agg = {};
+      for (const r of p.rows) agg[r.pid] = (agg[r.pid] || 0) + r.bytes;
+      const items = Object.entries(agg).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      top.textContent = (lang === "zh" ? "按进程 Top5（近 60 分钟）：pid " : "top processes (last 60 min): pid ") +
+        items.map(([pid, b]) => pid + " " + Number(b).toLocaleString() + " B").join(" · ");
+    } else {
+      top.textContent = "";
+    }
+  } catch (e) {
+    el.textContent = t("noData");
+  }
+}
 async function refreshView(name) {
   // 状态行任何视图都刷新（UX 走查 2026-10-12）：此前仅 overview 拉状态行，
   // 深链/F5 直进报告、应用、输入、洞察、异常页时标题下状态行滞留
   // "Loading…" 直到 30 秒轮询，期间采集状态不可见。
-  if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
+  if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline(), loadNetAttribution()]);
   else if (name === "apps") await Promise.all([loadStatus(), loadApps(), loadTopApps()]);
   else if (name === "report") await Promise.all([loadStatus(), loadReport(), loadHeatmap()]);
   else if (name === "insights") await Promise.all([loadStatus(), loadInsights()]);

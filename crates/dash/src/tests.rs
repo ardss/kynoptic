@@ -2875,3 +2875,100 @@ fn net_process_endpoint_returns_rows_and_rejects_bad_minutes() {
     let (code, _, _) = route_req(&conn, "GET", "/api/net-process?minutes=0", "", &db);
     assert_eq!(code, 400);
 }
+
+// === M3.4: /api/net-derived（网络归因分区 + 可信度标注） ===
+
+#[test]
+fn net_derived_partition_snapshot_with_proxy_evidence() {
+    // 端点数据快照：种子两进程分钟桶（4242=代理核心、7=普通应用），
+    // 注入代理 pid 证据与固定 now，断言五分区口径与 quality 徽标输入
+    let conn = mem_conn();
+    let now_ms = 1_800_000_000_000i64;
+    let now_bucket = now_ms / 60_000;
+    for (pid, metric, bytes, bucket_off) in [
+        (4242i64, "net.process.bytes_in", 1000i64, 5i64),
+        (4242, "net.process.bytes_out", 2000, 5),
+        (7, "net.process.bytes_in", 500, 3),
+    ] {
+        conn.execute(
+            "INSERT INTO net_process_minute (minute_bucket,pid,metric_id,bytes,loss_count,coverage,quality) VALUES (?1,?2,?3,?4,NULL,NULL,'confirmed')",
+            params![now_bucket - bucket_off, pid, metric, bytes],
+        )
+        .unwrap();
+    }
+    let v = api_net_derived_with(&conn, 60, now_ms, &[4242], true);
+    assert_eq!(v["minutes"], json!(60));
+    assert_eq!(v["evidence_available"], json!(true));
+    let secs = v["sections"].as_array().expect("必须返回 sections 数组");
+    assert_eq!(
+        secs.len(),
+        5,
+        "五分区：direct/via_proxy/proxy_outer/fuzzy/plan"
+    );
+    let get = |key: &str| {
+        secs.iter()
+            .find(|s| s["key"] == json!(key))
+            .unwrap_or_else(|| panic!("缺分区 {key}"))
+    };
+    // 代理外层：pid 命中证据，进出合计 3000，confirmed
+    let po = get("proxy_outer");
+    assert_eq!(po["bytes"], json!(3000));
+    assert_eq!(po["quality"], json!("confirmed"));
+    // 直连 / 代理相关：分钟聚合无远端归属，本切片诚实标 Unavailable+原因
+    for key in ["direct", "via_proxy"] {
+        let s = get(key);
+        assert_eq!(s["quality"], json!("unavailable"), "{key} 必须显式不可用");
+        assert!(s["bytes"].is_null());
+        let note = s["note"].as_str().unwrap_or("");
+        assert!(!note.is_empty(), "{key} 必须带原因文案");
+    }
+    // 模糊：非代理进程行合计 500，Incomplete + 原因（分钟聚合无远端归属）
+    let fz = get("fuzzy");
+    assert_eq!(fz["bytes"], json!(500));
+    assert_eq!(fz["quality"], json!("incomplete"));
+    assert!(fz["note"].as_str().unwrap_or("").contains("远端"));
+    // 套餐：M3.3 结论 Unavailable + 原因
+    let pl = get("plan");
+    assert_eq!(pl["quality"], json!("unavailable"));
+    assert!(pl["bytes"].is_null());
+    assert!(!pl["note"].as_str().unwrap_or("").is_empty());
+}
+
+#[test]
+fn net_derived_unavailable_when_port_evidence_fails() {
+    let conn = mem_conn();
+    let now_ms = 1_800_000_000_000i64;
+    let now_bucket = now_ms / 60_000;
+    conn.execute(
+        "INSERT INTO net_process_minute (minute_bucket,pid,metric_id,bytes,loss_count,coverage,quality) VALUES (?1,7,'net.process.bytes_in',500,NULL,NULL,'confirmed')",
+        params![now_bucket - 3],
+    )
+    .unwrap();
+    let v = api_net_derived_with(&conn, 60, now_ms, &[], false);
+    let secs = v["sections"].as_array().unwrap();
+    let get = |key: &str| secs.iter().find(|s| s["key"] == json!(key)).unwrap();
+    assert_eq!(v["evidence_available"], json!(false));
+    for key in ["proxy_outer", "fuzzy"] {
+        let s = get(key);
+        assert_eq!(
+            s["quality"],
+            json!("unavailable"),
+            "{key} 证据缺失必须显式降级"
+        );
+        assert!(!s["note"].as_str().unwrap_or("").is_empty());
+    }
+}
+
+#[test]
+fn net_derived_endpoint_route_and_bad_minutes() {
+    let conn = mem_conn();
+    let dir = tmpdir("netderived");
+    let db = dir.join("kyn.db");
+    let (code, ctype, body) = route_req(&conn, "GET", "/api/net-derived?minutes=60", "", &db);
+    assert_eq!(code, 200);
+    assert_eq!(ctype, "application/json");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["sections"].as_array().unwrap().len(), 5);
+    let (code, _, _) = route_req(&conn, "GET", "/api/net-derived?minutes=0", "", &db);
+    assert_eq!(code, 400);
+}
