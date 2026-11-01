@@ -25,3 +25,4 @@ pub mod types;
 
 // crate 统一错误类型——供业务层（analyzer/anomaly/queries 等）与 src-tauri 消费层共用。
 pub use error::{Error, Result};
+pub mod metrics;

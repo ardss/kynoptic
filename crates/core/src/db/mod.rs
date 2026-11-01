@@ -1396,9 +1396,20 @@ mod tests {
     /// 修复后 112.58ms vs 157ms（通过，余量 ~28%）。千行库对照仅作诊断输出。
     #[test]
     fn batch_flush_write_lock_time_does_not_scale_with_row_count() {
+        // panic 安全清理 guard：本测试临时库 ~4GB，机器 C: 盘长期 96% 满，
+        // 失败路径若不清理会形成「残留→磁盘满→下一轮测试 DiskFull」级联
+        // （实测两次）。Drop 在 unwind 时也执行。
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         const N: i64 = 10_000_000;
         let (small_db, small_dir) = s12_bulk_db("small", 1_000);
         let (big_db, big_dir) = s12_bulk_db("big", N);
+        let _guard_small = DirCleanup(small_dir.clone());
+        let _guard_big = DirCleanup(big_dir.clone());
         assert_eq!(s12_count(&big_db), N, "前置：大库须有千万行（模拟库）");
 
         // 预热（页面缓存/语句缓存），排除首批暖机噪声
