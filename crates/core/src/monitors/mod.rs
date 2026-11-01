@@ -28,11 +28,15 @@ pub mod battery;
 pub mod brightness;
 pub mod device;
 pub mod idle;
+pub mod net_etw;
 pub mod network;
+pub mod plan_probe;
 pub mod power_plan;
 pub mod process;
+pub mod proxy_link;
 pub mod session;
 pub mod system;
+pub mod traffic_derive;
 pub mod wifi;
 pub mod window;
 

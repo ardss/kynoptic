@@ -22,6 +22,7 @@ use crate::constants;
 pub mod agg;
 pub mod events;
 pub mod metadata;
+pub mod net_metrics;
 pub mod schema;
 pub mod sessions;
 
@@ -88,12 +89,18 @@ pub fn clear_degraded_flag(db_file: &Path) {
 /// 显式 opt-in 保留期清理删行后由 cleanup_old_events 与 CLI db cleanup 在同一
 /// 事务内同步推进水位，不会被下次 open 的对账误判为「回退」。
 ///
-/// 刷新时机不止正常停机——三处推进（见 [`persist_events_watermark`]）：
-/// 1. 每次批量事件落库（`insert_events` / `insert_events_with_agg`，与写入同事务）；
-/// 2. 每次成功的 WAL checkpoint（`maintenance` 的 `wal_checkpoint_truncate`）；
+/// 刷新时机不止正常停机——三处推进（见 [`persist_events_watermark`] 与
+/// [`bump_events_watermark`]）：
+/// 1. 每次批量事件落库（`insert_events` / `insert_events_with_agg`，与写入同
+///    事务；S1.2 起 O(1) 增量累加，delta 为批内真实新增行数）；
+/// 2. 每次成功的 WAL checkpoint（`maintenance` 的 `wal_checkpoint_truncate`，
+///    低频 COUNT(*) 精确重同步）；
 /// 3. 正常停机（[`Database::mark_stopping`]）+ opt-in 保留期清理后（core
 ///    `cleanup_old_events` 与 CLI `db cleanup` 均在**与删行同一事务内**推进，
 ///    删行与水位要么一起落库、要么一起回滚，强杀窗口无假「回退」）。
+///
+/// 增量累加的偏差由低频路径（checkpoint/停机/清理，均 COUNT(*) 精确）与下次
+/// open 的对账重定基线兜底收敛。
 const EVENTS_WATERMARK_KEY: &str = "events_watermark_row_count";
 
 /// 旧水位键（MAX(rowid) 语义，W33-F2 之前）：存量库 open 时清退——旧值与新
@@ -101,12 +108,16 @@ const EVENTS_WATERMARK_KEY: &str = "events_watermark_row_count";
 const LEGACY_EVENTS_WATERMARK_KEY: &str = "events_watermark_max_rowid";
 
 /// 把当前 events 行数（COUNT(*)）刷新持久化到 metadata（水位写入的唯一落库点，
-/// 收敛原 `mark_stopping` 的内联 SQL，供批量落库 / checkpoint / 停机 / 保留期
-/// 清理（core 与 CLI 各一条路径）共用）。查询失败（events 表不可用/已损坏）时
-/// **不写**——避免把水位误刷成 0 而丢失后续回退检测能力；写入失败仅留日志，
-/// 不阻塞调用方。调用方在开放事务内（BEGIN…COMMIT 之间）调用时，两条语句
-/// 加入该事务、随 COMMIT 原子落库——删行路径正是依此保证「删行与水位推进
-/// 同生同死」，强杀不会产生「删了行、水位没动」的假回退。
+/// 收敛原 `mark_stopping` 的内联 SQL，供 checkpoint / 正常停机 / 保留期清理
+/// （core 与 CLI 各一条路径）等**低频路径**共用）。查询失败（events 表不可用/
+/// 已损坏）时**不写**——避免把水位误刷成 0 而丢失后续回退检测能力；写入失败
+/// 仅留日志，不阻塞调用方。调用方在开放事务内（BEGIN…COMMIT 之间）调用时，
+/// 两条语句加入该事务、随 COMMIT 原子落库——删行路径正是依此保证「删行与水位
+/// 推进同生同死」，强杀不会产生「删了行、水位没动」的假回退。
+///
+/// S1.2 起**批量落库路径不再走本函数**（每批 SELECT COUNT(*) 是 O(N) 全索引
+/// 扫描，千万行级库下写锁持有时间随行数线性增长，见
+/// [`bump_events_watermark`]）；本函数退守低频精确重同步点。
 pub fn persist_events_watermark(conn: &Connection) {
     let n: i64 = match conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)) {
         Ok(n) => n,
@@ -118,6 +129,50 @@ pub fn persist_events_watermark(conn: &Connection) {
         params![EVENTS_WATERMARK_KEY, n.to_string()],
     ) {
         log::warn!("events 水位持久化失败: {e}");
+    }
+}
+
+/// S1.2 增量水位推进（批量落库路径专用，O(1)）：把本批**真实新增行数**
+/// `delta` SQL 侧单条 UPSERT 累加进 metadata 水位——替代每批
+/// `SELECT COUNT(*)` 的 O(N) 全索引扫描（千万行级库下每批 flush 的写锁
+/// 持有时间随行数线性增长，验收测试
+/// `batch_flush_write_lock_time_does_not_scale_with_row_count`）。
+///
+/// 口径（增量与 COUNT(*) 一致，验收测试
+/// `incremental_watermark_matches_count_over_random_insert_delete_sequence`）：
+/// - delta 由调用方按逐行结果精确累计：raw 行成功 +1；input_agg 行仅当
+///   UPSERT 走 INSERT 分支（新分钟/新类型首写）+1、DO UPDATE 覆盖 +0
+///   （events.rs 预检部分唯一索引判定，O(log N)）。
+/// - 调用方在**同一事务内**调用 → 批回滚时水位累加随之回滚，与删行路径的
+///   「删行与水位同生同死」同构；降级路径在收尾 with_writer 里按已提交
+///   子批的成功行数汇总一次（与旧实现收尾单次推进同位置）。
+/// - 键不存在时（理论不可达：open 的 reconcile 必先播种基线）以当前 COUNT(*)
+///   +delta 播种，不丢基线；delta == 0（纯覆盖批）直接跳过。
+///
+/// 实现注意：**不得**写成 `INSERT … VALUES (…, (SELECT COUNT(*) …)) ON
+/// CONFLICT …`——SQLite 先构造待插行再判冲突，VALUES 子查询在命中冲突路径时
+/// 照常求值，等价于每批一次 COUNT(*)（且执行计划更差，实测把千万行库单批
+/// flush 从 ~212ms 拖到 ~564ms）。UPDATE 命中键时零子查询、零 O(N) 求值。
+pub fn bump_events_watermark(conn: &Connection, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    match conn.execute(
+        "UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT) WHERE key = ?1",
+        params![EVENTS_WATERMARK_KEY, delta],
+    ) {
+        Ok(0) => {
+            // 键不存在（理论不可达，open reconcile 必先播种）：COUNT(*) 定基线
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap_or(0);
+            let _ = conn.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                params![EVENTS_WATERMARK_KEY, (n + delta).to_string()],
+            );
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("events 水位增量推进失败: {e}"),
     }
 }
 
@@ -1060,6 +1115,7 @@ pub(crate) fn lock_writer<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Event, EventAction, EventType};
 
     /// 短路径与已 verbatim 的路径必须原样返回（行为零变化）
     #[test]
@@ -1159,7 +1215,7 @@ mod tests {
     }
 
     /// WAL 水位对账：水位不高于当前行数时正常；回退即报告（WAL 静默蒸发
-    /// 防护，见 reconcile_events_watermark；W33-F2 起水位为 COUNT(*) 口径）。
+    /// 防护，见 reconcile_events_watermark；W33-F2 起水位为行数口径，S1.2 起批量路径 O(1) 增量累加）。
     #[test]
     fn watermark_regression_detected() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1186,6 +1242,210 @@ mod tests {
         conn.execute("DELETE FROM events WHERE x > 2", []).unwrap();
         let msg = reconcile_events_watermark(&conn).expect("回退必须被发现");
         assert!(msg.contains("回退"), "告警文本须含回退: {msg}");
+    }
+
+    // === S1.2 增量水位 ===
+
+    /// 固定种子的确定性伪随机（禁真实时钟/禁外部随机源）：LCG
+    fn s12_rng(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    fn s12_watermark(db: &Database) -> i64 {
+        db.get_metadata(EVENTS_WATERMARK_KEY)
+            .expect("水位键必须存在（open reconcile 已播种）")
+            .parse()
+            .unwrap()
+    }
+
+    fn s12_count(db: &Database) -> i64 {
+        db.reader()
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// S1.2 验收①：随机插删序列下，增量水位与 COUNT(*) 口径必须逐步一致。
+    /// 序列覆盖全部增量路径：整批 raw（insert_events / insert_events_with_agg）、
+    /// input_agg UPSERT 的 INSERT 与 DO UPDATE 两个分支、降级逐条收尾、
+    /// 保留期清理（COUNT 重同步点）。每步断言 watermark == COUNT(*)。
+    /// 时间戳全部相对固定基准日生成，不读真实时钟。
+    #[test]
+    fn incremental_watermark_matches_count_over_random_insert_delete_sequence() {
+        let dir = std::env::temp_dir().join(format!("kyn-s12-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("seq.db");
+        let mut db = Database::open(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            s12_watermark(&db),
+            s12_count(&db),
+            "open reconcile 后水位与行数一致"
+        );
+
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let base_day = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let old_ts = "2025-01-15T08:00:00+00:00".to_string(); // 恒过期（保留期 30 天）
+        for step in 0..40usize {
+            let op = s12_rng(&mut seed) % 5;
+            match op {
+                0..=2 => {
+                    // 整批 raw 插入（轮换 with_agg / 无 agg 两路径）
+                    let k = (s12_rng(&mut seed) % 20 + 1) as usize;
+                    let mut events = Vec::with_capacity(k);
+                    for _ in 0..k {
+                        let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+                        let day =
+                            base_day + chrono::Duration::days((s12_rng(&mut seed) % 60) as i64);
+                        let secs = (s12_rng(&mut seed) % 86_400) as u32;
+                        e.timestamp = day
+                            .and_hms_opt(0, 0, 0)
+                            .unwrap()
+                            .and_local_timezone(chrono::Utc)
+                            .unwrap()
+                            .timestamp()
+                            .checked_add(secs as i64)
+                            .map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap().to_rfc3339())
+                            .unwrap();
+                        events.push(e);
+                    }
+                    if op == 0 {
+                        db.insert_events(&events);
+                    } else {
+                        let (rowids, failed) = db.insert_events_with_agg(&events);
+                        assert!(!failed);
+                        assert_eq!(rowids.len(), k);
+                    }
+                }
+                3 => {
+                    // input_agg UPSERT：固定分钟首轮 INSERT 分支（+1 行），
+                    // 复写走 DO UPDATE 分支（+0 行）——增量口径的精度关键点
+                    let mut e = Event::new(EventAction::InputAgg, EventType::Keyboard)
+                        .data(serde_json::json!({"keys": 3, "samples": 3}));
+                    e.timestamp = "2026-06-10T12:00:00+00:00".to_string();
+                    let _ = db.insert_events_with_agg(std::slice::from_ref(&e));
+                    let _ = db.insert_events_with_agg(std::slice::from_ref(&e));
+                }
+                _ => {
+                    // 清理步：先塞一条恒过期行再 opt-in 清理（COUNT 重同步点）
+                    let mut e = Event::new(EventAction::Press, EventType::Keyboard);
+                    e.timestamp = old_ts.clone();
+                    db.insert_events_with_agg(std::slice::from_ref(&e));
+                    db.retention_days = 30;
+                    db.cleanup_old_events();
+                    db.retention_days = 0;
+                }
+            }
+            let wm = s12_watermark(&db);
+            let cnt = s12_count(&db);
+            assert_eq!(
+                wm, cnt,
+                "第 {step} 步（op={op}）增量水位必须与 COUNT(*) 一致"
+            );
+        }
+        db.mark_stopping();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 千万行模拟库的目录（与建库分离：目录先建、guard 先挂，建库 panic
+    /// 也不残留——实测教训：磁盘满时 bulk 中途 panic 会留下 3.6GB 孤儿）。
+    fn s12_bulk_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kyn-s12-bulk-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 在给定目录建一个 n 行 events 的库（单事务 CTE 直插，绕开应用层写入
+    /// 以压测水位刷新本身）。
+    fn s12_open_bulk(dir: &std::path::Path, n: i64) -> Database {
+        let db = Database::open(dir.join("bulk.db").to_str().unwrap()).unwrap();
+        db.with_writer(
+            |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                conn.execute(
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < ?1) \
+                     INSERT INTO events (timestamp, event_type, event_action, app_name, window_title) \
+                     SELECT '2026-01-01T00:00:00+00:00', 'keyboard', 'press', NULL, NULL FROM c",
+                    [n],
+                )
+                .unwrap();
+                conn.execute_batch("COMMIT").unwrap();
+            },
+            || (),
+        );
+        db
+    }
+
+    /// M 批 × 300 事件的平均单批耗时（毫秒），批量走生产主路径
+    /// insert_events_with_agg（整批事务 = 写锁持有区间的近似）。
+    fn s12_avg_flush_ms(db: &Database, batches: usize) -> f64 {
+        let mut events = Vec::with_capacity(300);
+        for _ in 0..300 {
+            events.push(Event::new(EventAction::Press, EventType::Keyboard));
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..batches {
+            let (rowids, failed) = db.insert_events_with_agg(&events);
+            assert!(!failed);
+            assert!(rowids.iter().all(|&r| r != 0), "前置：写入须成功");
+        }
+        t0.elapsed().as_secs_f64() * 1000.0 / batches as f64
+    }
+
+    /// S1.2 验收②（计时断言近似，R2.3 时钟复核修订）：千万行级模拟库下，
+    /// 每批 flush 的写锁持有时间不得随行数增长。判据为**机器自适应的相对
+    /// 界**：大库单批 flush 平均耗时不得高于同库一次裸 `SELECT COUNT(*)`
+    /// （修复前每批 flush ≈ COUNT(*) + 插入成本，必然高于裸 COUNT；
+    /// 修复后水位增量为 O(1)，flush ≈ 纯插入成本，显著低于 COUNT）——
+    /// 机器慢时两者同步变慢，阈值不随机器漂移（固定 3x 比率阈值在慢机器
+    /// 上会误伤，已废弃）。实测校准：修复前 212-270ms vs COUNT 157ms（判负）；
+    /// 修复后 112.58ms vs 157ms（通过，余量 ~28%）。千行库对照仅作诊断输出。
+    #[test]
+    fn batch_flush_write_lock_time_does_not_scale_with_row_count() {
+        // panic 安全清理 guard：本测试临时库 ~4GB，机器 C: 盘长期 96% 满，
+        // 失败路径若不清理会形成「残留→磁盘满→下一轮测试 DiskFull」级联
+        // （实测两次）。Drop 在 unwind 时也执行。
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        const N: i64 = 10_000_000;
+        // 目录先建、guard 先挂，再建库——bulk 直插中途 panic（如磁盘满）也不残留
+        let small_dir = s12_bulk_dir("small");
+        let big_dir = s12_bulk_dir("big");
+        let _guard_small = DirCleanup(small_dir.clone());
+        let _guard_big = DirCleanup(big_dir.clone());
+        let small_db = s12_open_bulk(&small_dir, 1_000);
+        let big_db = s12_open_bulk(&big_dir, N);
+        assert_eq!(s12_count(&big_db), N, "前置：大库须有千万行（模拟库）");
+
+        // 预热（页面缓存/语句缓存），排除首批暖机噪声
+        let _ = s12_avg_flush_ms(&small_db, 2);
+        let _ = s12_avg_flush_ms(&big_db, 2);
+        let small_ms = s12_avg_flush_ms(&small_db, 10);
+        let big_ms = s12_avg_flush_ms(&big_db, 10);
+        let count_ms = {
+            let t = std::time::Instant::now();
+            let _ = s12_count(&big_db);
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        println!(
+            "[S12] 千行库 {small_ms:.2}ms/批，千万行库 {big_ms:.2}ms/批，\
+             同库裸 COUNT {count_ms:.2}ms"
+        );
+        assert!(
+            big_ms < count_ms,
+            "千万行库单批 flush 平均 {big_ms:.2}ms 不得高于同库裸 COUNT(*) \
+             {count_ms:.2}ms（若高于即每批在做 O(N) 全表扫描，O(N) COUNT 回归）"
+        );
+
+        small_db.mark_stopping();
+        big_db.mark_stopping();
+        let _ = std::fs::remove_dir_all(&small_dir);
+        let _ = std::fs::remove_dir_all(&big_dir);
     }
 
     /// 真机探针（Win32 API 参数结构铁律）：db_free_space_bytes 的

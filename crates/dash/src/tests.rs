@@ -2846,3 +2846,374 @@ mod input_series_badge_fix {
         assert_eq!(falsy, "\"none\"", "alerts==0 分支应保持 \"none\" 隐藏");
     }
 }
+
+// === M2.4: /api/net-process ===
+
+#[test]
+fn net_process_endpoint_returns_rows_and_rejects_bad_minutes() {
+    let conn = mem_conn();
+    // 桶取相对当前时刻（端点窗口以 now 为基准；只对齐窗口，不断言墙钟值）
+    let now_bucket = chrono::Utc::now().timestamp_millis() / 60_000;
+    conn.execute(
+        "INSERT INTO net_process_minute (minute_bucket,pid,metric_id,bytes,loss_count,coverage,quality) VALUES (?1,7,'net.process.bytes_in',600,NULL,NULL,'confirmed')",
+        params![now_bucket - 5],
+    )
+    .unwrap();
+    let dir = tmpdir("netproc");
+    let db = dir.join("kyn.db");
+    let (code, ctype, body) = route_req(&conn, "GET", "/api/net-process?minutes=60", "", &db);
+    assert_eq!(code, 200);
+    assert_eq!(ctype, "application/json");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let rows = v["rows"].as_array().expect("必须返回 rows 数组");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["pid"], json!(7));
+    assert_eq!(rows[0]["bytes"], json!(600));
+    assert_eq!(rows[0]["metric_id"], json!("net.process.bytes_in"));
+    assert_eq!(rows[0]["quality"], json!("confirmed"));
+    // minutes=0 → 400（数值参数政策同既有端点）
+    let (code, _, _) = route_req(&conn, "GET", "/api/net-process?minutes=0", "", &db);
+    assert_eq!(code, 400);
+}
+
+// === M3.4: /api/net-derived（网络归因分区 + 可信度标注） ===
+
+#[test]
+fn net_derived_partition_snapshot_with_proxy_evidence() {
+    // 端点数据快照：种子两进程分钟桶（4242=代理核心、7=普通应用），
+    // 注入代理 pid 证据与固定 now，断言五分区口径与 quality 徽标输入
+    let conn = mem_conn();
+    let now_ms = 1_800_000_000_000i64;
+    let now_bucket = now_ms / 60_000;
+    for (pid, metric, bytes, bucket_off) in [
+        (4242i64, "net.process.bytes_in", 1000i64, 5i64),
+        (4242, "net.process.bytes_out", 2000, 5),
+        (7, "net.process.bytes_in", 500, 3),
+    ] {
+        conn.execute(
+            "INSERT INTO net_process_minute (minute_bucket,pid,metric_id,bytes,loss_count,coverage,quality) VALUES (?1,?2,?3,?4,NULL,NULL,'confirmed')",
+            params![now_bucket - bucket_off, pid, metric, bytes],
+        )
+        .unwrap();
+    }
+    let v = api_net_derived_with(&conn, 60, now_ms, &[4242], true);
+    assert_eq!(v["minutes"], json!(60));
+    assert_eq!(v["evidence_available"], json!(true));
+    let secs = v["sections"].as_array().expect("必须返回 sections 数组");
+    assert_eq!(
+        secs.len(),
+        5,
+        "五分区：direct/via_proxy/proxy_outer/fuzzy/plan"
+    );
+    let get = |key: &str| {
+        secs.iter()
+            .find(|s| s["key"] == json!(key))
+            .unwrap_or_else(|| panic!("缺分区 {key}"))
+    };
+    // 代理外层：pid 命中证据，进出合计 3000，confirmed
+    let po = get("proxy_outer");
+    assert_eq!(po["bytes"], json!(3000));
+    assert_eq!(po["quality"], json!("confirmed"));
+    // 直连 / 代理相关：分钟聚合无远端归属，本切片诚实标 Unavailable+原因
+    for key in ["direct", "via_proxy"] {
+        let s = get(key);
+        assert_eq!(s["quality"], json!("unavailable"), "{key} 必须显式不可用");
+        assert!(s["bytes"].is_null());
+        let note = s["note"].as_str().unwrap_or("");
+        assert!(!note.is_empty(), "{key} 必须带原因文案");
+    }
+    // 模糊：非代理进程行合计 500，Incomplete + 原因（分钟聚合无远端归属）
+    let fz = get("fuzzy");
+    assert_eq!(fz["bytes"], json!(500));
+    assert_eq!(fz["quality"], json!("incomplete"));
+    assert!(fz["note"].as_str().unwrap_or("").contains("远端"));
+    // 套餐：M3.3 结论 Unavailable + 原因
+    let pl = get("plan");
+    assert_eq!(pl["quality"], json!("unavailable"));
+    assert!(pl["bytes"].is_null());
+    assert!(!pl["note"].as_str().unwrap_or("").is_empty());
+}
+
+#[test]
+fn net_derived_unavailable_when_port_evidence_fails() {
+    let conn = mem_conn();
+    let now_ms = 1_800_000_000_000i64;
+    let now_bucket = now_ms / 60_000;
+    conn.execute(
+        "INSERT INTO net_process_minute (minute_bucket,pid,metric_id,bytes,loss_count,coverage,quality) VALUES (?1,7,'net.process.bytes_in',500,NULL,NULL,'confirmed')",
+        params![now_bucket - 3],
+    )
+    .unwrap();
+    let v = api_net_derived_with(&conn, 60, now_ms, &[], false);
+    let secs = v["sections"].as_array().unwrap();
+    let get = |key: &str| secs.iter().find(|s| s["key"] == json!(key)).unwrap();
+    assert_eq!(v["evidence_available"], json!(false));
+    for key in ["proxy_outer", "fuzzy"] {
+        let s = get(key);
+        assert_eq!(
+            s["quality"],
+            json!("unavailable"),
+            "{key} 证据缺失必须显式降级"
+        );
+        assert!(!s["note"].as_str().unwrap_or("").is_empty());
+    }
+}
+
+#[test]
+fn net_derived_endpoint_route_and_bad_minutes() {
+    let conn = mem_conn();
+    let dir = tmpdir("netderived");
+    let db = dir.join("kyn.db");
+    let (code, ctype, body) = route_req(&conn, "GET", "/api/net-derived?minutes=60", "", &db);
+    assert_eq!(code, 200);
+    assert_eq!(ctype, "application/json");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["sections"].as_array().unwrap().len(), 5);
+    let (code, _, _) = route_req(&conn, "GET", "/api/net-derived?minutes=0", "", &db);
+    assert_eq!(code, 400);
+}
+
+// === M4.2: 诊断模式（设置页字段 + /api/status diag 块） ===
+
+#[test]
+fn diag_mode_status_fields_and_settings_page() {
+    // /api/status 回 diag 块：默认 basic（诊断模式默认关）、剩余 0、
+    // 深诊档资源预算上限随块下发（设置页展示契约）
+    let conn = mem_conn();
+    let dir = tmpdir("diagmode");
+    let db = dir.join("kyn.db");
+    let (code, _, body) = route_req(&conn, "GET", "/api/status", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["diag"]["mode"], json!("basic"), "诊断模式必须默认关");
+    assert_eq!(v["diag"]["remaining_ms"], json!(0));
+    assert_eq!(
+        v["diag"]["budget_cpu_percent_single_core"],
+        json!(kynoptic_core::diag_mode::DIAG_BUDGET_CPU_PERCENT_SINGLE_CORE)
+    );
+    assert_eq!(
+        v["diag"]["budget_rss_mib"],
+        json!(kynoptic_core::diag_mode::DIAG_BUDGET_RSS_MIB)
+    );
+    // 设置页字段：当前模式 + 剩余时长（id 契约，前端 JS 回填）
+    assert!(
+        DASHBOARD_HTML.contains("set-diag-mode"),
+        "设置页须有诊断模式字段"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("set-diag-remaining"),
+        "设置页须有剩余时长字段"
+    );
+}
+
+// === M4.3: 三视图（系统总览 / 资源排行 / 诊断时间线） ===
+
+/// net_process_minute 直插（测试造数；列同 0012 迁移）。
+fn m43_net_row(conn: &Connection, bucket: i64, pid: u32, metric: &str, bytes: i64) {
+    conn.execute(
+        "INSERT INTO net_process_minute (minute_bucket, pid, metric_id, bytes, loss_count, coverage, quality) \
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'confirmed')",
+        params![bucket, pid, metric, bytes],
+    )
+    .unwrap();
+}
+
+/// 带任意 event_data 的插行（RFC3339 UTC）。
+fn m43_event(conn: &Connection, ts: &str, t: &str, a: &str, data: Option<&str>, app: Option<&str>) {
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, window_title, session_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+        params![ts, t, a, data, app],
+    )
+    .unwrap();
+}
+
+fn m43_ms_to_rfc3339(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .to_rfc3339()
+}
+
+#[test]
+fn m43_sys_overview_snapshot() {
+    // 系统总览快照：CPU/内存读最新 system heartbeat 事件、GPU 读最新
+    // gpu_snapshot、网络读 M2.4 分钟桶合计、关键异常/监控健康字段齐备。
+    // 全程注入 now_ms（禁真实时钟）。
+    let conn = mem_conn();
+    let db = tmpdir("m43sys").join("kyn.db");
+    const NOW: i64 = 10_000 * 60_000; // 10_000 号桶
+    m43_event(
+        &conn,
+        &m43_ms_to_rfc3339(NOW - 60_000),
+        "system",
+        "heartbeat",
+        Some(r#"{"cpu_percent":42.5,"memory":{"total":16,"available":8,"used_percent":50}}"#),
+        None,
+    );
+    m43_event(
+        &conn,
+        &m43_ms_to_rfc3339(NOW - 120_000),
+        "system",
+        "gpu_snapshot",
+        Some(r#"{"gpus":["TestGPU"]}"#),
+        None,
+    );
+    m43_net_row(&conn, NOW / 60_000 - 1, 7, "net.process.bytes_in", 600);
+    m43_net_row(&conn, NOW / 60_000 - 1, 7, "net.process.bytes_out", 50);
+    let v = api_sys_overview_at(&conn, &db, NOW);
+    assert_eq!(
+        v["cpu_memory"]["cpu_percent"],
+        json!(42.5),
+        "CPU 读自最新心跳"
+    );
+    assert_eq!(v["cpu_memory"]["memory"]["used_percent"], json!(50));
+    assert_eq!(v["cpu_memory"]["quality"], json!("confirmed"));
+    assert!(
+        v["gpu"]["data"].is_object(),
+        "GPU 快照读自最新 gpu_snapshot 事件"
+    );
+    assert_eq!(
+        v["network"]["bytes_in"],
+        json!(600),
+        "网络进合计来自 M2.4 桶"
+    );
+    assert_eq!(v["network"]["bytes_out"], json!(50));
+    assert_eq!(v["network"]["quality"], json!("confirmed"));
+    assert!(v["anomalies"]["count"].is_number(), "关键异常计数必须在场");
+    assert!(
+        v["monitor_health"]["enabled_monitors"].is_number(),
+        "监控健康须带启用监控器数"
+    );
+    assert!(
+        v["monitor_health"]["watchdog_alert"].is_null(),
+        "空库无看门狗告警"
+    );
+}
+
+#[test]
+fn m43_resource_top_ranks_by_bytes_with_injected_names() {
+    // 资源排行：网络维度按 pid 合计排序（降序），进程名注入解析（缺失显示
+    // null 不伪造）；CPU/内存/磁盘/进程树无持久化源 → 显式 Unavailable+原因。
+    let conn = mem_conn();
+    const NOW: i64 = 10_000 * 60_000;
+    m43_net_row(&conn, NOW / 60_000 - 1, 7, "net.process.bytes_in", 3_000);
+    m43_net_row(&conn, NOW / 60_000 - 1, 7, "net.process.bytes_out", 100);
+    m43_net_row(&conn, NOW / 60_000 - 2, 9, "net.process.bytes_in", 5_000);
+    let v = api_resource_top_at(&conn, 60, NOW, &|pid| {
+        if pid == 7 {
+            Some("alpha.exe".to_string())
+        } else {
+            None
+        }
+    });
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["pid"], json!(9), "字节最多者排第一");
+    assert_eq!(rows[0]["total"], json!(5_000));
+    assert!(rows[0]["name"].is_null(), "解析不到的名字保持 null，不伪造");
+    assert_eq!(rows[1]["pid"], json!(7));
+    assert_eq!(rows[1]["name"], json!("alpha.exe"));
+    assert_eq!(rows[1]["total"], json!(3_100));
+    for dim in ["cpu", "memory", "disk", "tree"] {
+        assert_eq!(
+            v["dimensions"][dim]["quality"],
+            json!("unavailable"),
+            "{dim} 无持久化按进程源，必须显式 Unavailable"
+        );
+        assert!(
+            v["dimensions"][dim]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("未采"),
+            "{dim} 原因须声明未采不伪造"
+        );
+    }
+}
+
+#[test]
+fn m43_diag_timeline_related_fields() {
+    // 诊断时间线：锚点 ± 窗口内关联事件（升序、含类型/动作/应用）+ 网络资源
+    // 变化（锚点前后分桶合计）+ 目的地址显式 Unavailable（分钟聚合无远端地址）。
+    let conn = mem_conn();
+    const A: i64 = 1_000 * 60_000; // 锚点：1_000 号桶整
+    m43_event(
+        &conn,
+        &m43_ms_to_rfc3339(A - 2 * 60_000),
+        "window",
+        "switch",
+        None,
+        Some("editor.exe"),
+    );
+    m43_event(
+        &conn,
+        &m43_ms_to_rfc3339(A + 3 * 60_000),
+        "clipboard",
+        "press",
+        None,
+        None,
+    );
+    m43_net_row(&conn, A / 60_000 - 1, 7, "net.process.bytes_out", 700);
+    m43_net_row(&conn, A / 60_000 + 1, 7, "net.process.bytes_out", 300);
+    let v = api_diag_timeline_at(&conn, A, 10);
+    let evs = v["window_events"].as_array().unwrap();
+    assert_eq!(evs.len(), 2, "窗口内两条关联事件");
+    assert_eq!(evs[0]["action"], json!("switch"), "按时间升序");
+    assert_eq!(evs[0]["app"], json!("editor.exe"), "关联字段含进程/应用");
+    assert_eq!(
+        v["resource_change"]["before_bytes"],
+        json!(700),
+        "锚点前合计"
+    );
+    assert_eq!(
+        v["resource_change"]["after_bytes"],
+        json!(300),
+        "锚点后合计"
+    );
+    assert_eq!(v["resource_change"]["quality"], json!("confirmed"));
+    assert_eq!(v["dest"]["quality"], json!("unavailable"), "远端地址未采");
+    assert!(v["dest"]["reason"].as_str().unwrap().contains("未采"));
+    assert_eq!(v["related"]["event_count"], json!(2));
+}
+
+#[test]
+fn m43_routes_param_contract() {
+    let conn = mem_conn();
+    let db = tmpdir("m43routes").join("kyn.db");
+    let (code, ctype, body) = route_req(&conn, "GET", "/api/sys-overview", "", &db);
+    assert_eq!(code, 200);
+    assert_eq!(ctype, "application/json");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["cpu_memory"].is_object());
+    let (code, _, _) = route_req(&conn, "GET", "/api/resource-top?minutes=0", "", &db);
+    assert_eq!(code, 400);
+    let (code, _, body) = route_req(&conn, "GET", "/api/resource-top?minutes=60", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["minutes"], json!(60));
+    let (code, _, _) = route_req(&conn, "GET", "/api/diag-timeline", "", &db);
+    assert_eq!(code, 400, "缺 at 锚点必须 400");
+    let (code, _, body) = route_req(&conn, "GET", "/api/diag-timeline?at=60000000", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["at_ms"], json!(60_000_000));
+    assert!(v["window_events"].is_array());
+}
+
+#[test]
+fn m43_dashboard_three_views_present() {
+    // 三视图 id 契约：页签 + 面板容器（HTML 结构，JS 回填）。
+    for id in [
+        "tab-sys",
+        "view-sys",
+        "tab-restop",
+        "view-restop",
+        "tab-diagtl",
+        "view-diagtl",
+        "sys-overview",
+        "restop-rows",
+        "diagtl-rows",
+        "diagtl-dest",
+    ] {
+        assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
+    }
+}

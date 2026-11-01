@@ -184,6 +184,14 @@
   .kb g:hover rect, .kb rect:hover { stroke: var(--brand); stroke-width: 2; }
   .badge { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px;
            padding: 0 7px; color: var(--warn); background: rgba(245,180,84,0.08); }
+  /* M3.4 网络归因可信度徽标（Confirmed 绿 / Estimated 琥珀 / Incomplete 蓝灰 / Unavailable 灰显） */
+  .q-badge { display:inline-block; font-size:10.5px; border:1px solid currentColor;
+    border-radius:999px; padding:0 7px; margin-left:6px; vertical-align:middle; }
+  .q-confirmed { color: var(--ok); }
+  .q-estimated { color: var(--warn); }
+  .q-incomplete { color: var(--dim); }
+  .q-unavailable { color: var(--faint); background: rgba(128,128,128,.08); }
+  .q-gray { opacity:.55; }
   /* 页签红色角标（异常页：未读 alert 级异常数） */
   .tab-badge { display: none; margin-left: 6px; padding: 0 6px; border-radius: 999px;
                background: var(--bad); color: #fff; font-size: 10.5px; font-weight: 700; }
@@ -272,6 +280,9 @@
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-apps" aria-controls="view-apps" tabindex="-1"><span class="l en">Apps</span><span class="l zh">应用</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-input" aria-controls="view-input" tabindex="-1"><span class="l en">Input</span><span class="l zh">输入</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-insights" aria-controls="view-insights" tabindex="-1"><span class="l en">Insights</span><span class="l zh">洞察</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-sys" aria-controls="view-sys" tabindex="-1"><span class="l en">System</span><span class="l zh">系统总览</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-restop" aria-controls="view-restop" tabindex="-1"><span class="l en">Resources</span><span class="l zh">资源排行</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-diagtl" aria-controls="view-diagtl" tabindex="-1"><span class="l en">Timeline</span><span class="l zh">诊断时间线</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" aria-controls="view-anomalies" tabindex="-1"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge" aria-live="polite"></span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" aria-controls="view-settings" tabindex="-1"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
@@ -318,6 +329,12 @@
 
 <!-- 后端口径说明（overview.metrics_note，双语已由后端给出），防御性渲染 -->
 <div id="overview-note" class="muted" style="font-size:12px;margin:4px 0 0"></div>
+
+<section>
+  <h2><span class="l en">network attribution — last hour (direct / via proxy / proxy outer / plan)</span><span class="l zh">网络归因 — 近 1 小时（直连 / 代理相关 / 代理外层 / 套餐）</span></h2>
+  <div id="net-attribution" class="muted">loading…</div>
+  <div id="net-top" class="muted" style="margin-top:8px;font-size:12px"></div>
+</section>
 
 <section>
   <h2><span class="l en">timeline — last 24 hours (presence / automation / away)</span><span class="l zh">时间线 — 近 24 小时（在场 / 自动化 / 无输入）</span></h2>
@@ -471,6 +488,31 @@
   <div id="insights-list"></div>
 </div>
 
+<div id="view-sys" role="tabpanel" aria-labelledby="tab-sys" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">System snapshot — only dimensions with a persisted source show numbers; the rest are marked unavailable.</span><span class="l zh">系统总览快照——只有存在持久化数据源的维度才显示数值，其余显式标注不可用。</span></div>
+  <section>
+    <h2><span class="l en">system overview</span><span class="l zh">系统总览</span></h2>
+    <div id="sys-overview" class="muted">loading…</div>
+  </section>
+</div>
+
+<div id="view-restop" role="tabpanel" aria-labelledby="tab-restop" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Per-process ranking from persisted ETW minute buckets (network). CPU/memory/disk per-process have no persisted source.</span><span class="l zh">按进程排行读自持久化的 ETW 分钟桶（网络维度）；按进程 CPU/内存/磁盘无持久化数据源，显式标注。</span></div>
+  <section>
+    <h2><span class="l en">resources — top processes (last 60 min)</span><span class="l zh">资源排行 — 按进程（近 60 分钟）</span></h2>
+    <div id="restop-rows" class="muted">loading…</div>
+  </section>
+</div>
+
+<div id="view-diagtl" role="tabpanel" aria-labelledby="tab-diagtl" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Point diagnostics: pick a moment, see related events, per-process traffic change and destination-address availability.</span><span class="l zh">点异常诊断：选一个时刻，查看关联事件、按进程流量变化与目的地址可得性。</span></div>
+  <section>
+    <h2><span class="l en">diagnostic timeline (now ± 5 min)</span><span class="l zh">诊断时间线（当前时刻 ± 5 分钟）</span></h2>
+    <div id="diagtl-rows" class="muted">loading…</div>
+    <div id="diagtl-dest" class="muted" style="font-size:12px;margin-top:8px"></div>
+  </section>
+</div>
+
 <div id="view-anomalies" role="tabpanel" aria-labelledby="tab-anomalies" style="display:none">
   <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Deviation from your own 7-day same-hour baseline — no cloud, no universal thresholds.</span><span class="l zh">基于你自己近 7 天同时段历史基线的偏差检测——没有云端、没有通用阈值，异常只相对你自己的常态。</span></div>
 <section>
@@ -545,6 +587,11 @@
     <!-- 实际监听端口（loadStatus/loadSettings 回填）：配置端口被占自动回退后，
          用户可在浏览器地址栏与本页之间对照同一个数字 -->
     <span class="muted" id="set-port-actual" style="font-size:11px"></span>
+  </div>
+  <div class="mon-row">
+    <span class="muted" style="font-size:12px"><span class="l en">diagnostic mode</span><span class="l zh">诊断模式</span>:</span>
+    <span id="set-diag-mode" class="badge">–</span>
+    <span class="muted" id="set-diag-remaining" style="font-size:11px"></span>
   </div>
   <div class="mon-row">
     <input type="checkbox" id="set-counts" checked>
@@ -831,6 +878,25 @@ function toggleLang() {
    切换中/英——Overview 卡片与 24h 时间线图例应立即变为目标语言，无需等 30 秒
    轮询；3) 切到"报告"页重复一次，热力图悬浮单位（min/分钟）应同步切换。 */
 /* ─── 状态行 / Overview ─── */
+async function updateDiagFields(diag) {
+  // M4.2 诊断模式设置页字段回填（当前模式 + 剩余时长；默认 basic/关）
+  const modeEl = document.getElementById("set-diag-mode");
+  const remEl = document.getElementById("set-diag-remaining");
+  if (!modeEl) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  const diagOn = diag.mode === "diagnostic";
+  modeEl.textContent = diagOn ? (lang === "zh" ? "诊断中" : "diagnostic")
+                              : (lang === "zh" ? "关（基础模式）" : "off (basic)");
+  modeEl.className = "badge " + (diagOn ? "q-confirmed" : "q-unavailable");
+  if (remEl) {
+    if (diagOn && diag.remaining_ms > 0) {
+      remEl.textContent = (lang === "zh" ? "剩余 " : "remaining ") +
+        Math.ceil(diag.remaining_ms / 60000) + (lang === "zh" ? " 分钟（到时自动恢复基础模式）" : " min (auto-reverts to basic)");
+    } else {
+      remEl.textContent = "";
+    }
+  }
+}
 async function loadStatus() {
   const s = await jget("/api/status");
   const el = document.getElementById("status-line");
@@ -839,6 +905,8 @@ async function loadStatus() {
   if (el) el.style.color = "";
   // 页脚鉴权声明跟随服务端实际状态（令牌已启用时不宣称"无需鉴权"）
   setFooterAuth(!!s.token_required);
+  // M4.2 诊断模式设置页字段（diag 块缺省容错：旧后端无此字段时静默）
+  if (s.diag) updateDiagFields(s.diag);
   // 监控器采集诊断（性能治理）：s.monitors 每项含 name / last_success_age_secs
   // / last_duration_ms / consecutive_slow / degraded_count。旧后端缺字段按空
   // 数组容错；有监控器退避或进程内有降级事件时占一行，正常时静默，不给状态
@@ -2407,7 +2475,7 @@ function parseUrlState() {
   const dOk = v => /^\d{4}-\d{2}-\d{2}$/.test(v || "") && v <= TODAY_STR;
   const hm = +q.get("hm") || 0;
   return {
-    view: ["overview", "report", "apps", "input", "insights", "anomalies", "settings"]
+    view: ["overview", "report", "apps", "input", "insights", "sys", "restop", "diagtl", "anomalies", "settings"]
       .includes(q.get("view")) ? q.get("view") : "overview",
     rd: dOk(q.get("rd")) ? q.get("rd") : "",
     ad: dOk(q.get("ad")) ? q.get("ad") : "",
@@ -2441,14 +2509,189 @@ function showView(name, fromHistory) {
   if (name === "settings" && SETTINGS_LOADED) return;
   refreshView(name).catch(e => showViewError(name, e.message));
 }
+/* ─── M3.4 网络归因卡（/api/net-derived + /api/net-process；可信度徽标） ─── */
+// 纯函数：quality → 徽标样式与文案（未知值一律按 unavailable 灰显；
+// check-js.mjs M3.4 扩展阶段对本函数跑断言）。
+function netQualityBadge(quality) {
+  switch (quality) {
+    case "confirmed": return { cls: "q-confirmed", en: "confirmed", zh: "实测" };
+    case "estimated": return { cls: "q-estimated", en: "estimated", zh: "估算" };
+    case "incomplete": return { cls: "q-incomplete", en: "incomplete", zh: "不完整" };
+    default: return { cls: "q-unavailable", en: "unavailable", zh: "不可用" };
+  }
+}
+// 纯函数：分区 JSON → 行 HTML（lang 显式入参，无 DOM 依赖；unavailable 整行灰显 + 原因文案）
+function netSectionRow(s, lang) {
+  const b = netQualityBadge(s.quality);
+  const gray = s.quality === "unavailable" ? " q-gray" : "";
+  const bytes = s.bytes == null ? "–" : Number(s.bytes).toLocaleString() + " B";
+  const label = lang === "zh" ? s.label_zh : s.label_en;
+  const note = s.note ? '<div style="font-size:11px;opacity:.75">' + esc(s.note) + "</div>" : "";
+  return '<div class="net-row' + gray + '" style="margin:4px 0">' +
+    '<span>' + esc(String(label)) + "</span>" +
+    '<span class="q-badge ' + b.cls + '">' + (lang === "zh" ? b.zh : b.en) + "</span>" +
+    ' <span>' + bytes + "</span>" + note + "</div>";
+}
+async function loadNetAttribution() {
+  const el = document.getElementById("net-attribution");
+  if (!el) return;
+  try {
+    const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+    const d = await jget("/api/net-derived?minutes=60");
+    el.innerHTML = d.sections.map(s => netSectionRow(s, lang)).join("");
+    const top = document.getElementById("net-top");
+    const p = await jget("/api/net-process?minutes=60");
+    if (p.rows && p.rows.length) {
+      const agg = {};
+      for (const r of p.rows) agg[r.pid] = (agg[r.pid] || 0) + r.bytes;
+      const items = Object.entries(agg).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      top.textContent = (lang === "zh" ? "按进程 Top5（近 60 分钟）：pid " : "top processes (last 60 min): pid ") +
+        items.map(([pid, b]) => pid + " " + Number(b).toLocaleString() + " B").join(" · ");
+    } else {
+      top.textContent = "";
+    }
+  } catch (e) {
+    el.textContent = t("noData");
+  }
+}
+/* ─── M4.3 三视图（系统总览 / 资源排行 / 诊断时间线；/api/sys-overview、
+       /api/resource-top、/api/diag-timeline；可信度徽标复用 netQualityBadge） ─── */
+// 纯函数：分区 JSON → 卡 HTML（check-js.mjs M4.3 阶段对本函数跑断言；
+// unavailable 整卡灰显 + 原因文案，value=null 显示 – 不泄漏 "null"）。
+function sysCard(s, lang) {
+  const b = netQualityBadge(s.quality);
+  const gray = s.quality === "unavailable" ? " q-gray" : "";
+  const val = s.value == null ? "–" : (typeof s.value === "number" && s.unit === "bytes"
+    ? Number(s.value).toLocaleString() + " B" : String(s.value));
+  const label = lang === "zh" ? s.label_zh : s.label_en;
+  const note = s.note ? '<div style="font-size:11px;opacity:.75">' + esc(s.note) + "</div>" : "";
+  return '<div class="net-row' + gray + '" style="margin:4px 0">' +
+    '<span>' + esc(String(label)) + "</span>" +
+    ' <span class="q-badge ' + b.cls + '">' + (lang === "zh" ? b.zh : b.en) + "</span>" +
+    ' <span>' + esc(val) + "</span>" + note + "</div>";
+}
+// 纯函数：资源排行行（pid + 解析到的进程名；无名显示 pid，不伪造名字）。
+function resourceTopRow(r, lang) {
+  const b = netQualityBadge(r.quality);
+  const label = r.name ? r.name : "pid " + r.pid;
+  const bytes = Number(r.total).toLocaleString() + " B";
+  return '<div class="net-row" style="margin:4px 0">' +
+    "<span>" + esc(label) + "</span>" +
+    ' <span class="q-badge ' + b.cls + '">' + (lang === "zh" ? b.zh : b.en) + "</span>" +
+    " <span>" + bytes + "</span></div>";
+}
+// 纯函数：诊断时间线行（关联字段：时间/类型/动作/应用 + 目的地址可得性）。
+function diagTimelineRow(e, lang) {
+  const line = '<div class="net-row" style="margin:2px 0">' +
+    "<span>" + esc(String(e.timestamp)) + "</span>" +
+    " <span>" + esc(String(e.type)) + "/" + esc(String(e.action)) + "</span>" +
+    (e.app ? " <span>" + esc(String(e.app)) + "</span>" : "") +
+    (e.dest && e.dest.quality === "unavailable" && e.dest.reason
+      ? ' <span style="font-size:11px;opacity:.75">' + esc(String(e.dest.reason)) + "</span>"
+      : "") +
+    "</div>";
+  return line;
+}
+async function loadSysOverview() {
+  const el = document.getElementById("sys-overview");
+  if (!el) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  try {
+    const d = await jget("/api/sys-overview");
+    const cm = d.cpu_memory || {};
+    const parts = [];
+    parts.push(sysCard({ label_en: "cpu", label_zh: "处理器", quality: cm.quality,
+      value: cm.cpu_percent == null ? null : cm.cpu_percent + "%",
+      note: cm.quality === "unavailable" ? (lang === "zh" ? "暂无心跳样本" : "no heartbeat sample yet") : null }, lang));
+    const mem = cm.memory || {};
+    parts.push(sysCard({ label_en: "memory", label_zh: "内存", quality: cm.quality,
+      value: mem.used_percent == null ? null : mem.used_percent + "%",
+      note: mem.quality === "unavailable" ? (lang === "zh" ? "暂无心跳样本" : "no heartbeat sample yet") : null }, lang));
+    const net = d.network || {};
+    parts.push(sysCard({ label_en: "network (60m)", label_zh: "网络（近 60 分钟）", quality: net.quality,
+      value: net.quality === "unavailable" ? null : (Number(net.bytes_in || 0) + Number(net.bytes_out || 0)),
+      unit: "bytes",
+      note: net.quality === "unavailable" ? (lang === "zh" ? "近 60 分钟无网络数据" : "no network data in the last 60 min") : null }, lang));
+    const gpu = d.gpu || {};
+    parts.push(sysCard({ label_en: "gpu", label_zh: "GPU", quality: gpu.quality,
+      value: gpu.data && gpu.data.gpus ? gpu.data.gpus.join(", ") : null,
+      note: gpu.quality === "unavailable" ? (lang === "zh" ? "暂无 GPU 快照" : "no GPU snapshot yet") : null }, lang));
+    const an = d.anomalies || {};
+    parts.push(sysCard({ label_en: "key anomalies (today)", label_zh: "关键异常（今日）", quality: "confirmed",
+      value: String(an.count || 0),
+      note: (an.top || []).slice(0, 3).map(x => x.kind + "·" + (x.message || "")).join("；") || null }, lang));
+    const mh = d.monitor_health || {};
+    parts.push(sysCard({ label_en: "monitors enabled", label_zh: "启用监控器", quality: "confirmed",
+      value: String(mh.enabled_monitors == null ? "–" : mh.enabled_monitors),
+      note: mh.watchdog_alert ? String(mh.watchdog_alert.message || "") : null }, lang));
+    el.innerHTML = parts.join("");
+  } catch (e) {
+    el.textContent = t("noData");
+  }
+}
+async function loadResourceTop() {
+  const el = document.getElementById("restop-rows");
+  if (!el) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  try {
+    const d = await jget("/api/resource-top?minutes=60");
+    const rows = d.rows || [];
+    el.innerHTML = rows.length
+      ? rows.map(r => resourceTopRow(r, lang)).join("")
+      : (lang === "zh" ? "近 60 分钟无网络数据" : "no network data in the last 60 min");
+    const dims = d.dimensions || {};
+    const notes = Object.entries(dims)
+      .filter(([, v]) => v && v.quality === "unavailable" && v.reason)
+      .map(([k, v]) => k + ": " + v.reason);
+    const noteEl = document.getElementById("diagtl-dest");
+    if (notes.length) {
+      const p = document.createElement("div");
+      p.className = "muted";
+      p.style.cssText = "font-size:11px;opacity:.75;margin-top:8px";
+      p.textContent = notes.join("；");
+      el.appendChild(p);
+    }
+  } catch (e) {
+    el.textContent = t("noData");
+  }
+}
+async function loadDiagTimeline() {
+  const el = document.getElementById("diagtl-rows");
+  if (!el) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  try {
+    // 锚点取当前时刻（页面交互语义，非检测逻辑——不参与任何测试断言）
+    const at = Date.now();
+    const d = await jget("/api/diag-timeline?at=" + at + "&window=10");
+    const evs = d.window_events || [];
+    el.innerHTML = evs.length
+      ? evs.map(e => diagTimelineRow(e, lang)).join("")
+      : (lang === "zh" ? "窗口内无关联事件" : "no related events in the window");
+    const rc = d.resource_change || {};
+    const rcLine = (lang === "zh" ? "网络流量 锚点前 " : "network: before anchor ") +
+      Number(rc.before_bytes || 0).toLocaleString() + " B · " +
+      (lang === "zh" ? "锚点后 " : "after anchor ") +
+      Number(rc.after_bytes || 0).toLocaleString() + " B";
+    const rcEl = document.createElement("div");
+    rcEl.className = "muted";
+    rcEl.style.cssText = "font-size:11px;opacity:.75;margin-top:8px";
+    rcEl.textContent = rcLine + "；" + ((d.dest && d.dest.reason) || "");
+    el.appendChild(rcEl);
+  } catch (e) {
+    el.textContent = t("noData");
+  }
+}
 async function refreshView(name) {
   // 状态行任何视图都刷新（UX 走查 2026-10-12）：此前仅 overview 拉状态行，
   // 深链/F5 直进报告、应用、输入、洞察、异常页时标题下状态行滞留
   // "Loading…" 直到 30 秒轮询，期间采集状态不可见。
-  if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline()]);
+  if (name === "overview") await Promise.all([loadStatus(), loadOverview(), loadTimeline(), loadNetAttribution()]);
   else if (name === "apps") await Promise.all([loadStatus(), loadApps(), loadTopApps()]);
   else if (name === "report") await Promise.all([loadStatus(), loadReport(), loadHeatmap()]);
   else if (name === "insights") await Promise.all([loadStatus(), loadInsights()]);
+  else if (name === "sys") await Promise.all([loadStatus(), loadSysOverview()]);
+  else if (name === "restop") await Promise.all([loadStatus(), loadResourceTop()]);
+  else if (name === "diagtl") await Promise.all([loadStatus(), loadDiagTimeline()]);
   else if (name === "input") await Promise.all([loadStatus(), loadInput()]);
   else if (name === "anomalies") await Promise.all([loadStatus(), loadAnomalies()]);
   // settings 分支同样带状态行（审查修复：#39 漏了本分支——深链
@@ -2574,7 +2817,8 @@ function markDisconnected() {
   const pick = e => { if (e.target.showPicker) e.target.showPicker(); };
   on("lang-btn", "click", () => toggleLang());
   [["tab-overview", "overview"], ["tab-report", "report"], ["tab-apps", "apps"],
-   ["tab-input", "input"], ["tab-insights", "insights"], ["tab-anomalies", "anomalies"],
+   ["tab-input", "input"], ["tab-insights", "insights"], ["tab-sys", "sys"],
+   ["tab-restop", "restop"], ["tab-diagtl", "diagtl"], ["tab-anomalies", "anomalies"],
    ["tab-settings", "settings"]].forEach(([id, v]) => on(id, "click", () => showView(v)));
   on("ops-toggle", "click", e => toggleOps(e));
   on("ops-h2", "click", () => toggleOps());

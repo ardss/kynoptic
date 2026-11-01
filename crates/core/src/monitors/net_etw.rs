@@ -1,0 +1,1938 @@
+//! M2.1 ETW 会话管理器（内核网络供应商 Microsoft-Windows-Kernel-Network）。
+//!
+//! 定位：**增强模式**网络监控的会话层——StartTrace/EnableTraceEx2/OpenTrace
+//! 经 windows-sys 直调（复用 core 既有 windows-sys 依赖面，仅补
+//! `Win32_System_Diagnostics_Etw` feature）。不在 [`crate::registry`] 的
+//! 40 项基础集合内（采集器全开裁定不受影响），由上层显式启用增强模式时
+//! 才实例化。
+//!
+//! 状态机：`Idle → Running → Stopped → Recover`——
+//! - 启动前检测同名残留会话（异常退出恢复路径）并 stop（Recover 经历标记）；
+//! - 启动链中途失败（enable/start_consumer）显式 stop_session 收口，不留内核
+//!   孤儿会话；stop 的 StopTrace 失败置重试旗标，stop/Drop 重试直至收口；
+//! - stop/Drop 保证 CloseTrace + StopTrace 资源释放（Drop 在 Running/重试态兜底）；
+//! - 权限不足（非管理员 ETW 限制）→ quality=Unavailable + note_degraded
+//!   显式留痕，不静默返回零。
+//!
+//! 消费专职线程：回调把记录推进通道，消费线程按 [`ETW_SINK_BATCH_MAX`]
+//! 手写批量循环出站（64 条/100ms 窗口整批；[`chunk_records`] 为独立纯函数，
+//! 测试钉住保序与边界，供离线分片复用）。
+//! M2.2：内核网络清单 V0 负载手写解析（[`parse_kernel_network_event`]）+
+//! 分钟桶聚合（[`MinuteAggregator`]）产出 M1 [`crate::metrics::MetricPoint`]
+//! （source=Etw，质量口径沿用 [`crate::metrics::MetricQuality`]；传输层字节
+//! ≠应用载荷≠物理线路，差异由接口计数对账——口径见 [`NetFlowRecord`]）。
+
+use crate::metrics::MetricQuality;
+use std::sync::Arc;
+
+/// ETW 实时会话专用名（残留清理只清同名，不碰他人会话）。
+pub const ETW_SESSION_NAME: &str = "KynopticNetMon";
+
+/// Microsoft-Windows-Kernel-Network 注册 GUID
+/// {7DD42A49-5329-4832-8DFD-43D979153A88}（组件形存放，跨平台可编译）。
+/// 勘误（M2.5 实测）：早期取值 {DDD0FCCD-…} 来自误读的清单记录，对系统
+/// 未注册——EnableTraceEx2 返回 ERROR_INVALID_PARAMETER(87)；`logman query
+/// providers` 在 B/A 两机均显示真值为 {7DD42A49-…}。
+pub const KERNEL_NETWORK_PROVIDER_GUID_COMPONENTS: (u32, u16, u16, [u8; 8]) = (
+    0x7DD42A49,
+    0x5329,
+    0x4832,
+    [0x8D, 0xFD, 0x43, 0xD9, 0x79, 0x15, 0x3A, 0x88],
+);
+
+/// 消费线程单批出站上限（64 条）。
+pub const ETW_SINK_BATCH_MAX: usize = 64;
+
+/// 会话状态机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtwState {
+    /// 未启动。
+    Idle,
+    /// 会话运行中（含消费线程）。
+    Running,
+    /// 已显式停止（可再次 start）。
+    Stopped,
+    /// 启动前清理过同名残留会话（异常退出恢复路径已经历）。
+    Recover,
+}
+
+/// 后端错误（WIN32 错误码的语义收敛）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EtwError {
+    /// ERROR_ACCESS_DENIED：非管理员启动 ETW 会话被拒。
+    AccessDenied,
+    /// ERROR_WMI_INSTANCE_NOT_FOUND / ERROR_NOT_FOUND。
+    NotFound,
+    /// 同名会话已存在（应走残留恢复路径）。
+    AlreadyExists,
+    /// 其它 WIN32 错误码。
+    Win32(u32),
+    /// 平台不支持（非 Windows 构建占位）。
+    Unsupported,
+}
+
+/// 批量出站回调（专职消费线程持有，整批投递；M2.2 起承载流记录）。
+pub type EventSink = Arc<dyn Fn(Vec<NetFlowRecord>) + Send + Sync>;
+
+/// 可注入后端（真实 ETW / 测试 Mock）。句柄以 u64 通行（真实 TRACEHANDLE
+/// 本就是 u64；Mock 用合成值），资源释放计数由 Mock 显式断言。
+pub trait EtwBackend {
+    /// 同名残留会话是否存在（异常退出恢复路径检测点）。
+    fn query_residual(&self) -> bool;
+    /// 停止同名会话（残留清理与正常停机共用 ControlTrace-STOP 收口）。
+    fn stop_session(&mut self) -> Result<(), EtwError>;
+    /// 启动会话，返回会话句柄。
+    fn start_session(&mut self) -> Result<u64, EtwError>;
+    /// 启用内核网络供应商。
+    fn enable_provider(&mut self, session: u64) -> Result<(), EtwError>;
+    /// 启动专职消费端，返回消费句柄。
+    fn start_consumer(&mut self, session: u64, sink: EventSink) -> Result<u64, EtwError>;
+    /// 关闭消费端（CloseTrace；真实实现须让 ProcessTrace 退出并回收线程）。
+    fn close_consumer(&mut self, consumer: u64);
+}
+
+/// 会话管理器（状态机 + 资源生命周期；后端可注入）。
+pub struct NetEtwMonitor<B: EtwBackend> {
+    state: EtwState,
+    quality: MetricQuality,
+    recovered_residual: bool,
+    handles: Option<(u64, u64)>, // (session, consumer)
+    /// StopTrace 曾失败（消费端已关、内核会话可能仍在）：stop/Drop 须重试
+    /// stop_session 直至收口（start 失败路径的收口失败同样置位）。
+    stop_retry: bool,
+    backend: B,
+}
+
+impl<B: EtwBackend> NetEtwMonitor<B> {
+    pub fn new(backend: B) -> Self {
+        Self {
+            state: EtwState::Idle,
+            quality: MetricQuality::Unavailable,
+            recovered_residual: false,
+            handles: None,
+            stop_retry: false,
+            backend,
+        }
+    }
+
+    pub fn state(&self) -> EtwState {
+        self.state
+    }
+
+    pub fn quality(&self) -> MetricQuality {
+        self.quality
+    }
+
+    /// 本次进程内是否清理过同名残留会话（Recover 经历标记）。
+    pub fn recovered_residual(&self) -> bool {
+        self.recovered_residual
+    }
+
+    /// 启动：Idle/Stopped/Recover → Running。同名残留先 stop（Recover 标记）。
+    /// AccessDenied：quality=Unavailable + note_degraded 显式留痕，Err 上抛
+    /// （不静默返回零——调用方读 quality 即知不可用）。
+    pub fn start(&mut self, sink: EventSink) -> Result<(), EtwError> {
+        if self.state == EtwState::Running {
+            return Ok(()); // 幂等：已运行不重复启动
+        }
+        self.recovered_residual = false;
+        if self.backend.query_residual() {
+            self.state = EtwState::Recover;
+            self.recovered_residual = true;
+            log::info!(
+                "ETW 会话 {} 存在残留（上次异常退出），先停再启",
+                ETW_SESSION_NAME
+            );
+            self.backend.stop_session()?;
+        }
+        let session = match self.backend.start_session() {
+            Ok(h) => h,
+            Err(EtwError::AccessDenied) => {
+                // 显式降级：不静默。非管理员 ETW 限制是预期内的环境结局。
+                self.quality = MetricQuality::Unavailable;
+                self.state = EtwState::Idle;
+                crate::monitors::note_degraded("net_etw: ETW 会话启动被拒（需要管理员权限）");
+                return Err(EtwError::AccessDenied);
+            }
+            Err(e) => return Err(e),
+        };
+        // 启动链中途失败显式收口：此刻内核里已存在（已启用的）真实会话，
+        // 不能只靠「下次 start 的 Recover」或进程退出收口——本调用内直接停。
+        if let Err(e) = self.backend.enable_provider(session) {
+            self.close_kernel_session();
+            return Err(e);
+        }
+        let consumer = match self.backend.start_consumer(session, sink) {
+            Ok(c) => c,
+            Err(e) => {
+                self.close_kernel_session();
+                return Err(e);
+            }
+        };
+        self.handles = Some((session, consumer));
+        self.state = EtwState::Running;
+        self.quality = MetricQuality::Confirmed;
+        Ok(())
+    }
+
+    /// 内核会话收口（启动链失败路径 / stop / Drop 重试共用）：失败置
+    /// stop_retry，由 Drop 兜底再试（StopTrace 失败不声明已停止）。
+    fn close_kernel_session(&mut self) {
+        if let Err(_e) = self.backend.stop_session() {
+            self.stop_retry = true;
+            log::warn!(
+                "ETW 会话 {} 收口失败（已置重试旗标，Drop 将再试）",
+                ETW_SESSION_NAME
+            );
+        } else {
+            self.stop_retry = false;
+        }
+    }
+
+    /// 停止：Running → Stopped（CloseTrace + StopTrace）；无活句柄且无重试
+    /// 旗标时幂等 no-op。StopTrace 失败：不置 Stopped、置重试旗标，Err 上抛
+    /// （Drop 会再收口一次）。
+    pub fn stop(&mut self) -> Result<(), EtwError> {
+        if let Some((_session, consumer)) = self.handles.take() {
+            // 先关消费端（CloseTrace 使 ProcessTrace 退出）再停会话
+            self.backend.close_consumer(consumer);
+        } else if !self.stop_retry {
+            return Ok(()); // 幂等：没有活的会话/消费端就无事可做
+        }
+        match self.backend.stop_session() {
+            Ok(()) => {
+                self.stop_retry = false;
+                self.state = EtwState::Stopped;
+                Ok(())
+            }
+            Err(e) => {
+                self.stop_retry = true;
+                Err(e)
+            }
+        }
+    }
+}
+
+impl<B: EtwBackend> Drop for NetEtwMonitor<B> {
+    /// Drop 兜底：Running 态直接 drop（进程退出路径）或存在未收口会话
+    /// （stop_retry）也必须 CloseTrace + StopTrace，不留孤儿会话（实在
+    /// 收口失败由下次 start 走 Recover 恢复）。
+    fn drop(&mut self) {
+        if self.state == EtwState::Running || self.stop_retry {
+            let _ = self.stop();
+        }
+    }
+}
+
+/// 批量分片纯函数（保序；空输入输出空；上限内原样单批）。
+pub fn chunk_records(records: Vec<NetFlowRecord>, max: usize) -> Vec<Vec<NetFlowRecord>> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    records
+        .chunks(max.max(1))
+        .map(<[NetFlowRecord]>::to_vec)
+        .collect()
+}
+
+/// 丢事件观测（ETW 回调/会话统计 → loss_count/coverage 的数据源）。
+/// seen=已交付解析的记录数；lost=会话报告的缓冲丢失事件数
+/// （EVENT_TRACE_PROPERTIES.EventsLost，运行中经 QUERY 增量收口、
+/// stop 时终局收口——EventsLost 为会话累计值，fold 按上次查询水位取差）。
+#[derive(Default)]
+pub struct LossStats {
+    pub seen: std::sync::atomic::AtomicU64,
+    pub lost: std::sync::atomic::AtomicU64,
+    /// 上次 QUERY 读到的 EventsLost 累计水位（差量折叠，防重复累计）。
+    last_queried_lost: std::sync::atomic::AtomicU64,
+}
+
+impl LossStats {
+    pub fn counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.seen.load(Relaxed), self.lost.load(Relaxed))
+    }
+
+    /// 折叠一次会话累计 EventsLost 读数：只累计自上次读数以来的增量
+    /// （QUERY 与 STOP 两条读数路径共用，防同段丢失双计）。
+    fn fold_lost_total(&self, total: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prev = self.last_queried_lost.swap(total, Relaxed);
+        if total > prev {
+            self.lost.fetch_add(total - prev, Relaxed);
+        }
+    }
+}
+
+// ─── 真实后端（windows-sys 直调） ──────────────────────────────────────────
+
+/// 真实 ETW 后端。
+pub struct RealEtw {
+    /// 批量出站线程（recv_timeout 窗口）；close 置停机旗标后 join。
+    batcher_thread: Option<std::thread::JoinHandle<()>>,
+    /// 事件通道发送端（回调经 UserContext 直取；close 时丢弃触发停机）。
+    tx: Option<Arc<crossbeam_channel::Sender<NetFlowRecord>>>,
+    /// 批量出站线程停机旗标。
+    stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 丢事件观测（回调 seen / stop 时 EventsLost 收口）。
+    stats: Arc<LossStats>,
+    /// ETW 会话名：默认 ETW_SESSION_NAME（生产）；受控验证等旁路场景可用
+    /// with_session_name 换成专用名（如 KynopticNetMonVerify），避免
+    /// stop_session 误停生产同名会话。
+    session_name: String,
+}
+
+impl RealEtw {
+    pub fn new() -> Self {
+        Self {
+            batcher_thread: None,
+            tx: None,
+            stop_flag: None,
+            stats: Arc::new(LossStats::default()),
+            session_name: ETW_SESSION_NAME.to_string(),
+        }
+    }
+
+    /// 旁路验证用：指定会话名（仅影响本实例 start/stop/query 的目标会话）。
+    pub fn with_session_name(name: &str) -> Self {
+        let mut s = Self::new();
+        s.session_name = name.to_string();
+        s
+    }
+}
+
+impl Default for RealEtw {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealEtw {
+    /// (seen, lost) 快照——供 MinuteAggregator::drain_metric_points 填
+    /// loss_count/coverage。Windows 上先经 EVENT_TRACE_CONTROL_QUERY 读
+    /// 会话累计 EventsLost 增量折叠：长会话运行期间的中间 drain 不再把
+    /// 已发生的丢失低报至停机（R3 复核）。
+    pub fn loss_stats(&self) -> (u64, u64) {
+        #[cfg(windows)]
+        self.refresh_loss_from_query();
+        self.stats.counts()
+    }
+}
+
+#[cfg(windows)]
+mod real {
+    use super::*;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Diagnostics::Etw::{
+        CloseTrace, ControlTraceW, EnableTraceEx, OpenTraceW, ProcessTrace, StartTraceW,
+        CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
+        EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+        PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+        TRACE_LEVEL_INFORMATION,
+    };
+
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_WMI_INSTANCE_NOT_FOUND: u32 = 4201;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const WNODE_FLAG_TRACED_GUID: u32 = 0x0002_0000;
+    const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn to_err(code: u32) -> EtwError {
+        match code {
+            ERROR_ACCESS_DENIED => EtwError::AccessDenied,
+            ERROR_WMI_INSTANCE_NOT_FOUND => EtwError::NotFound,
+            ERROR_ALREADY_EXISTS => EtwError::AlreadyExists,
+            c => EtwError::Win32(c),
+        }
+    }
+
+    /// 回调用户上下文：通道 + 丢事件观测（leaked Arc，会话级一次性，
+    /// EVENT_RECORD.UserContext 原样回传）。
+    struct ConsumerCtx {
+        tx: Arc<crossbeam_channel::Sender<NetFlowRecord>>,
+        stats: Arc<LossStats>,
+    }
+
+    unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
+        let ctx_ptr = (*record).UserContext as *const ConsumerCtx;
+        if ctx_ptr.is_null() {
+            return;
+        }
+        let ctx = &*ctx_ptr;
+        let r = &*record;
+        let header = &r.EventHeader;
+        // FILETIME(100ns since 1601) → UTC epoch 毫秒
+        let ts_ms = header.TimeStamp / 10_000 - 11_644_473_600_000;
+        // M2.2：内核网络清单 V0 负载手写解析（字节量口径）；连接类事件与
+        // 未知 id 返回 None 不出站（seen 只计交付的数据记录）
+        let payload =
+            std::slice::from_raw_parts(r.UserData as *const u8, r.UserDataLength as usize);
+        if let Some(flow) = parse_kernel_network_event(header.EventDescriptor.Id, payload, ts_ms) {
+            ctx.stats
+                .seen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = ctx.tx.send(flow);
+        }
+    }
+
+    /// 构造会话属性块（EVENT_TRACE_PROPERTIES + 尾随 LoggerName 宽串）。
+    unsafe fn make_session_properties(
+        name: &str,
+        buffer: &mut [u8],
+    ) -> *mut EVENT_TRACE_PROPERTIES {
+        let props = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        std::ptr::write_bytes(props, 0, 1);
+        let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+        (*props).Wnode.BufferSize = buffer.len() as u32;
+        (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        (*props).LoggerNameOffset = size as u32;
+        (*props).LogFileNameOffset = 0; // 实时会话无需日志文件
+        let name = wide(name);
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            buffer.as_mut_ptr().add(size) as *mut u16,
+            name.len(),
+        );
+        props
+    }
+
+    fn query_session(name: &str) -> Result<bool, EtwError> {
+        let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
+        let props = unsafe { make_session_properties(name, &mut buffer) };
+        let code = unsafe {
+            ControlTraceW(
+                CONTROLTRACE_HANDLE { Value: 0 },
+                wide(name).as_ptr(),
+                props,
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        match code {
+            ERROR_SUCCESS => Ok(true),
+            ERROR_WMI_INSTANCE_NOT_FOUND => Ok(false),
+            c => Err(to_err(c)),
+        }
+    }
+
+    impl RealEtw {
+        fn query_residual_real(&self) -> bool {
+            matches!(query_session(&self.session_name), Ok(true))
+        }
+
+        /// QUERY 同名会话的累计 EventsLost 并增量折叠进 loss 统计
+        /// （长会话运行中的中间收口；会话不存在时静默跳过）。
+        pub fn refresh_loss_from_query(&self) {
+            let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
+            let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
+            let code = unsafe {
+                ControlTraceW(
+                    CONTROLTRACE_HANDLE { Value: 0 },
+                    wide(&self.session_name).as_ptr(),
+                    props,
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            };
+            if code == ERROR_SUCCESS {
+                let lost = unsafe { (*props).EventsLost } as u64;
+                self.stats.fold_lost_total(lost);
+            }
+        }
+    }
+
+    impl EtwBackend for RealEtw {
+        fn query_residual(&self) -> bool {
+            self.query_residual_real()
+        }
+
+        fn stop_session(&mut self) -> Result<(), EtwError> {
+            let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
+            let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
+            let code = unsafe {
+                ControlTraceW(
+                    CONTROLTRACE_HANDLE { Value: 0 },
+                    wide(&self.session_name).as_ptr(),
+                    props,
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+            };
+            match code {
+                ERROR_SUCCESS | ERROR_WMI_INSTANCE_NOT_FOUND => {
+                    // 会话已不存在（对端刚退出）即达成目的。
+                    // STOP 后属性块带回终局统计：缓冲丢失事件数按增量折叠进
+                    // loss_count/coverage 管道（运行中 QUERY 可能已折叠部分，
+                    // fold_lost_total 取差防双计；残段会话的丢失同样计入）。
+                    let lost = unsafe { (*props).EventsLost } as u64;
+                    self.stats.fold_lost_total(lost);
+                    Ok(())
+                }
+                c => Err(to_err(c)),
+            }
+        }
+
+        fn start_session(&mut self) -> Result<u64, EtwError> {
+            let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
+            let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
+            let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
+            let code =
+                unsafe { StartTraceW(&mut handle, wide(&self.session_name).as_ptr(), props) };
+            if code != ERROR_SUCCESS {
+                return Err(to_err(code));
+            }
+            Ok(handle.Value)
+        }
+
+        fn enable_provider(&mut self, session: u64) -> Result<(), EtwError> {
+            let (d1, d2, d3, d4) = KERNEL_NETWORK_PROVIDER_GUID_COMPONENTS;
+            let guid = windows_sys::core::GUID {
+                data1: d1,
+                data2: d2,
+                data3: d3,
+                data4: d4,
+            };
+            // 勘误（M2.5 实测）：内核提供方（Kernel-Network）经 EnableTraceEx2
+            // 启用恒报 ERROR_INVALID_PARAMETER(87)（关键词/级别/会话模式全
+            // 组合矩阵试错一致，见 examples/m2_transfer_verify.rs --probe）；
+            // EnableTraceEx（参数同源、无 ENABLE_TRACE_PARAMETERS）启用成功，
+            // 故用之。logman 同为可用路径。
+            let code = unsafe {
+                EnableTraceEx(
+                    &guid,
+                    std::ptr::null(),
+                    CONTROLTRACE_HANDLE { Value: session },
+                    1,                             // 启用
+                    TRACE_LEVEL_INFORMATION as u8, // 4
+                    u64::MAX,                      // 全 keyword
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if code != ERROR_SUCCESS {
+                return Err(to_err(code));
+            }
+            Ok(())
+        }
+
+        fn start_consumer(&mut self, _session: u64, sink: EventSink) -> Result<u64, EtwError> {
+            let (tx, rx) = crossbeam_channel::unbounded::<NetFlowRecord>();
+            let tx = Arc::new(tx);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // 专职批量出站线程：回调推通道，线程按 64 条/100ms 窗口整批投递；
+            // 停机旗标置位且通道排空后退出（CloseTrace 后最多 ~100ms 延迟）
+            let stop_b = stop.clone();
+            let sink_b = sink.clone();
+            let batcher = std::thread::spawn(move || loop {
+                let mut batch: Vec<NetFlowRecord> = Vec::new();
+                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(r) => batch.push(r),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                }
+                while batch.len() < ETW_SINK_BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(r) => batch.push(r),
+                        Err(_) => break,
+                    }
+                }
+                if !batch.is_empty() {
+                    sink_b(batch);
+                }
+                if stop_b.load(std::sync::atomic::Ordering::Relaxed) {
+                    while let Ok(r) = rx.try_recv() {
+                        sink_b(vec![r]);
+                    }
+                    return;
+                }
+            });
+            self.batcher_thread = Some(batcher);
+            self.stop_flag = Some(stop);
+            self.tx = Some(tx.clone());
+            // OpenTrace 挂回调 + ProcessTrace 阻塞在专属线程（不占调用方）。
+            // 回调用户上下文 = 通道指针（会话级一次性 leaked，非事件级；
+            // EVENT_RECORD.UserContext 原样回传给回调）。
+            let ctx = Arc::into_raw(Arc::new(ConsumerCtx {
+                tx: tx.clone(),
+                stats: self.stats.clone(),
+            })) as *mut ConsumerCtx;
+            let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
+            let name = wide(&self.session_name);
+            logfile.LoggerName = name.as_ptr() as *mut u16;
+            logfile.Context = ctx as *mut core::ffi::c_void;
+            logfile.Anonymous1.ProcessTraceMode = EVENT_TRACE_REAL_TIME_MODE
+                | PROCESS_TRACE_MODE_REAL_TIME
+                | PROCESS_TRACE_MODE_EVENT_RECORD;
+            // union 字段写入是安全操作（读取才 unsafe）
+            logfile.Anonymous2.EventRecordCallback = Some(on_event);
+            let consumer = unsafe { OpenTraceW(&mut logfile) };
+            if consumer.Value == INVALID_PROCESSTRACE_HANDLE {
+                // 失败路径自清理：此刻 batcher 线程/通道/停机旗标已建立且
+                // 写入 self——必须关停（置旗标+断通道+join）并回收 ConsumerCtx，
+                // 否则线程存活到 RealEtw drop、ctx 永不回收（R3 复核）。
+                // 错误码取 GetLastError 真实值（OpenTraceW 失败未必是 5）。
+                let code = unsafe { GetLastError() };
+                if let Some(f) = &self.stop_flag {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.tx = None;
+                if let Some(t) = self.batcher_thread.take() {
+                    let _ = t.join();
+                }
+                self.stop_flag = None;
+                drop(unsafe { Arc::from_raw(ctx) });
+                return Err(to_err(if code == 0 { ERROR_ACCESS_DENIED } else { code }));
+            }
+            let h = consumer;
+            std::thread::spawn(move || unsafe {
+                ProcessTrace(&h, 1, std::ptr::null(), std::ptr::null());
+            });
+            Ok(consumer.Value)
+        }
+
+        fn close_consumer(&mut self, consumer: u64) {
+            unsafe {
+                CloseTrace(PROCESSTRACE_HANDLE { Value: consumer });
+            }
+            // CloseTrace 使 ProcessTrace 返回；置停机旗标、丢弃发送端，
+            // 批量出站线程排空残余后退出（最多 ~100ms 窗口）
+            if let Some(f) = &self.stop_flag {
+                f.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.tx = None;
+            if let Some(t) = self.batcher_thread.take() {
+                let _ = t.join();
+            }
+            self.stop_flag = None;
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl EtwBackend for RealEtw {
+    fn query_residual(&self) -> bool {
+        false
+    }
+    fn stop_session(&mut self) -> Result<(), EtwError> {
+        Err(EtwError::Unsupported)
+    }
+    fn start_session(&mut self) -> Result<u64, EtwError> {
+        Err(EtwError::Unsupported)
+    }
+    fn enable_provider(&mut self, _session: u64) -> Result<(), EtwError> {
+        Err(EtwError::Unsupported)
+    }
+    fn start_consumer(&mut self, _session: u64, _sink: EventSink) -> Result<u64, EtwError> {
+        Err(EtwError::Unsupported)
+    }
+    fn close_consumer(&mut self, _consumer: u64) {}
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    /// 共享计数器（Drop 后仍可断言，故放 Arc）
+    #[derive(Default, Clone)]
+    struct Counters(Arc<Mutex<MockCounts>>);
+
+    #[derive(Default, Clone)]
+    struct MockCounts {
+        sessions_started: u64,
+        sessions_stopped: u64,
+        residual_stops: u64,
+        consumers_opened: u64,
+        consumers_closed: u64,
+        provider_enabled: bool,
+        records: Vec<NetFlowRecord>,
+    }
+
+    impl Counters {
+        fn get(&self) -> MockCounts {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// 注入后端：可预置残留会话与启动失败模式，全路径状态机驱动。
+    struct MockBackend {
+        counters: Counters,
+        residual: bool,
+        fail_start: Option<EtwError>,
+        /// enable_provider 注入失败（启动链中途失败路径）。
+        fail_enable: Option<EtwError>,
+        /// start_consumer 注入失败（启动链中途失败路径）。
+        fail_consumer: Option<EtwError>,
+        /// stop_session 注入失败的剩余次数（0 = 恒成功；>0 每调一次减一）。
+        fail_stop_remaining: u32,
+    }
+
+    impl MockBackend {
+        fn new(residual: bool) -> (Self, Counters) {
+            let counters = Counters::default();
+            (
+                Self {
+                    counters: counters.clone(),
+                    residual,
+                    fail_start: None,
+                    fail_enable: None,
+                    fail_consumer: None,
+                    fail_stop_remaining: 0,
+                },
+                counters,
+            )
+        }
+    }
+
+    impl EtwBackend for MockBackend {
+        fn query_residual(&self) -> bool {
+            self.residual
+        }
+        fn stop_session(&mut self) -> Result<(), EtwError> {
+            let mut c = self.counters.0.lock().unwrap();
+            // 残留清理与正常停机同走 stop：首次调用收会话，后续收消费者
+            c.sessions_stopped += 1;
+            c.residual_stops += 1;
+            self.residual = false;
+            if self.fail_stop_remaining > 0 {
+                self.fail_stop_remaining -= 1;
+                return Err(EtwError::Win32(1));
+            }
+            Ok(())
+        }
+        fn start_session(&mut self) -> Result<u64, EtwError> {
+            let mut c = self.counters.0.lock().unwrap();
+            c.sessions_started += 1;
+            match &self.fail_start {
+                Some(e) => Err(e.clone()),
+                None => Ok(1000 + c.sessions_started),
+            }
+        }
+        fn enable_provider(&mut self, _session: u64) -> Result<(), EtwError> {
+            if let Some(e) = &self.fail_enable {
+                return Err(e.clone());
+            }
+            self.counters.0.lock().unwrap().provider_enabled = true;
+            Ok(())
+        }
+        fn start_consumer(&mut self, _session: u64, sink: EventSink) -> Result<u64, EtwError> {
+            if let Some(e) = &self.fail_consumer {
+                return Err(e.clone());
+            }
+            let mut c = self.counters.0.lock().unwrap();
+            c.consumers_opened += 1;
+            c.records.push(NetFlowRecord {
+                timestamp_utc_ms: 1_749_000_000_000,
+                pid: 100,
+                direction: NetDirection::Out,
+                proto: NetProto::Tcp,
+                ip_version: 4,
+                remote: vec![1, 2, 3, 4],
+                remote_port: 443,
+                bytes: 10,
+            });
+            sink(c.records.clone());
+            Ok(5000 + c.consumers_opened)
+        }
+        fn close_consumer(&mut self, _consumer: u64) {
+            self.counters.0.lock().unwrap().consumers_closed += 1;
+        }
+    }
+
+    #[test]
+    fn etw_session_name_is_dedicated_and_within_limits() {
+        // 会话名专用（不与他人会话撞名，残留清理只敢清自己的）
+        assert_eq!(ETW_SESSION_NAME, "KynopticNetMon");
+        // ETW 会话名上限 128（EVENT_TRACE_MAX_SESSION_NAME），留余量断言
+        assert!(
+            ETW_SESSION_NAME.chars().count() < 128,
+            "会话名必须短于 ETW 128 上限"
+        );
+    }
+
+    #[test]
+    fn kernel_network_provider_guid_constant() {
+        // Microsoft-Windows-Kernel-Network 注册 GUID（`logman query providers`
+        // 两机同源勘误值；旧值 DDD0FCCD 对系统未注册，EnableTraceEx2 报 87）
+        assert_eq!(
+            KERNEL_NETWORK_PROVIDER_GUID_COMPONENTS,
+            (
+                0x7DD42A49,
+                0x5329,
+                0x4832,
+                [0x8D, 0xFD, 0x43, 0xD9, 0x79, 0x15, 0x3A, 0x88]
+            )
+        );
+    }
+
+    fn noop_sink() -> EventSink {
+        Arc::new(|_| {})
+    }
+
+    #[test]
+    fn state_machine_idle_to_running_via_injected_backend() {
+        let (backend, counters) = MockBackend::new(false);
+        let mut m = NetEtwMonitor::new(backend);
+        assert_eq!(m.state(), EtwState::Idle);
+        m.start(noop_sink()).expect("无残留启动必须成功");
+        assert_eq!(m.state(), EtwState::Running);
+        assert_eq!(m.quality(), MetricQuality::Confirmed, "正常启动即实测确认");
+        let c = counters.get();
+        assert_eq!(c.sessions_started, 1);
+        assert!(c.provider_enabled, "启动必须启用内核网络供应商");
+        assert_eq!(c.consumers_opened, 1, "必须有专职消费端");
+    }
+
+    #[test]
+    fn residual_session_recovery_visits_recover_state() {
+        // 异常退出恢复路径：同名残留会话先 stop 再启动
+        let (backend, counters) = MockBackend::new(true);
+        let mut m = NetEtwMonitor::new(backend);
+        m.start(noop_sink()).expect("残留恢复启动必须成功");
+        assert_eq!(m.state(), EtwState::Running);
+        assert!(
+            m.recovered_residual(),
+            "启动前清过残留必须置 Recover 经历标记"
+        );
+        let c = counters.get();
+        assert!(c.residual_stops >= 1, "启动前必须先停掉同名残留会话");
+        assert_eq!(c.sessions_started, 1);
+    }
+
+    #[test]
+    fn access_denied_degrades_explicitly_not_silently() {
+        // 非管理员 ETW 限制：quality=Unavailable + note_degraded 留痕，
+        // 不静默返回零/不产出伪造数据
+        let before = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+        let (mut backend, _counters) = MockBackend::new(false);
+        backend.fail_start = Some(EtwError::AccessDenied);
+        let mut m = NetEtwMonitor::new(backend);
+        let sink_hits = Arc::new(Mutex::new(0usize));
+        let sink_hits2 = sink_hits.clone();
+        let sink: EventSink = Arc::new(move |_| {
+            *sink_hits2.lock().unwrap() += 1;
+        });
+        assert!(m.start(sink).is_err(), "权限不足必须显式报错");
+        assert_eq!(m.quality(), MetricQuality::Unavailable, "权限不足=不可用");
+        assert_ne!(m.state(), EtwState::Running);
+        assert_eq!(*sink_hits.lock().unwrap(), 0, "降级不得产出任何数据");
+        let after = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+        assert!(after > before, "降级必须经 note_degraded 显式留痕");
+    }
+
+    #[test]
+    fn stop_transitions_to_stopped_and_releases_handles() {
+        let (backend, counters) = MockBackend::new(false);
+        let mut m = NetEtwMonitor::new(backend);
+        m.start(noop_sink()).unwrap();
+        m.stop().expect("停机必须成功");
+        assert_eq!(m.state(), EtwState::Stopped);
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 1);
+        assert_eq!(c.consumers_closed, 1, "消费端句柄必须关闭");
+    }
+
+    #[test]
+    fn stop_is_idempotent_when_not_running() {
+        let (backend, counters) = MockBackend::new(false);
+        let mut m = NetEtwMonitor::new(backend);
+        m.stop().expect("Idle 上 stop 必须是安全 no-op");
+        m.start(noop_sink()).unwrap();
+        m.stop().unwrap();
+        m.stop().expect("Stopped 上二次 stop 必须幂等");
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 1, "幂等 stop 不得重复释放");
+        assert_eq!(c.consumers_closed, 1);
+    }
+
+    #[test]
+    fn restart_after_stop_can_run_again() {
+        let (backend, counters) = MockBackend::new(false);
+        let mut m = NetEtwMonitor::new(backend);
+        m.start(noop_sink()).unwrap();
+        m.stop().unwrap();
+        m.start(noop_sink()).expect("停机后重启必须成功");
+        assert_eq!(m.state(), EtwState::Running);
+        let c = counters.get();
+        assert_eq!(c.sessions_started, 2);
+        assert_eq!(c.consumers_opened, 2);
+    }
+
+    #[test]
+    fn drop_while_running_releases_session_and_consumer() {
+        // Drop 资源释放断言：Running 态直接 drop（模拟进程退出路径），
+        // 会话 StopTrace 与消费端 CloseTrace 都必须发生
+        let counters;
+        {
+            let (backend, c) = MockBackend::new(false);
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            m.start(noop_sink()).unwrap();
+            assert_eq!(m.state(), EtwState::Running);
+            // 无 stop，直接 drop
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 1, "Drop 必须停会话（StopTrace）");
+        assert_eq!(c.consumers_closed, 1, "Drop 必须关消费端（CloseTrace）");
+    }
+
+    #[test]
+    fn start_enable_failure_closes_kernel_session_inline() {
+        // R 复核[blocking]：start_session 成功后 enable_provider 失败，内核里
+        // 已存在的真实会话必须由本次调用显式收口——不能置 Stopped、不能留
+        // handles，也不能等下次 start 的 Recover 或进程退出兜底
+        let counters;
+        {
+            let (mut backend, c) = MockBackend::new(false);
+            backend.fail_enable = Some(EtwError::Win32(87));
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            let r = m.start(noop_sink());
+            assert!(r.is_err(), "启用失败必须上抛");
+            assert_eq!(m.state(), EtwState::Idle, "失败路径不得声明已停止");
+            assert_ne!(m.state(), EtwState::Running);
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_started, 1);
+        assert_eq!(
+            c.sessions_stopped, 1,
+            "启用失败路径必须立即 StopTrace 收口内核会话"
+        );
+        assert_eq!(c.consumers_closed, 0, "消费端尚未打开，不得误关");
+    }
+
+    #[test]
+    fn start_consumer_failure_closes_kernel_session_inline() {
+        // 同上：start_consumer 失败（此刻供应商已启用）也必须当场收口
+        let counters;
+        {
+            let (mut backend, c) = MockBackend::new(false);
+            backend.fail_consumer = Some(EtwError::Win32(2));
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            assert!(m.start(noop_sink()).is_err());
+            assert_eq!(m.state(), EtwState::Idle);
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 1, "消费端启动失败必须收口内核会话");
+        assert_eq!(c.consumers_closed, 0, "无 consumer 句柄不得误调 CloseTrace");
+    }
+
+    #[test]
+    fn stop_failure_defers_stopped_and_drop_retries() {
+        // R 复核[blocking]：StopTrace 失败不得声明 Stopped，须置重试旗标，
+        // 由 Drop 兜底重试直至收口成功
+        let counters;
+        {
+            let (mut backend, c) = MockBackend::new(false);
+            backend.fail_stop_remaining = 1; // 首次 stop 失败，重试成功
+            counters = c;
+            let mut m = NetEtwMonitor::new(backend);
+            m.start(noop_sink()).unwrap();
+            assert!(m.stop().is_err(), "StopTrace 失败必须上抛，不得静默成功");
+            assert_ne!(m.state(), EtwState::Stopped, "收口失败不得声明已停止");
+            // 无显式处理，直接 drop：Drop 必须再试一次并收口成功
+        }
+        let c = counters.get();
+        assert_eq!(c.sessions_stopped, 2, "Drop 必须重试 StopTrace（共 2 次）");
+    }
+
+    #[test]
+    fn loss_stats_fold_is_incremental_across_reads() {
+        // R 复核：EventsLost 是会话累计值——QUERY 与 STOP 两条读数路径共用
+        // 差量折叠，同段丢失不得双计
+        let stats = LossStats::default();
+        stats.fold_lost_total(5);
+        assert_eq!(stats.counts().1, 5);
+        stats.fold_lost_total(5); // 无新增：不得重复累计
+        assert_eq!(stats.counts().1, 5, "同水位重复读数不得双计");
+        stats.fold_lost_total(8); // 新增 3
+        assert_eq!(stats.counts().1, 8);
+        stats.fold_lost_total(2); // 回退读数（理论上不应出现）：按 0 增量处理
+        assert_eq!(stats.counts().1, 8, "读数回退不得产生负增量");
+    }
+
+    #[test]
+    fn chunk_records_batches_at_max() {
+        let rec = |i: u64| NetFlowRecord {
+            timestamp_utc_ms: i as i64,
+            pid: i as u32,
+            direction: NetDirection::Out,
+            proto: NetProto::Tcp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 443,
+            bytes: i,
+        };
+        let records: Vec<NetFlowRecord> = (0..70).map(rec).collect();
+        let batches = chunk_records(records, ETW_SINK_BATCH_MAX);
+        assert_eq!(batches.len(), 2, "70 条按 64 上限应分 2 批");
+        assert_eq!(batches[0].len(), 64);
+        assert_eq!(batches[1].len(), 6);
+        assert_eq!(batches[0][0].timestamp_utc_ms, 0, "分批必须保序");
+        assert_eq!(batches[1][5].timestamp_utc_ms, 69, "分批必须保序");
+
+        // 边界：恰一批 / 空输入
+        let one: Vec<NetFlowRecord> = (0..64).map(rec).collect();
+        assert_eq!(chunk_records(one, ETW_SINK_BATCH_MAX).len(), 1);
+        assert!(chunk_records(Vec::new(), ETW_SINK_BATCH_MAX).is_empty());
+    }
+
+    /// 真实环境 smoke（cfg(windows)）：启停一次无泄漏报错。非管理员环境下
+    /// ETW 启动必然 AccessDenied——两种结局都合法：Running→Stopped 干净
+    /// 启停，或显式降级（Unavailable + 留痕）；唯独不允许「声称 Running 却
+    /// 没有句柄」或静默失败。
+    #[cfg(windows)]
+    #[test]
+    fn real_etw_smoke_start_stop_once() {
+        let before = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+        let hits = Arc::new(Mutex::new(Vec::<NetFlowRecord>::new()));
+        let hits2 = hits.clone();
+        let sink: EventSink = Arc::new(move |batch| hits2.lock().unwrap().extend(batch));
+        let mut m = NetEtwMonitor::new(RealEtw::new());
+        let started = m.start(sink);
+        match started {
+            Ok(()) => {
+                assert_eq!(m.state(), EtwState::Running);
+                assert_eq!(m.quality(), MetricQuality::Confirmed);
+                m.stop().expect("smoke 停机不得失败");
+                assert_eq!(m.state(), EtwState::Stopped);
+            }
+            Err(EtwError::AccessDenied) => {
+                // 非管理员：显式降级路径
+                assert_eq!(m.quality(), MetricQuality::Unavailable);
+                let after = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+                assert!(after > before, "非管理员降级必须留痕");
+            }
+            Err(e) => panic!("smoke 只允许成功或 AccessDenied 两种结局，实际 {e:?}"),
+        }
+    }
+}
+
+/// 网络流方向（事件语义直译：transmitted=Out、received=In）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NetDirection {
+    In,
+    Out,
+}
+
+/// 传输层协议（清单事件族：10-18 TCPv4、26-34 TCPv6、42-49 UDPv4、58+ UDPv6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NetProto {
+    Tcp,
+    Udp,
+}
+
+/// 单笔数据事件解析产物（M2.2 信封；字节量即清单 `size` 字段）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetFlowRecord {
+    /// UTC epoch 毫秒（EVENT_HEADER.TimeStamp，测试注入）。
+    pub timestamp_utc_ms: i64,
+    pub pid: u32,
+    pub direction: NetDirection,
+    pub proto: NetProto,
+    /// 4 或 6。
+    pub ip_version: u8,
+    /// 远端地址载荷原样字节（4/16B；Out=daddr、In=saddr，清单 Description 语义）。
+    pub remote: Vec<u8>,
+    /// 远端端口（win:Port 线上大端，按 BE 解码）。
+    pub remote_port: u16,
+    /// 传输层字节量（清单 `size`）。
+    pub bytes: u64,
+}
+
+/// 口径注释（需求原文）：传输层字节 ≠ 应用载荷 ≠ 物理线路——TCP 头/重传/
+/// 链路开销都不在此列，与网卡接口计数的差异由接口计数对账（M2.3 出对账口径）。
+/// event id → (方向, 协议, 地址宽, 是否带 startime/endtime)。清单原文提取
+/// （本机 TDH，Get-WinEvent -ListProvider，2026-11-01）。
+const KERNEL_NET_DATA_EVENTS: &[(u16, NetDirection, NetProto, u8, bool)] = &[
+    (10, NetDirection::Out, NetProto::Tcp, 4, true), // TCPv4 transmitted
+    (11, NetDirection::In, NetProto::Tcp, 4, false), // TCPv4 received
+    (26, NetDirection::Out, NetProto::Tcp, 6, true), // TCPv6 transmitted
+    (27, NetDirection::In, NetProto::Tcp, 6, false), // TCPv6 received
+    (42, NetDirection::Out, NetProto::Udp, 4, false), // UDPv4 transmitted
+    (43, NetDirection::In, NetProto::Udp, 4, false), // UDPv4 received
+    (58, NetDirection::Out, NetProto::Udp, 6, false), // UDPv6 transmitted
+    (59, NetDirection::In, NetProto::Udp, 6, false), // UDPv6 received
+];
+
+/// 解析一笔内核网络数据事件（清单 V0 定长布局，字段紧排无对齐：
+/// PID u32, size u32, daddr, saddr, dport u16BE, sport u16BE,
+/// [startime u32, endtime u32,] seqnum u32, connid u32）。
+/// 未知 id / 连接类事件 / 截断载荷 → None（不伪造记录）。
+pub fn parse_kernel_network_event(
+    event_id: u16,
+    payload: &[u8],
+    timestamp_utc_ms: i64,
+) -> Option<NetFlowRecord> {
+    let (direction, proto, addr_len, with_time) = KERNEL_NET_DATA_EVENTS
+        .iter()
+        .find(|(id, ..)| *id == event_id)
+        .map(|(_, d, p, a, t)| (*d, *p, *a, *t))?;
+    // addr_len 存的是 IP 版本（4/6），字节宽由版本定（v4=4B，v6=16B）
+    let addr_bytes = if addr_len == 6 { 16usize } else { 4usize };
+    // 4 + 4 + addr*2 + 2 + 2 + (8 if with_time) + 4 + 4
+    let expect = 4 + 4 + addr_bytes * 2 + 2 + 2 + if with_time { 8 } else { 0 } + 8;
+    if payload.len() < expect {
+        return None;
+    }
+    let rd32 = |o: usize| u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
+    let rd16be = |o: usize| u16::from_be_bytes(payload[o..o + 2].try_into().unwrap());
+    let pid = rd32(0);
+    let size = rd32(4);
+    let daddr_off = 8;
+    let saddr_off = daddr_off + addr_bytes;
+    let dport_off = saddr_off + addr_bytes;
+    let sport_off = dport_off + 2;
+    // 方向语义（清单 Description）：transmitted「from saddr:sport to
+    // daddr:dport」→ 远端=daddr；received「from saddr:sport」→ 远端=saddr
+    let (remote_off, remote_port) = match direction {
+        NetDirection::Out => (daddr_off, rd16be(dport_off)),
+        NetDirection::In => (saddr_off, rd16be(sport_off)),
+    };
+    Some(NetFlowRecord {
+        timestamp_utc_ms,
+        pid,
+        direction,
+        proto,
+        ip_version: addr_len,
+        remote: payload[remote_off..remote_off + addr_bytes].to_vec(),
+        remote_port,
+        bytes: size as u64,
+    })
+}
+
+/// 分钟桶聚合器：key = (minute_bucket, pid, direction, proto) → 传输层字节。
+/// 事件乱序天然免疫（桶由事件自身时间戳决定，与到达顺序无关）；
+/// `drain_metric_points` 出站后清桶（不重复出站）。
+#[derive(Default)]
+pub struct MinuteAggregator {
+    buckets: std::collections::HashMap<(i64, u32, NetDirection, NetProto), u64>,
+}
+
+pub const METRIC_MINUTE_MS: i64 = 60_000;
+
+/// 指标 id（`<domain>.<subject>.<measure>` 三段）。
+pub const METRIC_NET_PROCESS_BYTES_IN: &str = "net.process.bytes_in";
+pub const METRIC_NET_PROCESS_BYTES_OUT: &str = "net.process.bytes_out";
+
+impl MinuteAggregator {
+    pub fn add(&mut self, r: &NetFlowRecord) {
+        let bucket = r.timestamp_utc_ms.div_euclid(METRIC_MINUTE_MS);
+        *self
+            .buckets
+            .entry((bucket, r.pid, r.direction, r.proto))
+            .or_insert(0) += r.bytes;
+    }
+
+    /// 桶快照（测试断言用；key 同 add）。
+    pub fn snapshot(&self) -> std::collections::BTreeMap<(i64, u32, NetDirection, NetProto), u64> {
+        self.buckets.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// 出站 MetricPoint（每桶一条）。口径：
+    /// - timestamp = 桶起点（bucket*60_000）、interval_ms = 60_000；
+    /// - source=Etw、unit=Bytes、quality=Confirmed（seen>0 且无丢失）；
+    ///   lost>0 时全批降 Incomplete 且 loss_count/coverage 显式填充
+    ///   （coverage = seen/(seen+lost)，丢失占比对每桶同权——损失数来自
+    ///   ETW 回调/会话统计，桶粒度损失数 ETW 不提供）；
+    /// - process_identity 携 pid（exe_start_epoch=0=未知，M2.3 由 process
+    ///   监控补齐防 PID 复用误绑）。
+    ///
+    /// `host_id`/`now_ms` 由调用方注入（禁真实时钟）。
+    pub fn drain_metric_points(
+        &mut self,
+        host_id: &str,
+        events_lost: u64,
+        events_seen: u64,
+        _now_ms: i64,
+        identity_of: &mut dyn FnMut(u32, i64) -> Option<(String, u64)>,
+    ) -> Vec<crate::metrics::MetricPoint> {
+        use crate::metrics::{MetricPoint, MetricQuality, MetricSource, MetricUnit};
+        let coverage = if events_lost > 0 {
+            let total = (events_seen + events_lost) as f64;
+            if total > 0.0 {
+                Some(events_seen as f64 / total)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut keys: Vec<_> = self.buckets.keys().copied().collect();
+        keys.sort();
+        let mut out = Vec::with_capacity(keys.len());
+        for (bucket, pid, direction, proto) in keys {
+            let bytes = self
+                .buckets
+                .remove(&(bucket, pid, direction, proto))
+                .unwrap_or(0);
+            let metric_id = match direction {
+                NetDirection::In => METRIC_NET_PROCESS_BYTES_IN,
+                NetDirection::Out => METRIC_NET_PROCESS_BYTES_OUT,
+            };
+            let _ = proto; // scope 收敛为 Process 身份后协议入 metric_id 方向族（见上）
+                           // M2.3 进程身份关联：桶起点秒作代表事件时刻（桶 60s 窗口，身份
+                           // 缓存区间粒度远粗于桶）。无法归属（短命进程整段未被快照覆盖等）
+                           // 不硬归属：保留 pid、exe_start=0、点 quality 降 Incomplete。
+            let identity = identity_of(pid, bucket * METRIC_MINUTE_MS / 1000);
+            let (process_identity, scope) = match &identity {
+                Some((_name, exe_start)) => (
+                    crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: *exe_start,
+                    },
+                    crate::metrics::MetricScope::Process(crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: *exe_start,
+                    }),
+                ),
+                None => (
+                    crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: 0,
+                    },
+                    crate::metrics::MetricScope::Process(crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: 0,
+                    }),
+                ),
+            };
+            // 点级 quality = 丢失口径 ∧ 身份口径（任一不完整即 Incomplete）
+            let quality = if events_lost > 0 || identity.is_none() {
+                MetricQuality::Incomplete
+            } else {
+                MetricQuality::Confirmed
+            };
+            out.push(MetricPoint {
+                metric_id: metric_id.to_string(),
+                source: MetricSource::Etw,
+                host_id: host_id.to_string(),
+                process_identity,
+                timestamp_utc_ms: bucket * METRIC_MINUTE_MS,
+                monotonic_ms: 0, // 桶时间语义下无单调时钟意义，恒 0（注释口径）
+                interval_ms: METRIC_MINUTE_MS as u64,
+                value: bytes as f64,
+                unit: MetricUnit::Bytes,
+                scope,
+                quality,
+                loss_count: if events_lost > 0 {
+                    Some(events_lost)
+                } else {
+                    None
+                },
+                coverage,
+                schema_version: crate::metrics::METRIC_SCHEMA_VERSION,
+            });
+        }
+        out
+    }
+}
+
+// ─── M2.3：进程身份关联（PID→进程名+启动时间） ──────────────────────────────
+// 复用面如实说明：process.rs 现有枚举（CreateToolhelp32Snapshot）只产 pid+exe
+// 基名、无缓存无启动时间；本切片按同一句柄模式（OpenProcess
+// PROCESS_QUERY_LIMITED_INFORMATION + GetProcessTimes-CreationTime，见
+// process.rs query_cpu_percent_map）补齐身份缓存，供 MetricPoint 的
+// process_identity/scope=Process 填充。
+
+/// 进程枚举条目（exe_start 为 UTC epoch 秒）。
+#[derive(Debug, Clone)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub name: String,
+    pub exe_start_epoch: u64,
+}
+
+/// 进程枚举源（可注入；真实源见 [`RealProcSource`]）。
+pub trait ProcSnapshotSource {
+    fn snapshot(&mut self) -> Vec<ProcEntry>;
+}
+
+/// 单世化身：同 pid 的一个 (exe_start) 世代。
+#[derive(Debug, Clone)]
+struct Incarnation {
+    name: String,
+    exe_start: u64,
+    /// 最后一次确认存活的刷新时刻（epoch 秒）；None=当前仍存活。
+    /// pid 从快照消失时置为当次刷新时刻——事件按 [exe_start, gone_at] 区间
+    /// 归属，采样瞬间已退出的进程仍可区间归属（短命进程整段未被快照覆盖
+    /// 则不硬归属，quality=Incomplete）。
+    gone_at: Option<u64>,
+}
+
+/// 进程身份缓存：refresh 吃快照，resolve 按事件时间归属。
+/// PID 复用：exe_start 变化即新一世；事件归属取「exe_start ≤ 事件时刻且
+/// 未退出」的**最新世**（防复用误绑旧进程）。
+#[derive(Default)]
+pub struct ProcessIdentityCache {
+    entries: std::collections::HashMap<u32, Vec<Incarnation>>,
+}
+
+impl ProcessIdentityCache {
+    /// 接受 `&mut dyn`（M3.1 proxy_link 以 trait object 注入；泛型调用点
+    /// 传具体类型自动 unsize 强转，兼容不变）。
+    pub fn refresh(&mut self, source: &mut dyn ProcSnapshotSource, now_epoch_s: u64) {
+        let snap = source.snapshot();
+        let seen: std::collections::HashSet<u32> = snap.iter().map(|e| e.pid).collect();
+        // 本轮消失的：收口存活区间
+        for (pid, incs) in self.entries.iter_mut() {
+            if !seen.contains(pid) {
+                if let Some(last) = incs.last_mut() {
+                    if last.gone_at.is_none() {
+                        last.gone_at = Some(now_epoch_s);
+                    }
+                }
+            }
+        }
+        for e in snap {
+            let incs = self.entries.entry(e.pid).or_default();
+            match incs.last() {
+                // 同世续见（exe_start 未变）：确认存活
+                Some(last) if last.exe_start == e.exe_start_epoch => {
+                    if last.gone_at.is_some() {
+                        // 曾判消失又出现：按复用新世处理（保守，防跨窗口误续）
+                        incs.push(Incarnation {
+                            name: e.name,
+                            exe_start: e.exe_start_epoch,
+                            gone_at: None,
+                        });
+                    }
+                }
+                // 新世（exe_start 变化）或首见
+                _ => incs.push(Incarnation {
+                    name: e.name,
+                    exe_start: e.exe_start_epoch,
+                    gone_at: None,
+                }),
+            }
+        }
+    }
+
+    /// 按事件时刻归属进程身份：(进程名, exe_start_epoch)。
+    /// 无覆盖区间（短命进程生灭间未被快照覆盖 / 事件早于出生 / pid 未知）
+    /// → None（调用方标 quality=Incomplete，不硬归属）。
+    pub fn resolve(&self, pid: u32, event_time_epoch_s: i64) -> Option<(&str, u64)> {
+        let t = u64::try_from(event_time_epoch_s).ok()?;
+        let incs = self.entries.get(&pid)?;
+        let best = incs
+            .iter()
+            .filter(|i| i.exe_start <= t && i.gone_at.is_none_or(|g| t <= g))
+            .max_by_key(|i| i.exe_start)?;
+        Some((best.name.as_str(), best.exe_start))
+    }
+}
+
+/// 真实枚举源：Toolhelp 快照（全量，不做 process.rs 的 should_skip 过滤——
+/// 身份归属需要覆盖系统进程）+ 逐 pid GetProcessTimes-CreationTime。
+pub struct RealProcSource {
+    _buf: Vec<u8>,
+}
+
+impl RealProcSource {
+    pub fn new() -> Self {
+        Self { _buf: Vec::new() }
+    }
+}
+
+impl Default for RealProcSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+impl ProcSnapshotSource for RealProcSource {
+    fn snapshot(&mut self) -> Vec<ProcEntry> {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let mut out = Vec::new();
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                // 快照失败：返回空——refresh 只是不新增/不收口，
+                // 绝不伪造「全灭」（与 process.rs Wave19 P0 同口径）
+                return out;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    let name_end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+                    let pid = entry.th32ProcessID;
+                    // 启动时间：CreationTime FILETIME(100ns/1601) → epoch 秒
+                    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                    let exe_start_epoch = if handle.is_null() {
+                        0
+                    } else {
+                        let mut creation = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let mut exit = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let mut kernel = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let mut user = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let epoch = if GetProcessTimes(
+                            handle,
+                            &mut creation,
+                            &mut exit,
+                            &mut kernel,
+                            &mut user,
+                        ) != 0
+                        {
+                            let ft = (creation.dwHighDateTime as u64) << 32
+                                | creation.dwLowDateTime as u64;
+                            (ft / 10_000_000).saturating_sub(11_644_473_600)
+                        } else {
+                            0
+                        };
+                        CloseHandle(handle);
+                        epoch
+                    };
+                    out.push(ProcEntry {
+                        pid,
+                        name,
+                        exe_start_epoch,
+                    });
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+impl ProcSnapshotSource for RealProcSource {
+    fn snapshot(&mut self) -> Vec<ProcEntry> {
+        Vec::new()
+    }
+}
+
+// ─── M2.2：内核网络事件解析与分钟聚合（MetricPoint 产出） ────────────────────
+// schema 权威来源：本机 TDH 清单（Get-WinEvent -ListProvider
+// 'Microsoft-Windows-Kernel-Network' 模板原文，2026-11-01 提取）——
+// 经典 V0 布局，数据事件（字节量口径）：
+//   10 TCPv4 送出 / 11 TCPv4 收到：PID u32, size u32, daddr u32, saddr u32,
+//      dport u16(BE), sport u16(BE), [startime u32, endtime u32,] seqnum u32,
+//      connid u32   （无 time 形 v4=28B / v6=52B；带 time 形 v4=36B / v6=60B）
+//   26 TCPv6 送出 / 27 TCPv6 收到：同上但 addr 各 16B
+//   42 UDPv4 送出 / 43 UDPv4 收到：同 11 形
+//   58 UDPv6 送出 / 59 UDPv6 收到：同 27 形
+// 方向按事件语义：transmitted=Out、received=In（清单 Description 原文）。
+#[cfg(test)]
+mod m22_tests {
+    use super::*;
+    use crate::metrics::{MetricQuality, MetricUnit, ProcessIdentity};
+
+    /// 合成 IPv4 数据载荷（data 事件，with_time=true 时 36B，否则 32B）
+    fn v4_payload(
+        pid: u32,
+        size: u32,
+        daddr: u32,
+        saddr: u32,
+        dport: u16,
+        sport: u16,
+        with_time: bool,
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&pid.to_le_bytes());
+        v.extend_from_slice(&size.to_le_bytes());
+        v.extend_from_slice(&daddr.to_le_bytes());
+        v.extend_from_slice(&saddr.to_le_bytes());
+        v.extend_from_slice(&dport.to_be_bytes());
+        v.extend_from_slice(&sport.to_be_bytes());
+        if with_time {
+            v.extend_from_slice(&0u32.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes());
+        }
+        v.extend_from_slice(&0u32.to_le_bytes()); // seqnum
+        v.extend_from_slice(&0u32.to_le_bytes()); // connid
+        v
+    }
+
+    /// 合成 IPv6 数据载荷（data 事件，with_time=true 时 60B，否则 52B）
+    fn v6_payload(
+        pid: u32,
+        size: u32,
+        daddr: [u8; 16],
+        saddr: [u8; 16],
+        dport: u16,
+        sport: u16,
+        with_time: bool,
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&pid.to_le_bytes());
+        v.extend_from_slice(&size.to_le_bytes());
+        v.extend_from_slice(&daddr);
+        v.extend_from_slice(&saddr);
+        v.extend_from_slice(&dport.to_be_bytes());
+        v.extend_from_slice(&sport.to_be_bytes());
+        if with_time {
+            v.extend_from_slice(&0u32.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes());
+        }
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn m22_parse_tcpv4_send_synthetic_bytes() {
+        let payload = v4_payload(4242, 1500, 0x0102_a8c0, 0x0100_007f_u32, 443, 51000, true);
+        let r = parse_kernel_network_event(10, &payload, 1_749_000_000_000)
+            .expect("ID=10 TCPv4 送出必须可解析");
+        assert_eq!(r.pid, 4242);
+        assert_eq!(r.bytes, 1500);
+        assert!(
+            matches!(r.direction, NetDirection::Out),
+            "ID=10 transmitted=送出"
+        );
+        assert!(matches!(r.proto, NetProto::Tcp));
+        assert_eq!(r.ip_version, 4);
+        assert_eq!(r.remote_port, 443, "win:Port 线上大端必须按 BE 解码");
+        assert_eq!(
+            r.remote,
+            0x0102_a8c0u32.to_le_bytes().to_vec(),
+            "daddr=远端（送出方向）"
+        );
+        assert_eq!(r.timestamp_utc_ms, 1_749_000_000_000);
+    }
+
+    #[test]
+    fn m22_parse_tcpv4_recv_synthetic_bytes() {
+        let payload = v4_payload(7, 2048, 0x0102_a8c0, 0x0b01_a8c0, 51000, 443, false);
+        let r = parse_kernel_network_event(11, &payload, 1).expect("ID=11 必须可解析");
+        assert_eq!(r.bytes, 2048);
+        assert!(
+            matches!(r.direction, NetDirection::In),
+            "ID=11 received=收到"
+        );
+        assert_eq!(
+            r.remote_port, 443,
+            "收到事件远端端口=sport（from saddr:sport）"
+        );
+        // ID=11 语义「received from saddr:sport」→ 远端 = saddr
+        assert_eq!(r.remote, 0x0b01_a8c0u32.to_le_bytes().to_vec());
+        assert_eq!(payload.len(), 28, "TCPv4 收到模板定长 28B（4×6+2+2）");
+    }
+
+    #[test]
+    fn m22_parse_tcpv6_synthetic_bytes() {
+        let mut d = [0u8; 16];
+        d[15] = 1;
+        let mut s = [0u8; 16];
+        s[15] = 2;
+        let payload = v6_payload(9, 300, d, s, 8080, 60000, true);
+        let r = parse_kernel_network_event(26, &payload, 1).expect("ID=26 TCPv6 送出必须可解析");
+        assert_eq!(r.ip_version, 6);
+        assert_eq!(r.bytes, 300);
+        assert!(matches!(r.direction, NetDirection::Out));
+        assert_eq!(r.remote, d.to_vec());
+        assert_eq!(r.remote_port, 8080);
+        // 无 startime 形（52B）
+        let r2 = parse_kernel_network_event(27, &v6_payload(9, 400, d, s, 8080, 60000, false), 1)
+            .expect("ID=27 TCPv6 收到必须可解析");
+        assert!(matches!(r2.direction, NetDirection::In));
+        assert_eq!(r2.bytes, 400);
+    }
+
+    #[test]
+    fn m22_parse_udp_events() {
+        let r42 = parse_kernel_network_event(42, &v4_payload(1, 100, 1, 2, 53, 40000, false), 1)
+            .expect("ID=42 UDPv4 送出必须可解析");
+        assert!(matches!(r42.proto, NetProto::Udp));
+        assert!(matches!(r42.direction, NetDirection::Out));
+        let r43 = parse_kernel_network_event(43, &v4_payload(1, 200, 1, 2, 40000, 53, false), 1)
+            .expect("ID=43 UDPv4 收到必须可解析");
+        assert!(matches!(r43.proto, NetProto::Udp));
+        assert!(matches!(r43.direction, NetDirection::In));
+        assert_eq!(r43.bytes, 200);
+        let r58 = parse_kernel_network_event(
+            58,
+            &v6_payload(1, 300, [0; 16], [1; 16], 53, 40000, false),
+            1,
+        )
+        .expect("ID=58 UDPv6 送出必须可解析");
+        assert_eq!(r58.ip_version, 6);
+        let r59 = parse_kernel_network_event(
+            59,
+            &v6_payload(1, 400, [0; 16], [1; 16], 40000, 53, false),
+            1,
+        )
+        .expect("ID=59 UDPv6 收到必须可解析");
+        assert_eq!(r59.bytes, 400);
+    }
+
+    #[test]
+    fn m22_parse_unknown_or_truncated_is_none_not_fabricated() {
+        // 未知事件 id（连接类/非数据事件）不产字节记录
+        assert!(parse_kernel_network_event(12, &v4_payload(1, 1, 1, 2, 1, 2, false), 1).is_none());
+        assert!(parse_kernel_network_event(99, &[0u8; 64], 1).is_none());
+        // 截断载荷：不得越界、不得伪造
+        let short = v4_payload(1, 100, 1, 2, 1, 2, false);
+        assert!(parse_kernel_network_event(10, &short[..20], 1).is_none());
+        assert!(parse_kernel_network_event(11, &short[..10], 1).is_none());
+    }
+
+    /// 造流：乱序注入跨两个分钟桶的若干记录
+    fn synthetic_stream() -> Vec<NetFlowRecord> {
+        let mk = |bucket_minute: i64, pid: u32, dir: NetDirection, proto: NetProto, bytes: u64| {
+            NetFlowRecord {
+                timestamp_utc_ms: bucket_minute * 60_000 + 12_345,
+                pid,
+                direction: dir,
+                proto,
+                ip_version: 4,
+                remote: vec![1, 2, 3, 4],
+                remote_port: 443,
+                bytes,
+            }
+        };
+        // 分钟 0：pid7 in tcp 3 笔 100/200/300 + pid8 out udp 50
+        // 分钟 1：pid7 in tcp 999
+        vec![
+            mk(1, 7, NetDirection::In, NetProto::Tcp, 999),
+            mk(0, 7, NetDirection::In, NetProto::Tcp, 200), // 乱序到达
+            mk(0, 8, NetDirection::Out, NetProto::Udp, 50),
+            mk(0, 7, NetDirection::In, NetProto::Tcp, 100),
+            mk(0, 7, NetDirection::In, NetProto::Tcp, 300),
+        ]
+    }
+
+    #[test]
+    fn m22_minute_aggregation_is_exact_and_order_immune() {
+        let mut agg = MinuteAggregator::default();
+        let stream = synthetic_stream();
+        for r in &stream {
+            agg.add(r);
+        }
+        // 乱序对照：逆序注入必须得到同一聚合
+        let mut agg_rev = MinuteAggregator::default();
+        for r in stream.iter().rev() {
+            agg_rev.add(r);
+        }
+        assert_eq!(
+            agg.snapshot(),
+            agg_rev.snapshot(),
+            "乱序容忍：桶聚合与到达顺序无关"
+        );
+
+        let snap = agg.snapshot();
+        let k0 = &(0i64, 7u32, NetDirection::In, NetProto::Tcp);
+        let k0b = &(0i64, 8u32, NetDirection::Out, NetProto::Udp);
+        let k1 = &(1i64, 7u32, NetDirection::In, NetProto::Tcp);
+        assert_eq!(snap.get(k0), Some(&600u64), "分钟 0 pid7 收到 100+200+300");
+        assert_eq!(snap.get(k0b), Some(&50u64));
+        assert_eq!(snap.get(k1), Some(&999u64));
+        // 无跨分钟漂移：同 key 不同分钟严格分桶
+        assert_eq!(snap.len(), 3);
+    }
+
+    #[test]
+    fn m22_metric_points_from_buckets_shape_and_values() {
+        let mut agg = MinuteAggregator::default();
+        for r in &synthetic_stream() {
+            agg.add(r);
+        }
+        // 无丢失：Confirmed、loss/coverage 缺省
+        let pts = agg.drain_metric_points("HOST-1", 0, 5, 1_749_000_000_000, &mut |pid, _t| {
+            Some((format!("p{pid}.exe"), 1_749_000_000))
+        });
+        assert_eq!(pts.len(), 3);
+        for p in &pts {
+            assert!(
+                matches!(p.source, crate::metrics::MetricSource::Etw),
+                "source=Etw"
+            );
+            assert_eq!(p.unit, MetricUnit::Bytes);
+            assert!(
+                matches!(p.quality, MetricQuality::Confirmed),
+                "无丢失=实测确认"
+            );
+            assert_eq!(p.loss_count, None);
+            assert_eq!(p.coverage, None);
+            assert_eq!(p.interval_ms, 60_000, "口径=分钟桶");
+            assert_eq!(p.host_id, "HOST-1");
+            assert_eq!(p.schema_version, crate::metrics::METRIC_SCHEMA_VERSION);
+            assert!(
+                p.metric_id.starts_with("net.process.bytes_"),
+                "三段命名: {}",
+                p.metric_id
+            );
+            match &p.process_identity {
+                ProcessIdentity::Id { pid, .. } => assert!([7u32, 8u32].contains(pid)),
+                other => panic!("进程粒度指标必须带 pid，实际 {other:?}"),
+            }
+        }
+        // 桶起点时间戳 + 值精确
+        let p0 = pts
+            .iter()
+            .find(|p| p.timestamp_utc_ms == 0 && p.metric_id == "net.process.bytes_in")
+            .expect("分钟 0 in 桶必须有 MetricPoint");
+        assert_eq!(p0.value, 600.0);
+        let p1 = pts
+            .iter()
+            .find(|p| p.timestamp_utc_ms == 60_000)
+            .expect("分钟 1 桶必须有 MetricPoint");
+        assert_eq!(p1.value, 999.0, "无跨分钟漂移：999 全部留在分钟 1");
+    }
+
+    #[test]
+    fn m22_loss_scenario_sets_incomplete_and_counts() {
+        let mut agg = MinuteAggregator::default();
+        for r in &synthetic_stream() {
+            agg.add(r);
+        }
+        // 丢 5 见 5：quality=Incomplete、loss_count=Some(5)、coverage=0.5
+        let pts = agg.drain_metric_points("HOST-1", 5, 5, 1_749_000_000_000, &mut |pid, _t| {
+            Some((format!("p{pid}.exe"), 1_749_000_000))
+        });
+        assert!(!pts.is_empty());
+        for p in &pts {
+            assert!(
+                matches!(p.quality, MetricQuality::Incomplete),
+                "有丢失时质量必须降为 Incomplete（估算/缺失不冒充实测）"
+            );
+            assert_eq!(p.loss_count, Some(5));
+            let cov = p.coverage.expect("丢失场景必须给 coverage");
+            assert!(
+                (cov - 0.5).abs() < 1e-9,
+                "coverage=seen/(seen+lost)=0.5，实际 {cov}"
+            );
+        }
+    }
+
+    #[test]
+    fn m22_drain_clears_buckets_no_double_count() {
+        let mut agg = MinuteAggregator::default();
+        for r in &synthetic_stream() {
+            agg.add(r);
+        }
+        let first = agg.drain_metric_points("H", 0, 5, 0, &mut |_pid, _t| None);
+        let second = agg.drain_metric_points("H", 0, 5, 0, &mut |_pid, _t| None);
+        assert!(!first.is_empty());
+        assert!(second.is_empty(), "drain 后桶必须清空（不重复出站）");
+    }
+}
+
+// ─── M2.3：进程身份关联（PID→进程名+启动时间，MetricPoint 填充） ─────────────
+// 复用面如实说明：process.rs 现有枚举（CreateToolhelp32Snapshot）只产 pid+exe
+// 基名，无启动时间缓存；本切片在该枚举形态上加 GetProcessTimes-CreationTime
+// （process.rs CPU 差分已用同一 OpenProcess 句柄模式）构成身份缓存。
+#[cfg(test)]
+mod m23_tests {
+    use super::*;
+
+    /// 注入源：测试直接喂快照（禁真实时钟——时间全部由 refresh 的 now 参数注入）
+    struct MockSource {
+        entries: Vec<ProcEntry>,
+    }
+    impl ProcSnapshotSource for MockSource {
+        fn snapshot(&mut self) -> Vec<ProcEntry> {
+            self.entries.clone()
+        }
+    }
+    fn entry(pid: u32, name: &str, exe_start: u64) -> ProcEntry {
+        ProcEntry {
+            pid,
+            name: name.to_string(),
+            exe_start_epoch: exe_start,
+        }
+    }
+
+    #[test]
+    fn m23_pid_reuse_distinguished_by_exe_start() {
+        // 同 PID 两世：start=100（首见 t=200），start=500 换世（t=600 刷新见新世）
+        let mut cache = ProcessIdentityCache::default();
+        let mut src = MockSource {
+            entries: vec![entry(7, "old.exe", 100)],
+        };
+        cache.refresh(&mut src, 200);
+        let mut src = MockSource {
+            entries: vec![entry(7, "new.exe", 500)],
+        };
+        cache.refresh(&mut src, 600);
+
+        // 旧世窗口内事件 → 归属旧世（start=100）
+        let r = cache.resolve(7, 300).expect("旧世窗口内事件必须可归属");
+        assert_eq!(r, ("old.exe", 100u64));
+        // 新世之后的事件 → 归属新世（start=500）
+        let r = cache.resolve(7, 700).expect("新世事件必须可归属");
+        assert_eq!(r, ("new.exe", 500u64));
+        // 重叠期（两世都覆盖）→ 取最新世（防 PID 复用误绑旧进程）
+        let r = cache.resolve(7, 550).expect("重叠期事件仍可归属");
+        assert_eq!(r.1, 500u64, "PID 复用必须按最新 exe_start 归属");
+    }
+
+    #[test]
+    fn m23_exited_process_interval_attribution_and_incomplete() {
+        // pid 9 t=100 首见；t=200 刷新不见（已退出）→ gone_at=200
+        let mut cache = ProcessIdentityCache::default();
+        let mut src = MockSource {
+            entries: vec![entry(9, "shortlived.exe", 50)],
+        };
+        cache.refresh(&mut src, 100);
+        let mut src = MockSource { entries: vec![] };
+        cache.refresh(&mut src, 200);
+
+        // 事件落在存活区间 [50,200] → 即使采样瞬间已退出也归属（区间归属）
+        let r = cache.resolve(9, 150).expect("存活区间内事件必须归属");
+        assert_eq!(r, ("shortlived.exe", 50u64));
+        // 事件在区间外（进程生灭之间从未被任何快照覆盖）→ 不硬归属
+        assert!(cache.resolve(9, 250).is_none(), "退出后事件不得硬归属");
+        assert!(cache.resolve(9, 10).is_none(), "出生前事件不得归属");
+        // 从未见过的 pid → 不硬归属
+        assert!(cache.resolve(12345, 150).is_none());
+    }
+
+    #[test]
+    fn m23_drain_unresolved_pid_marks_incomplete_with_scope_process() {
+        let mut agg = MinuteAggregator::default();
+        agg.add(&NetFlowRecord {
+            timestamp_utc_ms: 30_000,
+            pid: 7,
+            direction: NetDirection::In,
+            proto: NetProto::Tcp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 443,
+            bytes: 100,
+        });
+        // 身份回调返回 None（短命进程，无法归属）→ Incomplete，不硬归属
+        let pts = agg.drain_metric_points("H", 0, 1, 0, &mut |_pid, _t| None);
+        assert_eq!(pts.len(), 1);
+        let p = &pts[0];
+        assert!(
+            matches!(p.quality, MetricQuality::Incomplete),
+            "无法归属必须标记 Incomplete（短命进程不硬归属）"
+        );
+        match &p.process_identity {
+            crate::metrics::ProcessIdentity::Id {
+                pid,
+                exe_start_epoch,
+            } => {
+                assert_eq!(*pid, 7);
+                assert_eq!(*exe_start_epoch, 0, "未知启动时间=0（不伪造）");
+            }
+            other => panic!("必须保留 pid 身份，实际 {other:?}"),
+        }
+        assert!(
+            matches!(&p.scope, crate::metrics::MetricScope::Process(_)),
+            "scope 必须=Process（不再用 Connection 占位）"
+        );
+    }
+
+    #[test]
+    fn m23_drain_resolved_pid_keeps_confirmed_and_fills_identity() {
+        let mut agg = MinuteAggregator::default();
+        agg.add(&NetFlowRecord {
+            timestamp_utc_ms: 30_000,
+            pid: 7,
+            direction: NetDirection::Out,
+            proto: NetProto::Udp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 53,
+            bytes: 500,
+        });
+        let pts = agg.drain_metric_points("H", 0, 1, 0, &mut |pid, _t| {
+            Some((format!("p{pid}.exe"), 1_749_000_000))
+        });
+        let p = &pts[0];
+        assert!(
+            matches!(p.quality, MetricQuality::Confirmed),
+            "可归属且无丢失=Confirmed"
+        );
+        assert_eq!(
+            p.process_identity,
+            crate::metrics::ProcessIdentity::Id {
+                pid: 7,
+                exe_start_epoch: 1_749_000_000
+            }
+        );
+        match &p.scope {
+            crate::metrics::MetricScope::Process(crate::metrics::ProcessIdentity::Id {
+                pid,
+                exe_start_epoch,
+            }) => {
+                assert_eq!((*pid, *exe_start_epoch), (7, 1_749_000_000));
+            }
+            other => panic!("scope 必须=Process 且携完整身份，实际 {other:?}"),
+        }
+        assert_eq!(p.loss_count, None);
+        assert_eq!(p.coverage, None);
+    }
+
+    #[test]
+    fn m23_loss_and_unresolved_both_incomplete_no_conflict() {
+        let mut agg = MinuteAggregator::default();
+        agg.add(&NetFlowRecord {
+            timestamp_utc_ms: 30_000,
+            pid: 7,
+            direction: NetDirection::In,
+            proto: NetProto::Tcp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 443,
+            bytes: 100,
+        });
+        // 丢失 + 无法归属：仍 Incomplete，loss/coverage 照填
+        let pts = agg.drain_metric_points("H", 3, 1, 0, &mut |_pid, _t| None);
+        let p = &pts[0];
+        assert!(matches!(p.quality, MetricQuality::Incomplete));
+        assert_eq!(p.loss_count, Some(3));
+        let cov = p.coverage.expect("丢失场景必须给 coverage");
+        assert!(
+            (cov - 0.25).abs() < 1e-9,
+            "coverage=1/(1+3)=0.25，实际 {cov}"
+        );
+    }
+
+    /// 真实枚举源 smoke（cfg(windows)）：必须看到自身进程且启动时间非零
+    /// （无需管理员；Toolhelp+GetProcessTimes 与 process.rs CPU 差分同权限面）。
+    #[cfg(windows)]
+    #[test]
+    fn m23_real_source_sees_self_with_start_time() {
+        let mut src = RealProcSource::new();
+        let snap = src.snapshot();
+        let me = std::process::id();
+        let hit = snap
+            .iter()
+            .find(|e| e.pid == me)
+            .expect("快照必须含自身进程");
+        assert!(!hit.name.is_empty());
+        assert!(
+            hit.exe_start_epoch > 1_600_000_000,
+            "启动时间应为合理 epoch 秒（实际 {}）",
+            hit.exe_start_epoch
+        );
+    }
+}

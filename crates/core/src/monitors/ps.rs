@@ -519,28 +519,45 @@ mod tests {
 
     /// RED：宿主锁被他人持有时，run_ps 必须经有界并发 spawn 道返回数据，
     /// 而不是在引擎锁上排队到对方放锁（旧实现串行排队，本测试会超时失败）。
+    ///
+    /// R2.3 时钟复核修订：通过判据改为**事件顺序**而非 elapsed 时钟阈值——
+    /// busy 主线程持 ENGINE 锁直到 worker 明确报告「已拿到数据」才放锁；
+    /// worker 在报告前先核验放锁信号未发出（顺序反了即判负）。旧实现
+    /// （串行排队引擎锁）下 worker 永不返回，由 30s 看门狗兜底判负——
+    /// 看门狗只是失败快速通道，不参与通过判据，慢机器不再误伤。
     #[cfg(windows)]
     #[test]
     fn busy_host_calls_take_spawn_lane_and_return_data() {
-        // guard 留主线程持锁 8s（MutexGuard 非 Send 不跨线程）；run_ps 在
-        // worker 线程执行，必须在锁释放前（<5s）经 spawn 道拿到数据
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // 主线程先持锁再 spawn（MutexGuard 不跨线程，留主线程持有）
         let g = ENGINE.lock().unwrap();
-        let worker = std::thread::spawn(|| {
-            let start = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
             let out = run_ps_detailed("Write-Output 'lane-data'");
-            (out, start.elapsed())
+            // 顺序核验：此刻放锁信号必然尚未发出（主线程还没看到数据、
+            // 更未 drop guard）——若为 true 说明数据返回晚于放锁，判负
+            let released_before_data = release_rx.try_recv().is_ok();
+            data_tx.send((out, released_before_data)).ok();
         });
-        std::thread::sleep(std::time::Duration::from_secs(8));
-        drop(g);
-        let (out, elapsed) = worker.join().unwrap();
-        match out {
-            PsOutcome::Data(s) => assert!(s.contains("lane-data")),
-            other => panic!("spawn 道必须返回数据，实际 {other:?}"),
+        match data_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok((out, released_before_data)) => {
+                match out {
+                    PsOutcome::Data(s) => assert!(s.contains("lane-data")),
+                    other => panic!("spawn 道必须返回数据，实际 {other:?}"),
+                }
+                assert!(
+                    !released_before_data,
+                    "数据返回必须先于放锁（事件顺序判据）"
+                );
+            }
+            Err(_) => panic!(
+                "宿主被占时 run_ps 必须经 spawn 道立即返回（旧实现在引擎锁排队，30s 未返回）"
+            ),
         }
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "宿主被占时必须走 spawn 道立即执行（实测 {elapsed:?}，旧实现会排队 8s+）"
-        );
+        // worker 已报告拿到数据，此刻才放锁收尾
+        drop(g);
+        drop(release_tx);
+        worker.join().unwrap();
     }
 
     /// S0.4 RED：宿主 + spawn 双道均启动失败时，run_ps 必须计入
