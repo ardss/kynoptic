@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
+可观测性升级（obs-m 系列，feat/obs-m 分支 PR #72）。
+
+### Added
+
+- 统一指标契约（M1）：`MetricPoint` 12+1 字段信封（schema v1）——metric_id
+  三段命名、`source`（Etw/Derived/Provider）、`quality`（Confirmed/
+  Estimated/Incomplete/Unavailable；未采到不是零、估算不是实测）、
+  `process_identity`（pid+exe_start 防复用误绑）、loss/coverage 显式字段。
+- ETW 内核网络流量（M2）：专用会话 `KynopticNetMon`（Microsoft-Windows-
+  Kernel-Network）——会话管理器状态机、内核事件解析 + 分钟聚合、进程身份
+  关联（PID→进程名+启动时间，含短命进程区间归属与 PID 复用防护）、
+  `net_process_minute` 持久化（0012 迁移）与 `/api/net-process` 查询面、
+  受控传输验证（隔离会话 100MiB，production 不受影响）。
+- 代理归因链（M3）：代理进程与监听端口识别（GetExtendedTcp/UdpTable +
+  可配置进程名模式，证据层不做假设性归类）；四类流量派生（直连/代理相关/
+  代理外层/口径模糊，四独立 metric_id 永不互加；TUN/多路复用降 Estimated
+  并带原因）；网络归因面板视图（五分区，每分区带 Confirmed/Estimated/
+  Unavailable 徽标与原因）。
+- 资源异常模型（M4.1）：`ResourceAnomaly` 统一事件（滚动基线近 7 天同
+  小时分位 + 绝对阈值双门限防误报；流量激增/持续上传/CPU 持续+周期尖峰/
+  内存斜增/磁盘吞吐/短命进程反复/单父扇出/通道事件检测器集；只检测记录，
+  不自动杀进程/改代理/断网）。
+- 诊断模式（M4.2）：默认关；开启后临时提粒度（ETW 缓冲 64KB→256KB、采样
+  30s→5s），硬预算 CPU≤2% 单核 / RSS≤64MiB，超限强制收口；到期自动回落
+  Basic；设置页显示当前模式与剩余时间。
+- 三视图（M4.3）：系统总览（CPU/内存/GPU/网络/关键异常/监控健康）、
+  资源排行（按进程网络 Top20，无名不伪造）、诊断时间线（锚点关联事件/
+  资源变化/目的地址可得性）；无持久化源的维度一律显式 Unavailable+原因。
+- 数据保留策略（S1.1 骨架）：**默认关闭**，用户在设置中显式开启才生效；
+  清理覆盖 events 与 actor 证据缓存盲区。
+
+### Changed
+
+- ETW 启用路径勘误：内核网络供应商真实 GUID
+  `{7DD42A49-5329-4832-8DFD-43D979153A88}`（旧 GUID 未注册致 EnableTraceEx2
+  错 87）；内核供应商走 EnableTraceEx（EnableTraceEx2 对内核供应商恒 87，
+  24 组合探针矩阵证实）。启动链中途失败显式收口内核会话；运行中丢失数经
+  EVENT_TRACE_CONTROL_QUERY 可见。
+- CI/门禁：dashboard 内嵌 JS 由 check-js.mjs 语法+逻辑断言双护（M3.4/M4.3
+  徽标与渲染逻辑 vm 求值）；推送经 ls-remote 核验流程固化。
+
+### Pending-Admin / Limitations（如实）
+
+- 本机（DU）为非管理员、UAC 确认被策略自动取消：ETW 实采与端口表验证在
+  A 机（管理员 ssh 会话、隔离会话名/隔离端口）完成；本机管理员身份下的
+  等价实采验证仍为 Pending-Admin。
+- 套餐用量（plan 分区）恒 Unavailable：本机无可信套餐计量面（核心数据口
+  非 HTTP 面、配置加密、本地库无用量表）；禁止用进程 I/O/网卡累计/连接数
+  伪造，订阅端点 subscription-userinfo 头为后续远程接入候选。
+- 直连/代理相关（direct/via_proxy）流级拆分待 M3.2 ETW 派生全量接线，
+  当前显式 Unavailable 不硬拆；分钟聚合不含远端五元组，目的地址不可得。
+- 按进程 CPU/内存/磁盘无持久化数据源：资源排行仅网络维度出数，其余维度
+  显式 Unavailable（未采不伪造）。
+
 ## [0.7.0] - 2026-10-31
 
 ### Changed
@@ -1161,7 +1217,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ardss/kynoptic/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ardss/kynoptic/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ardss/kynoptic/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ardss/kynoptic/compare/v0.4.0...v0.5.0
