@@ -28,6 +28,7 @@ pub mod battery;
 pub mod brightness;
 pub mod device;
 pub mod idle;
+pub mod net_etw;
 pub mod network;
 pub mod power_plan;
 pub mod process;

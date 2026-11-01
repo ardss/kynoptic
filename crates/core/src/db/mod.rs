@@ -1347,11 +1347,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 造一个 n 行 events 的库（单事务 CTE 直插，绕开应用层写入以压测
-    /// 水位刷新本身）。返回 (Database, 目录)。
-    fn s12_bulk_db(tag: &str, n: i64) -> (Database, std::path::PathBuf) {
+    /// 千万行模拟库的目录（与建库分离：目录先建、guard 先挂，建库 panic
+    /// 也不残留——实测教训：磁盘满时 bulk 中途 panic 会留下 3.6GB 孤儿）。
+    fn s12_bulk_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("kyn-s12-bulk-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 在给定目录建一个 n 行 events 的库（单事务 CTE 直插，绕开应用层写入
+    /// 以压测水位刷新本身）。
+    fn s12_open_bulk(dir: &std::path::Path, n: i64) -> Database {
         let db = Database::open(dir.join("bulk.db").to_str().unwrap()).unwrap();
         db.with_writer(
             |conn| {
@@ -1367,7 +1373,7 @@ mod tests {
             },
             || (),
         );
-        (db, dir)
+        db
     }
 
     /// M 批 × 300 事件的平均单批耗时（毫秒），批量走生产主路径
@@ -1406,10 +1412,13 @@ mod tests {
             }
         }
         const N: i64 = 10_000_000;
-        let (small_db, small_dir) = s12_bulk_db("small", 1_000);
-        let (big_db, big_dir) = s12_bulk_db("big", N);
+        // 目录先建、guard 先挂，再建库——bulk 直插中途 panic（如磁盘满）也不残留
+        let small_dir = s12_bulk_dir("small");
+        let big_dir = s12_bulk_dir("big");
         let _guard_small = DirCleanup(small_dir.clone());
         let _guard_big = DirCleanup(big_dir.clone());
+        let small_db = s12_open_bulk(&small_dir, 1_000);
+        let big_db = s12_open_bulk(&big_dir, N);
         assert_eq!(s12_count(&big_db), N, "前置：大库须有千万行（模拟库）");
 
         // 预热（页面缓存/语句缓存），排除首批暖机噪声
