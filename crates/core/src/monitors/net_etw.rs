@@ -25,14 +25,16 @@ use std::sync::Arc;
 /// ETW 实时会话专用名（残留清理只清同名，不碰他人会话）。
 pub const ETW_SESSION_NAME: &str = "KynopticNetMon";
 
-/// Microsoft-Windows-Kernel-Network 清单 GUID
-/// {DDD0FCCD-3934-4E37-B454-31E8F4B9F803}（组件形存放，跨平台可编译；
-/// logman `-p {guid}` 同源，真实路径启用即 smoke 验证）。
+/// Microsoft-Windows-Kernel-Network 注册 GUID
+/// {7DD42A49-5329-4832-8DFD-43D979153A88}（组件形存放，跨平台可编译）。
+/// 勘误（M2.5 实测）：早期取值 {DDD0FCCD-…} 来自误读的清单记录，对系统
+/// 未注册——EnableTraceEx2 返回 ERROR_INVALID_PARAMETER(87)；`logman query
+/// providers` 在 B/A 两机均显示真值为 {7DD42A49-…}。
 pub const KERNEL_NETWORK_PROVIDER_GUID_COMPONENTS: (u32, u16, u16, [u8; 8]) = (
-    0xDDD0FCCD,
-    0x3934,
-    0x4E37,
-    [0xB4, 0x54, 0x31, 0xE8, 0xF4, 0xB9, 0xF8, 0x03],
+    0x7DD42A49,
+    0x5329,
+    0x4832,
+    [0x8D, 0xFD, 0x43, 0xD9, 0x79, 0x15, 0x3A, 0x88],
 );
 
 /// 消费线程单批出站上限（64 条）。
@@ -217,6 +219,10 @@ pub struct RealEtw {
     stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 丢事件观测（回调 seen / stop 时 EventsLost 收口）。
     stats: Arc<LossStats>,
+    /// ETW 会话名：默认 ETW_SESSION_NAME（生产）；受控验证等旁路场景可用
+    /// with_session_name 换成专用名（如 KynopticNetMonVerify），避免
+    /// stop_session 误停生产同名会话。
+    session_name: String,
 }
 
 impl RealEtw {
@@ -226,7 +232,15 @@ impl RealEtw {
             tx: None,
             stop_flag: None,
             stats: Arc::new(LossStats::default()),
+            session_name: ETW_SESSION_NAME.to_string(),
         }
+    }
+
+    /// 旁路验证用：指定会话名（仅影响本实例 start/stop/query 的目标会话）。
+    pub fn with_session_name(name: &str) -> Self {
+        let mut s = Self::new();
+        s.session_name = name.to_string();
+        s
     }
 }
 
@@ -249,11 +263,11 @@ mod real {
     use super::*;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Diagnostics::Etw::{
-        CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-        CONTROLTRACE_HANDLE, ENABLE_TRACE_PARAMETERS, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-        EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
-        EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE,
-        PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION,
+        CloseTrace, ControlTraceW, EnableTraceEx, OpenTraceW, ProcessTrace, StartTraceW,
+        CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
+        EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+        PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+        TRACE_LEVEL_INFORMATION,
     };
 
     const ERROR_ACCESS_DENIED: u32 = 5;
@@ -305,7 +319,10 @@ mod real {
     }
 
     /// 构造会话属性块（EVENT_TRACE_PROPERTIES + 尾随 LoggerName 宽串）。
-    unsafe fn make_session_properties(buffer: &mut [u8]) -> *mut EVENT_TRACE_PROPERTIES {
+    unsafe fn make_session_properties(
+        name: &str,
+        buffer: &mut [u8],
+    ) -> *mut EVENT_TRACE_PROPERTIES {
         let props = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         std::ptr::write_bytes(props, 0, 1);
         let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
@@ -314,7 +331,7 @@ mod real {
         (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         (*props).LoggerNameOffset = size as u32;
         (*props).LogFileNameOffset = 0; // 实时会话无需日志文件
-        let name = wide(ETW_SESSION_NAME);
+        let name = wide(name);
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
             buffer.as_mut_ptr().add(size) as *mut u16,
@@ -323,13 +340,13 @@ mod real {
         props
     }
 
-    fn query_session() -> Result<bool, EtwError> {
+    fn query_session(name: &str) -> Result<bool, EtwError> {
         let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
-        let props = unsafe { make_session_properties(&mut buffer) };
+        let props = unsafe { make_session_properties(name, &mut buffer) };
         let code = unsafe {
             ControlTraceW(
                 CONTROLTRACE_HANDLE { Value: 0 },
-                wide(ETW_SESSION_NAME).as_ptr(),
+                wide(name).as_ptr(),
                 props,
                 EVENT_TRACE_CONTROL_QUERY,
             )
@@ -343,7 +360,7 @@ mod real {
 
     impl RealEtw {
         fn query_residual_real(&self) -> bool {
-            matches!(query_session(), Ok(true))
+            matches!(query_session(&self.session_name), Ok(true))
         }
     }
 
@@ -354,11 +371,11 @@ mod real {
 
         fn stop_session(&mut self) -> Result<(), EtwError> {
             let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
-            let props = unsafe { make_session_properties(&mut buffer) };
+            let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
             let code = unsafe {
                 ControlTraceW(
                     CONTROLTRACE_HANDLE { Value: 0 },
-                    wide(ETW_SESSION_NAME).as_ptr(),
+                    wide(&self.session_name).as_ptr(),
                     props,
                     EVENT_TRACE_CONTROL_STOP,
                 )
@@ -383,9 +400,10 @@ mod real {
 
         fn start_session(&mut self) -> Result<u64, EtwError> {
             let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
-            let props = unsafe { make_session_properties(&mut buffer) };
+            let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
             let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-            let code = unsafe { StartTraceW(&mut handle, wide(ETW_SESSION_NAME).as_ptr(), props) };
+            let code =
+                unsafe { StartTraceW(&mut handle, wide(&self.session_name).as_ptr(), props) };
             if code != ERROR_SUCCESS {
                 return Err(to_err(code));
             }
@@ -400,17 +418,22 @@ mod real {
                 data3: d3,
                 data4: d4,
             };
-            let params: ENABLE_TRACE_PARAMETERS = unsafe { std::mem::zeroed() };
+            // 勘误（M2.5 实测）：内核提供方（Kernel-Network）经 EnableTraceEx2
+            // 启用恒报 ERROR_INVALID_PARAMETER(87)（关键词/级别/会话模式全
+            // 组合矩阵试错一致，见 examples/m2_transfer_verify.rs --probe）；
+            // EnableTraceEx（参数同源、无 ENABLE_TRACE_PARAMETERS）启用成功，
+            // 故用之。logman 同为可用路径。
             let code = unsafe {
-                EnableTraceEx2(
-                    CONTROLTRACE_HANDLE { Value: session },
+                EnableTraceEx(
                     &guid,
-                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    std::ptr::null(),
+                    CONTROLTRACE_HANDLE { Value: session },
+                    1,                             // 启用
                     TRACE_LEVEL_INFORMATION as u8, // 4
                     u64::MAX,                      // 全 keyword
                     0,
                     0,
-                    &params,
+                    std::ptr::null(),
                 )
             };
             if code != ERROR_SUCCESS {
@@ -461,7 +484,7 @@ mod real {
                 stats: self.stats.clone(),
             })) as *mut ConsumerCtx;
             let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
-            let name = wide(ETW_SESSION_NAME);
+            let name = wide(&self.session_name);
             logfile.LoggerName = name.as_ptr() as *mut u16;
             logfile.Context = ctx as *mut core::ffi::c_void;
             logfile.Anonymous1.ProcessTraceMode = EVENT_TRACE_REAL_TIME_MODE
@@ -623,14 +646,15 @@ mod tests {
 
     #[test]
     fn kernel_network_provider_guid_constant() {
-        // Microsoft-Windows-Kernel-Network 清单 GUID（logman -p 同源）
+        // Microsoft-Windows-Kernel-Network 注册 GUID（`logman query providers`
+        // 两机同源勘误值；旧值 DDD0FCCD 对系统未注册，EnableTraceEx2 报 87）
         assert_eq!(
             KERNEL_NETWORK_PROVIDER_GUID_COMPONENTS,
             (
-                0xDDD0FCCD,
-                0x3934,
-                0x4E37,
-                [0xB4, 0x54, 0x31, 0xE8, 0xF4, 0xB9, 0xF8, 0x03]
+                0x7DD42A49,
+                0x5329,
+                0x4832,
+                [0x8D, 0xFD, 0x43, 0xD9, 0x79, 0x15, 0x3A, 0x88]
             )
         );
     }
