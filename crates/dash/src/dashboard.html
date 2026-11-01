@@ -261,6 +261,9 @@
   <div id="watchdog-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #8a6d1f;border-radius:6px;background:#332a14;color:#f2ddaa;font-size:13px"></div>
   <div id="db-degraded-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #a33;border-radius:6px;background:#3a2020;color:#fdd;font-size:13px"></div>
   <div id="monitor-stats-line" role="status" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #8a6d1f;border-radius:6px;background:#332a14;color:#f2ddaa;font-size:13px"></div>
+  <!-- 磁盘空间不足写入暂停横幅（S0.3：core 写 disk-paused.flag、api_status
+       disk_write_paused 按存在性透出；黄色警示，指引清理磁盘） -->
+  <div id="disk-banner" role="alert" style="display:none;margin:6px 0;padding:8px 12px;border:1px solid #a80;border-radius:6px;background:#332a00;color:#fd6;font-size:13px"></div>
   <!-- ARIA APG tabs 键盘契约：活动 tab tabindex=0 其余 -1，方向键/Home/End
        移动并激活（JS 末尾 tablist keydown）；aria-controls/aria-labelledby 双向关联 -->
   <div class="tabs" role="tablist">
@@ -837,23 +840,36 @@ async function loadStatus() {
   // 页脚鉴权声明跟随服务端实际状态（令牌已启用时不宣称"无需鉴权"）
   setFooterAuth(!!s.token_required);
   // 监控器采集诊断（性能治理）：s.monitors 每项含 name / last_success_age_secs
-  // / last_duration_ms / consecutive_slow。旧后端缺字段按空数组容错；只在有
-  // 监控器处于退避（连续慢采集）时占一行，正常时静默，不给状态行加噪音。
+  // / last_duration_ms / consecutive_slow / degraded_count。旧后端缺字段按空
+  // 数组容错；有监控器退避或进程内有降级事件时占一行，正常时静默，不给状态
+  // 行加噪音。monitors 为空（独立 serve 进程无采集器，跨进程透出另见 S2.3）
+  // 时显示"诊断不可用"提示而非静默——静默会让用户把盲区当健康。
   const msLine = document.getElementById("monitor-stats-line");
   if (msLine) {
+    const zhMs = document.documentElement.lang === "zh";
     const ms = Array.isArray(s.monitors) ? s.monitors : [];
-    const backing = ms.filter(function (m) { return m.consecutive_slow > 0; });
-    if (backing.length > 0) {
-      const zhMs = document.documentElement.lang === "zh";
-      const detail = backing.map(function (m) {
-        return m.name + " x" + m.consecutive_slow + " (" + (m.last_duration_ms ?? "?") + "ms)";
-      }).join(", ");
+    if (ms.length === 0) {
       msLine.style.display = "";
       msLine.textContent = zhMs
-        ? "采集诊断：以下监控器连续慢采集已退避 —— " + detail
-        : "collector diagnostics: monitors in slow-collect backoff — " + detail;
+        ? "采集诊断不可用：此服务进程内无采集器（跨进程透出待后续切片）"
+        : "collector diagnostics unavailable: no collector in this serve process (cross-process passthrough pending)";
     } else {
-      msLine.style.display = "none";
+      const degraded = ms.length > 0 ? (ms[0].degraded_count ?? 0) : 0;
+      const backing = ms.filter(function (m) { return m.consecutive_slow > 0; });
+      if (backing.length > 0 || degraded > 0) {
+        const detail = backing.map(function (m) {
+          return m.name + " x" + m.consecutive_slow + " (" + (m.last_duration_ms ?? "?") + "ms)";
+        }).join(", ");
+        const degTxt = degraded > 0
+          ? (zhMs ? " · 降级事件 " + degraded + " 次" : " · " + degraded + " degraded event(s)")
+          : "";
+        msLine.style.display = "";
+        msLine.textContent = zhMs
+          ? "采集诊断：" + (backing.length > 0 ? "以下监控器连续慢采集已退避 —— " + detail : "监控器运行中") + degTxt
+          : "collector diagnostics: " + (backing.length > 0 ? "monitors in slow-collect backoff — " + detail : "monitors running") + degTxt;
+      } else {
+        msLine.style.display = "none";
+      }
     }
   }
   if (!s.last_event_ts) {
@@ -918,6 +934,22 @@ async function loadStatus() {
       dg.style.display = "none";
     }
   }
+  // 磁盘空间不足写入暂停横幅（S0.3）：core write_batch 低于阈值主动暂停
+  // 写入并落 disk-paused.flag，后端按存在性透出 disk_write_paused（跨进程
+  // 可见）+ disk_paused_events（进程级读数）。黄色警示 + 清理指引，空间
+  // 恢复后旗标删除、横幅自动消失（30s 轮询）。
+  const dbn = document.getElementById("disk-banner");
+  if (dbn) {
+    if (s.disk_write_paused) {
+      dbn.style.display = "";
+      const skipped = s.disk_paused_events ?? 0;
+      dbn.textContent = zh
+        ? "磁盘空间不足，采集写入已主动暂停（累计 " + skipped + " 条事件待落库）。请清理库所在磁盘空间，恢复后自动续写。"
+        : "Disk is low: collection writes are paused (" + skipped + " event(s) pending). Free up disk space on the database volume; writing resumes automatically.";
+    } else {
+      dbn.style.display = "none";
+    }
+  }
   // 看门狗告警横幅（修复：cli watchdog_alert 落库的 notification 系统事件
   // 此前全仓无消费方，采集空洞在 UI 零痕迹）。后端只回近 24h 内最新一条；
   // 最新一条是恢复事件（kind=collection_recovered，cli 心跳恢复路径 /
@@ -930,6 +962,16 @@ async function loadStatus() {
       // 按界面语言选同义文案：落库的 message 是中文原文，英文界面用
       // message_en（写入方同时落两语）；旧数据无 message_en 时回退原文
       const wamsg = zh ? wa.message : (wa.message_en || wa.message);
+      // S0.2：collector 落库的两个新 kind 前缀分类标签 + loss_count 量化；
+      // 旧 kind（无标签）保持原样渲染
+      const kindLabel =
+        wa.kind === "collection_dropped" ? (zh ? "采集丢弃" : "events dropped") :
+        wa.kind === "write_failed" ? (zh ? "数据库写失败" : "db write failures") :
+        "";
+      const lossTxt = (wa.loss_count ?? null) !== null
+        ? (zh ? "（损失 " + wa.loss_count + " 条）" : " (" + wa.loss_count + " event(s) lost)")
+        : "";
+      const wamsgTagged = kindLabel ? "[" + kindLabel + "] " + wamsg + lossTxt : wamsg;
       if (wa.recovered) {
         // 已解除：横幅换成中性配色 + 解除时刻（at 为带时区偏移的 RFC3339，
         // Date 按正确时点解析），与状态行时间戳同口径
@@ -939,12 +981,12 @@ async function loadStatus() {
         wb.style.background = "#243040";
         wb.style.color = "";
         wb.textContent = zh
-          ? "系统告警已解除" + (at ? "（" + at + "）：" : "：") + wamsg
-          : "system alert cleared" + (at ? " (" + at + "): " : ": ") + wamsg;
+          ? "系统告警已解除" + (at ? "（" + at + "）：" : "：") + wamsgTagged
+          : "system alert cleared" + (at ? " (" + at + "): " : ": ") + wamsgTagged;
       } else {
         wb.style.borderColor = "";
         wb.style.background = "";
-        wb.textContent = t("watchdogAlert").replace("{m}", wamsg);
+        wb.textContent = t("watchdogAlert").replace("{m}", wamsgTagged);
       }
     } else {
       wb.style.display = "none";

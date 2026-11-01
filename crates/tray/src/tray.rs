@@ -88,6 +88,16 @@ fn update_available_version(db: &std::path::Path) -> Option<String> {
     }
 }
 
+/// 磁盘写入暂停旗标轮询（S0.3）：core collector 进入低盘暂停时写
+/// <数据目录>\disk-paused.flag（与 db_degraded 的 degraded.flag 同模式），
+/// 托盘每 2s 查一次文件存在性，把"磁盘暂停"接入黄三角图标——此前磁盘
+/// 暂停只有看门狗日志与面板横幅（S0.3 起才有），托盘保持绿色。
+fn disk_paused(db: &std::path::Path) -> bool {
+    db.parent()
+        .map(|d| d.join(kynoptic_core::collector::DISK_PAUSE_FLAG).exists())
+        .unwrap_or(false)
+}
+
 /// 语义化版本比较：a > b 视为真（仅支持数字三段式；本项目的 tag 形态）
 fn version_gt(a: &str, b: &str) -> bool {
     let parse = |v: &str| -> Vec<u64> {
@@ -242,6 +252,9 @@ impl TrayCtx {
                     "Kynoptic: collector error / 采集异常"
                 } else if db_degraded(&self.args.db) {
                     "Kynoptic: database degraded / 数据库降级"
+                } else if disk_paused(&self.args.db) {
+                    // S0.3：磁盘暂停接入黄三角 tooltip（旗标文件轮询，同 db_degraded）
+                    "Kynoptic: disk low, writes paused / 磁盘空间不足，写入已暂停"
                 } else if crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed) {
                     "Kynoptic: stalled / 采集停滞"
                 } else if crate::WATCHDOG_TASK_UNHEALTHY.load(std::sync::atomic::Ordering::Relaxed)
@@ -394,6 +407,7 @@ impl TrayCtx {
                         .load(std::sync::atomic::Ordering::Relaxed)
                         || crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) == 1
                         || db_degraded(&self.args.db)
+                        || disk_paused(&self.args.db)
                         || crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed);
                     if !error_active {
                         self.set_state(hwnd, TrayState::Running);
@@ -623,10 +637,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let want = if crate::COLLECTOR_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
                     Some(TrayState::Error)
                 } else if db_degraded(&c.args.db)
+                    || disk_paused(&c.args.db)
                     || crate::COLLECTOR_STALLED.load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    // 数据库降级（degraded.flag）/采集停滞（心跳 stalled）：都切
-                    // 黄三角，tooltip 由 tip_text 按来源区分
+                    // 数据库降级（degraded.flag）/磁盘暂停（disk-paused.flag，
+                    // S0.3）/采集停滞（心跳 stalled）：都切黄三角，tooltip 由
+                    // tip_text 按来源区分
                     Some(TrayState::Error)
                 } else {
                     match crate::DASH_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -953,5 +969,33 @@ mod fault_injection_tests {
         assert_eq!(update_available_version(&db), None);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(update_available_version(&db), None); // 目录也没了
+    }
+}
+
+#[cfg(test)]
+mod disk_pause_flag_tests {
+    //! S0.3：磁盘暂停旗标存在性读取（托盘黄标消费端）。
+    use super::disk_paused;
+
+    #[test]
+    fn disk_paused_follows_flag_file_existence() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-tray-s03-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        assert!(!disk_paused(&db), "无旗标 = 未暂停");
+        std::fs::write(dir.join("disk-paused.flag"), "磁盘空间不足").unwrap();
+        assert!(disk_paused(&db), "旗标存在 = 磁盘暂停（托盘切黄三角）");
+        std::fs::remove_file(dir.join("disk-paused.flag")).unwrap();
+        assert!(!disk_paused(&db), "旗标清除 = 恢复");
+        // db 无父目录（极端形态）不 panic
+        assert!(!disk_paused(std::path::Path::new("t.db")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

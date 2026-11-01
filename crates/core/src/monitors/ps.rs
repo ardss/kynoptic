@@ -103,8 +103,14 @@ pub fn run_ps_detailed(script: &str) -> PsOutcome {
 ///
 /// 兼容包装：老调用方只需要"有数据/无数据"两态，启动失败同样折叠为 None，
 /// 但降级会计入 [`super::MONITOR_DEGRADED`]（见 [`run_ps_detailed`]）。
+/// S0.4 修复：此前实现 `run_ps_inner().ok().flatten()` 把 Err 静默丢弃、
+/// 降级零留痕，与本文档承诺相悖——改走 [`run_ps_detailed`]，LaunchFailed
+/// 由 detailed 层统一 note_degraded，两态折叠语义保持不变。
 pub fn run_ps(script: &str) -> Option<String> {
-    run_ps_inner(script).ok().flatten()
+    match run_ps_detailed(script) {
+        PsOutcome::Data(s) => Some(s),
+        PsOutcome::NoData | PsOutcome::LaunchFailed(_) => None,
+    }
 }
 
 /// run_ps 的实现体：Err = spawn 层面的失败（依赖被拦截等）。
@@ -534,6 +540,41 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "宿主被占时必须走 spawn 道立即执行（实测 {elapsed:?}，旧实现会排队 8s+）"
+        );
+    }
+
+    /// S0.4 RED：宿主 + spawn 双道均启动失败时，run_ps 必须计入
+    /// MONITOR_DEGRADED 且仍返回 None（两态折叠语义不破坏）——修复前
+    /// run_ps 直接 `run_ps_inner().ok().flatten()`，Err 被静默丢弃、
+    /// 降级零留痕，与文档承诺（"降级会计入 MONITOR_DEGRADED"）相悖。
+    /// 全局 ENGINE 换入双道全坏引擎、调用完还原；与 busy_host 测试共用
+    /// 全局引擎，用测试串行锁互斥避免互换窗口互相污染。
+    #[cfg(windows)]
+    #[test]
+    fn run_ps_notes_degraded_and_folds_launch_failure_to_none() {
+        static PS_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = PS_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+        {
+            let mut g = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            *g = fully_broken_engine();
+        }
+        let out = run_ps("Write-Output 'unreachable'");
+        {
+            // 还原为生产引擎，绝不让坏引擎泄漏给其他测试
+            let mut g = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            *g = PsEngine::production();
+        }
+        let after = crate::monitors::MONITOR_DEGRADED.load(Ordering::Relaxed);
+        assert!(
+            out.is_none(),
+            "启动失败必须折叠为 None（两态语义），实际 {out:?}"
+        );
+        assert!(
+            after > before,
+            "双道均启动失败必须计入 MONITOR_DEGRADED（before={before} after={after}）"
         );
     }
 
