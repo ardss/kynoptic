@@ -209,6 +209,11 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          # P0 delivery-governance (2026-11-01): a tag must NOT publish publicly on its own.
+          # Releases land as DRAFT; publishing requires the full acceptance chain
+          # (per-machine install proof -> real QA -> explicit USER GO). Contract:
+          # K:\AIControl\Release-Governance\DELIVERY-CONTRACT.md
+          draft: true
           body_path: dist/RELEASE_NOTES.md
           files: |
             dist/kynoptic.exe
