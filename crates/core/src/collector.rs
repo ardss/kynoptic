@@ -73,6 +73,48 @@ static DISK_LOW_SPACE: AtomicBool = AtomicBool::new(false);
 /// 暂停期间被跳过落库的事件累计（按批累加，仅观测）。
 static DISK_PAUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// 磁盘暂停旗标文件名（写 db 同目录，S0.3 出口接线：与 degraded.flag /
+/// tray.rs 旗标文件模式同款，dash api_status / 托盘黄标按存在性轮询——
+/// 进程内访问器跨进程不可见，旗标文件补上跨进程盲区）。
+pub const DISK_PAUSE_FLAG: &str = "disk-paused.flag";
+
+/// 旗标文件路径（db 同目录；db 无父目录时返回 None，调用方按尽力而为跳过）。
+fn disk_pause_flag_path(db: &Database) -> Option<std::path::PathBuf> {
+    std::path::Path::new(db.path_str())
+        .parent()
+        .map(|d| d.join(DISK_PAUSE_FLAG))
+}
+
+/// 磁盘暂停旗标写入/清除（尽力而为：失败只留日志，不影响写主流程）。
+/// note 写入文件正文（含剩余字节数等排障信息），恢复时整个删除——旗标
+/// 不得残留，否则空间恢复后面板/托盘永远黄标。
+fn set_disk_pause_flag(db: &Database, on: bool, note: &str) {
+    let Some(path) = disk_pause_flag_path(db) else {
+        return;
+    };
+    if on {
+        if let Err(e) = std::fs::write(&path, format!("{note}\n")) {
+            log::warn!("磁盘暂停旗标写入失败: {e}");
+        }
+    } else if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("磁盘暂停旗标清除失败: {e}");
+        }
+    }
+}
+
+/// 采集器启动时清除遗留磁盘暂停旗标（上次运行暂停中被强杀 → 旗标残留；
+/// 本实例启动时卷状态由 write_batch 首拍重新判定，旧旗标必须清掉）。
+fn clear_stale_disk_pause_flag(db: &Database) {
+    if let Some(path) = disk_pause_flag_path(db) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("遗留磁盘暂停旗标清除失败: {e}");
+            }
+        }
+    }
+}
+
 /// 磁盘空间不足导致的写入暂停当前是否生效（托盘/状态接口可查询，用于黄标/
 /// 横幅展示；与 db 层启动期损坏旗标 DB_DEGRADED 相互独立）。
 pub fn disk_write_paused() -> bool {
@@ -166,6 +208,64 @@ pub(crate) fn archive_write_failure(msg: &str) {
     let _ = writeln!(f, "[{}] {}", chrono::Utc::now().to_rfc3339(), msg);
 }
 
+/// 采集侧告警（S0.2：丢弃/写失败经 notification 系统事件落库，面板横幅可读，
+/// 不再只有 watchdog.log 一条通道）。kind 取值 collection_dropped / write_failed。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionAlert {
+    pub kind: String,
+    pub message: String,
+    pub message_en: String,
+    /// 丢弃/写失败行数（载荷字段，供面板横幅与排障量化）
+    pub loss_count: u64,
+}
+
+/// 丢弃分型/写失败升级 → 告警列表（纯函数，S0.2 单测注入断言）。
+/// 风暴控制沿用既有条件：write_failed 仅在连续 ≥3 周期升级时发告警，
+/// collection_dropped 每周期至多一条（60s swap 窗口内聚合）。
+fn collection_alerts(
+    chan_dropped: u64,
+    _future_rejected: u64,
+    _unparseable_rejected: u64,
+    write_failures: u64,
+    failed_rows: u64,
+    consecutive_wf: u64,
+) -> Vec<CollectionAlert> {
+    let mut out = Vec::new();
+    if chan_dropped > 0 {
+        out.push(CollectionAlert {
+            kind: "collection_dropped".into(),
+            message: format!("通道已满，过去 60 秒丢弃了 {chan_dropped} 个事件"),
+            message_en: format!("channel full: {chan_dropped} events dropped in the last 60s"),
+            loss_count: chan_dropped,
+        });
+    }
+    // 风暴控制沿用既有升级条件（watchdog_tick 同款）：写失败只在连续 ≥3 周期
+    // 时发告警事件，避免每次瞬时写失败都进面板横幅。
+    if write_failures > 0 && consecutive_wf >= 3 {
+        let rows_part = if failed_rows > 0 {
+            format!("，涉及 {failed_rows} 行")
+        } else {
+            String::new()
+        };
+        out.push(CollectionAlert {
+            kind: "write_failed".into(),
+            message: format!(
+                "数据库写失败，过去 60 秒新增 {write_failures} 批（连续 {consecutive_wf} 个周期）{rows_part}"
+            ),
+            message_en: format!(
+                "database write failures: {write_failures} batch(es) in the last 60s ({consecutive_wf} consecutive periods){rows_part_en}",
+                rows_part_en = if failed_rows > 0 {
+                    format!(", {failed_rows} row(s) affected")
+                } else {
+                    String::new()
+                }
+            ),
+            loss_count: failed_rows,
+        });
+    }
+    out
+}
+
 fn watchdog_tick(
     chan_dropped: u64,
     future_rejected: u64,
@@ -214,8 +314,39 @@ fn watchdog_tick(
     *consecutive_wf
 }
 
+/// 采集侧告警落库（S0.2）：复用 cli watchdog_alert 的 notification 事件形制
+/// （event_type='system', event_action='notification'，载荷带 source/kind/
+/// message/message_en + loss_count），dash latest_watchdog_alert 消费端零改动
+/// 即可读出。ts_rfc3339 由调用方注入（测试不读真实时钟）；全程尽力而为，
+/// 落库失败只留日志，不影响看门狗主流程。
+fn persist_collection_alerts(db: &Database, alerts: &[CollectionAlert], ts_rfc3339: &str) {
+    for a in alerts {
+        let payload = serde_json::json!({
+            "source": "collector",
+            "kind": a.kind,
+            "message": a.message,
+            "message_en": a.message_en,
+            "loss_count": a.loss_count,
+        })
+        .to_string();
+        let result = db.with_writer(
+            |w| {
+                w.execute(
+                    "INSERT INTO events (timestamp, event_type, event_action, event_data)
+                     VALUES (?1, 'system', 'notification', ?2)",
+                    rusqlite::params![ts_rfc3339, payload],
+                )
+            },
+            || Err(rusqlite::Error::InvalidQuery),
+        );
+        if let Err(e) = result {
+            log::warn!("采集告警事件落库失败（kind={}）: {e}", a.kind);
+        }
+    }
+}
+
 /// 丢弃/写失败计数的唯一消费方：看门狗线程每 60 秒 swap 一次（三个计数器）。
-fn log_dropped_events_watchdog() {
+fn log_dropped_events_watchdog(db: &Database) {
     let chan_dropped = CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
     let future_rejected = FUTURE_REJECTED.swap(0, Ordering::Relaxed);
     let unparseable_rejected = UNPARSEABLE_REJECTED.swap(0, Ordering::Relaxed);
@@ -230,6 +361,18 @@ fn log_dropped_events_watchdog() {
         failed_rows,
         &mut consecutive,
     );
+    let alerts = collection_alerts(
+        chan_dropped,
+        future_rejected,
+        unparseable_rejected,
+        write_failures,
+        failed_rows,
+        consecutive,
+    );
+    if !alerts.is_empty() {
+        let ts = chrono::Utc::now().to_rfc3339();
+        persist_collection_alerts(db, &alerts, &ts);
+    }
     CONSECUTIVE_WRITE_FAILURE_PERIODS.store(consecutive, Ordering::Relaxed);
     // 磁盘空间不足暂停态周期提醒（ENOSPC 主动防护）：暂停期每 60s 一条日志
     // 保证用户有持续信号；托盘侧经 disk_write_paused / disk_paused_events
@@ -609,11 +752,14 @@ fn write_batch(db: &Database, batch: &mut Vec<Event>, total_written: &AtomicUsiz
                 );
                 log::warn!("{msg}");
                 archive_write_failure(&msg);
+                // S0.3 出口接线：旗标文件落盘（dash /api/status 与托盘黄标跨进程消费）
+                set_disk_pause_flag(db, true, &msg);
             }
             return false;
         }
         if was_low {
             log::info!("磁盘空间已恢复，采集续写");
+            set_disk_pause_flag(db, false, "");
         }
     }
     // 审查 P0：Event::new 硬编码 session_id=None 且全链路无人回填，导致
@@ -1416,6 +1562,10 @@ pub fn start_collection_custom(
     );
 
     let db = Arc::new(Database::open(db_path).expect("数据库初始化失败"));
+    // S0.3：清除上次运行残留的磁盘暂停旗标（暂停中被强杀会留下旗标；
+    // 本实例卷状态由 write_batch 首拍重新判定，旧旗标不得让面板/托盘
+    // 永远黄标——与 clear_degraded_flag 的「健康启动清旗标」同口径）。
+    clear_stale_disk_pause_flag(&db);
     // 去重高水位必须与被去重的事件落在同一个库（回归修复：dedup 轻量连接
     // 此前固定走 resolve_db_path() 默认解析，无视 --db 覆盖——自定义部署读
     // 到别人库的高水位、推进后又 upsert 回默认库双向污染，纯 CLI 形态还会
@@ -1733,6 +1883,7 @@ pub fn start_collection_custom(
     // 静默。独立线程每 60 秒读一次全局 DROPPED_EVENTS 与 WRITE_FAILURES，
     // 任一增量 >0 即告警（写失败连续 3 个周期升级 error）——与 writer 状态解耦。
     let sd_watch = shutdown.clone();
+    let db_watch = db.clone();
     let watch_handle = thread::Builder::new()
         .name("DropWatchdog".into())
         .spawn(move || {
@@ -1745,7 +1896,7 @@ pub fn start_collection_custom(
                     }
                     thread::sleep(Duration::from_secs(1));
                 }
-                log_dropped_events_watchdog();
+                log_dropped_events_watchdog(&db_watch);
             }
         });
     if let Err(e) = watch_handle {
@@ -1838,6 +1989,122 @@ mod tests {
         // 通道丢弃/未来时间戳拒绝独立于写失败计数推进（33-F4 拆分口径）
         assert_eq!(watchdog_tick(9, 3, 0, 0, 0, &mut consecutive), 0);
         assert_eq!(watchdog_tick(0, 0, 0, 1, 12, &mut consecutive), 1);
+    }
+
+    /// S0.2 红灯测试：通道满 → collection_dropped 告警且载荷含 loss_count；
+    /// 写失败连续 ≥3 周期升级 → write_failed 告警；未达升级阈值不发（防风暴，
+    /// 沿用既有连续 3 周期条件）。
+    #[test]
+    fn collection_alerts_type_drops_and_escalated_write_failures_with_loss_count() {
+        // 通道满 → collection_dropped，loss_count = 本周期丢弃数
+        let alerts = collection_alerts(7, 0, 0, 0, 0, 0);
+        assert_eq!(alerts.len(), 1, "通道丢弃应产生恰好一条告警");
+        assert_eq!(alerts[0].kind, "collection_dropped");
+        assert_eq!(alerts[0].loss_count, 7, "载荷必须含量化的 loss_count");
+        assert!(!alerts[0].message.is_empty());
+        assert!(!alerts[0].message_en.is_empty(), "英文版文案必须同落");
+        // 写失败升级（连续第 3 周期）→ write_failed，loss_count = 失败行数
+        let alerts = collection_alerts(0, 0, 0, 1, 12, 3);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "write_failed");
+        assert_eq!(alerts[0].loss_count, 12);
+        // 未达升级阈值（连续 1 周期）→ 不发 write_failed（告警风暴防线）
+        let alerts = collection_alerts(0, 0, 0, 1, 12, 1);
+        assert!(
+            alerts.iter().all(|a| a.kind != "write_failed"),
+            "未升级的写失败不得产生告警事件"
+        );
+        // 干净周期 → 零告警
+        assert!(collection_alerts(0, 0, 0, 0, 0, 0).is_empty());
+    }
+
+    /// S0.2：告警落库为 notification 系统事件（与 cli watchdog_alert 同形制，
+    /// dash latest_watchdog_alert 消费端可直接读出），时刻由调用方注入。
+    #[test]
+    fn persist_collection_alerts_writes_notification_events_with_loss_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-s02-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.join("t.db").to_str().unwrap()).unwrap();
+        let alerts = vec![
+            CollectionAlert {
+                kind: "collection_dropped".into(),
+                message: "通道已满，过去 60 秒丢弃了 7 个事件".into(),
+                message_en: "channel full: 7 events dropped in the last 60s".into(),
+                loss_count: 7,
+            },
+            CollectionAlert {
+                kind: "write_failed".into(),
+                message: "数据库写失败，连续 3 个周期".into(),
+                message_en: "db write failures, 3 consecutive periods".into(),
+                loss_count: 12,
+            },
+        ];
+        persist_collection_alerts(&db, &alerts, "2026-11-01T00:00:00+00:00");
+        let rows: Vec<(String, String)> = db.with_writer(
+            |w| {
+                let mut st = w
+                    .prepare(
+                        "SELECT event_data, timestamp FROM events \
+                         WHERE event_type='system' AND event_action='notification' ORDER BY id",
+                    )
+                    .unwrap();
+                let it = st
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                it
+            },
+            Vec::new, // test fallback: writer 不可用时返回空（断言会失败）
+        );
+        assert_eq!(rows.len(), 2, "两条告警各落一条 notification 事件");
+        assert_eq!(rows[0].1, "2026-11-01T00:00:00+00:00", "时刻用注入值");
+        let v0: serde_json::Value = serde_json::from_str(&rows[0].0).unwrap();
+        assert_eq!(v0["kind"], "collection_dropped");
+        assert_eq!(v0["loss_count"], 7, "载荷必须含 loss_count");
+        assert_eq!(v0["source"], "collector");
+        let v1: serde_json::Value = serde_json::from_str(&rows[1].0).unwrap();
+        assert_eq!(v1["kind"], "write_failed");
+        assert_eq!(v1["loss_count"], 12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S0.3：磁盘暂停旗标文件写 db 同目录（disk-paused.flag，与 degraded.flag
+    /// 同模式），进入暂停写 note、恢复删除、启动清残留——旗标不得残留，
+    /// 否则空间恢复后面板/托盘永远黄标。
+    #[test]
+    fn disk_pause_flag_written_on_pause_and_cleared_on_recovery_and_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "kyn-s03-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.join("t.db").to_str().unwrap()).unwrap();
+        let flag = dir.join(DISK_PAUSE_FLAG);
+        // 启动清残留：预先放一个旧旗标，清除后必须消失
+        std::fs::write(&flag, "stale").unwrap();
+        clear_stale_disk_pause_flag(&db);
+        assert!(!flag.exists(), "启动时必须清除遗留旗标");
+        // 进入暂停：旗标出现且带排障 note
+        set_disk_pause_flag(&db, true, "磁盘空间不足（库所在卷剩余 1 字节）");
+        assert!(flag.exists(), "进入暂停必须写旗标文件");
+        let note = std::fs::read_to_string(&flag).unwrap();
+        assert!(note.contains("磁盘空间不足"), "旗标正文应带排障信息");
+        // 恢复：旗标删除
+        set_disk_pause_flag(&db, false, "");
+        assert!(!flag.exists(), "恢复后旗标必须删除，不得残留");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Wave45 写入侧防线回归：不可解析时间戳（非 RFC3339）在 reject_future_events

@@ -288,6 +288,66 @@ fn status_monitors_is_passthrough_array() {
     );
 }
 
+/// S0.2：collector 落库的 collection_dropped / write_failed 告警（带
+/// loss_count 载荷）必须经 api_status.watchdog_alert 透出，供面板横幅
+/// 映射两个新 kind。时刻用固定值插入（快照断言不读真实时钟）。
+#[test]
+fn watchdog_alert_exposes_collector_kinds_with_loss_count() {
+    let conn = mem_conn();
+    insert_notification(
+        &conn,
+        "2026-11-01T00:05:00+00:00",
+        r#"{"source":"collector","kind":"collection_dropped","message":"通道已满，过去 60 秒丢弃了 7 个事件","message_en":"channel full: 7 events dropped in the last 60s","loss_count":7}"#,
+    );
+    let v = api_status(&conn, Path::new("/tmp/x.db"));
+    let wa = &v["watchdog_alert"];
+    assert_eq!(wa["kind"], "collection_dropped", "新 kind 必须透出");
+    assert_eq!(wa["loss_count"], 7, "loss_count 必须透出供横幅量化显示");
+    assert_eq!(wa["recovered"], json!(false));
+    // 恢复事件仍走旧口径
+    insert_notification(
+        &conn,
+        "2026-11-01T00:10:00+00:00",
+        r#"{"source":"watchdog","kind":"collection_recovered","message":"采集已恢复","message_en":"collection recovered"}"#,
+    );
+    let v = api_status(&conn, Path::new("/tmp/x.db"));
+    assert_eq!(v["watchdog_alert"]["recovered"], json!(true));
+}
+
+/// S0.3：磁盘暂停旗标（collector 写 db 同目录 disk-paused.flag）必须经
+/// api_status.disk_write_paused 透出，供面板黄标横幅；旗标不存在 → false。
+/// 用临时目录放旗标文件（存在性读取，不读真实时钟）。
+#[test]
+fn status_exposes_disk_write_paused_flag() {
+    let dir = std::env::temp_dir().join(format!(
+        "kyn-dash-s03-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("t.db");
+    let conn = mem_conn();
+    // 无旗标 → false
+    let v = api_status(&conn, &db_path);
+    assert_eq!(
+        v["disk_write_paused"],
+        json!(false),
+        "无旗标时不得报磁盘暂停"
+    );
+    // 放旗标 → true
+    std::fs::write(dir.join("disk-paused.flag"), "磁盘空间不足").unwrap();
+    let v = api_status(&conn, &db_path);
+    assert_eq!(
+        v["disk_write_paused"],
+        json!(true),
+        "旗标存在必须透出 disk_write_paused=true"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // === watchdog 告警/恢复配对（修复：告警只有「发生」没有「解除」，采集
 // 恢复后横幅最长滞留 24h） ===
 
