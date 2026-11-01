@@ -940,13 +940,9 @@ impl MinuteAggregator {
         events_lost: u64,
         events_seen: u64,
         _now_ms: i64,
+        identity_of: &mut dyn FnMut(u32, i64) -> Option<(String, u64)>,
     ) -> Vec<crate::metrics::MetricPoint> {
         use crate::metrics::{MetricPoint, MetricQuality, MetricSource, MetricUnit};
-        let quality = if events_lost > 0 {
-            MetricQuality::Incomplete
-        } else {
-            MetricQuality::Confirmed
-        };
         let coverage = if events_lost > 0 {
             let total = (events_seen + events_lost) as f64;
             if total > 0.0 {
@@ -969,26 +965,50 @@ impl MinuteAggregator {
                 NetDirection::In => METRIC_NET_PROCESS_BYTES_IN,
                 NetDirection::Out => METRIC_NET_PROCESS_BYTES_OUT,
             };
+            let _ = proto; // scope 收敛为 Process 身份后协议入 metric_id 方向族（见上）
+                           // M2.3 进程身份关联：桶起点秒作代表事件时刻（桶 60s 窗口，身份
+                           // 缓存区间粒度远粗于桶）。无法归属（短命进程整段未被快照覆盖等）
+                           // 不硬归属：保留 pid、exe_start=0、点 quality 降 Incomplete。
+            let identity = identity_of(pid, bucket * METRIC_MINUTE_MS / 1000);
+            let (process_identity, scope) = match &identity {
+                Some((_name, exe_start)) => (
+                    crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: *exe_start,
+                    },
+                    crate::metrics::MetricScope::Process(crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: *exe_start,
+                    }),
+                ),
+                None => (
+                    crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: 0,
+                    },
+                    crate::metrics::MetricScope::Process(crate::metrics::ProcessIdentity::Id {
+                        pid,
+                        exe_start_epoch: 0,
+                    }),
+                ),
+            };
+            // 点级 quality = 丢失口径 ∧ 身份口径（任一不完整即 Incomplete）
+            let quality = if events_lost > 0 || identity.is_none() {
+                MetricQuality::Incomplete
+            } else {
+                MetricQuality::Confirmed
+            };
             out.push(MetricPoint {
                 metric_id: metric_id.to_string(),
                 source: MetricSource::Etw,
                 host_id: host_id.to_string(),
-                process_identity: crate::metrics::ProcessIdentity::Id {
-                    pid,
-                    exe_start_epoch: 0, // 未知；M2.3 补齐
-                },
+                process_identity,
                 timestamp_utc_ms: bucket * METRIC_MINUTE_MS,
                 monotonic_ms: 0, // 桶时间语义下无单调时钟意义，恒 0（注释口径）
                 interval_ms: METRIC_MINUTE_MS as u64,
                 value: bytes as f64,
                 unit: MetricUnit::Bytes,
-                scope: crate::metrics::MetricScope::Connection {
-                    proto: match proto {
-                        NetProto::Tcp => "tcp".to_string(),
-                        NetProto::Udp => "udp".to_string(),
-                    },
-                    remote: String::new(), // 桶 key 不含远端（对端维度 M2.3 再分）
-                },
+                scope,
                 quality,
                 loss_count: if events_lost > 0 {
                     Some(events_lost)
@@ -1000,6 +1020,208 @@ impl MinuteAggregator {
             });
         }
         out
+    }
+}
+
+// ─── M2.3：进程身份关联（PID→进程名+启动时间） ──────────────────────────────
+// 复用面如实说明：process.rs 现有枚举（CreateToolhelp32Snapshot）只产 pid+exe
+// 基名、无缓存无启动时间；本切片按同一句柄模式（OpenProcess
+// PROCESS_QUERY_LIMITED_INFORMATION + GetProcessTimes-CreationTime，见
+// process.rs query_cpu_percent_map）补齐身份缓存，供 MetricPoint 的
+// process_identity/scope=Process 填充。
+
+/// 进程枚举条目（exe_start 为 UTC epoch 秒）。
+#[derive(Debug, Clone)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub name: String,
+    pub exe_start_epoch: u64,
+}
+
+/// 进程枚举源（可注入；真实源见 [`RealProcSource`]）。
+pub trait ProcSnapshotSource {
+    fn snapshot(&mut self) -> Vec<ProcEntry>;
+}
+
+/// 单世化身：同 pid 的一个 (exe_start) 世代。
+#[derive(Debug, Clone)]
+struct Incarnation {
+    name: String,
+    exe_start: u64,
+    /// 最后一次确认存活的刷新时刻（epoch 秒）；None=当前仍存活。
+    /// pid 从快照消失时置为当次刷新时刻——事件按 [exe_start, gone_at] 区间
+    /// 归属，采样瞬间已退出的进程仍可区间归属（短命进程整段未被快照覆盖
+    /// 则不硬归属，quality=Incomplete）。
+    gone_at: Option<u64>,
+}
+
+/// 进程身份缓存：refresh 吃快照，resolve 按事件时间归属。
+/// PID 复用：exe_start 变化即新一世；事件归属取「exe_start ≤ 事件时刻且
+/// 未退出」的**最新世**（防复用误绑旧进程）。
+#[derive(Default)]
+pub struct ProcessIdentityCache {
+    entries: std::collections::HashMap<u32, Vec<Incarnation>>,
+}
+
+impl ProcessIdentityCache {
+    pub fn refresh<S: ProcSnapshotSource>(&mut self, source: &mut S, now_epoch_s: u64) {
+        let snap = source.snapshot();
+        let seen: std::collections::HashSet<u32> = snap.iter().map(|e| e.pid).collect();
+        // 本轮消失的：收口存活区间
+        for (pid, incs) in self.entries.iter_mut() {
+            if !seen.contains(pid) {
+                if let Some(last) = incs.last_mut() {
+                    if last.gone_at.is_none() {
+                        last.gone_at = Some(now_epoch_s);
+                    }
+                }
+            }
+        }
+        for e in snap {
+            let incs = self.entries.entry(e.pid).or_default();
+            match incs.last() {
+                // 同世续见（exe_start 未变）：确认存活
+                Some(last) if last.exe_start == e.exe_start_epoch => {
+                    if last.gone_at.is_some() {
+                        // 曾判消失又出现：按复用新世处理（保守，防跨窗口误续）
+                        incs.push(Incarnation {
+                            name: e.name,
+                            exe_start: e.exe_start_epoch,
+                            gone_at: None,
+                        });
+                    }
+                }
+                // 新世（exe_start 变化）或首见
+                _ => incs.push(Incarnation {
+                    name: e.name,
+                    exe_start: e.exe_start_epoch,
+                    gone_at: None,
+                }),
+            }
+        }
+    }
+
+    /// 按事件时刻归属进程身份：(进程名, exe_start_epoch)。
+    /// 无覆盖区间（短命进程生灭间未被快照覆盖 / 事件早于出生 / pid 未知）
+    /// → None（调用方标 quality=Incomplete，不硬归属）。
+    pub fn resolve(&self, pid: u32, event_time_epoch_s: i64) -> Option<(&str, u64)> {
+        let t = u64::try_from(event_time_epoch_s).ok()?;
+        let incs = self.entries.get(&pid)?;
+        let best = incs
+            .iter()
+            .filter(|i| i.exe_start <= t && i.gone_at.is_none_or(|g| t <= g))
+            .max_by_key(|i| i.exe_start)?;
+        Some((best.name.as_str(), best.exe_start))
+    }
+}
+
+/// 真实枚举源：Toolhelp 快照（全量，不做 process.rs 的 should_skip 过滤——
+/// 身份归属需要覆盖系统进程）+ 逐 pid GetProcessTimes-CreationTime。
+pub struct RealProcSource {
+    _buf: Vec<u8>,
+}
+
+impl RealProcSource {
+    pub fn new() -> Self {
+        Self { _buf: Vec::new() }
+    }
+}
+
+impl Default for RealProcSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+impl ProcSnapshotSource for RealProcSource {
+    fn snapshot(&mut self) -> Vec<ProcEntry> {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let mut out = Vec::new();
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                // 快照失败：返回空——refresh 只是不新增/不收口，
+                // 绝不伪造「全灭」（与 process.rs Wave19 P0 同口径）
+                return out;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    let name_end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+                    let pid = entry.th32ProcessID;
+                    // 启动时间：CreationTime FILETIME(100ns/1601) → epoch 秒
+                    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                    let exe_start_epoch = if handle.is_null() {
+                        0
+                    } else {
+                        let mut creation = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let mut exit = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let mut kernel = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let mut user = FILETIME {
+                            dwHighDateTime: 0,
+                            dwLowDateTime: 0,
+                        };
+                        let epoch = if GetProcessTimes(
+                            handle,
+                            &mut creation,
+                            &mut exit,
+                            &mut kernel,
+                            &mut user,
+                        ) != 0
+                        {
+                            let ft = (creation.dwHighDateTime as u64) << 32
+                                | creation.dwLowDateTime as u64;
+                            (ft / 10_000_000).saturating_sub(11_644_473_600)
+                        } else {
+                            0
+                        };
+                        CloseHandle(handle);
+                        epoch
+                    };
+                    out.push(ProcEntry {
+                        pid,
+                        name,
+                        exe_start_epoch,
+                    });
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+impl ProcSnapshotSource for RealProcSource {
+    fn snapshot(&mut self) -> Vec<ProcEntry> {
+        Vec::new()
     }
 }
 
@@ -1073,15 +1295,7 @@ mod m22_tests {
 
     #[test]
     fn m22_parse_tcpv4_send_synthetic_bytes() {
-        let payload = v4_payload(
-            4242,
-            1500,
-            0x0102_a8c0,
-            0x0100_007f_u32,
-            443,
-            51000,
-            true,
-        );
+        let payload = v4_payload(4242, 1500, 0x0102_a8c0, 0x0100_007f_u32, 443, 51000, true);
         let r = parse_kernel_network_event(10, &payload, 1_749_000_000_000)
             .expect("ID=10 TCPv4 送出必须可解析");
         assert_eq!(r.pid, 4242);
@@ -1238,7 +1452,9 @@ mod m22_tests {
             agg.add(r);
         }
         // 无丢失：Confirmed、loss/coverage 缺省
-        let pts = agg.drain_metric_points("HOST-1", 0, 5, 1_749_000_000_000);
+        let pts = agg.drain_metric_points("HOST-1", 0, 5, 1_749_000_000_000, &mut |pid, _t| {
+            Some((format!("p{pid}.exe"), 1_749_000_000))
+        });
         assert_eq!(pts.len(), 3);
         for p in &pts {
             assert!(
@@ -1285,7 +1501,9 @@ mod m22_tests {
             agg.add(r);
         }
         // 丢 5 见 5：quality=Incomplete、loss_count=Some(5)、coverage=0.5
-        let pts = agg.drain_metric_points("HOST-1", 5, 5, 1_749_000_000_000);
+        let pts = agg.drain_metric_points("HOST-1", 5, 5, 1_749_000_000_000, &mut |pid, _t| {
+            Some((format!("p{pid}.exe"), 1_749_000_000))
+        });
         assert!(!pts.is_empty());
         for p in &pts {
             assert!(
@@ -1307,9 +1525,203 @@ mod m22_tests {
         for r in &synthetic_stream() {
             agg.add(r);
         }
-        let first = agg.drain_metric_points("H", 0, 5, 0);
-        let second = agg.drain_metric_points("H", 0, 5, 0);
+        let first = agg.drain_metric_points("H", 0, 5, 0, &mut |_pid, _t| None);
+        let second = agg.drain_metric_points("H", 0, 5, 0, &mut |_pid, _t| None);
         assert!(!first.is_empty());
         assert!(second.is_empty(), "drain 后桶必须清空（不重复出站）");
+    }
+}
+
+// ─── M2.3：进程身份关联（PID→进程名+启动时间，MetricPoint 填充） ─────────────
+// 复用面如实说明：process.rs 现有枚举（CreateToolhelp32Snapshot）只产 pid+exe
+// 基名，无启动时间缓存；本切片在该枚举形态上加 GetProcessTimes-CreationTime
+// （process.rs CPU 差分已用同一 OpenProcess 句柄模式）构成身份缓存。
+#[cfg(test)]
+mod m23_tests {
+    use super::*;
+
+    /// 注入源：测试直接喂快照（禁真实时钟——时间全部由 refresh 的 now 参数注入）
+    struct MockSource {
+        entries: Vec<ProcEntry>,
+    }
+    impl ProcSnapshotSource for MockSource {
+        fn snapshot(&mut self) -> Vec<ProcEntry> {
+            self.entries.clone()
+        }
+    }
+    fn entry(pid: u32, name: &str, exe_start: u64) -> ProcEntry {
+        ProcEntry {
+            pid,
+            name: name.to_string(),
+            exe_start_epoch: exe_start,
+        }
+    }
+
+    #[test]
+    fn m23_pid_reuse_distinguished_by_exe_start() {
+        // 同 PID 两世：start=100（首见 t=200），start=500 换世（t=600 刷新见新世）
+        let mut cache = ProcessIdentityCache::default();
+        let mut src = MockSource {
+            entries: vec![entry(7, "old.exe", 100)],
+        };
+        cache.refresh(&mut src, 200);
+        let mut src = MockSource {
+            entries: vec![entry(7, "new.exe", 500)],
+        };
+        cache.refresh(&mut src, 600);
+
+        // 旧世窗口内事件 → 归属旧世（start=100）
+        let r = cache.resolve(7, 300).expect("旧世窗口内事件必须可归属");
+        assert_eq!(r, ("old.exe", 100u64));
+        // 新世之后的事件 → 归属新世（start=500）
+        let r = cache.resolve(7, 700).expect("新世事件必须可归属");
+        assert_eq!(r, ("new.exe", 500u64));
+        // 重叠期（两世都覆盖）→ 取最新世（防 PID 复用误绑旧进程）
+        let r = cache.resolve(7, 550).expect("重叠期事件仍可归属");
+        assert_eq!(r.1, 500u64, "PID 复用必须按最新 exe_start 归属");
+    }
+
+    #[test]
+    fn m23_exited_process_interval_attribution_and_incomplete() {
+        // pid 9 t=100 首见；t=200 刷新不见（已退出）→ gone_at=200
+        let mut cache = ProcessIdentityCache::default();
+        let mut src = MockSource {
+            entries: vec![entry(9, "shortlived.exe", 50)],
+        };
+        cache.refresh(&mut src, 100);
+        let mut src = MockSource { entries: vec![] };
+        cache.refresh(&mut src, 200);
+
+        // 事件落在存活区间 [50,200] → 即使采样瞬间已退出也归属（区间归属）
+        let r = cache.resolve(9, 150).expect("存活区间内事件必须归属");
+        assert_eq!(r, ("shortlived.exe", 50u64));
+        // 事件在区间外（进程生灭之间从未被任何快照覆盖）→ 不硬归属
+        assert!(cache.resolve(9, 250).is_none(), "退出后事件不得硬归属");
+        assert!(cache.resolve(9, 10).is_none(), "出生前事件不得归属");
+        // 从未见过的 pid → 不硬归属
+        assert!(cache.resolve(12345, 150).is_none());
+    }
+
+    #[test]
+    fn m23_drain_unresolved_pid_marks_incomplete_with_scope_process() {
+        let mut agg = MinuteAggregator::default();
+        agg.add(&NetFlowRecord {
+            timestamp_utc_ms: 30_000,
+            pid: 7,
+            direction: NetDirection::In,
+            proto: NetProto::Tcp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 443,
+            bytes: 100,
+        });
+        // 身份回调返回 None（短命进程，无法归属）→ Incomplete，不硬归属
+        let pts = agg.drain_metric_points("H", 0, 1, 0, &mut |_pid, _t| None);
+        assert_eq!(pts.len(), 1);
+        let p = &pts[0];
+        assert!(
+            matches!(p.quality, MetricQuality::Incomplete),
+            "无法归属必须标记 Incomplete（短命进程不硬归属）"
+        );
+        match &p.process_identity {
+            crate::metrics::ProcessIdentity::Id {
+                pid,
+                exe_start_epoch,
+            } => {
+                assert_eq!(*pid, 7);
+                assert_eq!(*exe_start_epoch, 0, "未知启动时间=0（不伪造）");
+            }
+            other => panic!("必须保留 pid 身份，实际 {other:?}"),
+        }
+        assert!(
+            matches!(&p.scope, crate::metrics::MetricScope::Process(_)),
+            "scope 必须=Process（不再用 Connection 占位）"
+        );
+    }
+
+    #[test]
+    fn m23_drain_resolved_pid_keeps_confirmed_and_fills_identity() {
+        let mut agg = MinuteAggregator::default();
+        agg.add(&NetFlowRecord {
+            timestamp_utc_ms: 30_000,
+            pid: 7,
+            direction: NetDirection::Out,
+            proto: NetProto::Udp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 53,
+            bytes: 500,
+        });
+        let pts = agg.drain_metric_points("H", 0, 1, 0, &mut |pid, _t| {
+            Some((format!("p{pid}.exe"), 1_749_000_000))
+        });
+        let p = &pts[0];
+        assert!(
+            matches!(p.quality, MetricQuality::Confirmed),
+            "可归属且无丢失=Confirmed"
+        );
+        assert_eq!(
+            p.process_identity,
+            crate::metrics::ProcessIdentity::Id {
+                pid: 7,
+                exe_start_epoch: 1_749_000_000
+            }
+        );
+        match &p.scope {
+            crate::metrics::MetricScope::Process(crate::metrics::ProcessIdentity::Id {
+                pid,
+                exe_start_epoch,
+            }) => {
+                assert_eq!((*pid, *exe_start_epoch), (7, 1_749_000_000));
+            }
+            other => panic!("scope 必须=Process 且携完整身份，实际 {other:?}"),
+        }
+        assert_eq!(p.loss_count, None);
+        assert_eq!(p.coverage, None);
+    }
+
+    #[test]
+    fn m23_loss_and_unresolved_both_incomplete_no_conflict() {
+        let mut agg = MinuteAggregator::default();
+        agg.add(&NetFlowRecord {
+            timestamp_utc_ms: 30_000,
+            pid: 7,
+            direction: NetDirection::In,
+            proto: NetProto::Tcp,
+            ip_version: 4,
+            remote: vec![1, 2, 3, 4],
+            remote_port: 443,
+            bytes: 100,
+        });
+        // 丢失 + 无法归属：仍 Incomplete，loss/coverage 照填
+        let pts = agg.drain_metric_points("H", 3, 1, 0, &mut |_pid, _t| None);
+        let p = &pts[0];
+        assert!(matches!(p.quality, MetricQuality::Incomplete));
+        assert_eq!(p.loss_count, Some(3));
+        let cov = p.coverage.expect("丢失场景必须给 coverage");
+        assert!(
+            (cov - 0.25).abs() < 1e-9,
+            "coverage=1/(1+3)=0.25，实际 {cov}"
+        );
+    }
+
+    /// 真实枚举源 smoke（cfg(windows)）：必须看到自身进程且启动时间非零
+    /// （无需管理员；Toolhelp+GetProcessTimes 与 process.rs CPU 差分同权限面）。
+    #[cfg(windows)]
+    #[test]
+    fn m23_real_source_sees_self_with_start_time() {
+        let mut src = RealProcSource::new();
+        let snap = src.snapshot();
+        let me = std::process::id();
+        let hit = snap
+            .iter()
+            .find(|e| e.pid == me)
+            .expect("快照必须含自身进程");
+        assert!(!hit.name.is_empty());
+        assert!(
+            hit.exe_start_epoch > 1_600_000_000,
+            "启动时间应为合理 epoch 秒（实际 {}）",
+            hit.exe_start_epoch
+        );
     }
 }
