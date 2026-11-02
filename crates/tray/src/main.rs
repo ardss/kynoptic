@@ -68,9 +68,19 @@ static WATCHDOG_TASK_ALERTED: std::sync::atomic::AtomicBool =
 
 /// 采集停滞阈值（审查 P1）：采集器在跑且"醒着的时间"内 flush 停滞超过该秒数,
 /// 心跳打 stalled:true。30s 写一轮心跳、正常批次间隔远小于此。
-const HEARTBEAT_STALLED_SECS: i64 = 1800; // 30min：必须大于最慢的周期性写入者
-                                          //（process 监控器 600s 强制心跳 + 30% 抖动 ≈ 780s），否则空闲机器会被误判
-                                          // stalled 遭看门狗循环误杀（全库审查 P0：300<600 的余量倒挂）
+fn heartbeat_stalled_secs() -> i64 {
+    // B6（0.8.1）：阈值配置化——KYNOPTIC_STALLED_SECS 环境变量可覆盖，
+    // 双机部署不再需要重编译；缺省/非法回落 1800（原常量语义与余量
+    // 注释不变：必须大于最慢周期性写入者 600s+30% ≈ 780s）
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KYNOPTIC_STALLED_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|v| *v >= 900)
+            .unwrap_or(1800)
+    })
+}
 
 /// 进程启动时刻的无偏中断时间基线（秒）。QueryUnbiasedInterruptTime 不计
 /// 系统休眠时间，是区分"机器睡过"与"writer 挂死"的唯一可靠时钟——墙钟 gap
@@ -79,7 +89,7 @@ const HEARTBEAT_STALLED_SECS: i64 = 1800; // 30min：必须大于最慢的周期
 static PROCESS_START_UNBIASED_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// 最近一次观测到 flush 前进时的无偏秒数（心跳线程刷新）。stalled 判据 =
-/// 当前无偏秒 - 该值 > HEARTBEAT_STALLED_SECS；休眠不积累无偏时间，
+/// 当前无偏秒 - 该值 > heartbeat_stalled_secs()；休眠不积累无偏时间，
 /// 所以睡着的机器永远不会因此被打 stalled。
 static LAST_FLUSH_AWAKE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -417,7 +427,7 @@ fn main() {
     // 审查 P1 心跳解耦修复:旧实现心跳线程无脑每 30s 写 RFC3339,采集主循环
     // 挂死时心跳照常新鲜,"心跳新鲜 = 采集健康"被架空。现在内容升级为 JSON
     // {"pid","ts","flush","stalled"}:flush 取 core 的 last_flush_epoch()(writer
-    // 每次成功落库刷新);采集运行中且 flush 停滞超 HEARTBEAT_STALLED_SECS(1800s)
+    // 每次成功落库刷新);采集运行中且 flush 停滞超 heartbeat_stalled_secs()(1800s)
     // 时打 stalled:true,watchdog 侧 classify_heartbeat 据此判为过期并 kill。
     // 旧版纯时间戳内容仍被 watchdog 兼容解析(向后兼容,滚动升级期两代共存)。
     //
@@ -464,7 +474,7 @@ fn main() {
                         && flush > 0
                         && awake.saturating_sub(
                             LAST_FLUSH_AWAKE_SECS.load(std::sync::atomic::Ordering::Relaxed),
-                        ) > HEARTBEAT_STALLED_SECS as u64;
+                        ) > heartbeat_stalled_secs() as u64;
                     // stalled 接线托盘 UI（审查 high）：置位/复位同步静态量，
                     // WM_TIMER 分支据此切换"采集停滞"提示。上升沿再落一条
                     // notification 事件——看门狗按 stalled 强杀前用户至少有
@@ -472,8 +482,8 @@ fn main() {
                     let prev_stalled =
                         COLLECTOR_STALLED.swap(stalled, std::sync::atomic::Ordering::Relaxed);
                     if stalled && !prev_stalled {
-                        log::error!("采集停滞：writer 已 {}s 未落库，看门狗将介入", HEARTBEAT_STALLED_SECS);
-                        insert_stalled_notice(&hb_db, HEARTBEAT_STALLED_SECS);
+                        log::error!("采集停滞：writer 已 {}s 未落库，看门狗将介入", heartbeat_stalled_secs());
+                        insert_stalled_notice(&hb_db, heartbeat_stalled_secs());
                     } else if !stalled && prev_stalled && running && flush > 0 {
                         // 停滞解除（横幅滞留修复的 tray 侧配合）：下降沿且采集
                         // 确在跑（running 且 flush>0，排除托盘退出/重启造成的

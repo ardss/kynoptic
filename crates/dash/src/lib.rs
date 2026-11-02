@@ -3925,9 +3925,13 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
             .and_then(|n| n.to_str())
             .unwrap_or("kynoptic.db")
     );
+    // P2（0.8.1）：stdout 横幅与 log 纪律对齐——只回文件名不回完整路径
     println!(
         "dashboard: http://127.0.0.1:{bound}  (db: {}, read-only; Ctrl+C 停止)",
-        db_path.display()
+        db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("kynoptic.db")
     );
     // 并发上限（审查 P2：无界 spawn + 每连接新建 SQLite 连接可被本地进程
     // 耗尽线程/句柄）。超限直接 503 拒绝，不排队。

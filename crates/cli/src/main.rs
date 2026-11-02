@@ -1001,9 +1001,15 @@ fn db_cleanup(db_path: &Path, rest: &[String]) -> Result<()> {
         other => other,
     })?;
     let n = if with_events {
-        // 四表同事务（与 core db/events.rs cleanup_old_events 同一口径）：
+        // 七表同事务（与 core db/events.rs cleanup_old_events 同一口径；
+        // 0.8.1 B1：补 agg_minute_actor / net_process_minute /
+        // self_metric_minute——此前 CLI 路径漏删，core 修过的 actor 孤儿
+        // 行问题在 CLI 路径复发 + M2.4/A1 两张分钟桶表同样漏）：
         // 只删 events 不删派生 agg，孤儿行会让仪表盘分钟级/聚合视图
         // 继续展示原始数据已删的日期。事务失败回滚，不半删。
+        let cutoff_ts_ms = chrono::DateTime::parse_from_rfc3339(&cutoff)
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0);
         let deleted = (|| -> rusqlite::Result<usize> {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let ev = conn.execute("DELETE FROM events WHERE timestamp < ?1", params![&cutoff])?;
@@ -1018,6 +1024,18 @@ fn db_cleanup(db_path: &Path, rest: &[String]) -> Result<()> {
             let _app = conn.execute(
                 "DELETE FROM agg_daily WHERE bucket_id LIKE 'app:%' AND date < ?1",
                 params![&cutoff_date],
+            )?;
+            let _minute_actor = conn.execute(
+                "DELETE FROM agg_minute_actor WHERE date < ?1",
+                params![&cutoff_date],
+            )?;
+            let _net_minute = conn.execute(
+                "DELETE FROM net_process_minute WHERE minute_bucket < ?1",
+                params![cutoff_ts_ms.div_euclid(60_000)],
+            )?;
+            let _self_minute = conn.execute(
+                "DELETE FROM self_metric_minute WHERE minute_bucket < ?1",
+                params![cutoff_ts_ms.div_euclid(60_000)],
             )?;
             // 水位回归修复：W33-F2 起 events 水位是 COUNT(*) 行数口径——
             // 删历史行后持久化水位必然高于当前行数，若不同步推进，下次
@@ -2625,8 +2643,19 @@ const EXIT_FLAG_FILE: &str = "tray-exit.flag";
 const HEARTBEAT_FILE: &str = "kynoptic-heartbeat";
 const EXIT_FLAG_ENV: &str = "KYNOPTIC_EXIT_FLAG";
 const WATCHDOG_LOG_FILE: &str = "watchdog.log";
-/// 心跳最大年龄：tray 每 30s touch，180s ≈ 6 个周期未更新即判挂死
-const HEARTBEAT_MAX_AGE_SECS: i64 = 180;
+/// 心跳最大年龄：tray 每 30s touch，180s ≈ 6 个周期未更新即判挂死。
+/// B6（0.8.1）：KYNOPTIC_MAX_AGE_SECS 环境变量可覆盖（≥60 才接受），
+/// 双机部署调阈值不再需要重编译。
+fn heartbeat_max_age_secs() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KYNOPTIC_MAX_AGE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|v| *v >= 60)
+            .unwrap_or(180)
+    })
+}
 /// 看门狗状态文件（exe 同目录，记录连续拉起失败计数与退避窗口）
 const WATCHDOG_STATE_FILE: &str = "watchdog-state.json";
 /// 看门狗互斥锁文件（exe 同目录，审查 P2：防两个 watchdog 进程并发
@@ -2660,7 +2689,7 @@ const RECHECK_WAIT_ENV: &str = "KYNOPTIC_WATCHDOG_RECHECK_SECS";
 fn stale_recheck_wait_secs(once: bool) -> u64 {
     if let Ok(v) = std::env::var(RECHECK_WAIT_ENV) {
         if let Ok(n) = v.trim().parse::<u64>() {
-            return n.min(HEARTBEAT_MAX_AGE_SECS as u64);
+            return n.min(heartbeat_max_age_secs() as u64);
         }
     }
     if once {
@@ -2748,7 +2777,7 @@ fn heartbeat_stale(now: chrono::DateTime<Utc>, content: Option<&str>) -> bool {
                 return false;
             }
             match heartbeat_age_secs(now, c) {
-                Some(age) => age > HEARTBEAT_MAX_AGE_SECS,
+                Some(age) => age > heartbeat_max_age_secs(),
                 None => true,
             }
         }
@@ -3337,7 +3366,7 @@ enum HeartbeatRead {
 
 fn recheck_should_kill(_first: HeartbeatRead, recheck: HeartbeatRead) -> bool {
     match recheck {
-        HeartbeatRead::Age(a) if a <= HEARTBEAT_MAX_AGE_SECS => false,
+        HeartbeatRead::Age(a) if a <= heartbeat_max_age_secs() => false,
         // 仍超龄（含与首次持平的停滞）：两次间隔 40s 都异常,判挂死
         HeartbeatRead::Age(_) => true,
         // 审查 P1：复查仍 stalled = 采集持续停滞（进程活着也没用）,判挂死
@@ -3601,7 +3630,8 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                     // 审查 P1：stalled=true（tray 自报采集停滞）也走此复查路径
                     let recheck_wait = stale_recheck_wait_secs(once);
                     watchdog_log(&format!(
-                        "心跳缺失/不可读/超龄(>{HEARTBEAT_MAX_AGE_SECS}s)/采集停滞(stalled), 疑似睡眠唤醒/挂死, {recheck_wait}s 后复查"
+                        "心跳缺失/不可读/超龄(>{}s)/采集停滞(stalled), 疑似睡眠唤醒/挂死, {recheck_wait}s 后复查",
+                        heartbeat_max_age_secs()
                     ));
                     std::thread::sleep(std::time::Duration::from_secs(recheck_wait));
                     let still_running = unsafe {
@@ -3997,7 +4027,7 @@ fn main() -> ExitCode {
                 return match cmd_probe(&rest) {
                     Ok(code) => code,
                     Err(e) => {
-                        eprintln!("✗ {}", enrich_open_failure(&e));
+                        eprintln!("✗ {}", enrich_open_failure_bilingual(&e));
                         ExitCode::FAILURE
                     }
                 };
@@ -4027,7 +4057,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("✗ {}", enrich_open_failure(&e));
+            eprintln!("✗ {}", enrich_open_failure_bilingual(&e));
             ExitCode::FAILURE
         }
     }
@@ -4109,6 +4139,23 @@ fn parent_dir_writable(dir: Option<&Path>) -> bool {
 /// 指引。命中该文案时先做一次独立的写方式打开探测，判别 Windows 共享冲突
 /// (os error 32，文件被备份/杀毒/同步工具以不共享方式独占) 并给出可行动建议；
 /// 其余情况挂 core 现成的 diagnose_open_failure（只读诊断，不写不动数据）。
+/// B2（0.8.1）：用户可见错误统一双语出口——`bilingual()` 机制此前零接线
+/// （审查 P1：双语铁律落空）。enrich 的修正建议拼在双语渲染之后。
+fn enrich_open_failure_bilingual(e: &Error) -> String {
+    let rendered = enrich_open_failure(e);
+    if rendered != e.to_string() {
+        // 命中 open-failure 修正建议：建议文本保持中文原文（含路径指引），
+        // 前置双语根因
+        return format!(
+            "{}
+{}",
+            e.bilingual(),
+            rendered
+        );
+    }
+    e.bilingual()
+}
+
 fn enrich_open_failure(e: &Error) -> String {
     let raw = e.to_string();
     if !raw.contains("unable to open database file") {
@@ -4433,12 +4480,12 @@ mod tests {
         // 垃圾内容 = 过期
         assert!(heartbeat_stale(now, Some("garbage")));
         // 新鲜（阈值内）不过期
-        let recent = (now - Duration::seconds(HEARTBEAT_MAX_AGE_SECS - 1)).to_rfc3339();
+        let recent = (now - Duration::seconds(heartbeat_max_age_secs() - 1)).to_rfc3339();
         assert!(!heartbeat_stale(now, Some(&recent)));
         // 恰好等于阈值不算过期,超过 1 秒过期
-        let exact = (now - Duration::seconds(HEARTBEAT_MAX_AGE_SECS)).to_rfc3339();
+        let exact = (now - Duration::seconds(heartbeat_max_age_secs())).to_rfc3339();
         assert!(!heartbeat_stale(now, Some(&exact)));
-        let old = (now - Duration::seconds(HEARTBEAT_MAX_AGE_SECS + 1)).to_rfc3339();
+        let old = (now - Duration::seconds(heartbeat_max_age_secs() + 1)).to_rfc3339();
         assert!(heartbeat_stale(now, Some(&old)));
     }
 
@@ -4932,7 +4979,7 @@ mod tests {
         // 复查时年龄回到阈值内 → 放行
         assert!(!recheck_should_kill(
             HeartbeatRead::Age(200),
-            HeartbeatRead::Age(HEARTBEAT_MAX_AGE_SECS)
+            HeartbeatRead::Age(heartbeat_max_age_secs())
         ));
         // 复查时年龄仍在增长且超龄 → kill
         assert!(recheck_should_kill(

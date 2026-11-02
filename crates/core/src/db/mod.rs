@@ -955,6 +955,25 @@ impl Database {
             log::info!("正在压缩数据库（空闲页 {freelist}/{page_count}）...");
             if let Err(e) = conn.execute_batch("VACUUM;") {
                 log::error!("VACUUM 失败: {e}");
+                // B3（0.8.1）：磁盘满是 VACUUM 失败的最常见根因，此前只留
+                // 日志无用户可见面。写 S0.3 同款 disk-paused.flag（面板黄标
+                // 横幅+托盘黄标；与 collector 的 set_disk_pause_flag 同文件
+                // 同生命周期——collector 启动清残留、write_batch 判定恢复清除）。
+                let el = e.to_string().to_lowercase();
+                if el.contains("disk") || el.contains("full") {
+                    let flag = std::path::Path::new(self.path_str())
+                        .parent()
+                        .map(|d| d.join(crate::collector::DISK_PAUSE_FLAG));
+                    if let Some(f) = flag {
+                        if let Err(we) = std::fs::write(
+                            &f,
+                            "VACUUM 失败：磁盘空间不足
+",
+                        ) {
+                            log::warn!("磁盘暂停旗标写入失败: {we}");
+                        }
+                    }
+                }
             } else {
                 log::info!("数据库压缩完成");
             }

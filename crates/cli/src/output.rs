@@ -43,5 +43,6 @@ fn log_raw_only(msg: &str) {
 /// 日志文件；终端只给「数据安全 + 可重试 + 详情在日志」的用户语义。
 pub fn db_failure(context: &str, raw: &impl std::fmt::Display) -> String {
     log_raw_only(&format!("CLI {context}: {raw}"));
-    format!("⚠ {context}，数据本身安全，可稍后重试（详细原因已写入 watchdog.log）")
+    // B2（0.8.1）：⚠ 在 Windows 终端渲染成彩色 emoji（违禁 emoji 铁律张力），换纯文本标记
+    format!("[!] {context}，数据本身安全，可稍后重试 / data is safe, retry later（详细原因已写入 watchdog.log / details in watchdog.log）")
 }
