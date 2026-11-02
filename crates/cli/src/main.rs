@@ -2125,6 +2125,8 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         // 标题脱敏（隐私 opt-in，默认关）：settings.json → CollectorSettings
         // → title_privacy::set_redact_titles
         redact_titles,
+        // ETW 增强模式（0.8.1 A2，默认关）：settings.json → CollectorSettings
+        net_etw_enabled: crate::settings::load(std::path::Path::new(&db_path)).net_etw_enabled,
         ..collector::CollectorSettings::default()
     };
     let mut c = collector::start_collection_custom(&enabled, csettings, &db_path);

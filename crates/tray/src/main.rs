@@ -812,6 +812,9 @@ fn main() {
                             // 标题脱敏（隐私 opt-in，默认关）：settings.json →
                             // CollectorSettings → title_privacy::set_redact_titles
                             redact_titles: app_settings.redact_titles,
+                            // ETW 增强模式（0.8.1 A2，默认关）：设置页开关 →
+                            // CollectorSettings → collector spawn NetEtw 线程
+                            net_etw_enabled: app_settings.net_etw_enabled,
                             ..kynoptic_core::collector::CollectorSettings::default()
                         };
                         let db_str = owner_db.to_string_lossy().into_owned();

@@ -609,6 +609,8 @@
     <span class="l zh">每天检查一次新版本。关闭 = 不再定期检查（已发现的新版本提示保持原样）。</span></label>
   </div>
   <div class="mon-row">
+    <input type="checkbox" id="set-netetw">
+    <label for="set-netetw"><span class="l en">Enhanced network telemetry (ETW, per-process bytes; needs admin; applies at the next collector restart)</span><span class="l zh">增强网络采集（ETW 按进程字节量；需管理员；保存后下次采集自动重启生效）</span></label>
     <input type="checkbox" id="set-lowpower">
     <label for="set-lowpower"><span class="l en">low-spec mode: sample less often, for weaker machines (applies at the next collector restart, which happens automatically after saving)</span>
     <span class="l zh">低配模式：降低采样频率，适合配置较低的电脑（保存后下一次采集重启自动生效）</span></label>
@@ -2264,6 +2266,8 @@ async function loadSettings() {
   // 旧后端/旧文件缺字段时按默认回填（update_check 默认开、low_power 默认关）
   document.getElementById("set-updatecheck").checked = s.update_check !== false;
   document.getElementById("set-lowpower").checked = !!s.low_power;
+  // 旧后端缺字段按默认关回填（0.8.1 新增 net_etw_enabled）
+  document.getElementById("set-netetw").checked = !!s.net_etw_enabled;
   // 标题脱敏（隐私 opt-in，默认关）：旧后端缺字段时按默认关回填
   document.getElementById("set-redact").checked = !!s.redact_titles;
   settingsMsg("", true);
@@ -2353,6 +2357,7 @@ async function saveSettings() {
       dashboard_port: Math.max(1, Math.min(65535, num("set-port", oldPort, 8422))),
       update_check: document.getElementById("set-updatecheck").checked,
       low_power: document.getElementById("set-lowpower").checked,
+      net_etw_enabled: document.getElementById("set-netetw").checked,
       // 标题脱敏（隐私 opt-in，默认关）：采集侧剥 URL 查询串，仅拦新写入
       redact_titles: document.getElementById("set-redact").checked
     };

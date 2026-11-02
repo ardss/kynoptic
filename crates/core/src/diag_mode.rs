@@ -148,6 +148,39 @@ impl DiagnosticController {
     }
 }
 
+/// 进程级控制器（0.8.1 A3 接线）：dash 的 POST /api/diag 与采集线程的
+/// 巡检/档位读取共用同一实例——诊断开关的「入口」在 dash，「执行」在
+/// collector，二者必须同状态（此前静态只在 dash，采集侧零消费方=不可达）。
+pub static CONTROLLER: std::sync::LazyLock<std::sync::Mutex<DiagnosticController>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(DiagnosticController::new()));
+
+/// 开启诊断（POST /api/diag 入口）。锁中毒恢复同 collector 口径。
+pub fn controller_enable(now_ms: i64, requested_duration_ms: i64) -> i64 {
+    let mut c = CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+    c.enable(now_ms, requested_duration_ms)
+}
+
+/// 提前结束诊断。
+pub fn controller_disable(now_ms: i64) {
+    let mut c = CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+    c.disable(now_ms);
+}
+
+/// 采集线程周期巡检（到期自动收口 + 预算强制回退）。
+pub fn controller_poll(now_ms: i64, rss_mib: f64, cpu_percent_single_core: f64) -> DiagState {
+    let mut c = CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+    c.poll(now_ms, rss_mib, cpu_percent_single_core)
+}
+
+/// 当前档位：诊断态 → DIAG_PROFILE，否则 BASIC_PROFILE。
+pub fn current_profile() -> ModeProfile {
+    let c = CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+    match c.state {
+        DiagState::Diagnostic => DIAG_PROFILE,
+        DiagState::Basic => BASIC_PROFILE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

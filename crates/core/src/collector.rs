@@ -650,6 +650,13 @@ pub struct CollectorSettings {
     /// `start_collection_custom` 内 [`monitors::title_privacy::set_redact_titles`]
     /// 即生效。
     pub redact_titles: bool,
+    /// ETW 内核网络采集开关（0.8.1 A2，默认关）：开启后启动 NetEtw 线程
+    /// （KynopticNetMon 会话 → MinuteAggregator → net_process_minute）。
+    /// 需管理员权限；AccessDenied 时线程留档 quality=Unavailable 不静默。
+    /// 接线路径：dash 设置项 `net_etw_enabled`（AppSettings，默认 false）→
+    /// tray / CLI 构造 `CollectorSettings` 映射 → start_collection_custom 内
+    /// spawn NetEtw 线程。
+    pub net_etw_enabled: bool,
 }
 
 impl Default for CollectorSettings {
@@ -658,6 +665,7 @@ impl Default for CollectorSettings {
             input_granularity: InputGranularity::default(),
             write_flush_interval_secs: constants::WRITE_FLUSH_INTERVAL_SECS,
             vk_frequency_enabled: true,
+            net_etw_enabled: false,
             redact_titles: false,
             low_power: false,
         }
@@ -1918,6 +1926,24 @@ pub fn start_collection_custom(
             first_workers.clone()
         );
         panic!("丢弃看门狗线程启动失败: {e}");
+    }
+
+    // 0.8.1 A2：ETW 增强模式（设置开关默认关）。句柄进 monitor_handles 统一
+    // join（shutdown 语义复用）；AccessDenied 留档不静默。
+    if settings.net_etw_enabled {
+        let db_etw = db.clone();
+        let sd_etw = shutdown.clone();
+        let etw_handle = thread::Builder::new().name("NetEtw".into()).spawn(move || {
+            set_thread_priority_below_normal();
+            // panic 防护（口径同聚合/看门狗线程）：ETW 故障不允许终结采集
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                monitors::net_etw_runtime::etw_runtime_loop(&db_etw, &sd_etw);
+            }));
+        });
+        match etw_handle {
+            Ok(h) => monitor_handles.push(h),
+            Err(e) => log::warn!("NetEtw 线程启动失败（增强模式本轮缺席，其余采集不受影响）: {e}"),
+        }
     }
 
     Collector {

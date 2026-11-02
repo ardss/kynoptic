@@ -973,11 +973,10 @@ static ACTUAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16:
 
 /// M4.2 诊断模式控制器（serve 进程视角；采集进程的控制器经后续切片接线，
 /// 独立 serve 进程恒 Basic——与 monitors 统计的跨进程盲区同口径，前端容错）。
-static DIAG_CONTROLLER: std::sync::LazyLock<
-    std::sync::Mutex<kynoptic_core::diag_mode::DiagnosticController>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(kynoptic_core::diag_mode::DiagnosticController::new())
-});
+// 0.8.1 A3：控制器实例上收 core::diag_mode::CONTROLLER——诊断开关的「入口」
+// （本文件 POST /api/diag）与「执行」（collector 巡检/档位消费）必须同状态；
+// 此前静态只在 dash、采集侧零消费方，设置页恒显 basic（不可达路径）。
+use kynoptic_core::diag_mode::CONTROLLER as DIAG_CONTROLLER;
 
 /// 诊断模式当前状态块（设置页消费；now 由调用方注入）。
 fn diag_status_json(now_ms: i64) -> Value {
@@ -2799,7 +2798,7 @@ pub fn api_settings(db_path: &Path) -> Value {
 /// 里回显 null）+ 加一处 `req.get` 接受站点（否则该字段会被列进 ignored）；
 /// tests.rs 有回归测试固化「常量全集均被接受、落盘且不出现在 ignored」。
 /// 响应专用键 `monitors` 不属于本集——请求若误带它，按未知字段列进 ignored。
-const ACCEPTED_SETTING_FIELDS: [&str; 11] = [
+const ACCEPTED_SETTING_FIELDS: [&str; 12] = [
     "enabled_monitors",
     "input_counts_only",
     "vk_frequency_enabled",
@@ -2811,6 +2810,7 @@ const ACCEPTED_SETTING_FIELDS: [&str; 11] = [
     "update_check",
     "low_power",
     "redact_titles",
+    "net_etw_enabled",
 ];
 
 /// [`ACCEPTED_SETTING_FIELDS`] 各字段在响应侧的取值（响应键 = 常量条目）。
@@ -2827,6 +2827,7 @@ fn setting_field_value(s: &AppSettings, field: &str) -> Value {
         "update_check" => json!(s.update_check),
         "low_power" => json!(s.low_power),
         "redact_titles" => json!(s.redact_titles),
+        "net_etw_enabled" => json!(s.net_etw_enabled),
         // 不可达：settings_payload 只按常量条目迭代；加常量条目后须补上臂。
         _ => Value::Null,
     }
@@ -2917,6 +2918,10 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     // title_privacy::set_redact_titles，采集侧剥 URL 查询串，只拦新写入
     if let Some(v) = req.get("redact_titles") {
         next.redact_titles = v.as_bool().ok_or("redact_titles 应为布尔值")?;
+    }
+    // ETW 增强模式（0.8.1 A2，默认关）：true 时下次采集启动接线 NetEtw 线程
+    if let Some(v) = req.get("net_etw_enabled") {
+        next.net_etw_enabled = v.as_bool().ok_or("net_etw_enabled 应为布尔值")?;
     }
     if let Some(v) = req.get("autostart") {
         next.autostart = v.as_bool().ok_or("autostart 应为布尔值")?;
@@ -3077,6 +3082,7 @@ fn settings_audit_summary(old: &AppSettings, new: &AppSettings) -> String {
         ),
         ("update_check", old.update_check, new.update_check),
         ("low_power", old.low_power, new.low_power),
+        ("net_etw_enabled", old.net_etw_enabled, new.net_etw_enabled),
     ] {
         if a != b {
             d.insert(k.into(), json!([a, b]));
@@ -3674,6 +3680,48 @@ pub fn route_req(
             });
             add_ignored(&mut v, ignored_params(&[]));
             (200, "application/json", v.to_string())
+        }
+        ("POST", "/api/diag") => {
+            // 0.8.1 A3：诊断模式开关入口（此前控制器零消费方=不可达路径）。
+            // body {"action":"start","duration_minutes":N} / {"action":"stop"}；
+            // 时长硬上限 30min 在 controller_enable 内钳制（有界铁律）。
+            let req: Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        400,
+                        "application/json",
+                        err_json(&format!("请求体不是合法 JSON（第 {} 行第 {} 列附近）", e.line(), e.column())),
+                    )
+                }
+            };
+            let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            match action {
+                "start" => {
+                    let mins = req
+                        .get("duration_minutes")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(15);
+                    let dur = kynoptic_core::diag_mode::controller_enable(now_ms, mins * 60_000);
+                    let v = json!({
+                        "mode": "diagnostic",
+                        "duration_ms": dur,
+                        "note": "深诊档采样 5s/缓冲 256KB；预算 CPU≤2% 单核、RSS≤64MiB，超限或到期自动回 Basic"
+                    });
+                    (200, "application/json", v.to_string())
+                }
+                "stop" => {
+                    kynoptic_core::diag_mode::controller_disable(now_ms);
+                    let v = json!({"mode": "basic"});
+                    (200, "application/json", v.to_string())
+                }
+                _ => (
+                    400,
+                    "application/json",
+                    err_json("action 应为 start 或 stop"),
+                ),
+            }
         }
         ("POST", "/api/settings") => {
             // 读-改-写整段串行化（审查 P1：并发 POST 会用旧快照覆盖对方字段）

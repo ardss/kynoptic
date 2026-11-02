@@ -124,6 +124,15 @@ impl<B: EtwBackend> NetEtwMonitor<B> {
     }
 
     /// 本次进程内是否清理过同名残留会话（Recover 经历标记）。
+    /// 后端访问（0.8.1 A2/A3 运行时：设 buffer_kb / 读 loss_stats）。
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
+    pub fn backend_ref(&self) -> &B {
+        &self.backend
+    }
+
     pub fn recovered_residual(&self) -> bool {
         self.recovered_residual
     }
@@ -276,6 +285,9 @@ pub struct RealEtw {
     stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 丢事件观测（回调 seen / stop 时 EventsLost 收口）。
     stats: Arc<LossStats>,
+    /// 会话内核缓冲 KB（0.8.1 A3：基本档 64 / 深诊档 256，启动时按当前档位定，
+    /// 会话存续期不重建；字段 EVENT_TRACE_PROPERTIES.BufferSize 单位即 KB）。
+    pub buffer_kb: u32,
     /// ETW 会话名：默认 ETW_SESSION_NAME（生产）；受控验证等旁路场景可用
     /// with_session_name 换成专用名（如 KynopticNetMonVerify），避免
     /// stop_session 误停生产同名会话。
@@ -289,6 +301,7 @@ impl RealEtw {
             tx: None,
             stop_flag: None,
             stats: Arc::new(LossStats::default()),
+            buffer_kb: 64,
             session_name: ETW_SESSION_NAME.to_string(),
         }
     }
@@ -477,6 +490,8 @@ mod real {
         fn start_session(&mut self) -> Result<u64, EtwError> {
             let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512];
             let props = unsafe { make_session_properties(&self.session_name, &mut buffer) };
+            // 0.8.1 A3：档位缓冲（Basic 64KB / 深诊 256KB），会话建立时生效
+            unsafe { (*props).BufferSize = self.buffer_kb };
             let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
             let code =
                 unsafe { StartTraceW(&mut handle, wide(&self.session_name).as_ptr(), props) };
