@@ -7,14 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-02
+
+深度并行审查（测试卫生/代码规范/API 文档一致性/DB 运维面四路）产出的标准化迭代；
+另含用户明确要求的自体遥测与 0.8.0 两处「写了但没接」的接线交付。
+
+### Added
+
+- 自体遥测（A1）：self_metric_minute 分钟桶表（0013 迁移）+ 采集循环每分钟
+  连续记录自身进程 CPU/内存/线程/句柄（M1 MetricPoint 契约）+ `/api/self-metrics`
+  查询面。此前自身消耗只能靠全机 Top5 旁路采样偶尔看到（10 月内存 194→350MB
+  爬升一个月才被发现）。
+- ETW 增强模式接线（A2）：settings `net_etw_enabled`（默认关）→ NetEtw 采集
+  线程（KynopticNetMon 会话 → net_process_minute 落库）。0.8.0 该表恒空、
+  归因面恒 Unavailable（模块+读路径已建，写路径缺位），本版补齐唯一生产写入方。
+- 诊断模式接线（A3）：`POST /api/diag` start/stop（硬上限 30 分钟钳制）；
+  采集侧消费档位（采样 30s→5s 实时生效、ETW 缓冲 64→256KB 建会话时生效）；
+  预算巡检喂自体实测（超限强制回退）。0.8.0 档位/控制器零消费方=不可达路径。
+- 端点清单补齐：skill.md 与 lib.rs 头注释补入 self-metrics 与 0.8.0 漏记的
+  net-process/net-derived/sys-overview/resource-top/diag-timeline（自家
+  「路由表与 skill.md 两处同步」规则此前破约）。
+
+### Changed
+
+- 心跳阈值配置化：KYNOPTIC_STALLED_SECS（≥900，缺省 1800）/ 
+  KYNOPTIC_MAX_AGE_SECS（≥60，缺省 180）环境变量可覆盖，双机调阈值不再重编译。
+- CLI 可见错误统一双语出口（`bilingual()` 此前零接线，双语铁律落空）。
+- `⚠` 符号全部换 `[!]`（Windows 终端把 ⚠ 渲染成彩色 emoji，违禁 emoji 铁律）。
+
 ### Fixed
 
-- Dash (tests): `watchdog_alert_exposes_collector_kinds_with_loss_count`
-  was a calendar time bomb: it inserted fixed 2026-11-01 timestamps while
-  `api_status` filtered the 24h alert window against the real clock, so the
-  test turned red the day the window slid past (observed in CI on
-  2026-11-02). Time is now parameterized via `api_status_at` (the existing
-  `_at` injection pattern); the test injects a fixed now.
+- CLI `db cleanup` 补删 agg_minute_actor / net_process_minute / self_metric_minute
+  （此前 CLI 路径漏删留孤儿行；core 侧 S1.1 修过的问题在 CLI 路径复发）。
+- VACUUM 满盘失败写 disk-paused.flag（此前只有日志无用户可见面）。
+- 测试时钟竞态×2：input_agg 激活分钟与断言分钟两次读钟跨分钟边界随机红；
+  mcp summary 历史日期基准两次读钟跨本地午夜同日。均改单锚/注入
+  （同 0.8.1 前哨 PR #75 的 api_status 24h 窗口日历炸弹根因族）。
+- mcp-wait spawn 失败降级留档+跳过（原 expect 会让整条 stdio 服务 panic）。
+- CHANGELOG [0.8.0] M2/M4.2 两条如实修正（0.8.0 实际交付范围与 0.8.1 接线说明）。
+- 过期注释与横幅：dash stdout 横幅只回 db 文件名；「Wave31 挂账」注释修正
+  （访问令牌已实现）。
+
+### 移交后续（如实）
+
+- 临时目录命名两范式并存（pid+seq vs 纳秒）：纯风格、不触断言，0.8.2 统一。
+- categories 分类规则暂只能手改 settings.json（契约三方一致，仅无设置页 UI）。
+- DU 本机管理员身份的 ETW 等价实采验证仍为 Pending-Admin（A 机隔离会话已验
+  100MiB 口径）。
 
 ## [0.8.0] - 2026-11-02
 
@@ -1228,7 +1267,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/ardss/kynoptic/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ardss/kynoptic/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ardss/kynoptic/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ardss/kynoptic/compare/v0.5.0...v0.6.0
