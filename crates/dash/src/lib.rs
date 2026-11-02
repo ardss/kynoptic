@@ -1029,6 +1029,15 @@ fn latest_watchdog_alert(conn: &Connection) -> Option<Value> {
 }
 
 pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
+    api_status_at(conn, db_path, Utc::now())
+}
+
+/// api_status 的时间参数化变体（_at，供测试注入固定时刻）：
+/// watchdog_alert 有「近 24h」窗口，api_status 直读 Utc::now() 时，插固定
+/// 时刻的测试会在窗口滑出后跨日变红（2026-11-02 实测：CI 连续两轮红，
+/// 首轮 ps 模块抖动掩盖了这枚日历炸弹）。测试不读真实时钟的既定
+/// 约定由本变体落实。
+pub fn api_status_at(conn: &Connection, db_path: &Path, now: chrono::DateTime<Utc>) -> Value {
     // 构建指纹（ci 修复）：审查/排障先比对运行态与源码版本——曾实际发生
     // 旧 exe 上探测令牌门全 200 的「源码已修但运行态未修」脱节。CI 构建
     // 注入 KYNOPTIC_GIT_HASH / KYNOPTIC_BUILD_TIME，本地构建缺省 unknown。
@@ -1085,7 +1094,7 @@ pub fn api_status(conn: &Connection, db_path: &Path) -> Value {
         // 实际绑定端口（0 = 未知；与配置端口不同即发生了自动回退）
         "actual_port": ACTUAL_PORT.load(std::sync::atomic::Ordering::Relaxed),
         // 近 24h 看门狗告警（null = 无），面板顶部横幅消费
-        "watchdog_alert": latest_watchdog_alert(conn),
+        "watchdog_alert": latest_watchdog_alert_at(conn, now),
         // M4.2 诊断模式（默认关 basic；设置页展示当前模式与剩余时长）
         "diag": diag_status_json(chrono::Utc::now().timestamp_millis()),
         // 监控器采集统计（性能治理）：每项含 name / last_success_age_secs /
