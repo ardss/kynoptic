@@ -1052,7 +1052,8 @@ fn settings_post_full_accepted_set_never_ignored_and_persisted() {
         "dashboard_port": 8422,
         "update_check": false,
         "low_power": true,
-        "redact_titles": true
+        "redact_titles": true,
+        "net_etw_enabled": true
     });
     let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &body.to_string(), &db);
     assert_eq!(code, 200, "接受字段全集必须 200: {out}");
@@ -1327,6 +1328,36 @@ fn route_table_and_error_codes() {
     // 缺省 date = 今日 → 200
     let (code, _, _) = route_req(&conn, "GET", "/api/summary", "", db);
     assert_eq!(code, 200);
+
+    // 0.8.1 A3：/api/diag 开→关全链（与 collector 共享 core 控制器）
+    let (code, _, _body) = route_req(&conn, "POST", "/api/diag", "{oops}", db);
+    assert_eq!(code, 400, "非法 JSON 必须 400");
+    let (code, _, _body) = route_req(&conn, "POST", "/api/diag", "{\"action\":\"nope\"}", db);
+    assert_eq!(code, 400, "未知 action 必须 400");
+    let (code, _, body) = route_req(
+        &conn,
+        "POST",
+        "/api/diag",
+        "{\"action\":\"start\",\"duration_minutes\":999}",
+        db,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["mode"], json!("diagnostic"));
+    assert!(
+        v["duration_ms"].as_i64().unwrap() <= 30 * 60 * 1000,
+        "时长必须被硬上限钳制: {v}"
+    );
+    let (code, _, _) = route_req(&conn, "POST", "/api/diag", "{\"action\":\"stop\"}", db);
+    assert_eq!(code, 200);
+    let (code, _, body) = route_req(&conn, "GET", "/api/status", "", db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["diag"]["mode"],
+        json!("basic"),
+        "stop 后 /api/status 必须回 basic"
+    );
 
     // 0.8.1 A1：/api/self-metrics 空表 200 + 结构；minutes 非法 400
     let (code, _, body) = route_req(&conn, "GET", "/api/self-metrics", "", db);

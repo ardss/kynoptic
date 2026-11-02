@@ -29,6 +29,7 @@ pub mod brightness;
 pub mod device;
 pub mod idle;
 pub mod net_etw;
+pub mod net_etw_runtime;
 pub mod network;
 pub mod plan_probe;
 pub mod power_plan;

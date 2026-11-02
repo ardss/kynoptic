@@ -52,6 +52,7 @@ HTTP API（GET 全部只读）：
 `/api/net-derived`（网络归因五分区，带 Confirmed/Estimated/Unavailable 徽标）、
 `/api/sys-overview`（系统总览视图）、`/api/resource-top?minutes=N`（资源排行）、`/api/diag-timeline`（诊断时间线）。
 查询参数统一语义（全 GET 端点）：重复参数取**首个**；显式空值（如 `?date=`、`?days=`）返回 400；数值参数非数字或低于下界返回 400，错误文案写明有效域（timeline `hours` 1–744、heatmap `weeks` 1–52、anomalies `days` 1–30、apps `days` 1–365、daily_top/input `days` 1–90）；超上限仍 200，但服务端钳制并在响应标注 `X_requested`+`note`（anomalies 同时置 `truncated=true`）；未识别或大小写错误的参数在响应 `ignored_params` 数组中回显。
+另有 `POST /api/diag`（0.8.1）：身体 `{"action":"start","duration_minutes":N}`（硬上限 30 分钟，到期/预算超限自动回 Basic）或 `{"action":"stop"}`；深诊档介导 ETW 采样 5s/缓冲 256KB（ETW 需管理员权限且需设置页开启 net_etw_enabled）。
 写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（Origin 必须与 dashboard-port.txt 里的实际端口一致）；**另有每会话 `X-Kynoptic-Token` 校验**——该令牌由服务端随机生成、仅注入面板页面，外部脚本拿不到，直连 POST 会被 403。外部脚本无法写设置，请引导用户在面板里改，或提示用户手动操作。
 
 ## 退出码契约（脚本/AI 判断成败只看这里）

@@ -193,6 +193,11 @@ pub struct AppSettings {
     /// collector 启动时调 title_privacy::set_redact_titles。
     #[serde(default)]
     pub redact_titles: bool,
+    /// ETW 内核网络采集（0.8.1 A2，默认关，隐私/资源 opt-in）：开启后采集
+    /// 进程启动 KynopticNetMon 会话记录按进程网络字节量（不存内容/地址）。
+    /// 需管理员权限，无权限时会话启动失败并留档。
+    #[serde(default)]
+    pub net_etw_enabled: bool,
 }
 
 fn default_update_check() -> bool {
@@ -240,6 +245,7 @@ impl Default for AppSettings {
             update_check: true,
             low_power: false,
             redact_titles: false,
+            net_etw_enabled: false,
         }
     }
 }

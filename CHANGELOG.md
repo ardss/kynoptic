@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   关联（PID→进程名+启动时间，含短命进程区间归属与 PID 复用防护）、
   `net_process_minute` 持久化（0012 迁移）与 `/api/net-process` 查询面、
   受控传输验证（隔离会话 100MiB，production 不受影响）。
+  如实注：本版仅模块+读路径，采集进程接线（settings 开关 + NetEtw 线程）
+  于 0.8.1 交付，0.8.0 运行时 net_process_minute 恒空。
 - 代理归因链（M3）：代理进程与监听端口识别（GetExtendedTcp/UdpTable +
   可配置进程名模式，证据层不做假设性归类）；四类流量派生（直连/代理相关/
   代理外层/口径模糊，四独立 metric_id 永不互加；TUN/多路复用降 Estimated
@@ -40,9 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   小时分位 + 绝对阈值双门限防误报；流量激增/持续上传/CPU 持续+周期尖峰/
   内存斜增/磁盘吞吐/短命进程反复/单父扇出/通道事件检测器集；只检测记录，
   不自动杀进程/改代理/断网）。
-- 诊断模式（M4.2）：默认关；开启后临时提粒度（ETW 缓冲 64KB→256KB、采样
-  30s→5s），硬预算 CPU≤2% 单核 / RSS≤64MiB，超限强制收口；到期自动回落
-  Basic；设置页显示当前模式与剩余时间。
+- 诊断模式（M4.2）：默认关；本版交付档位/控制器与设置页展示骨架，
+  开启入口与采集侧接线（ETW 缓冲 64KB→256KB、采样 30s→5s、硬预算强制收口、
+  到期自动回落 Basic）于 0.8.1 交付（审查发现 0.8.0 接线不在，如实修正）。
 - 三视图（M4.3）：系统总览（CPU/内存/GPU/网络/关键异常/监控健康）、
   资源排行（按进程网络 Top20，无名不伪造）、诊断时间线（锚点关联事件/
   资源变化/目的地址可得性）；无持久化源的维度一律显式 Unavailable+原因。
