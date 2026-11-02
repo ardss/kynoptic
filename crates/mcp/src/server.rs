@@ -685,17 +685,23 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
             let writer = writer.clone();
             let live = live_wait.clone();
             live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            threads.push(
-                std::thread::Builder::new()
-                    .name("mcp-wait".into())
-                    .spawn(move || {
-                        if let Some(r) = server.handle(&msg) {
-                            respond(&writer, &r.to_string());
-                        }
-                        live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    })
-                    .expect("mcp-wait spawn"),
-            );
+            let live_thread = live_wait.clone();
+            // P2（0.8.1）：spawn 失败降级为留档+跳过（运行时外部路径，
+            // 原 expect 会让整条 stdio 服务 panic）
+            match std::thread::Builder::new()
+                .name("mcp-wait".into())
+                .spawn(move || {
+                    if let Some(r) = server.handle(&msg) {
+                        respond(&writer, &r.to_string());
+                    }
+                    live_thread.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }) {
+                Ok(h) => threads.push(h),
+                Err(e) => {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("mcp-wait spawn 失败，请求跳过: {e}");
+                }
+            }
             continue;
         }
         let response = match parsed {
@@ -764,6 +770,9 @@ pub fn serve_stdio() {
 
 #[cfg(test)]
 mod tests {
+    /// env 是进程全局的（cli/tray 同款先例）：env 测试串行化
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::*;
 
     #[test]
@@ -1216,7 +1225,10 @@ mod tests {
         );
         let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(v["apps"][0]["app"], json!("envmarker"));
-        // 读取端契约：KYNOPTIC_DB 优先于默认解析
+        // 读取端契约：KYNOPTIC_DB 优先于默认解析。
+        // P2（0.8.1）：env 是进程全局的，按 cli/tray 的 ENV_LOCK 先例上锁，
+        // 防未来测试并行互踩。
+        let env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("KYNOPTIC_DB", &db);
         assert_eq!(
             std::env::var("KYNOPTIC_DB").unwrap(),
@@ -1224,6 +1236,7 @@ mod tests {
             "cmd_mcp 必须通过 KYNOPTIC_DB 传递 --db"
         );
         std::env::remove_var("KYNOPTIC_DB");
+        drop(env_guard);
     }
 
     // ─── 审查 P2 回归：批量拒绝 / 参数类型一致性 / wait_for 边界 ─────────

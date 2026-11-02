@@ -580,7 +580,7 @@ fn cmd_export(args: &[String]) -> Result<()> {
         out_path.display()
     );
     if skipped > 0 {
-        println!("⚠ 有 {skipped} 行因类型不兼容被跳过（详见日志）");
+        println!("[!] 有 {skipped} 行因类型不兼容被跳过（详见日志）");
     }
     Ok(())
 }
@@ -912,7 +912,7 @@ fn db_stats(db_path: &Path) -> Result<()> {
     // 降级门禁（2026-09）：损坏库上先显著告警并非零退出，不再打印
     // 全零统计（详见 db_quick_check 注释）
     if let Err(reason) = db_quick_check(&conn) {
-        println!("⚠ 数据库完整性检查未通过: {reason}");
+        println!("[!] 数据库完整性检查未通过: {reason}");
         return Err(Error::InvalidData(format!(
             "数据库完整性检查未通过，统计结果不可信: {reason}"
         )));
