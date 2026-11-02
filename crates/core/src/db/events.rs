@@ -514,6 +514,11 @@ impl Database {
                         "DELETE FROM net_process_minute WHERE minute_bucket < ?1",
                         [cutoff.timestamp_millis().div_euclid(60_000)],
                     );
+                    // 0.8.1 A1：自体遥测分钟桶同事务清理（桶口径同 net_process_minute）
+                    let self_minute = conn.execute(
+                        "DELETE FROM self_metric_minute WHERE minute_bucket < ?1",
+                        [cutoff.timestamp_millis().div_euclid(60_000)],
+                    );
                     // 水位自 W33-F2 起是行数口径（COUNT(*)）：显式 opt-in 保留期
                     // 清理删行后必须在**同一事务内（COMMIT 之前）**推进水位——
                     // 否则下次 open 的对账会把合法的「清理后减少」误判为数据
@@ -523,7 +528,7 @@ impl Database {
                     // 行数 → 下次 open 假报「回退」。移进同事务后删行与水位
                     // 推进随 COMMIT 原子落库，事务失败回滚时水位也一并还原。
                     let deleted =
-                        (deleted?, daily?, minute?, minute_actor?, app?, net_minute?);
+                        (deleted?, daily?, minute?, minute_actor?, app?, net_minute?, self_minute?);
                     if deleted.0 > 0 {
                         super::persist_events_watermark(conn);
                     }

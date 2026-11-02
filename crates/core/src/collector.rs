@@ -1888,6 +1888,10 @@ pub fn start_collection_custom(
         .name("DropWatchdog".into())
         .spawn(move || {
             set_thread_priority_below_normal();
+            // 0.8.1 A1 自体遥测：复用本线程 60s 节奏与 join/停机语义，
+            // 每轮采自身进程指标，分钟桶滚动即落 self_metric_minute
+            // （连续记录防“内存爬升一个月才被旁路 Top5 采样看见”复发）。
+            let mut self_state = monitors::self_probe::TickState::default();
             loop {
                 // 睡眠 1 秒切片：shutdown join 本线程时最多 ~1 秒退出（审查 LOW）
                 for _ in 0..60 {
@@ -1897,6 +1901,10 @@ pub fn start_collection_custom(
                     thread::sleep(Duration::from_secs(1));
                 }
                 log_dropped_events_watchdog(&db_watch);
+                // panic 防护（同 log_dropped 口径）：自体采样失败不终结看门狗
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    monitors::self_probe::tick(&mut self_state, &db_watch);
+                }));
             }
         });
     if let Err(e) = watch_handle {

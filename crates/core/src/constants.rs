@@ -51,7 +51,7 @@ pub const DB_FILENAME: &str = "kynoptic.db";
 /// 超过则降级为新建临时连接，避免调用方无限阻塞。
 pub const READER_POOL_MAX_WAITS: u32 = 3;
 /// 0011（0.4.0 F1）：actor 证据缓存 agg_minute_actor。
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段

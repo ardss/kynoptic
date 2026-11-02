@@ -1328,6 +1328,18 @@ fn route_table_and_error_codes() {
     let (code, _, _) = route_req(&conn, "GET", "/api/summary", "", db);
     assert_eq!(code, 200);
 
+    // 0.8.1 A1：/api/self-metrics 空表 200 + 结构；minutes 非法 400
+    let (code, _, body) = route_req(&conn, "GET", "/api/self-metrics", "", db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["minutes"], json!(60));
+    assert!(v["rows"].is_array(), "self-metrics 必须有 rows 数组");
+    assert_eq!(
+        route_req(&conn, "GET", "/api/self-metrics?minutes=nope", "", db).0,
+        400,
+        "minutes 非法必须 400"
+    );
+
     let (code, _, body) = route_req(&conn, "GET", "/api/timeline?hours=6", "", db);
     assert_eq!(code, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
