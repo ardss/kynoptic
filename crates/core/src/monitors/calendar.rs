@@ -136,7 +136,11 @@ fn persist_emitted_keys(emitted: &HashSet<String>) {
 /// 对应事件的当前态必已更晚、key 必已失效（ending 例外窗口：事件结束前
 /// ≤5min 内重启会重放该条一次，比改前「重启重放全部窗口事件」窄得多）。
 fn prune_old_calendar_keys(keys: &mut HashSet<String>) {
-    let now = chrono::Utc::now();
+    prune_old_calendar_keys_at(keys, chrono::Utc::now());
+}
+
+/// 时间参数化变体（测试红线）。
+fn prune_old_calendar_keys_at(keys: &mut HashSet<String>, now: chrono::DateTime<chrono::Utc>) {
     let cutoff = now - chrono::Duration::hours(PRUNE_HOURS);
     keys.retain(|k| {
         let start_old = match k.split('|').nth(1) {
@@ -166,8 +170,9 @@ mod tests {
         format!("{subject}|{start}|{state}")
     }
 
-    fn hours_ago(h: i64) -> String {
-        (chrono::Utc::now() - chrono::Duration::hours(h))
+    /// 单锚：每个测试先固定 now，所有 key 与修剪都用同一时刻（不读真实时钟）。
+    fn hours_ago_at(now: chrono::DateTime<chrono::Utc>, h: i64) -> String {
+        (now - chrono::Duration::hours(h))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
     }
@@ -178,10 +183,11 @@ mod tests {
     #[test]
     fn old_ongoing_key_is_kept() {
         let mut keys = HashSet::new();
-        keys.insert(key("跨日事件", &hours_ago(80), "ongoing"));
-        prune_old_calendar_keys(&mut keys);
+        let now = chrono::Utc::now();
+        keys.insert(key("跨日事件", &hours_ago_at(now, 80), "ongoing"));
+        prune_old_calendar_keys_at(&mut keys, now);
         assert!(
-            keys.contains(&key("跨日事件", &hours_ago(80), "ongoing")),
+            keys.contains(&key("跨日事件", &hours_ago_at(now, 80), "ongoing")),
             "start 早于 72h 的 ongoing key 不得被修剪"
         );
     }
@@ -190,15 +196,16 @@ mod tests {
     #[test]
     fn old_non_ongoing_keys_are_pruned() {
         let mut keys = HashSet::new();
-        keys.insert(key("旧upcoming", &hours_ago(80), "upcoming"));
-        keys.insert(key("旧ending", &hours_ago(80), "ending"));
-        keys.insert(key("新ongoing", &hours_ago(1), "ongoing"));
-        keys.insert(key("新ending", &hours_ago(1), "ending"));
-        prune_old_calendar_keys(&mut keys);
-        assert!(!keys.contains(&key("旧upcoming", &hours_ago(80), "upcoming")));
-        assert!(!keys.contains(&key("旧ending", &hours_ago(80), "ending")));
-        assert!(keys.contains(&key("新ongoing", &hours_ago(1), "ongoing")));
-        assert!(keys.contains(&key("新ending", &hours_ago(1), "ending")));
+        let now = chrono::Utc::now();
+        keys.insert(key("旧upcoming", &hours_ago_at(now, 80), "upcoming"));
+        keys.insert(key("旧ending", &hours_ago_at(now, 80), "ending"));
+        keys.insert(key("新ongoing", &hours_ago_at(now, 1), "ongoing"));
+        keys.insert(key("新ending", &hours_ago_at(now, 1), "ending"));
+        prune_old_calendar_keys_at(&mut keys, now);
+        assert!(!keys.contains(&key("旧upcoming", &hours_ago_at(now, 80), "upcoming")));
+        assert!(!keys.contains(&key("旧ending", &hours_ago_at(now, 80), "ending")));
+        assert!(keys.contains(&key("新ongoing", &hours_ago_at(now, 1), "ongoing")));
+        assert!(keys.contains(&key("新ending", &hours_ago_at(now, 1), "ending")));
     }
 
     /// 解析失败/缺段的 key 一律保留（宁多不少，不丢去重数据）。
@@ -206,9 +213,10 @@ mod tests {
     fn malformed_keys_are_kept() {
         let mut keys = HashSet::new();
         keys.insert("garbage".to_string()); // 无 '|' 段
+        let now = chrono::Utc::now();
         keys.insert(key("坏时间", "not-a-date", "ongoing"));
-        keys.insert(format!("{}|{}", "缺段", hours_ago(80))); // 只有 2 段
-        prune_old_calendar_keys(&mut keys);
+        keys.insert(format!("{}|{}", "缺段", hours_ago_at(now, 80))); // 只有 2 段
+        prune_old_calendar_keys_at(&mut keys, now);
         assert_eq!(keys.len(), 3, "畸形 key 不得被修剪");
     }
 }
