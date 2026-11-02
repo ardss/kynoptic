@@ -1035,10 +1035,12 @@ mod tests {
         assert_eq!(v["yesterday_same_period"], json!(6.0));
         assert_eq!(v["change_pct"], json!(-66.7));
         // 查历史日期：基准同样是该日期的前一天，而非硬编码的“今天-1”
-        let past = (chrono::Local::now() - chrono::Duration::days(5))
+        // 单锚派生（原两次独立读钟跨本地午夜时 past/past_prev 会同日，断言跨日变红）
+        let anchor = chrono::Local::now().date_naive();
+        let past = (anchor - chrono::Duration::days(5))
             .format("%Y-%m-%d")
             .to_string();
-        let past_prev = (chrono::Local::now() - chrono::Duration::days(6))
+        let past_prev = (anchor - chrono::Duration::days(6))
             .format("%Y-%m-%d")
             .to_string();
         let v = summary(&conn, &past, "keys").unwrap();

@@ -832,11 +832,11 @@ mod tests {
     /// agg_minute_actor 各两行）：`old_ts` 在保留期外，`recent_ts` 在保留期内。
     /// 时间全部相对 now 计算（过期/存留分界由 60d vs 30d vs 1h 的余量保证，
     /// 不依赖真实时钟的绝对值）。
-    fn seed_across_retention_boundary(db: &Database) {
+    fn seed_across_retention_boundary(db: &Database, now: chrono::DateTime<chrono::Utc>) {
         let fmt =
             |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
-        let old = fmt(chrono::Utc::now() - chrono::Duration::days(60));
-        let recent = fmt(chrono::Utc::now() - chrono::Duration::hours(1));
+        let old = fmt(now - chrono::Duration::days(60));
+        let recent = fmt(now - chrono::Duration::hours(1));
         for ts in [old, recent] {
             let mut e = Event::new(EventAction::Press, EventType::Keyboard);
             e.timestamp = ts;
@@ -861,7 +861,8 @@ mod tests {
         let dir = tmp_dir("s11actor");
         std::fs::create_dir_all(&dir).unwrap();
         let mut db = Database::open(dir.join("s11actor.db").to_str().unwrap()).unwrap();
-        seed_across_retention_boundary(&db);
+        let now = chrono::Utc::now();
+        seed_across_retention_boundary(&db, now);
         assert_eq!(
             count(&db, "SELECT COUNT(*) FROM agg_minute_actor"),
             2,
@@ -869,7 +870,7 @@ mod tests {
         );
 
         set_retention_days(&mut db, 30);
-        let deleted = db.cleanup_old_events();
+        let deleted = db.cleanup_old_events_at(now.timestamp_millis());
         assert_eq!(deleted, 1, "只应删除保留期外的原始事件（60 天前那条）");
 
         // 过期 actor 行被清、存留 actor 行保留
@@ -878,7 +879,7 @@ mod tests {
 
         // 与生产清理同口径的边界（本地日历日字符串比较）：残留 actor 行的
         // date 必须全部 >= cutoff_date
-        let cutoff_date = (chrono::Utc::now() - chrono::Duration::days(30))
+        let cutoff_date = (now - chrono::Duration::days(30))
             .with_timezone(&chrono::Local)
             .format("%Y-%m-%d")
             .to_string();
@@ -913,12 +914,11 @@ mod tests {
         let mut db = Database::open(dir.join("s11sync.db").to_str().unwrap()).unwrap();
 
         // 三档日期：60d（过期删）、10d（保留期内留）、当天（留）
+        let now = chrono::Utc::now();
         let fmt =
             |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
         for offset in [-60i64, -10, 0] {
-            let ts = fmt(chrono::Utc::now()
-                + chrono::Duration::days(offset)
-                + chrono::Duration::hours(12));
+            let ts = fmt(now + chrono::Duration::days(offset) + chrono::Duration::hours(12));
             let mut e = Event::new(EventAction::Press, EventType::Keyboard);
             e.timestamp = ts;
             let (rowids, failed) = db.insert_events_with_agg(std::slice::from_ref(&e));
@@ -927,7 +927,7 @@ mod tests {
         }
 
         set_retention_days(&mut db, 30);
-        let deleted = db.cleanup_old_events();
+        let deleted = db.cleanup_old_events_at(now.timestamp_millis());
         assert_eq!(deleted, 1, "只有 60 天前那条过期");
 
         // 存活原始事件的本地日历日集合

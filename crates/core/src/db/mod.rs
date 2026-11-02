@@ -1401,6 +1401,7 @@ mod tests {
     /// 机器慢时两者同步变慢，阈值不随机器漂移（固定 3x 比率阈值在慢机器
     /// 上会误伤，已废弃）。实测校准：修复前 212-270ms vs COUNT 157ms（判负）；
     /// 修复后 112.58ms vs 157ms（通过，余量 ~28%）。千行库对照仅作诊断输出。
+    #[ignore = "千万行 4GB 临时库，不应在 cargo test 默认路径（CI 磁盘/时间成本）；手动 cargo test -- --ignored 跑"]
     #[test]
     fn batch_flush_write_lock_time_does_not_scale_with_row_count() {
         // panic 安全清理 guard：本测试临时库 ~4GB，机器 C: 盘长期 96% 满，

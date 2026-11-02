@@ -262,13 +262,13 @@ impl MinuteCounters {
 
 /// 当前分钟桶：本地时间截断到分钟 + 对应 UTC 起点时间戳。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MinuteKey {
+pub(crate) struct MinuteKey {
     /// 本地分钟起点（second/纳秒清零）
     start_local: DateTime<Local>,
 }
 
 impl MinuteKey {
-    fn of(now: DateTime<Local>) -> Self {
+    pub(crate) fn of(now: DateTime<Local>) -> Self {
         Self {
             start_local: now
                 .with_second(0)
@@ -659,9 +659,14 @@ pub fn reset() {
 
 /// 进入 minute 聚合模式（仅 [`crate::collector::start_collection_with`] 调用）。
 pub(crate) fn activate() {
+    activate_at(MinuteKey::of(chrono::Local::now()));
+}
+
+/// activate 的时间参数化变体（测试红线：测试不读真实时钟）。此前测试先 activate()再独立读钟取 t0，两次读钟跨分钟边界时断言随机变红（2026-11-02 审查发现）。
+pub(crate) fn activate_at(key: crate::input_agg::MinuteKey) {
     set_minute_mode(true);
     let mut sup = SUPPRESS_MINUTE.lock().unwrap_or_else(|e| e.into_inner());
-    *sup = Some(MinuteKey::of(chrono::Local::now()));
+    *sup = Some(key);
 }
 
 /// 取消本会话的重启分钟抑制（合并续写模式，审查 P1：硬杀后部分分钟快照修复）。
@@ -791,8 +796,10 @@ mod tests {
     fn suppress_minute_survives_rollover() {
         let _g = guard();
         reset();
-        activate(); // 抑制当前分钟（重启抑制路径）
-        let t0 = MinuteKey::of(chrono::Local::now()).start_local;
+        // 单锚：抑制 key 与断言派生同源，不读真实时钟
+        let anchor_key = local_min(2026, 6, 15, 10, 30);
+        activate_at(MinuteKey::of(anchor_key));
+        let t0 = anchor_key;
         record_key();
         record_key();
         record_click_button(0, false);

@@ -2041,13 +2041,14 @@ mod tests {
     fn under_agg_dates_only_checks_recent_seven_days() {
         let c = conn();
         // 8 天前的 press（欠聚合，超出 7 天窗口）+ 今天的 press（欠聚合，窗口内）
-        let old = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
-        let recent = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(8)).to_rfc3339();
+        let recent = now.to_rfc3339();
         ins(&c, &old, "keyboard", "press", None, None);
         ins(&c, &recent, "keyboard", "press", None, None);
 
-        let dates = under_agg_dates(&c);
-        let old_local_date = (Utc::now() - chrono::Duration::days(8))
+        let dates = under_agg_dates_at(&c, now);
+        let old_local_date = (now - chrono::Duration::days(8))
             .with_timezone(&Local)
             .format("%Y-%m-%d")
             .to_string();
