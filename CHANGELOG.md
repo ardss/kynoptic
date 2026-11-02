@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-01
+
+### Added
+
+- Dash (API): `/api/status` now carries per-monitor health (`monitor_stats`:
+  `degraded_count`, `last_duration_ms`, `last_success_age_secs`,
+  `consecutive_slow`), so degraded collectors are visible without reading logs.
+- Tray (notifications): collection-drop and DB write-failure notifications
+  (`kind=collection_dropped` / `write_failed`); disk-full pause now reflects a
+  real `disk-paused.flag` wiring instead of a guessed state.
+- Core (PS monitors): a single PowerShell launch failure now degrades the
+  monitor (`run_ps_detailed` -> `LaunchFailed`) instead of surfacing as a
+  generic error.
+- Core (metrics): unified `MetricPoint` contract (12 fields: metric_id,
+  source, host_id, process_identity, timestamp_utc, interval_ms, value, unit,
+  scope, quality, loss_count, coverage, schema_version) for all new
+  observability data paths.
+- Core (DB): data retention policy (default off; raw events protected for at
+  least 30 days) and cleanup blind-spot fixes across five tables; retention
+  watermark scan is no longer O(N).
+- Core (ETW, module only): kernel-network ETW session manager
+  (`net_etw`): session lifecycle with recovery of residual sessions,
+  permission-denied -> `quality=Unavailable`, loss accounting via
+  `EVENT_TRACE_CONTROL_QUERY`, per-minute aggregation and process association
+  keyed on (pid, exe_start_epoch) to survive PID reuse, `net_process_minute`
+  persistence plus query endpoint. **Note: the module is not yet wired into
+  settings/collector - there is no runtime switch yet, so enhanced network
+  collection cannot be enabled in 0.8.0 (planned wiring slice).**
+- Dash (attribution): network attribution card - proxy process/port
+  identification, four derived traffic classes that are mutually exclusive
+  (never summed), TUN ambiguity marked `Estimated` instead of being split
+  blindly, and a per-provider reconciliation probe whose outcome is shown
+  only from trusted sources (otherwise `Unavailable`).
+- Core (anomaly): `ResourceAnomaly` model on rolling 7-day same-hour
+  percentile baselines; detection is record-only, it never intervenes.
+- Dash (diagnostic mode): bounded diagnostic collection window (default off,
+  hard cap 30 min, auto-exit) and three new dashboard views.
+
+### Changed
+
+- Core (perf, PS monitors): the single PowerShell engine lock no longer
+  serializes every monitor into a 60s-timeout chain. Dual-lane design: the
+  persistent host keeps its <=1-resident invariant via `try_lock`; when busy,
+  monitors take a bounded concurrent spawn lane (max 3 permits); when permits
+  are exhausted, they queue on the host lock instead of being rejected.
+  Measured on DU: host 60s timeouts 9+ -> 0; first-shot misses 9+ -> 6.
+- Core (perf, clipboard): `GetClipboardSequenceNumber` gate skips no-op polls
+  (observed 30s stalls -> 0).
+- Core (perf, thermal): empty sensor reads back off exponentially (60s ->
+  ... -> capped at 15 min) with an info log at the second consecutive empty
+  read; data resets the gate.
+
 ## [Unreleased]
 
 ## [0.8.0] - 2026-11-02
