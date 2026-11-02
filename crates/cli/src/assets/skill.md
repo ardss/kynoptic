@@ -46,7 +46,11 @@ HTTP API（GET 全部只读）：
 `/api/settings`、`/api/status`、`/api/summary`、`/api/input?date=`（逐时输入序列，date 指定统计哪一天，缺省今天；空值或非法日期返回 400）、
 `/api/autostart-status`（自启同步读回：settings.json 的 autostart 值 vs 注册表 Run 键现状）、
 `/api/apps?days=N`（应用使用排行，按窗口切换事件数）、`/api/hours?date=`（每小时输入次数，含自动化注入输入；非黄金时段；黄金时段洞察取 /api/insights）、
-`/api/apps_grid`、`/api/daily_top`、`/api/trends`（本周/上周对比，注意 active_minutes 是 raw 口径）、`/api/diagnostics`（运行诊断信息）。
+`/api/apps_grid`、`/api/daily_top`、`/api/trends`（本周/上周对比，注意 active_minutes 是 raw 口径）、`/api/diagnostics`（运行诊断信息）、
+`/api/self-metrics?minutes=N`（近 N 分钟自体遥测：采集进程自身 CPU/内存/线程/句柄，分钟桶；0.8.1）、
+`/api/net-process?minutes=N`（近 N 分钟按进程网络分钟桶；ETW 增强模式，未开启时恒空表）、
+`/api/net-derived`（网络归因五分区，带 Confirmed/Estimated/Unavailable 徽标）、
+`/api/sys-overview`（系统总览视图）、`/api/resource-top?minutes=N`（资源排行）、`/api/diag-timeline`（诊断时间线）。
 查询参数统一语义（全 GET 端点）：重复参数取**首个**；显式空值（如 `?date=`、`?days=`）返回 400；数值参数非数字或低于下界返回 400，错误文案写明有效域（timeline `hours` 1–744、heatmap `weeks` 1–52、anomalies `days` 1–30、apps `days` 1–365、daily_top/input `days` 1–90）；超上限仍 200，但服务端钳制并在响应标注 `X_requested`+`note`（anomalies 同时置 `truncated=true`）；未识别或大小写错误的参数在响应 `ignored_params` 数组中回显。
 写设置仅 `POST /api/settings`：需头 `X-Kynoptic: 1` + `Origin: http://127.0.0.1:<实际端口>`（Origin 必须与 dashboard-port.txt 里的实际端口一致）；**另有每会话 `X-Kynoptic-Token` 校验**——该令牌由服务端随机生成、仅注入面板页面，外部脚本拿不到，直连 POST 会被 403。外部脚本无法写设置，请引导用户在面板里改，或提示用户手动操作。
 

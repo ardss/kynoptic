@@ -34,6 +34,7 @@ pub mod plan_probe;
 pub mod power_plan;
 pub mod process;
 pub mod proxy_link;
+pub mod self_probe;
 pub mod session;
 pub mod system;
 pub mod traffic_derive;

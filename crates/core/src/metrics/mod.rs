@@ -34,6 +34,11 @@ pub const METRIC_DISK_HOST_IO_READ: &str = "disk.host.io_read_bytes";
 pub const METRIC_DISK_PROCESS_IO_READ: &str = "disk.process.io_read_bytes";
 pub const METRIC_NET_IFACE_BYTES_SENT: &str = "net.iface.bytes_sent";
 pub const METRIC_NET_HOST_BYTES_SENT: &str = "net.host.bytes_sent";
+/// 自体遥测（0.8.1 A1）：采集进程自身资源（连续记录，防“内存爬升一个月才被旁路采样看见”复发）。
+pub const METRIC_SELF_PROCESS_CPU_PERCENT: &str = "self.process.cpu_percent";
+pub const METRIC_SELF_PROCESS_WORKING_SET_MB: &str = "self.process.working_set_mb";
+pub const METRIC_SELF_PROCESS_THREADS: &str = "self.process.threads";
+pub const METRIC_SELF_PROCESS_HANDLES: &str = "self.process.handles";
 
 /// 采集来源（防「值从哪来」口径混用：ETW 实时流 ≠ WinAPI 轮询 ≠ 派生计算）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

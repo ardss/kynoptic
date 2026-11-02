@@ -24,6 +24,7 @@ pub mod events;
 pub mod metadata;
 pub mod net_metrics;
 pub mod schema;
+pub mod self_metrics;
 pub mod sessions;
 
 // 子模块方法以 `impl Database` 形式分散定义，统一从根重新导出

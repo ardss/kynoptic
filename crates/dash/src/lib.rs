@@ -20,7 +20,11 @@
 //! - `/api/anomalies?days=`          与 MCP `get_anomalies` 同一异常检测
 //!   （marathon 桥接阈值读 settings 的 presence_bridge_minutes）
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
+//! - `/api/sys-overview`             系统总览视图（M4.3）
+//! - `/api/resource-top?minutes=`     资源排行（M4.3）
+//! - `/api/diag-timeline`             诊断时间线（M4.3）
 //! - `/api/net-derived?minutes=`     网络归因五分区（M3.4，含 quality 标注）
+//! - `/api/self-metrics?minutes=`     近 N 分钟自体遥测（0.8.1 A1）
 //! - `/api/net-process?minutes=`     近 N 分钟净指标分钟桶（M2.4，ETW 内核
 //!   网络 MetricPoint 持久化，只读）
 //! - `/api/overview`                 本次会话 uptime / 今日事件数 / 启用监控器数 /
@@ -606,6 +610,19 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
 fn api_net_process(conn: &Connection, minutes: u32) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let rows = kynoptic_core::db::net_metrics::query_net_process_minute(conn, minutes, now_ms);
+    json!({
+        "minutes": minutes,
+        "count": rows.len(),
+        "rows": rows,
+    })
+}
+
+/// GET /api/self-metrics — 近 N 分钟自体遥测分钟桶（0.8.1 A1）。
+/// 只读：self_metric_minute 表（采集进程自身 CPU/内存/线程/句柄，
+/// M1 MetricPoint 契约，每分钟一行）。now 注入供单测，路由侧实时取。
+fn api_self_metrics(conn: &Connection, minutes: u32) -> Value {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let rows = kynoptic_core::db::self_metrics::query_self_metric_minute(conn, minutes, now_ms);
     json!({
         "minutes": minutes,
         "count": rows.len(),
@@ -3337,6 +3354,15 @@ pub fn route_req(
         ("GET", "/api/status") => {
             let mut v = api_status(conn, db_path);
             add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
+        ("GET", "/api/self-metrics") => {
+            let minutes_req = match qnum("minutes", 1, 1440) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 60,
+                Ok(Some(m)) => m,
+            };
+            let v = api_self_metrics(conn, minutes_req);
             (200, "application/json", v.to_string())
         }
         ("GET", "/api/net-process") => {
