@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Dash (tests): `watchdog_alert_exposes_collector_kinds_with_loss_count`
+  was a calendar time bomb: it inserted fixed 2026-11-01 timestamps while
+  `api_status` filtered the 24h alert window against the real clock, so the
+  test turned red the day the window slid past (observed in CI on
+  2026-11-02). Time is now parameterized via `api_status_at` (the existing
+  `_at` injection pattern); the test injects a fixed now.
+
 ## [0.8.0] - 2026-11-02
 
 可观测性升级（obs-m 系列，feat/obs-m 分支 PR #72）。

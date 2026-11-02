@@ -299,7 +299,13 @@ fn watchdog_alert_exposes_collector_kinds_with_loss_count() {
         "2026-11-01T00:05:00+00:00",
         r#"{"source":"collector","kind":"collection_dropped","message":"通道已满，过去 60 秒丢弃了 7 个事件","message_en":"channel full: 7 events dropped in the last 60s","loss_count":7}"#,
     );
-    let v = api_status(&conn, Path::new("/tmp/x.db"));
+    // now 一并固定：api_status 内部有近 24h 告警窗口，固定插入时刻
+    // 在真实 now 滑出窗口后会跨日变红（2026-11-02 CI 实测），改用
+    // api_status_at 注入固定 now。
+    let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:20:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let v = api_status_at(&conn, Path::new("/tmp/x.db"), now);
     let wa = &v["watchdog_alert"];
     assert_eq!(wa["kind"], "collection_dropped", "新 kind 必须透出");
     assert_eq!(wa["loss_count"], 7, "loss_count 必须透出供横幅量化显示");
@@ -310,7 +316,7 @@ fn watchdog_alert_exposes_collector_kinds_with_loss_count() {
         "2026-11-01T00:10:00+00:00",
         r#"{"source":"watchdog","kind":"collection_recovered","message":"采集已恢复","message_en":"collection recovered"}"#,
     );
-    let v = api_status(&conn, Path::new("/tmp/x.db"));
+    let v = api_status_at(&conn, Path::new("/tmp/x.db"), now);
     assert_eq!(v["watchdog_alert"]["recovered"], json!(true));
 }
 
