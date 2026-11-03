@@ -283,6 +283,7 @@
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-sys" aria-controls="view-sys" tabindex="-1"><span class="l en">System</span><span class="l zh">系统总览</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-restop" aria-controls="view-restop" tabindex="-1"><span class="l en">Resources</span><span class="l zh">资源排行</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-diagtl" aria-controls="view-diagtl" tabindex="-1"><span class="l en">Timeline</span><span class="l zh">诊断时间线</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-unifiedtl" aria-controls="view-unifiedtl" tabindex="-1"><span class="l en">Unified timeline</span><span class="l zh">统一时间轴</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" aria-controls="view-anomalies" tabindex="-1"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge" aria-live="polite"></span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" aria-controls="view-settings" tabindex="-1"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
@@ -510,6 +511,25 @@
     <h2><span class="l en">diagnostic timeline (now ± 5 min)</span><span class="l zh">诊断时间线（当前时刻 ± 5 分钟）</span></h2>
     <div id="diagtl-rows" class="muted">loading…</div>
     <div id="diagtl-dest" class="muted" style="font-size:12px;margin-top:8px"></div>
+  </section>
+</div>
+
+<div id="view-unifiedtl" role="tabpanel" aria-labelledby="tab-unifiedtl" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Unified timeline (tracks A-E) from the activity_intervals derived table. unknown = real evidence gap, shown as texture — not zero. Tracks without a data source are marked "not connected", not hidden.</span><span class="l zh">统一时间轴（轨道 A-E），数据来自 activity_intervals 派生表。unknown 是真实证据缺口，以纹理底显示，不是零。无数据源的轨道明确标注「未接入」，不隐藏。</span></div>
+  <section>
+    <h2><span class="l en">unified timeline</span><span class="l zh">统一时间轴</span></h2>
+    <div class="mon-row" id="utl-zoom" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+      <span class="muted" style="font-size:11px"><span class="l en">range:</span><span class="l zh">窗口：</span></span>
+      <button type="button" class="save btn-ghost utl-zoom-btn" data-utl-minutes="30" style="background:var(--surface-btn)"><span class="l en">30 min</span><span class="l zh">30 分钟</span></button>
+      <button type="button" class="save btn-ghost utl-zoom-btn" data-utl-minutes="60" style="background:var(--surface-btn)"><span class="l en">60 min</span><span class="l zh">60 分钟</span></button>
+      <button type="button" class="save btn-ghost utl-zoom-btn" data-utl-minutes="180" style="background:var(--surface-btn)"><span class="l en">3 h</span><span class="l zh">3 小时</span></button>
+      <button type="button" class="save btn-ghost utl-zoom-btn" data-utl-minutes="360" style="background:var(--surface-btn)"><span class="l en">6 h</span><span class="l zh">6 小时</span></button>
+      <button type="button" class="save btn-ghost utl-zoom-btn" data-utl-minutes="1440" style="background:var(--surface-btn)"><span class="l en">24 h</span><span class="l zh">24 小时</span></button>
+      <span id="utl-window" class="muted" style="font-size:11px"></span>
+    </div>
+    <div id="utl-legend" class="muted" style="font-size:11px;margin:8px 0"></div>
+    <div id="utl-tracks"></div>
+    <div id="utl-detail" class="muted" style="font-size:12px;margin-top:10px;white-space:normal"></div>
   </section>
 </div>
 
@@ -2480,7 +2500,7 @@ function parseUrlState() {
   const dOk = v => /^\d{4}-\d{2}-\d{2}$/.test(v || "") && v <= TODAY_STR;
   const hm = +q.get("hm") || 0;
   return {
-    view: ["overview", "report", "apps", "input", "insights", "sys", "restop", "diagtl", "anomalies", "settings"]
+    view: ["overview", "report", "apps", "input", "insights", "sys", "restop", "diagtl", "unifiedtl", "anomalies", "settings"]
       .includes(q.get("view")) ? q.get("view") : "overview",
     rd: dOk(q.get("rd")) ? q.get("rd") : "",
     ad: dOk(q.get("ad")) ? q.get("ad") : "",
@@ -2493,7 +2513,7 @@ function showView(name, fromHistory) {
   // 防御：任何 view/tab 元素缺失都不能让异常逃出 showView——否则会落在
   // refreshView 之前，页签能显示但 loader 永不触发、也无控制台报错可查
   //（正是"切换后 loading… 永不解析、数据 API 零请求"这类回归的形态）。
-  for (const v of ["overview", "apps", "report", "insights", "input", "anomalies", "settings"]) {
+  for (const v of ["overview", "apps", "report", "insights", "input", "unifiedtl", "anomalies", "settings"]) {
     const view = document.getElementById("view-" + v);
     if (view) view.style.display = v === name ? "" : "none";
     const tab = document.getElementById("tab-" + v);
@@ -2686,6 +2706,117 @@ async function loadDiagTimeline() {
     el.textContent = t("noData");
   }
 }
+/* ─── 统一时间轴（F07，/api/timeline?minutes=；轨道 A-E、缩放、下钻） ─── */
+let UTL_MINUTES = 60;
+let UTL_DATA = null; // 最近一次响应（点击下钻时取明细）
+function utlTimeStr(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+function utlDurStr(ms) {
+  const min = Math.round(ms / 60000);
+  if (min >= 60) return Math.floor(min / 60) + " h " + (min % 60) + " min";
+  if (min >= 1) return min + " min";
+  return Math.round(ms / 1000) + " s";
+}
+// 证据等级 → 底色（unknown 用纹理底：真实缺口不是零；inferred 斜纹标注推导）
+function utlBarBg(level) {
+  if (level === "unknown") return "repeating-linear-gradient(45deg,#565656 0 4px,#2c2c2c 4px 8px)";
+  if (level === "inferred") return "repeating-linear-gradient(45deg,#4b7a4b 0 6px,#3a5f3a 6px 12px)";
+  return "#3b6ea5"; // observed
+}
+// 纯渲染：区间 → 绝对定位色块（CSP 无内联 onclick，点击走 #utl-tracks 事件委托）
+function utlIntervalBlock(tr, ti, ii, win, lang) {
+  const iv = tr.intervals[ii];
+  const span = Math.max(1, win.end - win.start);
+  const left = Math.max(0, (iv.start_ms - win.start) / span * 100);
+  const right = Math.min(100, (iv.end_ms - win.start) / span * 100);
+  const w = Math.max(0.3, right - left);
+  const label = iv.app_name || (lang === "zh" ? "无应用信息" : "no app info");
+  const ev = iv.evidence_level || iv.quality || "unknown";
+  const tip = utlTimeStr(iv.start_ms) + " - " + utlTimeStr(iv.end_ms) + "  " + utlDurStr(iv.duration_ms) +
+    "  " + label + "  [" + ev + "]";
+  return '<div data-utl="' + ti + ":" + ii + '" title="' + esc(tip) + '" style="position:absolute;' +
+    'left:' + left + '%;width:' + w + '%;top:2px;bottom:2px;border-radius:2px;' +
+    'background:' + utlBarBg(ev) + ';cursor:pointer;border:1px solid rgba(255,255,255,.12)"></div>';
+}
+async function loadUnifiedTimeline() {
+  const el = document.getElementById("utl-tracks");
+  if (!el) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  try {
+    const d = await jget("/api/timeline?minutes=" + UTL_MINUTES);
+    UTL_DATA = d;
+    const win = { start: d.window_start_ms, end: d.window_end_ms };
+    const winEl = document.getElementById("utl-window");
+    if (winEl) winEl.textContent = utlTimeStr(win.start) + " - " + utlTimeStr(win.end) + " (" + utlDurStr(win.end - win.start) + ")";
+    const legend = d.legend || {};
+    const legendEl = document.getElementById("utl-legend");
+    if (legendEl) legendEl.textContent =
+      (lang === "zh" ? "图例：" : "Legend: ") +
+      "observed = " + (legend.observed || "") + "；inferred = " + (legend.inferred || "") + "；unknown = " + (legend.unknown || "");
+    let html = "";
+    const tracks = d.tracks || [];
+    for (let ti = 0; ti < tracks.length; ti++) {
+      const tr = tracks[ti];
+      const label = lang === "zh" ? tr.label_zh : tr.label_en;
+      const note = lang === "zh" ? tr.note_zh : tr.note_en;
+      const ivs = tr.intervals || [];
+      let barInner = "";
+      let barNote = "";
+      if (ivs.length === 0) {
+        barNote = tr.connected
+          ? (lang === "zh" ? "窗口内无区间" : "no intervals in window")
+          : (lang === "zh" ? "未接入" : "not connected");
+      } else {
+        for (let ii = 0; ii < ivs.length; ii++) barInner += utlIntervalBlock(tr, ti, ii, win, lang);
+      }
+      html += '<div style="display:flex;align-items:center;gap:8px;margin:6px 0">' +
+        '<div style="flex:0 0 130px;font-size:12px">' + esc(String(label)) +
+        (tr.connected ? "" : ' <span class="badge">未接入</span>') + "</div>" +
+        '<div style="position:relative;flex:1;height:20px;background:var(--bg);border:1px solid var(--border);border-radius:3px;min-width:0">' +
+        barInner +
+        (barNote ? '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;opacity:.7">' + esc(barNote) + "</div>" : "") +
+        "</div>" +
+        '<div class="muted" style="flex:0 0 130px;font-size:11px;opacity:.75">' + esc(String(note || "")) + "</div>" +
+        "</div>";
+    }
+    el.innerHTML = html;
+    document.getElementById("utl-detail").textContent = "";
+  } catch (e) {
+    el.textContent = t("noData");
+  }
+}
+function utlSyncZoomButtons() {
+  document.querySelectorAll(".utl-zoom-btn").forEach(b => {
+    const active = +b.dataset.utlMinutes === UTL_MINUTES;
+    b.style.fontWeight = active ? "700" : "400";
+    b.style.outline = active ? "1px solid var(--border)" : "none";
+  });
+}
+// 下钻：区间块点击 → 明细 + 证据等级（事件委托，CSP 无内联 onclick）
+function utlShowDetail(key) {
+  const el = document.getElementById("utl-detail");
+  if (!el || !UTL_DATA || !UTL_DATA.tracks) return;
+  const [ti, ii] = key.split(":").map(Number);
+  const tr = UTL_DATA.tracks[ti];
+  const iv = tr && tr.intervals ? tr.intervals[ii] : null;
+  if (!iv) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  const zh = lang === "zh";
+  const rows = [
+    [zh ? "轨道" : "Track", (lang === "zh" ? tr.label_zh : tr.label_en) + " (" + tr.id + ")"],
+    [zh ? "时间" : "time", utlTimeStr(iv.start_ms) + " - " + utlTimeStr(iv.end_ms)],
+    [zh ? "时长" : "duration", utlDurStr(iv.duration_ms)],
+    [zh ? "应用" : "app", iv.app_name || (zh ? "（无）" : "(none)")],
+    [zh ? "标题哈希" : "title hash", iv.title_hash || (zh ? "（无）" : "(none)")],
+    [zh ? "质量" : "quality", iv.quality || "-"],
+    [zh ? "证据等级" : "evidence level", iv.evidence_level || "-"],
+    [zh ? "来源" : "source", iv.source_id || "-"],
+  ];
+  el.textContent = rows.map(r => r[0] + ": " + r[1]).join("  |  ");
+}
 async function refreshView(name) {
   // 状态行任何视图都刷新（UX 走查 2026-10-12）：此前仅 overview 拉状态行，
   // 深链/F5 直进报告、应用、输入、洞察、异常页时标题下状态行滞留
@@ -2697,6 +2828,7 @@ async function refreshView(name) {
   else if (name === "sys") await Promise.all([loadStatus(), loadSysOverview()]);
   else if (name === "restop") await Promise.all([loadStatus(), loadResourceTop()]);
   else if (name === "diagtl") await Promise.all([loadStatus(), loadDiagTimeline()]);
+  else if (name === "unifiedtl") await Promise.all([loadStatus(), loadUnifiedTimeline()]);
   else if (name === "input") await Promise.all([loadStatus(), loadInput()]);
   else if (name === "anomalies") await Promise.all([loadStatus(), loadAnomalies()]);
   // settings 分支同样带状态行（审查修复：#39 漏了本分支——深链
@@ -2823,7 +2955,7 @@ function markDisconnected() {
   on("lang-btn", "click", () => toggleLang());
   [["tab-overview", "overview"], ["tab-report", "report"], ["tab-apps", "apps"],
    ["tab-input", "input"], ["tab-insights", "insights"], ["tab-sys", "sys"],
-   ["tab-restop", "restop"], ["tab-diagtl", "diagtl"], ["tab-anomalies", "anomalies"],
+   ["tab-restop", "restop"], ["tab-diagtl", "diagtl"], ["tab-unifiedtl", "unifiedtl"], ["tab-anomalies", "anomalies"],
    ["tab-settings", "settings"]].forEach(([id, v]) => on(id, "click", () => showView(v)));
   on("ops-toggle", "click", e => toggleOps(e));
   on("ops-h2", "click", () => toggleOps());
@@ -2840,6 +2972,18 @@ function markDisconnected() {
     document.getElementById("apps-date").value = todayStr();
     syncUrl();
     loadApps().catch(e => showViewError("apps", e.message));
+  });
+  // 统一时间轴：缩放按钮重取窗口；轨道区点击下钻区间明细（事件委托）
+  on("utl-zoom", "click", e => {
+    const b = e.target.closest("[data-utl-minutes]");
+    if (!b) return;
+    UTL_MINUTES = +b.dataset.utlMinutes;
+    utlSyncZoomButtons();
+    loadUnifiedTimeline().catch(err => showViewError("unifiedtl", err.message));
+  });
+  on("utl-tracks", "click", e => {
+    const block = e.target.closest("[data-utl]");
+    if (block) utlShowDetail(block.dataset.utl);
   });
   on("preset-essential", "click", () => applyPreset("essential"));
   on("preset-full", "click", () => applyPreset("full"));

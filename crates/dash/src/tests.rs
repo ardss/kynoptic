@@ -3266,3 +3266,192 @@ fn m43_dashboard_three_views_present() {
         assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
     }
 }
+
+// === 统一时间轴（/api/timeline?minutes=，F07，只读 activity_intervals） ===
+
+/// 与 core activity_intervals 单测同锚（2026-11-02T03:00:00Z），固定不读真实时钟。
+const UTL_BASE_MS: i64 = 1_792_977_600_000;
+
+fn utl_rfc(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .to_rfc3339()
+}
+
+fn utl_switch(conn: &Connection, off_secs: i64, app: &str, title: &str) {
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, app_name, window_title) \
+         VALUES (?1, 'window', 'switch', ?2, ?3)",
+        params![utl_rfc(UTL_BASE_MS + off_secs * 1000), app, title],
+    )
+    .unwrap();
+}
+
+fn utl_idle(conn: &Connection, off_secs: i64, action: &str) {
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action) VALUES (?1, 'system', ?2)",
+        params![utl_rfc(UTL_BASE_MS + off_secs * 1000), action],
+    )
+    .unwrap();
+}
+
+/// 轨道分组与区间聚合（_at 注入时钟）：A 轨吃下去重后的前台区间
+/// （同题重复只产一个区间），C 轨 = away；B 轨无 tab 数据源 → 整段 unknown
+/// + 未接入标注；D/E 留空。证据等级映射 observed/estimated→inferred。
+#[test]
+fn unified_timeline_groups_tracks_and_aggregates_intervals() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let conn = mem_conn();
+    // 0-3s 同题重复（A/T）→ 1 个区间；10-20s away；30s 切到 B/U（尾部断线收口）
+    utl_switch(&conn, 0, "appA.exe", "T");
+    utl_switch(&conn, 1, "appA.exe", "T");
+    utl_switch(&conn, 3, "appA.exe", "T");
+    utl_idle(&conn, 10, "idle_start");
+    utl_idle(&conn, 20, "idle_end");
+    utl_switch(&conn, 30, "appB.exe", "U");
+    let now = UTL_BASE_MS + 120_000;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+
+    let v = api_unified_timeline_at(&conn, 60, now).unwrap();
+    assert_eq!(v["endpoint"], json!("unified_timeline"));
+    assert_eq!(v["minutes"], json!(60));
+    assert_eq!(v["window_end_ms"], json!(now));
+    assert_eq!(v["window_start_ms"], json!(now - 60 * 60_000));
+
+    let tracks = v["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 5, "轨道 A-E");
+    for (i, id) in ["A", "B", "C", "D", "E"].iter().enumerate() {
+        assert_eq!(tracks[i]["id"], json!(id));
+    }
+    assert!(v["legend"]["unknown"].as_str().unwrap().contains("不是零"));
+
+    // A 轨：两个前台区间（appA [0,3s] observed；appB [30s,now] 断线收口 unknown）
+    let a = tracks[0]["intervals"].as_array().unwrap();
+    assert_eq!(
+        a.len(),
+        2,
+        "同题重复只产一个区间: {}",
+        tracks[0]["intervals"]
+    );
+    assert_eq!(a[0]["app_name"], json!("appA.exe"));
+    assert_eq!(a[0]["duration_ms"], json!(3_000));
+    assert_eq!(a[0]["quality"], json!("observed"));
+    assert_eq!(a[0]["evidence_level"], json!("observed"));
+    assert_eq!(a[1]["app_name"], json!("appB.exe"));
+    assert_eq!(a[1]["duration_ms"], json!(90_000)); // 30s → now(120s)
+    assert_eq!(a[1]["quality"], json!("unknown"));
+    assert_eq!(a[1]["evidence_level"], json!("unknown"));
+
+    // B 轨：无 tab 数据源 → 单条整窗 unknown + connected=false
+    let b = &tracks[1];
+    assert_eq!(b["connected"], json!(false));
+    assert!(b["note_zh"].as_str().unwrap().contains("未接入"));
+    let biv = b["intervals"].as_array().unwrap();
+    assert_eq!(biv.len(), 1);
+    assert_eq!(biv[0]["evidence_level"], json!("unknown"));
+    assert_eq!(biv[0]["duration_ms"], json!(60 * 60_000));
+
+    // C 轨：away [10,20s] observed
+    let c = tracks[2]["intervals"].as_array().unwrap();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["duration_ms"], json!(10_000));
+    assert_eq!(c[0]["quality"], json!("observed"));
+
+    // D/E：本阶段无数据源 → 留空 + 未接入（不隐藏）
+    for i in [3usize, 4] {
+        assert_eq!(tracks[i]["connected"], json!(false));
+        assert_eq!(tracks[i]["intervals"].as_array().unwrap().len(), 0);
+        assert!(!tracks[i]["note_en"].as_str().unwrap().is_empty());
+    }
+}
+
+/// 窗口过滤与裁剪：窗口外的区间整体排除，跨界区间裁到窗口边界。
+#[test]
+fn unified_timeline_window_filters_and_clamps() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let conn = mem_conn();
+    // 3600s（1 小时）前一个区间（同题两条 → [−3600,−3550] 50s）；
+    // 30s 前一个（尾部收口到 now → 30s）。中间不再插别的 switch：
+    // 单条 switch 无重复时是零时长点区间，端点不输出（区间口径，单点非区间）。
+    utl_switch(&conn, -3600, "old.exe", "O");
+    utl_switch(&conn, -3550, "old.exe", "O");
+    utl_switch(&conn, -30, "tail.exe", "L");
+    let now = UTL_BASE_MS;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+
+    let v = api_unified_timeline_at(&conn, 5, now).unwrap(); // 5 分钟窗
+    let a = v["tracks"].as_array().unwrap()[0]["intervals"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(a.len(), 1, "窗口外 old/new 区间必须整体排除: {a:?}");
+    assert_eq!(a[0]["app_name"], json!("tail.exe"));
+    assert_eq!(a[0]["start_ms"], json!(now - 30_000));
+    assert_eq!(a[0]["end_ms"], json!(now), "尾部收口裁到窗口终点");
+
+    // 大窗口（60 分钟）能看到 2 段（new.exe 是单点事件 → 零时长区间，
+    // 端点对 end<=start 的点区间不输出——区间口径，单点非区间）
+    let v60 = api_unified_timeline_at(&conn, 60, now).unwrap();
+    let a60 = v60["tracks"].as_array().unwrap()[0]["intervals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(a60.len(), 2);
+    // 跨窗口裁剪：old 段 [-3600,-3550] 起点裁到窗口边界（60min 窗起点恰含）
+    assert_eq!(a60[0]["start_ms"], json!(now - 3_600_000));
+    assert_eq!(a60[0]["duration_ms"], json!(50_000));
+}
+
+/// HTTP 层契约（路由注册 + 参数校验）：minutes= 空值/0/非数字 → 400；
+/// 超上限钳制 + minutes_requested/note 标注；缺省（无 minutes）走历史小时桶；
+/// 未知参数回显；tracks 结构齐全。
+#[test]
+fn unified_timeline_route_param_contract() {
+    let conn = mem_conn();
+    let db = tmpdir("utlroute").join("kyn.db");
+    // 参数校验：空 / 0 / 非数字 / 负数 一律 400
+    for q in ["minutes=", "minutes=0", "minutes=abc", "minutes=-1"] {
+        let (code, _, _) = route_req(&conn, "GET", &format!("/api/timeline?{q}"), "", &db);
+        assert_eq!(code, 400, "?{q} 必须 400");
+    }
+    // 超上限：钳到 1440 + 标注
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?minutes=9999", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["minutes"], json!(1440));
+    assert_eq!(v["minutes_requested"], json!(9999));
+    assert!(v["note"].as_str().unwrap().contains("1440"));
+    // 未知参数回显
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?minutes=30&foo=1", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ignored_params"], json!(["foo"]));
+    // 空库上 200（空轨道 + B 轨整段 unknown 兜底）
+    let tracks = v["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 5);
+    // 缺省（无 minutes）→ 既有小时桶端点行为不变（向后兼容）
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?hours=12", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["buckets"].is_array(), "无 minutes 时仍走小时桶口径");
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["buckets"].is_array());
+}
+
+/// dashboard 视图注册：页签 + 容器 + 缩放/图例/下钻挂点齐全。
+#[test]
+fn unified_timeline_view_registered_in_dashboard() {
+    for id in [
+        "tab-unifiedtl",
+        "view-unifiedtl",
+        "utl-zoom",
+        "utl-legend",
+        "utl-tracks",
+        "utl-detail",
+        "loadUnifiedTimeline",
+        "utlShowDetail",
+    ] {
+        assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
+    }
+}
