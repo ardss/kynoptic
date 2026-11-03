@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::constants;
 
+pub mod activity_intervals;
 pub mod agg;
 pub mod events;
 pub mod metadata;

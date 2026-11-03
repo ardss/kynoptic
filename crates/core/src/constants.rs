@@ -50,8 +50,9 @@ pub const DB_FILENAME: &str = "kynoptic.db";
 /// 读连接池耗尽时最多等待的周期数（每周期 5s）。
 /// 超过则降级为新建临时连接，避免调用方无限阻塞。
 pub const READER_POOL_MAX_WAITS: u32 = 3;
-/// 0011（0.4.0 F1）：actor 证据缓存 agg_minute_actor。
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+/// 0014（PRD v1.0 Stage 1）：统一事件结构（events 加列 source_id/device_id/quality）
+/// + activity_intervals 派生区间表。
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段

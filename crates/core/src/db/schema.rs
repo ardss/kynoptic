@@ -10,6 +10,8 @@
 //! - 0010：device_snapshot「最新含字段快照」部分索引（api_input / overview 硬件卡）
 //! - 0011：actor 证据缓存 agg_minute_actor（0.4.0 F1——只存分钟级输入证据计数，
 //!   actor/channel/E_f 标签在查询层计算，见 queries/actor.rs）
+//! - 0014：统一事件结构（events 加列 source_id/device_id/quality，存量回填）
+//!   + activity_intervals 派生区间表（rebuild 见 db/activity_intervals.rs）
 //!
 //! PRAGMA 只在 [`apply_pragmas`] 出现一次。
 
@@ -67,6 +69,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0013_self_metric_minute",
         include_str!("migrations/0013_self_metric_minute.sql"),
+    ),
+    (
+        "0014_unified_event_and_intervals",
+        include_str!("migrations/0014_unified_event_and_intervals.sql"),
     ),
 ];
 
