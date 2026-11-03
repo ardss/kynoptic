@@ -1,0 +1,9 @@
+{
+  "name": "kynoptic_browser_host",
+  "description": "Kynoptic browser native messaging host: receives .tab_change events from the extension and writes them into the kynoptic events table.",
+  "path": "C:\\PATH\\TO\\kynoptic-browser-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://EXTENSION_ID_PLACEHOLDER/"
+  ]
+}
