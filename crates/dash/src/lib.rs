@@ -17,6 +17,8 @@
 //! - `/`                             内嵌双语单页（Overview/Activity/Anomalies/Settings）
 //! - `/api/summary?date=`            当日 active_minutes / keys / clicks / top_app
 //! - `/api/timeline?hours=`          近 N 小时按本地小时桶的应用分布（top5 + other）
+//! - `/api/timeline?minutes=`        统一时间轴（PRD v1.0 F07）：只读
+//!   activity_intervals 派生表，按轨道 A-E 分组返回区间 + 证据等级
 //! - `/api/anomalies?days=`          与 MCP `get_anomalies` 同一异常检测
 //!   （marathon 桥接阈值读 settings 的 presence_bridge_minutes）
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
@@ -529,6 +531,166 @@ fn anomaly_message_en(kind: &str, message: &str, at: Option<&str>) -> String {
         }
         other => format!("Anomaly detected: {other}"),
     }
+}
+
+/// GET /api/timeline?minutes= — 统一时间轴（PRD v1.0 F07，Stage 1）。只读
+/// activity_intervals 派生表（stage0-audit §5 决策 4：UI/CLI/MCP 三端只读
+/// 派生表保证数值一致；本端点不写、不重建，重建由 collector 侧
+/// rebuild_activity_intervals 负责），按轨道 A-E 分组返回区间：
+/// - A 前台窗口（foreground_dwell）；
+/// - B 浏览器 tab（tab_foreground_dwell）：Stage 2 F02 扩展接入前无数据源，
+///   整段合成一条 unknown 区间并标注「未接入」（不隐藏）；
+/// - C 在场/离场（away 区间）；
+/// - D AI 活动 / E 网络遥测：本阶段无数据源，intervals 留空 + 「未接入」。
+///
+/// 证据等级按 PRD §2.3 词表：quality=observed → observed（原始事件直证）；
+/// estimated → inferred（推导，如与 away 相交）；unknown → unknown（无证据
+/// 缺口，不是零）。区间裁剪到 [now − minutes, now] 窗口，`now_ms` 注入
+/// （_at 变体，测试零真实时钟依赖，先例 api_status_at / api_timeline_at）。
+/// 与既有 `?hours=` 小时桶端点共用 /api/timeline 路由：请求带 `minutes`
+/// 参数即走本端点，两套口径互不掺和（HTTP 层见 route_req）。
+pub fn api_unified_timeline_at(
+    conn: &Connection,
+    minutes: u32,
+    now_ms: i64,
+) -> rusqlite::Result<Value> {
+    let minutes = minutes.clamp(1, 1440);
+    let window_start_ms = now_ms - i64::from(minutes) * 60_000;
+    // activity_intervals 的时间戳统一由 core 侧 to_rfc3339() 写入
+    // （+00:00 后缀、无亚秒），字典序比较与时间序一致，窗口过滤安全。
+    let fmt_ms = |ms: i64| -> String {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+            .to_rfc3339()
+    };
+    let parse_ms = |ts: &str| -> i64 {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0)
+    };
+    // quality → 证据等级（PRD §2.3：observed / inferred / unknown 三级词表）
+    let evidence_level = |quality: &str| -> &'static str {
+        match quality {
+            "observed" | "confirmed" => "observed",
+            "estimated" | "inferred" => "inferred",
+            _ => "unknown",
+        }
+    };
+    let mut stmt = conn.prepare(
+        "SELECT interval_kind, start_ts, end_ts, app_name, title_hash, quality, source_id \
+         FROM activity_intervals \
+         WHERE end_ts >= ?1 AND start_ts <= ?2 \
+         ORDER BY interval_kind, start_ts",
+    )?;
+    let rows = stmt.query_map(params![fmt_ms(window_start_ms), fmt_ms(now_ms)], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    let mut track_a: Vec<Value> = Vec::new();
+    let mut track_b: Vec<Value> = Vec::new();
+    let mut track_c: Vec<Value> = Vec::new();
+    for row in rows {
+        let (kind, start_ts, end_ts, app, title_hash, quality, source_id) = row?;
+        let start = parse_ms(&start_ts).max(window_start_ms);
+        let end = parse_ms(&end_ts).min(now_ms);
+        if end <= start {
+            continue; // 完全在窗口外的裁剪残留（理论不可达，防御）
+        }
+        let iv = json!({
+            "start_ms": start,
+            "end_ms": end,
+            "start_ts": fmt_ms(start),
+            "end_ts": fmt_ms(end),
+            "duration_ms": end - start,
+            "app_name": app,
+            "title_hash": title_hash,
+            "quality": quality,
+            "evidence_level": evidence_level(&quality),
+            "source_id": source_id,
+        });
+        match kind.as_str() {
+            kynoptic_core::db::activity_intervals::KIND_FOREGROUND_DWELL => track_a.push(iv),
+            kynoptic_core::db::activity_intervals::KIND_TAB_FOREGROUND_DWELL => track_b.push(iv),
+            kynoptic_core::db::activity_intervals::KIND_AWAY => track_c.push(iv),
+            _ => {}
+        }
+    }
+    // B 轨无数据源：整段 unknown（真实缺口，不是隐藏，也不标 0）
+    if track_b.is_empty() {
+        track_b.push(json!({
+            "start_ms": window_start_ms,
+            "end_ms": now_ms,
+            "start_ts": fmt_ms(window_start_ms),
+            "end_ts": fmt_ms(now_ms),
+            "duration_ms": now_ms - window_start_ms,
+            "app_name": Value::Null,
+            "title_hash": Value::Null,
+            "quality": "unknown",
+            "evidence_level": "unknown",
+            "source_id": Value::Null,
+        }));
+    }
+    let track = |id: &str,
+                 label_en: &str,
+                 label_zh: &str,
+                 kind: Value,
+                 connected: bool,
+                 note_en: Value,
+                 note_zh: Value,
+                 intervals: Vec<Value>| {
+        json!({
+            "id": id,
+            "label_en": label_en,
+            "label_zh": label_zh,
+            "interval_kind": kind,
+            "connected": connected,
+            "note_en": note_en,
+            "note_zh": note_zh,
+            "intervals": intervals,
+        })
+    };
+    Ok(json!({
+        "endpoint": "unified_timeline",
+        "minutes": minutes,
+        "window_start_ms": window_start_ms,
+        "window_end_ms": now_ms,
+        "window_start": fmt_ms(window_start_ms),
+        "window_end": fmt_ms(now_ms),
+        "legend": {
+            "observed": "原始事件直证 / directly evidenced by raw events",
+            "inferred": "推导（如与离场区间相交）/ inferred (e.g. overlapped away)",
+            "unknown": "无证据缺口，不是零 / real gap, not zero",
+        },
+        "tracks": [
+            track("A", "Foreground windows", "前台窗口",
+                json!(kynoptic_core::db::activity_intervals::KIND_FOREGROUND_DWELL),
+                true, Value::Null, Value::Null, track_a),
+            track("B", "Browser tabs", "浏览器 Tab",
+                json!(kynoptic_core::db::activity_intervals::KIND_TAB_FOREGROUND_DWELL),
+                false,
+                json!("Not connected yet — whole track unknown until Stage 2 extension (F02)"),
+                json!("未接入——Stage 2 浏览器扩展（F02）接入前整段 unknown"),
+                track_b),
+            track("C", "Presence / away", "在场 / 离场",
+                json!(kynoptic_core::db::activity_intervals::KIND_AWAY),
+                true, Value::Null, Value::Null, track_c),
+            track("D", "AI activity", "AI 活动", Value::Null, false,
+                json!("No data source in this stage"),
+                json!("本阶段无数据源，未接入"),
+                Vec::<Value>::new()),
+            track("E", "Network / telemetry", "网络 / 遥测", Value::Null, false,
+                json!("No data source in this stage"),
+                json!("本阶段无数据源，未接入"),
+                Vec::<Value>::new()),
+        ],
+    }))
 }
 
 /// GET /api/anomalies?days= — 与 MCP get_anomalies 同一检测入口（days 须 >= 1，
@@ -3226,6 +3388,31 @@ pub fn route_req(
             }
         }
         ("GET", "/api/timeline") => {
+            // 分流：带 `minutes` 参数 → 统一时间轴（F07，只读
+            // activity_intervals 派生表，轨道 A-E）；不带 → 历史小时桶
+            // （?hours=，本 arm 其余部分）。两套口径共用路由但互不掺和。
+            if first_val("minutes").is_some() {
+                let minutes_req = match qnum("minutes", 1, 1440) {
+                    Err(e) => return (400, "application/json", err_json(&e)),
+                    Ok(None) => 60, // 不可达：minutes 已确认在场
+                    Ok(Some(m)) => m,
+                };
+                // 纯函数 api_unified_timeline_at（tests.rs 直调）不受缓存影响；
+                // 窗口小（<= 1440 分钟）、只扫派生表，无需 TTL 缓存。
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                match api_unified_timeline_at(conn, minutes_req.min(1440), now_ms) {
+                    Ok(mut v) => {
+                        if minutes_req > 1440 {
+                            if let Some(obj) = v.as_object_mut() {
+                                cap_note(obj, "minutes", minutes_req, 1440);
+                            }
+                        }
+                        add_ignored(&mut v, ignored_params(&["minutes"]));
+                        (200, "application/json", v.to_string())
+                    }
+                    Err(e) => (400, "application/json", err_json(&e.to_string())),
+                }
+            } else {
             // hours 超 744 → 钳制 + 响应标注 hours_requested（不再无声）
             let hours_req = match qnum("hours", 1, 744) {
                 Err(e) => return (400, "application/json", err_json(&e)),
@@ -3296,6 +3483,7 @@ pub fn route_req(
                     (200, "application/json", v.to_string())
                 }
                 Err(e) => (400, "application/json", err_json(&e)),
+            }
             }
         }
         ("GET", "/api/anomalies") => {
