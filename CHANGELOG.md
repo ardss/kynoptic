@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- browser-extension/ 骨架（PRD v1.0 F02，Stage 1）：MV3 事件驱动 Chromium 扩展
+  （tabs.onActivated/onUpdated，无轮询无 content script，权限 activeTab/tabs/idle），
+  tab 事件经 chrome.runtime.sendNativeMessage 以 .tab_change 上报，host 不可达时
+  chrome.storage.local 缓冲（上限 500 条）按序重发；native-messaging/ 含 host
+  清单模板（allowed_origins 占位）与 Rust host 实现说明（走现有 db 写入路径写
+  events 表；本期只交付文档，不写 Rust 代码）。
+- 统一事件结构（0014 迁移，PRD v1.0 Stage 1）：events 表加列 source_id /
+  device_id / quality，存量行回填 source_id='windows'、quality='observed'
+  （append-only，不删不重排；不建第二真相表）。CURRENT_SCHEMA_VERSION 13→14。
+- activity_intervals 派生区间表（可由 events 全量重建，不进真相链）：
+  interval_kind（foreground_dwell / tab_foreground_dwell（Stage 2 预留）/ away）、
+  start_ts / end_ts / app_name / title_hash / quality / source_id，及
+  rebuild_activity_intervals_at(conn, now) 重建函数。口径（stage0-audit §2/§4）：
+  连续同 (app,title) 事件只刷新不产生新区间（修复重复事件多算时长）；与
+  away（idle_start/idle_end 对）求交标 estimated；尾部断线按重建时刻收口标
+  unknown（unknown 是真实缺口，不静默归 0）。单测全部 `_at` 注入时钟，
+  fixture 按 sample-30min.json 真实模式（同题重复、整点刷新、idle 交集、
+  断线收口）构造。
+- 统一时间轴端点 `GET /api/timeline?minutes=`（PRD v1.0 F07，Stage 1）：
+  只读 activity_intervals 派生表（默认 60、上限 1440 分钟，超限钳制并标注
+  minutes_requested），按轨道 A-E 分组返回区间——A 前台窗口、C 在场/away
+  为真实数据；B 浏览器 tab 无数据源时整段 unknown 并标注「未接入」；
+  D AI 活动 / E 网络遥测本阶段留空 + 「未接入」。每条区间含 quality 与
+  证据等级（PRD §2.3 词表：observed / inferred / unknown，unknown 不是零）。
+  与既有 `?hours=` 小时桶端点共用路由、按参数分流，向后兼容。dashboard
+  新增「统一时间轴」视图：横向分轨渲染、unknown 纹理底、30 分钟-24 小时
+  缩放、点击区间下钻明细与证据等级。测试 4 个（轨道分组聚合、窗口过滤
+  裁剪、路由参数契约、视图注册），全部 `_at` 注入时钟。
+
 ## [0.8.1] - 2026-11-02
 
 深度并行审查（测试卫生/代码规范/API 文档一致性/DB 运维面四路）产出的标准化迭代；

@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Kynoptic Tab Tracker",
+  "version": "0.1.0",
+  "description": "Event-driven tab change reporting for Kynoptic timeline. No page polling; reports on tab activation/update only.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "idle"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [],
+  "minimum_chrome_version": "110"
+}
