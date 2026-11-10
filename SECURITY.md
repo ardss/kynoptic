@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---|---|
-| 0.8.x | Yes |
+| 0.9.x | Yes |
 
-Kynoptic is pre-1.0; only the latest 0.8.x release receives security
+Kynoptic is pre-1.0; only the latest 0.9.x release receives security
 fixes. Please update to the latest version before reporting.
 
 ## Outbound network & offline operation
