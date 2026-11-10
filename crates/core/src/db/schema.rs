@@ -100,6 +100,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0019_browser_event_unique_idx",
         include_str!("migrations/0019_browser_event_unique_idx.sql"),
     ),
+    (
+        "0020_intervals_project_device_selfheal",
+        include_str!("migrations/0020_intervals_project_device_selfheal.sql"),
+    ),
 ];
 
 /// 0001 的内容单独导出：供 CLI 等外部工具对裸库做幂等初始化。
@@ -190,6 +194,37 @@ fn sync_user_version(conn: &Connection, version: i64) {
     let _ = conn.execute_batch(&format!("PRAGMA user_version = {version};"));
 }
 
+/// 0020 自愈：activity_intervals 缺 project / device_id 列时条件补上
+/// （DU/A 双机残局，见 0020 SQL 文件头注释）。列已存在（全新 0.9.0 链）
+/// 就跳过 ALTER，幂等。
+fn apply_0020_intervals_selfheal(conn: &Connection) -> rusqlite::Result<()> {
+    let mut added = 0usize;
+    for col in ["project", "device_id"] {
+        let mut hit = false;
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(activity_intervals)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                let name: String = r.get(1)?;
+                if name == col {
+                    hit = true;
+                }
+            }
+        }
+        if !hit {
+            conn.execute_batch(&format!(
+                "ALTER TABLE activity_intervals ADD COLUMN {col} TEXT;"
+            ))?;
+            added += 1;
+            log::info!("0020 自愈：activity_intervals 补列 {col}");
+        }
+    }
+    if added == 0 {
+        log::info!("0020 自愈：两列均已存在，仅补记版本号（幂等）");
+    }
+    Ok(())
+}
+
 /// 审查 HIGH：0007 是唯一非 IF NOT EXISTS 迁移（裸 ALTER ADD COLUMN）。
 /// 非事务老二进制可能"加列成功但没写 schema_version"（断电），重启重放
 /// 即 duplicate column 且无自愈路径。列已存在时跳过 ALTER、只补记版本号。
@@ -236,11 +271,17 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         // 侧「缺则建空壳 + 无条件 RENAME」在 legacy_pet_signals 已在场的任何
         // 半应用残局下重放必撞名硬失败，库永久打不开。
         let is_0002 = *name == "0002_bucket_model";
+        let is_0020 = *name == "0020_intervals_project_device_selfheal";
         let sql_effective: String = if is_0002 {
             match sql.find("-- pet 遗留表改名保留") {
                 Some(i) => format!("-- {name}: pet 段改由 Rust 侧条件执行\n{}", &sql[..i]),
                 None => (*sql).to_string(),
             }
+        } else if is_0020 {
+            // DU/A 残局自愈（2026-11-11 真机实证）：同名不同物的开发期迁移把
+            // 版本号顶过后，正式 0015/0016 被跳过，activity_intervals 缺
+            // project / device_id。条件加列在 Rust 侧执行（见下方 helper）。
+            format!("-- {name}: 条件加列由 Rust 侧 apply_0020_intervals_selfheal 执行")
         } else if *name == "0007_agg_minute_max_rowid" && agg_minute_has_max_event_rowid(conn) {
             log::warn!(
                 "0007 自愈：agg_minute.max_event_rowid 已存在（半应用），跳过 ALTER 只补记版本号"
@@ -255,6 +296,8 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             .and_then(|_| {
                 if is_0002 {
                     apply_0002_pet_tables(conn)
+                } else if is_0020 {
+                    apply_0020_intervals_selfheal(conn)
                 } else {
                     Ok(())
                 }

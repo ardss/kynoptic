@@ -1,0 +1,21 @@
+-- 0020: activity_intervals project/device_id 半应用自愈（DU/A 双机真机残局，2026-11-11）
+--
+-- 根因（真机实证，tray.log 2026-11-07 vs 2026-11-11）：工作流开发期的中间态
+-- 二进制曾在真机库上跑过一套【同名不同物】的 0015-0017（window_daily_cover /
+-- report_timestamp_guard / browser_event_identity），把 schema_version 顶到 17。
+-- 正式 0.9.0 链的 0015_intervals_project / 0016_intervals_device 到真机上因
+-- applied >= version 被跳过 → activity_intervals 缺 project / device_id 列，
+-- 派生表重建与 /api/timeline、/api/reports 全部报 no such column: project。
+--
+-- 本迁移按 0007/0002 的自愈先例做【条件加列】：列已存在（正常 0.9.0 全新链）
+-- 就跳过 ALTER 只补版本号；列缺失（DU/A 残局）就补上。ALTER 只加列不删行，
+-- append-only 铁律不受影响。实际条件逻辑在 Rust 侧 apply_0020_intervals_selfheal
+-- （SQLite 无 ADD COLUMN IF NOT EXISTS），SQL 文件留档并防 schema.rs 漏注册。
+--
+-- 开发期残留的同名异构索引（idx_events_window_cover / idx_events_non_utc_timestamp
+-- / ux_events_browser_identity 等）只加索引不落数据，语义兼容正式链，保留不删。
+-- 0019 的两个部分唯一索引在残局机上已由本日 0.9.0 应用到位（tray.log v19）。
+
+-- 条件加列由 Rust 侧执行（SQLite 无 ADD COLUMN IF NOT EXISTS）：
+-- ALTER TABLE activity_intervals ADD COLUMN project TEXT;   -- 缺则补
+-- ALTER TABLE activity_intervals ADD COLUMN device_id TEXT; -- 缺则补

@@ -66,7 +66,7 @@ pub const READER_POOL_MAX_WAITS: u32 = 3;
 /// 0019（复审 2026-11-11）：browser-host 事件去重键（$.event_id /
 /// $.event_data.session_id）表达式部分唯一索引——并发重发幂等下沉到
 /// 约束层，摄取改 INSERT OR IGNORE 单步写入。
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段

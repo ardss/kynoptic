@@ -170,3 +170,63 @@ fn failed_migration_transaction_rolls_back_and_keeps_version() {
         kynoptic_core::constants::CURRENT_SCHEMA_VERSION
     );
 }
+
+/// DU/A 真机残局复现（2026-11-11 真机实证）：开发期同名不同物的迁移把版本
+/// 顶到 v17 后，正式 0015/0016 被跳过，activity_intervals 缺 project/device_id。
+/// 0020 自愈必须把这种库收敛到完整形状；全新链上则幂等只补版本号。
+#[test]
+fn selfheal_0020_converges_pre_bumped_residue_db() {
+    let files = migration_files();
+    // 1) 残局构造：正常应用 0001..0014（v14），随后人为把版本顶到 17，
+    //    制造“0015-0017 被跳过”的残局（与 DU/A 真机一致）。
+    let conn = upgraded_to(&files, 14);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('schema_version', '17')
+         ON CONFLICT(key) DO UPDATE SET value = '17'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(version_of(&conn), 17, "前置：残局版本应为 17");
+    let has = |col: &str| -> bool {
+        let mut st = conn
+            .prepare("PRAGMA table_info(activity_intervals)")
+            .unwrap();
+        let mut hit = false;
+        let mut rows = st.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let name: String = r.get(1).unwrap();
+            if name == col {
+                hit = true;
+            }
+        }
+        hit
+    };
+    assert!(!has("project") && !has("device_id"), "前置：残局应缺两列");
+
+    kynoptic_core::db::run_migrations(&conn).expect("残局库应经 0020 自愈完成迁移");
+    assert_eq!(
+        version_of(&conn),
+        kynoptic_core::constants::CURRENT_SCHEMA_VERSION,
+        "残局收敛后应到最终版本"
+    );
+    assert!(has("project"), "自愈后应有 project 列");
+    assert!(has("device_id"), "自愈后应有 device_id 列");
+
+    // 2) 幂等：再跑一次迁移链不报错、不重复加列。
+    kynoptic_core::db::run_migrations(&conn).expect("幂等重放应成功");
+    assert!(has("project") && has("device_id"));
+
+    // 3) 全新链（v1 → 全部迁移）终点也应具备两列（0020 幂等跳过路径）。
+    let fresh = v1_conn();
+    kynoptic_core::db::run_migrations(&fresh).expect("全新链应完成");
+    let mut st = fresh
+        .prepare("PRAGMA table_info(activity_intervals)")
+        .unwrap();
+    let mut cols = Vec::new();
+    let mut rows = st.query([]).unwrap();
+    while let Some(r) = rows.next().unwrap() {
+        cols.push(r.get::<_, String>(1).unwrap());
+    }
+    assert!(cols.contains(&"project".to_string()));
+    assert!(cols.contains(&"device_id".to_string()));
+}

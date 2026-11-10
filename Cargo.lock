@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-browser-host"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "env_logger",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-dash"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-mcp"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "kynoptic-tray"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "kynoptic-core",
