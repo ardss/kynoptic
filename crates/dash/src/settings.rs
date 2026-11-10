@@ -146,6 +146,38 @@ fn clamp_categories(categories: &mut [CategoryRule]) {
     }
 }
 
+/// F11 多设备远端端点（opt-in，默认空列表 = 多设备合流关闭）：一台远端
+/// 设备 = 另一台机器上运行的本产品 dashboard（`http://127.0.0.1:8422` 经
+/// SSH 隧道时指向本地转发端口）。dashboard `GET /api/timeline?merge=1`
+/// 逐个拉取远端 `/api/timeline?minutes=…` 合流展示；远端 token 非空时以
+/// `X-Kynoptic-Access-Token` 头携带（对端开启 dashboard-token.txt 时鉴权）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEndpoint {
+    pub name: String,
+    pub url: String,
+    /// 可选访问令牌（空串 = 对端无 token 鉴权）。落盘 settings.json，与
+    /// dashboard-token.txt 的可选门槛一致。
+    #[serde(default)]
+    pub token: String,
+}
+
+/// 加载后的钳制：device_endpoints 条数 ≤ MAX_CATEGORIES、单字段字符级截断
+/// （手改文件兜底；POST 通道在 api_settings_post 校验）。
+fn clamp_device_endpoints(endpoints: &mut [DeviceEndpoint]) {
+    for e in endpoints.iter_mut() {
+        for (field, label) in [
+            (&mut e.name, "name"),
+            (&mut e.url, "url"),
+            (&mut e.token, "token"),
+        ] {
+            if field.chars().count() > MAX_PATTERN_CHARS {
+                log::warn!("device_endpoints[].{label} 超过 {MAX_PATTERN_CHARS} 字符，已截断");
+                *field = field.chars().take(MAX_PATTERN_CHARS).collect();
+            }
+        }
+    }
+}
+
 /// 应用设置文件内容。缺省值见 [`AppSettings::default`]。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -193,11 +225,28 @@ pub struct AppSettings {
     /// collector 启动时调 title_privacy::set_redact_titles。
     #[serde(default)]
     pub redact_titles: bool,
+    /// 整标题脱敏（F10 隐私加固，默认关，隐私 opt-in）：true = 新写入的
+    /// window/tab_change 标题一律替换为 `[redacted]`（比 redact_titles 的
+    /// URL 查询串剥离更强一档）。只拦新写入，不清洗历史数据。
+    /// 接线路径与 redact_titles 同款：tray / CLI 映射 CollectorSettings →
+    /// collector 启动时调 title_privacy::set_redact_full。
+    #[serde(default)]
+    pub redact_titles_full: bool,
     /// ETW 内核网络采集（0.8.1 A2，默认关，隐私/资源 opt-in）：开启后采集
     /// 进程启动 KynopticNetMon 会话记录按进程网络字节量（不存内容/地址）。
     /// 需管理员权限，无权限时会话启动失败并留档。
     #[serde(default)]
     pub net_etw_enabled: bool,
+    /// F06 项目归属规则（路径前缀/标题关键词 → 项目名）。opt-in：默认空
+    /// 列表 = 不打标。匹配顺序即优先级，rebuild activity_intervals 时消费
+    /// （区间 project 字段，证据 inferred）。见 core
+    /// db::activity_intervals::ProjectRule。
+    #[serde(default)]
+    pub project_rules: Vec<kynoptic_core::db::activity_intervals::ProjectRule>,
+    /// F11 多设备远端端点（opt-in，默认空 = 单机模式）：远端 dashboard 地址
+    /// 清单，timeline merge 时逐个拉取（失败降级 offline 标注，不阻塞本机）。
+    #[serde(default)]
+    pub device_endpoints: Vec<DeviceEndpoint>,
 }
 
 fn default_update_check() -> bool {
@@ -245,7 +294,10 @@ impl Default for AppSettings {
             update_check: true,
             low_power: false,
             redact_titles: false,
+            redact_titles_full: false,
             net_etw_enabled: false,
+            project_rules: Vec::new(),
+            device_endpoints: Vec::new(),
         }
     }
 }
@@ -277,6 +329,30 @@ pub fn try_load(db_path: &Path) -> Option<AppSettings> {
     for r in &mut s.categories {
         r.recompile();
     }
+    // project_rules 同族钳制：条数 ≤ MAX_CATEGORIES、单字段字符级截断到
+    // MAX_PATTERN_CHARS（手改文件兜底；POST 通道在 api_settings_post 校验）
+    if s.project_rules.len() > MAX_CATEGORIES {
+        log::warn!("project_rules 条数超过 {MAX_CATEGORIES}，已截断");
+        s.project_rules.truncate(MAX_CATEGORIES);
+    }
+    for r in &mut s.project_rules {
+        for (field, label) in [
+            (&mut r.name, "name"),
+            (&mut r.path_prefix, "path_prefix"),
+            (&mut r.title_keywords, "title_keywords"),
+        ] {
+            if field.chars().count() > MAX_PATTERN_CHARS {
+                log::warn!("project_rules[].{label} 超过 {MAX_PATTERN_CHARS} 字符，已截断");
+                *field = field.chars().take(MAX_PATTERN_CHARS).collect();
+            }
+        }
+    }
+    // F11 device_endpoints 同族钳制：条数 ≤ MAX_CATEGORIES、字段级截断
+    if s.device_endpoints.len() > MAX_CATEGORIES {
+        log::warn!("device_endpoints 条数超过 {MAX_CATEGORIES}，已截断");
+        s.device_endpoints.truncate(MAX_CATEGORIES);
+    }
+    clamp_device_endpoints(&mut s.device_endpoints);
     Some(s)
 }
 
@@ -557,5 +633,56 @@ mod tests {
             Some("nope".into())
         );
         assert_eq!(first_invalid_id(&[]), None);
+    }
+
+    /// F06：project_rules 默认空（opt-in），落盘/读回 roundtrip；部分 JSON
+    /// 缺该字段回退空列表（不报错）。
+    #[test]
+    fn project_rules_default_empty_and_roundtrip() {
+        use kynoptic_core::db::activity_intervals::ProjectRule;
+        assert!(
+            AppSettings::default().project_rules.is_empty(),
+            "opt-in：默认空"
+        );
+        let dir = tmpdir("projrules");
+        let db = dir.join("kyn.db");
+        let s = AppSettings {
+            project_rules: vec![ProjectRule {
+                name: "alpha".into(),
+                path_prefix: "k:/proj/alpha".into(),
+                title_keywords: "sample-project".into(),
+            }],
+            ..AppSettings::default()
+        };
+        save(&db, &s).unwrap();
+        assert_eq!(try_load(&db), Some(s));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F11：device_endpoints 默认空（opt-in），落盘/读回 roundtrip；部分
+    /// JSON 缺该字段回退空列表（不报错）。
+    #[test]
+    fn device_endpoints_default_empty_and_roundtrip() {
+        use DeviceEndpoint;
+        assert!(
+            AppSettings::default().device_endpoints.is_empty(),
+            "opt-in：默认空"
+        );
+        let dir = tmpdir("devendpoints");
+        let db = dir.join("kyn.db");
+        let s = AppSettings {
+            device_endpoints: vec![DeviceEndpoint {
+                name: "workstation-b".into(),
+                url: "http://127.0.0.1:18422".into(),
+                token: "sample-token".into(),
+            }],
+            ..AppSettings::default()
+        };
+        save(&db, &s).unwrap();
+        assert_eq!(try_load(&db), Some(s));
+        // 缺字段的部分 JSON：回退空列表
+        std::fs::write(settings_path(&db), r#"{"autostart": false}"#).unwrap();
+        assert!(load(&db).device_endpoints.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

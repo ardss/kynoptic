@@ -79,8 +79,9 @@ target\release\kynoptic.exe dashboard          # 仅本机可访问的网页面�
 
 ### 让 AI 助手使用它（MCP）
 
-内置 MCP server（stdio JSON-RPC），提供六个工具：`get_current_status`、
-`get_summary`、`get_timeline`、`get_top_apps`、`get_anomalies`、`wait_for`。接入你的 MCP 客户端：
+内置 MCP server（stdio JSON-RPC），提供九个工具：`get_current_status`、
+`get_summary`、`get_timeline`、`get_top_apps`、`get_topics`、`get_anomalies`、`wait_for`、
+`get_unified_timeline`、`get_reports`。接入你的 MCP 客户端：
 
 ```json
 {

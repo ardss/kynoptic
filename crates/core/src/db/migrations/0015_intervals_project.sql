@@ -1,0 +1,12 @@
+-- 0015: activity_intervals 加 project 列（PRD v1.0 F06 项目归属，Stage 3）
+--
+-- F06：settings.json 的 project_rules（路径前缀/标题关键词 → 项目名，
+-- opt-in 默认空）在 rebuild_activity_intervals_at 推导区间时按规则给区间
+-- 打 project 字段。project 是**推导标注**（从窗口标题匹配规则得出，证据
+-- 等级 = inferred），不改变区间 quality 本身；未命中规则的区间 project 为
+-- NULL（无归属证据，不猜）。
+--
+-- 派生表可全量重建（不进真相链）：加列 + 重建即生效，无数据回填——旧行
+-- 由下次 rebuild 带上 project。append-only 铁律不受影响（本表是派生缓存，
+-- 且只加列不删行）。
+ALTER TABLE activity_intervals ADD COLUMN project TEXT;

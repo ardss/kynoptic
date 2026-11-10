@@ -789,6 +789,12 @@ fn main() {
                         // 每次启动都读 settings.json（dashboard 保存即写此处），
                         // 使"设置页勾选 = 实际采集集"单一事实源；--all 仍可覆盖。
                         let app_settings = kynoptic_dash::settings::load(&owner_db);
+                        // 独立复审 2026-11-03 接线：collector 重建派生表用的
+                        // project_rules 快照随每次采集器（重）启动刷新——
+                        // 规则保存后在下一重建窗口生效，不「落盘即死」。
+                        kynoptic_core::db::activity_intervals::set_current_project_rules(
+                            app_settings.project_rules.clone(),
+                        );
                         let enabled: std::collections::HashSet<String> = if owner_all {
                             kynoptic_core::registry::all_monitor_ids()
                                 .into_iter()
@@ -822,6 +828,10 @@ fn main() {
                             // 标题脱敏（隐私 opt-in，默认关）：settings.json →
                             // CollectorSettings → title_privacy::set_redact_titles
                             redact_titles: app_settings.redact_titles,
+                            // F10 整标题脱敏（隐私 opt-in，默认关）：
+                            // settings.json → CollectorSettings →
+                            // title_privacy::set_redact_full
+                            redact_titles_full: app_settings.redact_titles_full,
                             // ETW 增强模式（0.8.1 A2，默认关）：设置页开关 →
                             // CollectorSettings → collector spawn NetEtw 线程
                             net_etw_enabled: app_settings.net_etw_enabled,
@@ -1001,6 +1011,12 @@ fn main() {
             }
             if debounce.poll(now_ms) {
                 let st = kynoptic_dash::settings::load(&watch_db);
+                // 独立复审 2026-11-03 接线：settings.json 变化（含独立
+                // dashboard 进程的保存）同步 project_rules 快照，规则变更
+                // 不重启托盘也在下一重建窗口生效。
+                kynoptic_core::db::activity_intervals::set_current_project_rules(
+                    st.project_rules.clone(),
+                );
                 apply_autostart_if_changed(st.autostart, &mut last_applied_autostart);
                 log::info!("设置已变更（防抖合并后生效），自动重启采集器");
                 let _ = watch_tx.send(CollectorCmd::Start);

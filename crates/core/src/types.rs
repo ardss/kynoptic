@@ -17,6 +17,8 @@ pub enum EventType {
     Session,
     Device,
     Location,
+    // AI 会话（Stage 2 F05 AIActivityAdapter；ai_adapter.rs 扫描外部源写入）
+    AiSession,
 }
 
 impl EventType {
@@ -33,6 +35,7 @@ impl EventType {
             Self::Clipboard => "clipboard",
             Self::Network => "network",
             Self::Session => "session",
+            Self::AiSession => "ai_session",
             Self::Device => "device",
             Self::Location => "location",
         }
@@ -107,6 +110,8 @@ pub enum EventAction {
     ImeChange,
     // 输入聚合（opt-in minute 粒度：每分钟每桶一行计数型事件）
     InputAgg,
+    // AI 会话运行（Stage 2 F05：ai_adapter 摄入的事件动作）
+    AiRun,
     // 音频
     AudioInputChange,
     AudioOutput,
@@ -165,6 +170,7 @@ impl EventAction {
             Self::AudioInputChange => "audio_input_change",
             Self::AudioOutput => "audio_output",
             Self::InputAgg => "input_agg",
+            Self::AiRun => "ai_run",
         }
     }
 }

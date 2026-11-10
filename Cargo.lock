@@ -814,6 +814,7 @@ dependencies = [
  "csv",
  "ctrlc",
  "env_logger",
+ "kynoptic-browser-host",
  "kynoptic-core",
  "kynoptic-dash",
  "kynoptic-mcp",
@@ -825,6 +826,19 @@ dependencies = [
  "windows-sys 0.59.0",
  "winreg",
  "winresource",
+]
+
+[[package]]
+name = "kynoptic-browser-host"
+version = "0.8.1"
+dependencies = [
+ "chrono",
+ "env_logger",
+ "kynoptic-core",
+ "log",
+ "rusqlite",
+ "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

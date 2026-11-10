@@ -23,7 +23,7 @@ use std::process::ExitCode;
 
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OpenFlags};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use kynoptic_core::analyzer;
 use kynoptic_core::anomaly;
@@ -74,11 +74,24 @@ Subcommands:
   update [--check]                          Self-update from GitHub releases (--check: report only)
   watchdog [--db PATH] [--once]             Ensure tray is alive (for Task Scheduler)
   presence  [--days N]                      Daily presence/automation/foreground summary
+  timeline  [--minutes N] [--json]          Unified timeline (PRD F07; same source as /api/timeline?minutes=)
+  health    [--json]                        Collector health summary (PRD F09; same source as /api/health)
+  reports   [--days N] [--json]             Unified reports (PRD F08; same source as /api/reports)
+  project-overrides [--limit N] [--json]    Manual project assignments, read-only audit list
+                                            (PRD F06; newest first)
   apps      [--days N] [--actor user|agent|unattended|mixed|unknown|all] [--json]
                                              Per-app actor dwell estimate (0.4.0; estimated split)
   topics    [--days N] [--raw] [--json]     Topic aggregation from window titles (0.4.0; default redacted)
   recompute-actors [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run]
                                              Rebuild actor evidence cache (derived only; events untouched)
+  host-register [--ext ID]... [--host-exe PATH] [--manifest PATH]
+                                             Register the Chrome native messaging host (fill manifest + HKCU registry, no admin; PRD F02)
+  ext-event --source claude_code|zcode [--session ID]
+                                             AI hook 事件通道：stdin 读 JSON 直写 db（与
+                                             POST /api/ext/events 同一校验与幂等路径；PRD F05）
+  ai-hooks render [--target claude_code|zcode|all]
+                                             输出 AI 工具 hooks 配置片段（命令指向本机
+                                             kynoptic ext-event；dsh 无 hook 机制不渲染；PRD F05）
 
 Global options (all subcommands unless noted):
   --db PATH   Explicit db path, overrides the default resolution. When absent, \
@@ -2143,6 +2156,10 @@ fn cmd_collect(args: &[String]) -> Result<()> {
         // 标题脱敏（隐私 opt-in，默认关）：settings.json → CollectorSettings
         // → title_privacy::set_redact_titles
         redact_titles,
+        // F10 整标题脱敏（隐私 opt-in，默认关）：settings.json →
+        // CollectorSettings → title_privacy::set_redact_full
+        redact_titles_full: crate::settings::load(std::path::Path::new(&db_path))
+            .redact_titles_full,
         // ETW 增强模式（0.8.1 A2，默认关）：settings.json → CollectorSettings
         net_etw_enabled: crate::settings::load(std::path::Path::new(&db_path)).net_etw_enabled,
         ..collector::CollectorSettings::default()
@@ -2288,6 +2305,437 @@ fn cmd_presence(args: &[String]) -> Result<()> {
         println!("{date} automation: {} min", day.automation_minutes);
         println!("{date} mixed:      {} min", day.mixed_minutes);
         println!("{date} foreground: {foreground} min");
+    }
+    Ok(())
+}
+
+// ─── PRD v1.0 Stage 3：timeline / reports（F07/F08/F11，三端对等暴露）───────
+// 只读，与 dash /api/timeline?minutes= / /api/reports 同一纯函数
+// （api_unified_timeline_at / api_reports_at）：同源同数值（PRD DoD「三端
+// 一致」）。--json 直接吐端点响应体（含 device_boundary 等全部字段）；
+// 默认输出人类可读摘要，数值同样取自该响应体，不另起第二口径。
+
+fn parse_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+fn parse_u32_arg(args: &[String], name: &str, default: u32) -> Result<u32> {
+    let mut v = default;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == name {
+            let s = args
+                .get(i + 1)
+                .ok_or_else(|| Error::InvalidData(format!("{name} 需要一个数字")))?;
+            v = s
+                .parse::<u32>()
+                .map_err(|_| Error::InvalidData(format!("{name} 不是合法数字: {s}")))?;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(v)
+}
+
+/// `kynoptic host-register [--ext ID]... [--host-exe PATH] [--manifest PATH]`：
+/// 注册 Chrome Native Messaging host（PRD F02）。生成填写好的 host 清单
+/// （host 可执行文件绝对路径 + 扩展 ID）写入 `%APPDATA%\kynoptic\`，再把
+/// `HKCU\Software\Google\Chrome\NativeMessagingHosts\kynoptic_browser_host`
+/// 默认值指向该清单（HKCU 无需管理员）。扩展 ID 在 `chrome://extensions`
+/// 开发者模式加载扩展后可见；`--ext` 可重复（多浏览器 profile 用同一 ID）。
+fn cmd_host_register(args: &[String]) -> Result<()> {
+    let mut ext_ids: Vec<String> = Vec::new();
+    let mut host_exe: Option<PathBuf> = None;
+    let mut manifest_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" => {
+                let v = args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidData("--ext 需要一个扩展 ID".into()))?;
+                ext_ids.push(v);
+                i += 2;
+            }
+            "--host-exe" => {
+                let v = args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidData("--host-exe 需要路径".into()))?;
+                host_exe = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--manifest" => {
+                let v = args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidData("--manifest 需要路径".into()))?;
+                manifest_path = Some(PathBuf::from(v));
+                i += 2;
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "host-register 未知参数: {other}"
+                )))
+            }
+        }
+    }
+
+    // 扩展 ID：拒绝占位符原样注册（Chrome 会拒绝清单里未替换的占位 origin，
+    // 用户却以为注册成功——如实报错并指路 chrome://extensions）。
+    if ext_ids.is_empty() {
+        return Err(Error::InvalidData(
+            "host-register 需要至少一个 --ext <扩展ID>\n\
+             扩展 ID 获取：chrome://extensions 开发者模式加载 browser-extension/ 后，\n\
+             扩展卡片上显示的 ID 即扩展 ID"
+                .into(),
+        ));
+    }
+    for id in &ext_ids {
+        if id == "EXTENSION_ID_PLACEHOLDER"
+            || id.len() != 32
+            || !id.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(Error::InvalidData(format!(
+                "--ext 的值不是合法的 Chrome 扩展 ID（32 位字母数字）: {id}"
+            )));
+        }
+    }
+
+    // host 可执行文件默认取本 exe 同目录的 kynoptic-browser-host.exe
+    // （cargo build 后两者同在 target/<profile>/ 下，随包分发也同目录）。
+    let host_exe = host_exe.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("kynoptic-browser-host.exe")))
+            .unwrap_or_else(|| PathBuf::from("kynoptic-browser-host.exe"))
+    });
+    if !host_exe.is_file() {
+        return Err(Error::InvalidData(format!(
+            "host 可执行文件不存在: {}（先 cargo build -p kynoptic-browser-host，\
+             或用 --host-exe 显式指定）",
+            host_exe.display()
+        )));
+    }
+    // canonicalize 产生 \\?\ verbatim 前缀；Chrome 的清单 path / 注册表
+    // 默认值都按普通绝对路径解释，必须剥掉（verbatim 形式可能被 Chrome 拒绝）。
+    fn plain_abs(p: &Path) -> String {
+        let s = p
+            .canonicalize()
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    }
+    let host_exe_abs = plain_abs(&host_exe);
+
+    // 清单默认 %APPDATA%\kynoptic\kynoptic_browser_host.json（与 README 安装步骤一致）
+    let manifest_path = manifest_path.unwrap_or_else(|| {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        PathBuf::from(appdata)
+            .join("kynoptic")
+            .join("kynoptic_browser_host.json")
+    });
+    if let Some(dir) = manifest_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let ext_refs: Vec<&str> = ext_ids.iter().map(|s| s.as_str()).collect();
+    let manifest = kynoptic_browser_host::build_host_manifest(&host_exe_abs, &ext_refs);
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    // HKCU 注册表键（无需管理员；非 Windows 平台返回 Unsupported，如实上抛）
+    let manifest_abs = plain_abs(&manifest_path);
+    kynoptic_browser_host::register_windows(&manifest_abs)?;
+
+    println!("✓ host 清单已写入: {}", manifest_path.display());
+    println!("✓ HKCU 注册表已指向: {manifest_abs}");
+    println!(
+        "  注册表键: HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\kynoptic_browser_host"
+    );
+    println!("  host 程序: {}", host_exe_abs);
+    println!("  allowed_origins: {} 个扩展 ID", ext_ids.len());
+    println!("下一步: 重新加载扩展或重启 Chrome 使注册生效。");
+    Ok(())
+}
+
+/// `kynoptic timeline [--minutes N] [--json]`：统一时间轴（PRD F07）。
+/// `kynoptic health`：采集器健康汇总（PRD F09）。与 /api/health 同一
+/// api_health_at 纯函数入口（同源同数值，DoD 三端一致）；时钟注入 Utc::now。
+/// 状态词表 ok/degraded/stale/unknown——unknown 表示本进程无证据（CLI
+/// 独立进程读不到采集器内存态，监视器表为空属预期），不是零也不是故障。
+fn cmd_health(args: &[String]) -> Result<()> {
+    let db_path = resolve_db();
+    let conn = open_db_read(&db_path)?;
+    let v = kynoptic_dash::api_health_at(&conn, Utc::now());
+    if parse_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("=== Health: {} ===", v["status"].as_str().unwrap_or("?"));
+    println!(
+        "[i] thresholds: monitor stale > {}s, AI channel stale > {}s, extension stale > {}s",
+        v["thresholds"]["monitor_stale_secs"].as_u64().unwrap_or(0),
+        v["thresholds"]["ai_channel_stale_secs"]
+            .as_i64()
+            .unwrap_or(0),
+        v["thresholds"]["extension_stale_secs"]
+            .as_i64()
+            .unwrap_or(0)
+    );
+    let mons = v["monitors"].as_array().cloned().unwrap_or_default();
+    if mons.is_empty() {
+        println!("monitors: [unknown] (no in-process collector stats; tray process holds them)");
+    } else {
+        println!("monitors ({}):", mons.len());
+        for m in &mons {
+            println!(
+                "  {:<24} {:<9} age={:>6} slow={} dur={}ms",
+                m["name"].as_str().unwrap_or("?"),
+                m["state"].as_str().unwrap_or("?"),
+                m["last_success_age_secs"]
+                    .as_u64()
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                m["consecutive_slow"].as_u64().unwrap_or(0),
+                m["last_duration_ms"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    for (key, label) in [("ai_channels", "AI channels"), ("extensions", "extensions")] {
+        println!("{label}:");
+        for c in v[key].as_array().cloned().unwrap_or_default() {
+            println!(
+                "  {:<24} {:<9} last={} age={}",
+                c["channel"].as_str().unwrap_or("?"),
+                c["state"].as_str().unwrap_or("?"),
+                c["last_event_ts"].as_str().unwrap_or("-"),
+                c["age_secs"]
+                    .as_i64()
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_timeline(args: &[String]) -> Result<()> {
+    let minutes = parse_u32_arg(args, "--minutes", 60)?.clamp(1, 1440);
+    let db_path = resolve_db();
+    let conn = open_db_read(&db_path)?;
+    let now_ms = Utc::now().timestamp_millis();
+    let v = kynoptic_dash::api_unified_timeline_at(&conn, minutes, now_ms)?;
+    if parse_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!(
+        "=== Unified timeline: {} -> {} ({} min) ===",
+        v["window_start"].as_str().unwrap_or("?"),
+        v["window_end"].as_str().unwrap_or("?"),
+        minutes
+    );
+    if let Some(b) = v["device_boundary"].as_object() {
+        println!("[i] device: {}", b["note_zh"].as_str().unwrap_or_default());
+    }
+    for t in v["tracks"].as_array().unwrap_or(&vec![]) {
+        let ivs = t["intervals"].as_array().cloned().unwrap_or_default();
+        let label = t["label_zh"].as_str().unwrap_or("?");
+        let connected = t["connected"].as_bool().unwrap_or(false);
+        if !connected {
+            let note = t["note_zh"]
+                .as_str()
+                .or(t["note_en"].as_str())
+                .unwrap_or("未接入");
+            println!(
+                "track {} {}: [未接入] {note}",
+                t["id"].as_str().unwrap_or("?"),
+                label
+            );
+            continue;
+        }
+        println!(
+            "track {} {}: {} interval(s)",
+            t["id"].as_str().unwrap_or("?"),
+            label,
+            ivs.len()
+        );
+        for iv in ivs.iter().take(20) {
+            println!(
+                "  {} ~ {}  {}ms  {}  {}  [{}]  evidence={}  device={}",
+                iv["start_ts"].as_str().unwrap_or("?"),
+                iv["end_ts"].as_str().unwrap_or("?"),
+                iv["duration_ms"].as_i64().unwrap_or(0),
+                iv["app_name"].as_str().unwrap_or("-"),
+                iv["project"].as_str().unwrap_or("-"),
+                // F06 可追溯：项目来源三档 rule/manual/unassigned
+                iv["project_source"].as_str().unwrap_or("unassigned"),
+                iv["evidence_level"].as_str().unwrap_or("?"),
+                iv["device_id"].as_str().unwrap_or("-"),
+            );
+        }
+        if ivs.len() > 20 {
+            println!("  ... {} more (use --json for all)", ivs.len() - 20);
+        }
+    }
+    Ok(())
+}
+
+/// `kynoptic reports [--days N] [--json]`：统计报表（PRD F08）。
+fn cmd_reports(args: &[String]) -> Result<()> {
+    let days = parse_u32_arg(args, "--days", 7)?.clamp(1, 90);
+    let db_path = resolve_db();
+    let conn = open_db_read(&db_path)?;
+    let now_ms = Utc::now().timestamp_millis();
+    let v = kynoptic_dash::api_reports_at(&conn, days, now_ms)?;
+    if parse_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let totals = &v["totals"];
+    println!(
+        "=== Unified reports: {} -> {} ({} day(s)) ===",
+        v["window_start"].as_str().unwrap_or("?"),
+        v["window_end"].as_str().unwrap_or("?"),
+        days
+    );
+    println!(
+        "totals: observed={}ms estimated={}ms unknown={}ms",
+        totals["observed_ms"].as_i64().unwrap_or(0),
+        totals["estimated_ms"].as_i64().unwrap_or(0),
+        totals["unknown_ms"].as_i64().unwrap_or(0),
+    );
+    if let Some(b) = v["device_boundary"].as_object() {
+        println!("[i] device: {}", b["note_zh"].as_str().unwrap_or_default());
+    }
+    println!(
+        "{:<11} {:<14} {:<18} {:<12} {:<12} {:<10} {:>12} {:>12} {:>12}",
+        "date",
+        "device",
+        "kind",
+        "source",
+        "project",
+        "p-source",
+        "observed",
+        "estimated",
+        "unknown"
+    );
+    for r in v["rows"].as_array().unwrap_or(&vec![]) {
+        println!(
+            "{:<11} {:<14} {:<18} {:<12} {:<12} {:<10} {:>12} {:>12} {:>12}",
+            r["date"].as_str().unwrap_or("?"),
+            r["device_id"].as_str().unwrap_or("-"),
+            r["kind"].as_str().unwrap_or("?"),
+            r["source"].as_str().unwrap_or("?"),
+            r["project"].as_str().unwrap_or("-"),
+            // F06 可追溯：manual / rule / unassigned
+            r["project_source"].as_str().unwrap_or("unassigned"),
+            r["observed_ms"].as_i64().unwrap_or(0),
+            r["estimated_ms"].as_i64().unwrap_or(0),
+            r["unknown_ms"].as_i64().unwrap_or(0),
+        );
+    }
+    Ok(())
+}
+
+/// `kynoptic project-overrides [--limit N] [--json]`：人工项目指定记录的
+/// 只读清单（F06 可追溯，migration 0018 project_overrides）。append-only
+/// 派生层：每行是用户对区间→项目归属的一次指定，含指定前来源（审计）。
+/// 只读打开，绝不写库；不做归属计算——区间级归属看 `timeline` / `reports`。
+fn cmd_project_overrides(args: &[String]) -> Result<()> {
+    let limit = parse_u32_arg(args, "--limit", 100)?.clamp(1, 10_000) as usize;
+    let db_path = resolve_db();
+    let conn = open_db_read(&db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, interval_kind, start_ts, end_ts, app_name, title_hash, project, \
+                corrected_from, source, created_at, created_by, note \
+         FROM project_overrides ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
+            r.get::<_, String>(9)?,
+            r.get::<_, String>(10)?,
+            r.get::<_, Option<String>>(11)?,
+        ))
+    })?;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for row in rows {
+        let (
+            id,
+            kind,
+            start_ts,
+            end_ts,
+            app,
+            title_hash,
+            project,
+            corrected_from,
+            source,
+            created_at,
+            created_by,
+            note,
+        ) = row?;
+        out.push(json!({
+            "id": id,
+            "interval_kind": kind,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "app_name": app,
+            "title_hash": title_hash,
+            "project": project,
+            "corrected_from": corrected_from,
+            "source": source,
+            "created_at": created_at,
+            "created_by": created_by,
+            "note": note,
+        }));
+    }
+    if parse_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "endpoint": "project_overrides",
+                "count": out.len(),
+                "rows": out,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("=== Project overrides (manual assignments, newest first, limit {limit}) ===");
+    if out.is_empty() {
+        println!("(none)"); // 无人工指定记录，如实展示
+    }
+    for r in &out {
+        println!(
+            "#{id} {kind}  {start} ~ {end}  app={app}  project={project}  corrected_from={cf}  source={source}  at={at}  by={by}{note}",
+            id = r["id"].as_i64().unwrap_or(0),
+            kind = r["interval_kind"].as_str().unwrap_or("?"),
+            start = r["start_ts"].as_str().unwrap_or("?"),
+            end = r["end_ts"].as_str().unwrap_or("?"),
+            app = r["app_name"].as_str().unwrap_or("-"),
+            project = r["project"].as_str().unwrap_or("-"),
+            cf = r["corrected_from"].as_str().unwrap_or("-"),
+            source = r["source"].as_str().unwrap_or("-"),
+            at = r["created_at"].as_str().unwrap_or("-"),
+            by = r["created_by"].as_str().unwrap_or("-"),
+            note = r["note"]
+                .as_str()
+                .map(|n| format!("  note={n}"))
+                .unwrap_or_default(),
+        );
     }
     Ok(())
 }
@@ -3950,6 +4398,173 @@ fn csv_cell(v: &str) -> String {
     }
 }
 
+/// 从参数取 `--flag <VALUE>`（首个；无值/缺值 → 错误）。
+fn flag_value(args: &[String], flag: &str) -> Result<Option<String>> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return it
+                .next()
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| Error::InvalidData(format!("{flag} 需要值")));
+        }
+    }
+    Ok(None)
+}
+
+/// F05 AI hook 事件通道（PRD F05）：stdin 读 JSON 直写 db。校验与幂等走
+/// kynoptic_core::ai_hooks——与 dash POST /api/ext/events 完全同一条路径
+/// （铁律：真实通道不建第二真相表，事件写现有 events 表）。
+///
+/// 请求体形状与 /api/ext/events 一致：
+/// `{"source":"claude_code","events":[{hook_event_name, session_id,
+///   tool_name?, duration_ms?, waiting?, retry?, timestamp?}]}`
+/// `--session ID`：payload 缺 session_id 时的兜底（如 ZCode hook 用
+/// `${CLAUDE_SESSION_ID}` 模板变量；payload 有则 payload 优先）。
+///
+/// 结果 JSON 打到 stderr（hook runner 会把 stdout 当输出协议解析——
+/// ZCode 对 stdout JSON 是严格 schema，多余键即校验失败；stdout 保持空，
+/// 退出码 0 即「通过」）。
+fn cmd_ext_event(args: &[String]) -> Result<()> {
+    let source = flag_value(args, "--source")?
+        .ok_or_else(|| Error::InvalidData("缺少 --source（claude_code 或 zcode）".into()))?;
+    if !kynoptic_core::ai_hooks::AI_HOOK_SOURCES.contains(&source.as_str()) {
+        return Err(Error::InvalidData(format!(
+            "未知 --source \"{source}\"（AI hook 通道允许: {}；dsh 无 hook 机制，走文件扫描）",
+            kynoptic_core::ai_hooks::AI_HOOK_SOURCES.join(", ")
+        )));
+    }
+    let session_fallback = flag_value(args, "--session")?;
+    let mut body = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)?;
+    let body = body.trim().to_string();
+    if body.is_empty() {
+        return Err(Error::InvalidData(
+            "stdin 为空：hook 应把 payload JSON 传给本命令".into(),
+        ));
+    }
+    // payload 兜底注入 --session（payload 自带 session_id 时不覆盖）
+    let body = if let Some(sid) = &session_fallback {
+        let mut v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::InvalidData(format!("stdin 不是合法 JSON: {e}")))?;
+        if let Some(events) = v.get_mut("events").and_then(|e| e.as_array_mut()) {
+            for ev in events {
+                if let Some(obj) = ev.as_object_mut() {
+                    if !obj.contains_key("session_id") {
+                        obj.insert("session_id".into(), serde_json::Value::from(sid.as_str()));
+                    }
+                }
+            }
+        }
+        v.to_string()
+    } else {
+        body
+    };
+    let db = resolve_db();
+    // 门禁：库不存在不静默新建空库（与 db cleanup 写门禁同口径）——
+    // hook 事件应落到采集器/面板初始化过的生产库。
+    if !db.is_file() {
+        return Err(Error::InvalidData(output::db_missing(
+            &db,
+            "ext-event 写库",
+            "ext-event write",
+        )));
+    }
+    let conn = open_db(&db)?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // 与 /api/ext/events 同一校验（整批先验后写）
+    let parsed =
+        kynoptic_core::ai_hooks::parse_hook_payload(&body, now_ms).map_err(Error::InvalidData)?;
+    let (inserted, duplicates) = kynoptic_core::ai_hooks::ingest_hook_events(&conn, &parsed.1)?;
+    // 区间派生（observed hook 优先、扫描 inferred 兜底、并集不双计），
+    // 与 dash 分支同一 rebuild 口径（带项目规则）
+    let rules = kynoptic_core::db::activity_intervals::current_project_rules();
+    if let Err(e) = kynoptic_core::db::activity_intervals::rebuild_activity_intervals_with_rules_at(
+        &conn, now_ms, &rules,
+    ) {
+        // 事件已落库（append-only），派生表可由下一次重建自愈；不失败退出
+        eprintln!("✗ 事件已落库，但重建 activity_intervals 失败（将自愈）: {e}");
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "received": parsed.1.len(),
+            "inserted": inserted,
+            "duplicates": duplicates,
+        })
+    );
+    Ok(())
+}
+
+/// F05 `ai-hooks render`：输出三种 AI 工具真实可用的 hooks 配置片段，
+/// 命令指向本机 kynoptic ext-event（current_exe），供安装阶段使用。
+/// 安装（写用户工具配置文件）属于安装验收阶段动作，本命令只渲染不落盘。
+fn cmd_ai_hooks(args: &[String]) -> Result<()> {
+    let target = flag_value(args, "--target")?.unwrap_or_else(|| "all".into());
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::InvalidData(format!("定位本机 kynoptic 失败: {e}")))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let hook = |cmd: String| serde_json::json!({"type": "command", "command": cmd});
+    let out = serde_json::json!({
+        "claude_code": {
+            "install_into": "Claude Code settings.json（~/.claude/settings.json 或项目 .claude/settings.json）的 hooks 键",
+            "config": {
+                "hooks": {
+                    "PreToolUse": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source claude_code"))]}],
+                    "PostToolUse": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source claude_code"))]}],
+                    "Notification": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source claude_code"))]}],
+                    "Stop": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source claude_code"))]}],
+                }
+            }
+        },
+        "zcode": {
+            "install_into": "~/.zcode/cli/config.json（或工作区 config）顶层 hooks 键；注意配置文件 hooks 默认禁用，必须 enabled:true；Notification 不在 ZCode 支持的七事件内（官方文档），不渲染",
+            "config": {
+                "hooks": {
+                    "enabled": true,
+                    "events": {
+                        "SessionStart": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                        "UserPromptSubmit": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                        "PreToolUse": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                        "PermissionRequest": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                        "PostToolUse": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                        "PostToolUseFailure": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                        "Stop": [{"matcher": "*", "hooks": [hook(format!("{exe} ext-event --source zcode"))]}],
+                    }
+                }
+            }
+        },
+        "notes": [
+            "dsh 无 hook/插件事件机制（调研 2026-11-03：.dsh 目录只有 workflow 产物，无 hooks 配置面），不渲染；该源由文件扫描提供 inferred 后备。",
+            "hook payload 无时间戳：事件时间取 kynoptic 收到时刻（observed）。",
+            "幂等键三档（复审 2026-11-11）：payload 带 event_id（去重头）→ 重试重发不重复写；带 timestamp → payload 哈希去重；无 timestamp（常态）→ 哈希含接收毫秒，两次相同内容是两次独立 observed 事件。",
+            "ZCode 命令型 hook 经 shell 执行；本片段用 command 型保持跨源一致。若 ZCode payload 缺 session_id 且未给 --session，该事件整批拒收（宁缺毋假）。",
+        ],
+    });
+    let rendered = match target.as_str() {
+        "all" => out,
+        "claude_code" | "zcode" => {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = out.get(&target) {
+                m.insert(target.clone(), v.clone());
+            }
+            if let Some(n) = out.get("notes") {
+                m.insert("notes".into(), n.clone());
+            }
+            Value::Object(m)
+        }
+        other => {
+            return Err(Error::InvalidData(format!(
+                "未知 --target \"{other}\"（claude_code / zcode / all）"
+            )))
+        }
+    };
+    println!("{rendered}");
+    Ok(())
+}
+
 /// 子命令名定位：参数里第一个非 `--db` 且非"`--db` 的值"的元素下标。
 /// 修复位置陷阱：`kynoptic --db X presence` 旧实现取 args[0] 当子命令，
 /// 报"未知子命令 --db"。纯函数，单测覆盖。
@@ -4042,9 +4657,16 @@ fn main() -> ExitCode {
             }
             "watchdog" => cmd_watchdog(&rest),
             "presence" => cmd_presence(&rest),
+            "timeline" => cmd_timeline(&rest),
+            "health" => cmd_health(&rest),
+            "reports" => cmd_reports(&rest),
+            "project-overrides" => cmd_project_overrides(&rest),
             "apps" => cmd_apps(&rest),
             "topics" => cmd_topics(&rest),
             "recompute-actors" => cmd_recompute_actors(&rest),
+            "host-register" => cmd_host_register(&rest),
+            "ext-event" => cmd_ext_event(&rest),
+            "ai-hooks" => cmd_ai_hooks(&rest),
             "help" | "-h" | "--help" => {
                 print!("{}", USAGE);
                 Ok(())

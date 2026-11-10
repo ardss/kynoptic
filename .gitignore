@@ -3,3 +3,7 @@ probe_all_run1.txt
 probe_all_*.txt
 audit_review/
 dist/
+
+vscode-extension/node_modules/
+vscode-extension/out/
+*.vsix

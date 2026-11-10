@@ -1036,7 +1036,8 @@ fn settings_post_reports_ignored_unknown_fields() {
 /// 不出现 ignored（旧 KNOWN 表曾漏 update_check/low_power）。
 /// 既有期望修改（10→11 字段）：本轮 R3 把隐私开关 redact_titles 纳入设置
 /// 契约（AppSettings + 常量 + req.get 接受站点三处同改），字段集随之扩一，
-/// 非回退。
+/// 非回退。Stage 3 再扩 11→12：新增 F06 project_rules（opt-in，默认空）。
+/// F10 再扩 14 字段：新增整标题脱敏 redact_titles_full（opt-in，默认 false）。
 #[test]
 fn settings_post_full_accepted_set_never_ignored_and_persisted() {
     let dir = tmpdir("accepted-set");
@@ -1053,7 +1054,10 @@ fn settings_post_full_accepted_set_never_ignored_and_persisted() {
         "update_check": false,
         "low_power": true,
         "redact_titles": true,
-        "net_etw_enabled": true
+        "redact_titles_full": true,
+        "net_etw_enabled": true,
+        "project_rules": [],
+        "device_endpoints": []
     });
     let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &body.to_string(), &db);
     assert_eq!(code, 200, "接受字段全集必须 200: {out}");
@@ -3295,6 +3299,108 @@ fn utl_idle(conn: &Connection, off_secs: i64, action: &str) {
     .unwrap();
 }
 
+/// F05 Stage 2：ai_session 事件 → activity_intervals 的 ai_run 区间 →
+/// D 轨（connected=true）按证据等级返回。
+#[test]
+fn unified_timeline_track_d_shows_ai_run_intervals() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let conn = mem_conn();
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, source_id, quality) \
+         VALUES (?1, 'ai_session', 'ai_run', ?2, 'claude_code', 'ai', 'observed')",
+        params![
+            utl_rfc(UTL_BASE_MS + 5_000),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": "fix-d-track",
+                "source": "claude_code",
+                "start": utl_rfc(UTL_BASE_MS + 5_000),
+                "end": utl_rfc(UTL_BASE_MS + 65_000),
+                "start_quality": "observed",
+                "end_quality": "observed",
+                "prompt_count": 2,
+            })
+            .to_string(),
+        ],
+    )
+    .unwrap();
+    let now = UTL_BASE_MS + 120_000;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+    let v = api_unified_timeline_at(&conn, 60, now).unwrap();
+    let d = &v["tracks"].as_array().unwrap()[3];
+    assert_eq!(d["connected"], json!(true));
+    let ivs = d["intervals"].as_array().unwrap();
+    assert_eq!(ivs.len(), 1);
+    assert_eq!(ivs[0]["app_name"], json!("claude_code"));
+    assert_eq!(ivs[0]["quality"], json!("observed"));
+    assert_eq!(ivs[0]["evidence_level"], json!("observed"));
+    assert_eq!(ivs[0]["source_id"], json!("ai"));
+}
+
+/// F11 多设备：timeline 区间带 device_id（源事件原样抄写；未带 → null），
+/// 响应带 device_boundary 边界说明（双机不相加）。
+#[test]
+fn unified_timeline_intervals_carry_device_id() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let conn = mem_conn();
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, app_name, window_title, source_id, device_id) \
+         VALUES (?1, 'window', 'switch', 'appA.exe', 'T', 'windows', 'dev-fix-0001')",
+        params![utl_rfc(UTL_BASE_MS)],
+    )
+    .unwrap();
+    // 同题刷新（无 device_id 行）：区间设备归属仍取首现事件，且形成非零区间
+    utl_switch(&conn, 3, "appA.exe", "T");
+    utl_switch(&conn, 30, "appB.exe", "U"); // 无 device_id
+    let now = UTL_BASE_MS + 120_000;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+
+    let v = api_unified_timeline_at(&conn, 60, now).unwrap();
+    assert_eq!(v["device_boundary"]["scope"], json!("this_database"));
+    let a = v["tracks"].as_array().unwrap()[0]["intervals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(a.len(), 2);
+    assert_eq!(a[0]["device_id"], json!("dev-fix-0001"));
+    assert_eq!(
+        a[1]["device_id"],
+        Value::Null,
+        "未带设备标识 → null，不虚构"
+    );
+}
+
+/// F11 多设备：reports 行按 device_id 分组，响应带 devices 列表与
+/// device_boundary 说明；无 device_id 的行归入 "(unknown)" 分组标签。
+#[test]
+fn reports_rows_carry_device_dimension() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let conn = mem_conn();
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, app_name, window_title, source_id, device_id) \
+         VALUES (?1, 'window', 'switch', 'appA.exe', 'T', 'windows', 'dev-fix-0001')",
+        params![utl_rfc(UTL_BASE_MS)],
+    )
+    .unwrap();
+    utl_switch(&conn, 3, "appA.exe", "T"); // 同题刷新 → 非零区间
+    utl_switch(&conn, 30, "appB.exe", "U");
+    let now = UTL_BASE_MS + 120_000;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+
+    let v = api_reports_at(&conn, 7, now).unwrap();
+    assert_eq!(v["device_boundary"]["scope"], json!("this_database"));
+    let rows = v["rows"].as_array().unwrap();
+    let dev_of = |app: &str| -> Option<String> {
+        rows.iter()
+            .find(|r| r["source"].as_str() == Some(app))
+            .map(|r| r["device_id"].as_str().unwrap().to_string())
+    };
+    assert_eq!(dev_of("appA.exe").as_deref(), Some("dev-fix-0001"));
+    assert_eq!(dev_of("appB.exe").as_deref(), Some("(unknown)"));
+    let devices = v["devices"].as_array().unwrap();
+    assert!(devices.contains(&json!("dev-fix-0001")));
+    assert!(devices.contains(&json!("(unknown)")));
+}
+
 /// 轨道分组与区间聚合（_at 注入时钟）：A 轨吃下去重后的前台区间
 /// （同题重复只产一个区间），C 轨 = away；B 轨无 tab 数据源 → 整段 unknown
 /// + 未接入标注；D/E 留空。证据等级映射 observed/estimated→inferred。
@@ -3357,12 +3463,20 @@ fn unified_timeline_groups_tracks_and_aggregates_intervals() {
     assert_eq!(c[0]["duration_ms"], json!(10_000));
     assert_eq!(c[0]["quality"], json!("observed"));
 
-    // D/E：本阶段无数据源 → 留空 + 未接入（不隐藏）
-    for i in [3usize, 4] {
-        assert_eq!(tracks[i]["connected"], json!(false));
-        assert_eq!(tracks[i]["intervals"].as_array().unwrap().len(), 0);
-        assert!(!tracks[i]["note_en"].as_str().unwrap().is_empty());
-    }
+    // D 轨（Stage 3 起 ai_run+editor_session 双源；本库无 AI/编辑器区间
+    // → 空轨道按契约标「未接入」connected=false——空数据不隐藏也不标 0）；
+    // E 轨仍预留未接入。
+    assert_eq!(
+        tracks[3]["connected"],
+        json!(false),
+        "空 D 轨 = 未接入: {}",
+        tracks[3]
+    );
+    assert!(tracks[3]["note_zh"].as_str().unwrap().contains("未接入"));
+    assert_eq!(tracks[3]["intervals"].as_array().unwrap().len(), 0);
+    assert_eq!(tracks[4]["connected"], json!(false));
+    assert_eq!(tracks[4]["intervals"].as_array().unwrap().len(), 0);
+    assert!(!tracks[4]["note_en"].as_str().unwrap().is_empty());
 }
 
 /// 窗口过滤与裁剪：窗口外的区间整体排除，跨界区间裁到窗口边界。
@@ -3451,7 +3565,2038 @@ fn unified_timeline_view_registered_in_dashboard() {
         "utl-detail",
         "loadUnifiedTimeline",
         "utlShowDetail",
+        // F07 筛选条（项目/来源/证据等级）：UI 挂点齐全
+        "utl-filter",
+        "utl-filter-project",
+        "utl-filter-source",
+        "utl-filter-apply",
+        "utl-filter-clear",
+        "utl-filter-active",
+        "utlFilterQuery",
+        "utlFilterEcho",
     ] {
         assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
     }
+}
+
+// === F07 筛选（project / source / evidence）：core 纯函数 + HTTP 契约 ===
+
+/// 筛选 fixture（区间语义按 rebuild 真实口径：同题首末事件成区间，单条
+/// switch 是零宽点区间不输出；idle 相交整段打 estimated）：
+/// - A/alpha [0,100]s：idle 50→60 相交 → 整段 estimated → evidence=inferred；
+/// - A/alpha [200,290]s：同题闭区间 → observed；
+/// - B/beta [300,315]s：observed，规则未命中 → unassigned；
+/// - D/ddd [320,330]s：observed，unassigned；
+/// - E/eee @400s（== now）：零宽点区间不输出（不留 trailing unknown 段）；
+/// - AI claude_code [320,360]s observed（app_name=claude_code，source_id=ai）。
+///
+/// 返回 (conn, now)。
+fn utl_filter_fixture() -> (Connection, i64) {
+    use kynoptic_core::db::activity_intervals::{
+        rebuild_activity_intervals_with_rules_at, ProjectRule,
+    };
+    let conn = mem_conn();
+    // alpha 第一段：0→100s，idle 相交 → inferred
+    utl_switch(&conn, 0, "A.exe", "alphafile");
+    utl_idle(&conn, 50, "idle_start");
+    utl_idle(&conn, 60, "idle_end");
+    utl_switch(&conn, 100, "A.exe", "alphafile");
+    utl_switch(&conn, 110, "Z.exe", "zzz");
+    // alpha 第二段：200→290s，observed
+    utl_switch(&conn, 200, "A.exe", "alphafile");
+    utl_switch(&conn, 290, "A.exe", "alphafile");
+    utl_switch(&conn, 300, "B.exe", "betafile");
+    // beta：300→315s observed
+    utl_switch(&conn, 315, "B.exe", "betafile");
+    utl_switch(&conn, 320, "D.exe", "ddd");
+    // ddd：320→330s observed
+    utl_switch(&conn, 330, "D.exe", "ddd");
+    utl_switch(&conn, 400, "E.exe", "eee"); // == now，零宽点区间不输出
+                                            // AI 会话 320→360s observed
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, source_id, quality) \
+         VALUES (?1, 'ai_session', 'ai_run', ?2, 'claude_code', 'ai', 'observed')",
+        params![
+            utl_rfc(UTL_BASE_MS + 320_000),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": "fix-filter",
+                "source": "claude_code",
+                "start": utl_rfc(UTL_BASE_MS + 320_000),
+                "end": utl_rfc(UTL_BASE_MS + 360_000),
+                "start_quality": "observed",
+                "end_quality": "observed",
+                "prompt_count": 1,
+            })
+            .to_string(),
+        ],
+    )
+    .unwrap();
+    let now = UTL_BASE_MS + 400_000;
+    let rules = vec![ProjectRule {
+        name: "alpha".into(),
+        path_prefix: String::new(),
+        title_keywords: "alpha".into(),
+    }];
+    rebuild_activity_intervals_with_rules_at(&conn, now, &rules).unwrap();
+    (conn, now)
+}
+
+fn utl_track_a(v: &Value) -> Vec<Value> {
+    v["tracks"].as_array().unwrap()[0]["intervals"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+fn utl_track_b(v: &Value) -> Vec<Value> {
+    v["tracks"].as_array().unwrap()[1]["intervals"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// 证据等级过滤（observed/inferred/unknown 词表）：inferred 段单列可筛；
+/// unknown 词表值 + source/project 均空时 B 轨 unknown 占位段保留——占位段
+/// 是「无数据源」声明，不是被筛选掉的数据。
+#[test]
+fn unified_timeline_filter_by_evidence_level() {
+    let (conn, now) = utl_filter_fixture();
+    let f = kynoptic_core::timeline::TimelineFilter {
+        evidence: vec!["observed".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    let a = utl_track_a(&v);
+    assert_eq!(
+        a.len(),
+        3,
+        "observed 过滤命中 alpha/beta/ddd 三段，inferred 已排除: {a:?}"
+    );
+    assert!(a.iter().all(|iv| iv["evidence_level"] == json!("observed")));
+    // AI 段 observed 仍在 D 轨
+    assert_eq!(
+        v["tracks"].as_array().unwrap()[3]["intervals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // B 轨占位段：evidence=observed（不含 unknown）→ 占位段不保留
+    assert!(
+        utl_track_b(&v).is_empty(),
+        "unknown 占位段被 evidence 过滤排除"
+    );
+
+    // inferred 单列可筛
+    let f = kynoptic_core::timeline::TimelineFilter {
+        evidence: vec!["inferred".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    let a = utl_track_a(&v);
+    assert_eq!(a.len(), 1, "inferred 过滤只命中 idle 相交段: {a:?}");
+    assert_eq!(a[0]["evidence_level"], json!("inferred"));
+    assert_eq!(a[0]["project"], json!("alpha"), "inferred 段项目归属保留");
+    assert!(utl_track_b(&v).is_empty());
+
+    // evidence=unknown：占位段保留（它是 B 轨唯一内容）
+    let f = kynoptic_core::timeline::TimelineFilter {
+        evidence: vec!["unknown".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    let b = utl_track_b(&v);
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0]["evidence_level"], json!("unknown"));
+    // observed/inferred 的真实区间全被排除——unknown 不是它们的别名
+    assert!(utl_track_a(&v).is_empty());
+    // filters 回显
+    assert_eq!(v["filters"]["evidence"], json!(["unknown"]));
+}
+
+/// 来源过滤：foreground 段 source_id=windows 命中；ai_run 的
+/// app_name=claude_code 命中（用户无需知道存储里 source_id='ai'）；无来源
+/// 证据的 unknown 占位段在带 source 过滤时缺席（轨道标注「未接入」仍在）。
+#[test]
+fn unified_timeline_filter_by_source() {
+    let (conn, now) = utl_filter_fixture();
+    let f = kynoptic_core::timeline::TimelineFilter {
+        source: vec!["windows".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    let a = utl_track_a(&v);
+    assert_eq!(a.len(), 4, "windows 过滤命中全部四个前台段: {a:?}");
+    assert!(a.iter().all(|iv| iv["source_id"] == json!("windows")));
+    // D 轨 ai_run source_id=ai 不命中 windows → 空
+    assert_eq!(
+        v["tracks"].as_array().unwrap()[3]["intervals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    // B 轨占位段（source null）被 source 过滤排除
+    assert!(utl_track_b(&v).is_empty());
+
+    // 按源名过滤：claude_code 经 app_name 命中（存储细节封装在契约里）
+    let f = kynoptic_core::timeline::TimelineFilter {
+        source: vec!["claude_code".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    assert!(utl_track_a(&v).is_empty());
+    let d = v["tracks"].as_array().unwrap()[3]["intervals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0]["app_name"], json!("claude_code"));
+    assert_eq!(v["filters"]["source"], json!(["claude_code"]));
+
+    // 多来源逗号语义：windows + claude_code 两个维度同时命中
+    let f = kynoptic_core::timeline::TimelineFilter {
+        source: vec!["windows".into(), "claude_code".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    assert_eq!(utl_track_a(&v).len(), 4);
+    assert_eq!(
+        v["tracks"].as_array().unwrap()[3]["intervals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// 项目过滤：精确匹配 project 字段；unassigned（null）区间不命中；
+/// 不存在的项目名 → 空表（合法的「无命中」，与错误响应可区分——filters
+/// 回显说明过滤在生效）。
+#[test]
+fn unified_timeline_filter_by_project() {
+    let (conn, now) = utl_filter_fixture();
+    let f = kynoptic_core::timeline::TimelineFilter {
+        project: vec!["alpha".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    let a = utl_track_a(&v);
+    assert_eq!(
+        a.len(),
+        2,
+        "alpha 规则命中的两段（inferred+observed）都在: {a:?}"
+    );
+    assert!(a.iter().all(|iv| iv["project"] == json!("alpha")));
+    // B/beta 无归属（规则未命中）→ 不命中 alpha 过滤
+    assert!(!a.iter().any(|iv| iv["app_name"] == json!("B.exe")));
+    // AI 段 unassigned → 不命中
+    assert_eq!(
+        v["tracks"].as_array().unwrap()[3]["intervals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    // 占位段（无 project）被 project 过滤排除
+    assert!(utl_track_b(&v).is_empty());
+    assert_eq!(v["filters"]["project"], json!(["alpha"]));
+
+    // 不存在的项目：合法空结果（不是错误）
+    let f = kynoptic_core::timeline::TimelineFilter {
+        project: vec!["nonexistent".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    assert!(utl_track_a(&v).is_empty());
+    assert_eq!(v["filters"]["project"], json!(["nonexistent"]));
+}
+
+/// 组合过滤（AND 语义）：project=alpha + evidence=observed 同时成立才命中；
+/// 默认（空 TimelineFilter）与 api_unified_timeline_at 同值——wrapper 契约。
+#[test]
+fn unified_timeline_filter_combination_and_default_parity() {
+    let (conn, now) = utl_filter_fixture();
+    let f = kynoptic_core::timeline::TimelineFilter {
+        project: vec!["alpha".into()],
+        evidence: vec!["observed".into()],
+        ..Default::default()
+    };
+    let v = api_unified_timeline_filtered_at(&conn, 60, now, &f).unwrap();
+    let a = utl_track_a(&v);
+    assert!(a
+        .iter()
+        .all(|iv| iv["project"] == json!("alpha") && iv["evidence_level"] == json!("observed")));
+    assert!(!a.is_empty(), "alpha observed 段组合命中");
+
+    // 默认过滤器与既有端点完全同值（同一实现，wrapper 传 Default）
+    let base = api_unified_timeline_at(&conn, 60, now).unwrap();
+    let fdef = kynoptic_core::timeline::TimelineFilter::default();
+    let with_def = api_unified_timeline_filtered_at(&conn, 60, now, &fdef).unwrap();
+    assert_eq!(base, with_def, "空过滤 = 无过滤，同值契约");
+    assert_eq!(
+        base["filters"],
+        json!({"project": [], "source": [], "evidence": []})
+    );
+}
+
+/// HTTP 层筛选契约：evidence 越词表值 → 400（静默空表会被误读为「无活动」）；
+/// 合法值回显 filters；逗号分隔与重复参数两种写法等价；未知参数照旧回显。
+#[test]
+fn unified_timeline_route_filter_contract() {
+    let conn = mem_conn();
+    let db = tmpdir("utlfilter").join("kyn.db");
+    // 词表越值 → 400
+    let (code, _, body) = route_req(
+        &conn,
+        "GET",
+        "/api/timeline?minutes=30&evidence=confirmed_only",
+        "",
+        &db,
+    );
+    assert_eq!(code, 400, "evidence 越词表必须 400: {body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["error"].as_str().unwrap().contains("observed"));
+    // 合法值（逗号分隔）→ 200 + filters 回显
+    let (code, _, body) = route_req(
+        &conn,
+        "GET",
+        "/api/timeline?minutes=30&evidence=observed,inferred",
+        "",
+        &db,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["filters"]["evidence"], json!(["observed", "inferred"]));
+    // 重复参数写法等价
+    let (code, _, body) = route_req(
+        &conn,
+        "GET",
+        "/api/timeline?minutes=30&evidence=observed&evidence=inferred",
+        "",
+        &db,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["filters"]["evidence"], json!(["observed", "inferred"]));
+    // source/project 透传 + 未知参数照旧回显 ignored_params
+    let (code, _, body) = route_req(
+        &conn,
+        "GET",
+        "/api/timeline?minutes=30&source=windows&project=alpha&foo=1",
+        "",
+        &db,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["filters"]["source"], json!(["windows"]));
+    assert_eq!(v["filters"]["project"], json!(["alpha"]));
+    assert_eq!(v["ignored_params"], json!(["foo"]));
+    // 不带筛选时 filters 为空数组（契约字段恒在）
+    let (code, _, body) = route_req(&conn, "GET", "/api/timeline?minutes=30", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["filters"],
+        json!({"project": [], "source": [], "evidence": []})
+    );
+}
+
+/// F11 merge + F07 筛选：筛选条件透传远端（fetch_remote_timeline 的 query
+/// 参数进请求行）；空 query 只带 minutes（向后兼容远端旧版本）。
+#[test]
+fn fetch_remote_timeline_forwards_filter_query() {
+    use crate::merge::fetch_remote_timeline;
+    use std::io::{Read as _, Write as _};
+    use std::time::Duration;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        // 两次请求（带 query / 空 query）：mock 服务端循环 accept
+        for _ in 0..2 {
+            let Ok((mut s, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            // 把收到的请求行原样回给客户端（透传核对面）
+            let req = String::from_utf8_lossy(&buf).to_string();
+            let line = req.lines().next().unwrap_or("").to_string();
+            let body = serde_json::json!({ "request_line": line }).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    let url = format!("http://{}", addr);
+    let v = fetch_remote_timeline(
+        &url,
+        "",
+        60,
+        "project=alpha&source=windows&evidence=observed,inferred",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(
+        v["request_line"].as_str().unwrap().contains(
+            "api/timeline?minutes=60&project=alpha&source=windows&evidence=observed,inferred"
+        ),
+        "筛选 query 必须原样进请求行: {}",
+        v["request_line"]
+    );
+    // 空 query：只带 minutes（不追加尾随 &）
+    let v = fetch_remote_timeline(&url, "", 60, "", Duration::from_secs(5)).unwrap();
+    let line = v["request_line"].as_str().unwrap();
+    assert!(
+        line.contains("api/timeline?minutes=60"),
+        "空 query 只带 minutes: {line}"
+    );
+    assert!(!line.contains("&&"), "空 query 不得产生空参数: {line}");
+    h.join().unwrap();
+}
+
+// === Stage 3：D 轨真实数据（ai_run + editor_session）、F06 项目归属、F08 报表 ===
+
+/// D 轨（Stage 3）：ai_run + editor_session 两类区间进同一轨道（按 source
+/// 分色由前端消费，端点只保证 source_id/app_name/interval_kind/project 字段
+/// 齐全）；project 有值时 project_evidence=inferred（F06 规则匹配是推导）。
+#[test]
+fn unified_timeline_track_d_merges_ai_run_and_editor_session() {
+    use kynoptic_core::db::activity_intervals::{
+        rebuild_activity_intervals_with_rules_at, ProjectRule,
+    };
+    let conn = mem_conn();
+    // 编辑器前台：Code.exe/alphafile.rs 200s→250s（250s 切走，闭区间 observed）
+    utl_switch(&conn, 200, "Code.exe", "alphafile.rs - Visual Studio Code");
+    utl_switch(&conn, 250, "Code.exe", "alphafile.rs - Visual Studio Code");
+    utl_switch(&conn, 260, "chrome.exe", "web");
+    // AI 会话：observed 300s→360s
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, source_id, quality) \
+         VALUES (?1, 'ai_session', 'ai_run', ?2, 'claude_code', 'ai', 'observed')",
+        params![
+            utl_rfc(UTL_BASE_MS + 300_000),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": "fix-stage3-d",
+                "source": "claude_code",
+                "start": utl_rfc(UTL_BASE_MS + 300_000),
+                "end": utl_rfc(UTL_BASE_MS + 360_000),
+                "start_quality": "observed",
+                "end_quality": "observed",
+                "prompt_count": 1,
+            })
+            .to_string(),
+        ],
+    )
+    .unwrap();
+    let now = UTL_BASE_MS + 400_000;
+    let rules = vec![ProjectRule {
+        name: "alpha".into(),
+        path_prefix: String::new(),
+        title_keywords: "alphafile".into(),
+    }];
+    rebuild_activity_intervals_with_rules_at(&conn, now, &rules).unwrap();
+    let v = api_unified_timeline_at(&conn, 60, now).unwrap();
+    let d = &v["tracks"].as_array().unwrap()[3];
+    assert_eq!(d["connected"], json!(true), "有区间时 D 轨接入");
+    let ivs = d["intervals"].as_array().unwrap();
+    assert_eq!(ivs.len(), 2, "editor_session + ai_run 都进 D 轨: {ivs:?}");
+    // 两类区间按 interval_kind 可辨，前端据此分色
+    let kinds: Vec<&str> = ivs
+        .iter()
+        .map(|x| x["interval_kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"editor_session"));
+    assert!(kinds.contains(&"ai_run"));
+    // 编辑器区间：source_id=windows、app_name=编辑器进程、project=alpha
+    let ed = ivs
+        .iter()
+        .find(|x| x["interval_kind"] == json!("editor_session"))
+        .unwrap();
+    assert_eq!(ed["app_name"], json!("Code.exe"));
+    assert_eq!(ed["source_id"], json!("windows"));
+    assert_eq!(ed["project"], json!("alpha"));
+    assert_eq!(ed["project_evidence"], json!("inferred"));
+    // AI 区间：source_id=ai、app_name=源名、无归属证据（ai_session 事件不带
+    // 标题/路径——隐私铁律，不猜）
+    let ai = ivs
+        .iter()
+        .find(|x| x["interval_kind"] == json!("ai_run"))
+        .unwrap();
+    assert_eq!(ai["app_name"], json!("claude_code"));
+    assert_eq!(ai["source_id"], json!("ai"));
+    assert_eq!(ai["project"], Value::Null);
+    assert_eq!(ai["project_evidence"], Value::Null);
+}
+
+/// /api/reports?days=N（F08）：按本地日 × 类别/来源/项目汇总；
+/// estimated 段单列不并入 observed 合计（复审口径）；project=(none) 表示
+/// 无归属证据。`_at` 注入时钟。
+#[test]
+fn reports_aggregate_by_day_and_bucket_quality() {
+    use kynoptic_core::db::activity_intervals::{
+        rebuild_activity_intervals_with_rules_at, ProjectRule,
+    };
+    let conn = mem_conn();
+    // A/T（含 alpha）：0s→100s observed；50s idle_start/60s idle_end 相交
+    // → 整段打 estimated（只打标不裁剪，duration 不变）
+    utl_switch(&conn, 0, "A.exe", "alphafile");
+    utl_switch(&conn, 50, "A.exe", "alphafile");
+    utl_idle(&conn, 50, "idle_start");
+    utl_idle(&conn, 60, "idle_end");
+    utl_switch(&conn, 100, "A.exe", "alphafile");
+    // B/X（含 beta）：110s→150s observed（同题刷新闭区间；单条 switch 只产
+    // 零宽点区间——rebuild 口径，点区间非区间，不产时长）
+    utl_switch(&conn, 110, "B.exe", "betafile");
+    utl_switch(&conn, 150, "B.exe", "betafile");
+    // 编辑器：200s→250s observed
+    utl_switch(&conn, 200, "Code.exe", "alphamain.rs - VS Code");
+    utl_switch(&conn, 250, "Code.exe", "alphamain.rs - VS Code");
+    utl_switch(&conn, 260, "chrome.exe", "web");
+    // AI 会话 300s→360s observed
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, source_id, quality) \
+         VALUES (?1, 'ai_session', 'ai_run', ?2, 'claude_code', 'ai', 'observed')",
+        params![
+            utl_rfc(UTL_BASE_MS + 300_000),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": "fix-reports",
+                "source": "claude_code",
+                "start": utl_rfc(UTL_BASE_MS + 300_000),
+                "end": utl_rfc(UTL_BASE_MS + 360_000),
+                "start_quality": "observed",
+                "end_quality": "observed",
+                "prompt_count": 1,
+            })
+            .to_string(),
+        ],
+    )
+    .unwrap();
+    let now = UTL_BASE_MS + 400_000;
+    let rules = vec![
+        ProjectRule {
+            name: "alpha".into(),
+            path_prefix: String::new(),
+            title_keywords: "alpha".into(),
+        },
+        ProjectRule {
+            name: "beta".into(),
+            path_prefix: String::new(),
+            title_keywords: "beta".into(),
+        },
+    ];
+    rebuild_activity_intervals_with_rules_at(&conn, now, &rules).unwrap();
+
+    let v = api_reports_at(&conn, 7, now).unwrap();
+    assert_eq!(v["endpoint"], json!("reports"));
+    assert_eq!(v["days"], json!(7));
+    let rows = v["rows"].as_array().unwrap();
+    // 行查找 helper（日期按本地日界，与实现同一换算源 Local）
+    let find = |kind: &str, source: &str, project: &str| -> Value {
+        rows.iter()
+            .find(|r| {
+                r["kind"] == json!(kind)
+                    && r["source"] == json!(source)
+                    && r["project"] == json!(project)
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("缺行 {kind}/{source}/{project}: {rows:?}"))
+    };
+    // A 前台 [0,100s]：与 away 相交 → 整段 estimated（100s），不进 observed
+    let a = find("foreground_dwell", "A.exe", "alpha");
+    assert_eq!(
+        a["observed_ms"],
+        json!(0),
+        "estimated 段不得计入 observed: {a}"
+    );
+    assert_eq!(a["estimated_ms"], json!(100_000));
+    // B/X（含 beta）：[110,150s] observed 40s（200s Code.exe 切走前已闭合）
+    let b = find("foreground_dwell", "B.exe", "beta");
+    assert_eq!(b["observed_ms"], json!(40_000));
+    assert_eq!(b["estimated_ms"], json!(0));
+    assert_eq!(b["unknown_ms"], json!(0));
+    // chrome 尾部断线收口 unknown：260s→400s = 140s，单列（不并入 observed）
+    let ch = find("foreground_dwell", "chrome.exe", "(none)");
+    assert_eq!(ch["unknown_ms"], json!(140_000));
+    assert_eq!(ch["observed_ms"], json!(0));
+    // 编辑器 [200,250s] observed + 项目 alpha
+    let ed = find("editor_session", "Code.exe", "alpha");
+    assert_eq!(ed["observed_ms"], json!(50_000));
+    assert_eq!(ed["estimated_ms"], json!(0));
+    // AI 会话 observed 60s，无归属证据 → (none)
+    let ai = find("ai_run", "claude_code", "(none)");
+    assert_eq!(ai["observed_ms"], json!(60_000));
+    // 窗口合计（复审口径 2026-11-03）：editor_session 是 foreground_dwell 的
+    // 分类视图（同一时段两行），totals 排除它避免编辑器 50s 计两次。
+    // observed 只含 observed 桶（B 40s + 编辑器 dwell 50s + AI 60s = 150s）
+    assert_eq!(v["totals"]["observed_ms"], json!(150_000));
+    assert_eq!(v["totals"]["estimated_ms"], json!(100_000));
+    assert_eq!(v["totals"]["unknown_ms"], json!(140_000));
+    // 日期列 = 区间所在本地日（与实现同一 Local 换算）
+    use chrono::TimeZone;
+    let expected_date = Local
+        .timestamp_opt(UTL_BASE_MS / 1000, 0)
+        .single()
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(a["date"], json!(expected_date));
+}
+
+/// /api/reports 跨本地午界的区间按午界拆分归日（不整段记入起始日）。
+#[test]
+fn reports_split_intervals_at_local_midnight() {
+    use chrono::TimeZone;
+    let conn = mem_conn();
+    // 直接造一条跨越本地午界的 dwell 区间（不经 rebuild——派生表是只读
+    // 汇总入口，本测端点的拆分口径）：当日 23:50 → 次日 00:10 本地钟面。
+    let day = Local
+        .timestamp_opt(UTL_BASE_MS / 1000, 0)
+        .single()
+        .unwrap()
+        .date_naive();
+    let start_local = day.and_hms_opt(23, 50, 0).unwrap();
+    let end_local = day.succ_opt().unwrap().and_hms_opt(0, 10, 0).unwrap();
+    let start_utc = Local.from_local_datetime(&start_local).single().unwrap();
+    let end_utc = Local.from_local_datetime(&end_local).single().unwrap();
+    let start_ms = start_utc.timestamp_millis();
+    let end_ms = end_utc.timestamp_millis();
+    let midnight_ms = Local
+        .from_local_datetime(&day.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    conn.execute(
+        "INSERT INTO activity_intervals \
+         (interval_kind, start_ts, end_ts, app_name, title_hash, quality, source_id, project) \
+         VALUES ('foreground_dwell', ?1, ?2, 'A.exe', 'h', 'observed', 'windows', NULL)",
+        params![utl_rfc(start_ms), utl_rfc(end_ms)],
+    )
+    .unwrap();
+    let v = api_reports_at(&conn, 7, end_ms).unwrap();
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "跨午界应拆成两天: {rows:?}");
+    let d0 = start_utc.format("%Y-%m-%d").to_string();
+    let d1 = end_utc.format("%Y-%m-%d").to_string();
+    let r0 = rows.iter().find(|r| r["date"] == json!(d0)).unwrap();
+    let r1 = rows.iter().find(|r| r["date"] == json!(d1)).unwrap();
+    assert_eq!(
+        r0["observed_ms"],
+        json!(midnight_ms - start_ms),
+        "首日只记到午界: {r0}"
+    );
+    assert_eq!(
+        r1["observed_ms"],
+        json!(end_ms - midnight_ms),
+        "次日只记午界后: {r1}"
+    );
+}
+
+/// /api/reports 路由：缺省 days=7；>90 钳制 + days_requested/note 标注；
+/// days=0/负数/非数字 → 400。
+#[test]
+fn reports_route_days_default_cap_and_validation() {
+    let conn = mem_conn();
+    let db = std::path::Path::new("kyn.db");
+    let (code, _, body) = route_req(&conn, "GET", "/api/reports", "", db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["days"], json!(7), "缺省 7 天");
+    let (code, _, body) = route_req(&conn, "GET", "/api/reports?days=95", "", db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["days"], json!(90), "上限 90 钳制");
+    assert_eq!(v["days_requested"], json!(95));
+    assert!(v["note"].as_str().unwrap().contains("90"));
+    for bad in ["0", "-1", "abc"] {
+        let (code, _, _) = route_req(&conn, "GET", &format!("/api/reports?days={bad}"), "", db);
+        assert_eq!(code, 400, "days={bad} 必须 400");
+    }
+}
+
+/// F06 设置面：project_rules 是接受字段——POST 生效落盘、响应回显、不进
+/// ignored；两个字段都空的规则与缺失 name 拒绝 400；超 100 条拒绝。
+#[test]
+fn settings_post_project_rules_accepted_and_validated() {
+    let dir = tmpdir("projrules-api");
+    let db = dir.join("kyn.db");
+    let body = json!({
+        "project_rules": [
+            {"name": "alpha", "path_prefix": "k:/proj/alpha", "title_keywords": ""},
+            {"name": "beta", "path_prefix": "", "title_keywords": "sample-project spec"}
+        ]
+    });
+    let (code, _, out) = route_req(&mem_conn(), "POST", "/api/settings", &body.to_string(), &db);
+    assert_eq!(code, 200, "合法规则应接受: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("ignored").is_none(),
+        "project_rules 不得进 ignored: {out}"
+    );
+    assert_eq!(v["project_rules"], body["project_rules"]);
+    // 落盘复核
+    let (_, _, out2) = route_req(&mem_conn(), "GET", "/api/settings", "", &db);
+    let g: Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(g["project_rules"], body["project_rules"], "须落盘");
+    // 防呆：两字段全空 → 400
+    let (code, _, out) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"project_rules":[{"name":"x","path_prefix":"","title_keywords":"  "}]}"#,
+        &db,
+    );
+    assert_eq!(code, 400, "全空规则必须拒绝: {out}");
+    // 缺 name → 400
+    let (code, _, _) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        r#"{"project_rules":[{"path_prefix":"p"}]}"#,
+        &db,
+    );
+    assert_eq!(code, 400);
+    // 超 100 条 → 400
+    let rules: Vec<Value> = (0..101)
+        .map(|i| json!({"name": format!("r{i}"), "path_prefix": format!("p{i}")}))
+        .collect();
+    let (code, _, _) = route_req(
+        &mem_conn(),
+        "POST",
+        "/api/settings",
+        &json!({"project_rules": rules}).to_string(),
+        &db,
+    );
+    assert_eq!(code, 400, "超上限必须拒绝");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 报表页签注册：页签 + 容器 + 天数按钮 + 加载函数在 dashboard.html 中。
+#[test]
+fn reports_view_registered_in_dashboard() {
+    for id in [
+        "tab-reports",
+        "view-reports",
+        "rep-table",
+        "rep-totals",
+        "rep-days-btn",
+        "loadReports",
+        "proj-rules",
+        "proj-rule-add",
+        "renderProjRules",
+    ] {
+        assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
+    }
+}
+
+// === F04 编辑器扩展摄取（POST /api/ext/events） ===
+
+/// 建一个带完整 schema 的临时库文件 + 写好扩展令牌，返回 (dir, db 路径)。
+/// ingest 在 route 层自开写连接，不消费传入的内存只读连接。
+fn ext_db(tag: &str, token: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = tmpdir(tag);
+    let db = dir.join("kyn.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+    kynoptic_core::db::run_migrations(&conn).unwrap();
+    drop(conn);
+    std::fs::write(dir.join("ext-token.txt"), token).unwrap();
+    (dir, db)
+}
+
+const EXT_TEST_TOKEN: &str = "ext-token-fix";
+
+fn ext_body(paths: &[(&str, &str, &str, &str)]) -> String {
+    let evs: Vec<Value> = paths
+        .iter()
+        .map(|(id, ts, action, path)| {
+            let mut ev = json!({"event_id": id, "timestamp": ts, "action": action});
+            if !path.is_empty() {
+                ev["file_path"] = json!(path);
+            }
+            ev
+        })
+        .collect();
+    json!({"source": "vscode", "events": evs}).to_string()
+}
+
+/// 固定注入时钟（不读真实时钟；与 activity_intervals 测试同基准日附近）。
+const EXT_NOW_MS: i64 = 1_792_977_600_000 + 600_000; // 2026-11-02T03:10:00Z
+
+#[test]
+fn ext_events_ingest_writes_and_is_idempotent() {
+    let (dir, db) = ext_db("ext-ingest", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    let body = ext_body(&[
+        (
+            "id-1",
+            "2026-11-02T03:00:00Z",
+            "file_open",
+            "K:/proj/x/main.rs",
+        ),
+        (
+            "id-2",
+            "2026-11-02T03:00:10Z",
+            "focus_gained",
+            "K:/proj/x/main.rs",
+        ),
+        (
+            "id-2",
+            "2026-11-02T03:00:10Z",
+            "focus_gained",
+            "K:/proj/x/main.rs",
+        ), // 同 id → 幂等
+    ]);
+    let (code, _, out) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["inserted"], json!(2));
+    assert_eq!(v["duplicates"], json!(1));
+    // 重发整批：全部幂等命中，不产生新行（append-only 行数不变）
+    let (code, _, out) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["inserted"], json!(0));
+    assert_eq!(v["duplicates"], json!(3));
+    // 落库形态：events 表 event_type='editor'、source_id='vscode_ext'、
+    // window_title=路径，ext_event_id 带来源前缀
+    let rd = Connection::open(&db).unwrap();
+    let total: i64 = rd
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type='editor'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 2, "幂等：同 event_id 只落一行");
+    let (src, title, eid): (String, Option<String>, String) = rd
+        .query_row(
+            "SELECT source_id, window_title, ext_event_id FROM events \
+             WHERE event_type='editor' ORDER BY id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(src, "vscode_ext");
+    assert_eq!(title.as_deref(), Some("K:/proj/x/main.rs"));
+    assert_eq!(eid, "vscode_ext:id-1");
+    drop(rd); // Windows：WAL 侧车文件持锁，先关连接再清目录
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ext_events_rejects_bad_or_missing_token() {
+    let (dir, db) = ext_db("ext-auth", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    let body = ext_body(&[("a", "2026-11-02T03:00:00Z", "file_open", "")]);
+    // 无令牌
+    let (code, _, _) = route_req_ext(&conn, "POST", "/api/ext/events", &body, &db, None);
+    assert_eq!(code, 401);
+    // 错令牌
+    let (code, _, _) = route_req_ext(&conn, "POST", "/api/ext/events", &body, &db, Some("wrong"));
+    assert_eq!(code, 401);
+    // 旧 route_req（不传令牌）同样 401——直调不可绕过鉴权
+    let (code, _, _) = route_req(&conn, "POST", "/api/ext/events", &body, &db);
+    assert_eq!(code, 401);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ext_events_rejects_invalid_schema_whole_batch() {
+    let (dir, db) = ext_db("ext-schema", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    let cases = [
+        (
+            "未知 source",
+            r#"{"source":"jetbrains","events":[{"event_id":"a","timestamp":"2026-11-02T03:00:00Z","action":"file_open"}]}"#,
+        ),
+        (
+            "未知 action",
+            r#"{"source":"vscode","events":[{"event_id":"a","timestamp":"2026-11-02T03:00:00Z","action":"keystroke"}]}"#,
+        ),
+        (
+            "坏 timestamp",
+            r#"{"source":"cursor","events":[{"event_id":"a","timestamp":"not-a-time","action":"file_open"}]}"#,
+        ),
+        (
+            "缺 event_id",
+            r#"{"source":"vscode","events":[{"timestamp":"2026-11-02T03:00:00Z","action":"file_open"}]}"#,
+        ),
+        ("空 events", r#"{"source":"vscode","events":[]}"#),
+        ("坏 JSON", "{oops"),
+    ];
+    for (tag, body) in cases {
+        let (code, _, out) = route_req_ext(
+            &conn,
+            "POST",
+            "/api/ext/events",
+            body,
+            &db,
+            Some(EXT_TEST_TOKEN),
+        );
+        assert_eq!(code, 400, "{tag}: {out}");
+    }
+    // 校验失败的批不落任何行（整批先验后写）
+    let rd = Connection::open(&db).unwrap();
+    let n: i64 = rd
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+    drop(rd); // Windows：WAL 侧车文件持锁，先关连接再清目录
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ext_events_feed_editor_session_intervals() {
+    let (dir, db) = ext_db("ext-intervals", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    let t = |s: i64| {
+        chrono::DateTime::from_timestamp_millis(1_792_977_600_000 + s * 1000)
+            .unwrap()
+            .to_rfc3339()
+    };
+    let body = ext_body(&[
+        ("e1", &t(0), "file_open", "K:/proj/alpha/src/main.rs"),
+        ("e2", &t(30), "focus_lost", ""),
+    ]);
+    let (code, _, out) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 200, "{out}");
+    // ingest 内置节流重建与其它测试共享 static，可能被跳过——直接注入
+    // 时钟重建（派生表口径与 route 层同一函数），断言 editor_session。
+    let w = Connection::open(&db).unwrap();
+    kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at(&w, EXT_NOW_MS).unwrap();
+    let rows: Vec<(String, String, i64)> = {
+        let mut stmt = w
+            .prepare(
+                "SELECT app_name, quality, (julianday(end_ts)-julianday(start_ts))*86400000.0 \
+                 FROM activity_intervals WHERE interval_kind='editor_session' AND source_id='vscode_ext'",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                (r.get::<_, f64>(2)?).round() as i64,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], ("vscode".into(), "observed".into(), 30_000));
+    drop(w); // Windows：WAL 侧车文件持锁，先关连接再清目录
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ext_token_get_and_reset_rotate() {
+    let (dir, db) = ext_db("ext-token-api", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    // GET 显示当前令牌
+    let (code, _, out) = route_req(&conn, "GET", "/api/ext/token", "", &db);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["configured"], json!(true));
+    assert_eq!(v["token"], json!(EXT_TEST_TOKEN));
+    // 重置后旧令牌 401、新令牌 200
+    let (code, _, out) = route_req(&conn, "POST", "/api/ext/token/reset", "", &db);
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let new_token = v["token"].as_str().unwrap().to_string();
+    assert_ne!(new_token, EXT_TEST_TOKEN);
+    let body = ext_body(&[("a", "2026-11-02T03:00:00Z", "file_open", "")]);
+    let (code, _, _) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 401, "旧令牌必须失效");
+    let (code, _, _) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(&new_token),
+    );
+    assert_eq!(code, 200);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F04 设置页注册：扩展令牌展示/重置的元素与加载/重置函数在
+/// dashboard.html 中（与 reports 页签注册同款防漂移检查）。
+#[test]
+fn ext_token_ui_registered_in_dashboard() {
+    for id in [
+        "ext-token-value",
+        "ext-token-reset",
+        "ext-token-msg",
+        "loadExtToken",
+        "resetExtToken",
+    ] {
+        assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
+    }
+}
+
+/// F04 全链路（真实 TCP）：serve 绑定随机端口，扩展形态的请求（无 Origin、
+/// 无浏览器头，仅 X-Kynoptic-Ext-Token）应 200；无令牌应 401——验证
+/// handle_client 对 /api/ext/events 的 CSRF/会话令牌豁免与扩展令牌鉴权。
+#[test]
+fn ext_events_http_end_to_end() {
+    let (dir, db) = ext_db("ext-http", EXT_TEST_TOKEN);
+    let db_for_serve = db.clone();
+    let server = std::thread::spawn(move || {
+        let _ = serve(&db_for_serve, 0, true);
+    });
+    // serve 把实际端口写入 ACTUAL_PORT；等待其就绪
+    let mut port = 0u16;
+    for _ in 0..100 {
+        port = ACTUAL_PORT.load(std::sync::atomic::Ordering::SeqCst);
+        if port != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_ne!(port, 0, "serve 未在超时内绑定端口");
+    let body = ext_body(&[("h1", "2026-11-02T03:00:00Z", "file_open", "K:/proj/x/a.rs")]);
+    let send = |token: Option<&str>| -> (u16, String) {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut req = format!(
+            "POST /api/ext/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(t) = token {
+            req.push_str(&format!("X-Kynoptic-Ext-Token: {t}\r\n"));
+        }
+        req.push_str("\r\n");
+        req.push_str(&body);
+        use std::io::Write as _;
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        use std::io::Read as _;
+        s.read_to_string(&mut resp).unwrap();
+        let status: u16 = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (status, resp)
+    };
+    // 扩展形态（无 Origin/Sec-Fetch 头）+ 正确令牌 → 200
+    let (code, resp) = send(Some(EXT_TEST_TOKEN));
+    assert_eq!(code, 200, "{resp}");
+    assert!(resp.contains("\"inserted\":1"), "{resp}");
+    // 无令牌 → 401（且不是 403 csrf——扩展不是浏览器请求）
+    let (code, resp) = send(None);
+    assert_eq!(code, 401, "{resp}");
+    drop(server); // 线程与连接随测试进程结束回收
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// === F05 AI hook 真实事件通道（POST /api/ext/events 的 claude_code/zcode 分支） ===
+
+/// hook 请求体：模拟真实 Claude Code hook stdin payload（脱敏自造；
+/// 官方 payload 字段：session_id / hook_event_name / tool_name，无 timestamp
+/// ——事件时间取接收时刻 now_ms 注入）。
+fn ai_hook_body(source: &str, events: &[Value]) -> String {
+    json!({"source": source, "events": events}).to_string()
+}
+
+/// 与 dash 分支同校验同幂等路径的直接入口（`_at` 注入时钟）。
+#[test]
+fn ai_hook_events_ingest_observed_and_idempotent() {
+    let (dir, db) = ext_db("ai-hook-ingest", EXT_TEST_TOKEN);
+    let body = ai_hook_body(
+        "claude_code",
+        &[
+            json!({"hook_event_name": "PreToolUse", "session_id": "sess-dash-1", "tool_name": "Bash", "waiting": true}),
+            json!({"hook_event_name": "PostToolUse", "session_id": "sess-dash-1", "tool_name": "Bash", "duration_ms": 1500}),
+            json!({"hook_event_name": "Notification", "session_id": "sess-dash-1"}),
+            json!({"hook_event_name": "Stop", "session_id": "sess-dash-1"}),
+        ],
+    );
+    let r1 = crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS).unwrap();
+    assert_eq!(r1["received"], json!(4));
+    assert_eq!(r1["inserted"], json!(4));
+    // 同 payload 重发 → 全部幂等命中（payload 哈希 ext_event_id）
+    let r2 = crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS).unwrap();
+    assert_eq!(r2["inserted"], json!(0));
+    assert_eq!(r2["duplicates"], json!(4));
+    let rd = Connection::open(&db).unwrap();
+    let (n, src, q): (i64, String, String) = rd
+        .query_row(
+            "SELECT COUNT(*), source_id, quality FROM events WHERE event_type='ai_session'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(n, 4, "幂等：4 条 hook 事件只落 4 行");
+    assert_eq!(src, "claude_code", "真实通道 source_id=工具源名");
+    assert_eq!(q, "observed");
+    let eid: String = rd
+        .query_row(
+            "SELECT ext_event_id FROM events WHERE event_type='ai_session' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(eid.starts_with("claude_code:"), "幂等键带来源前缀: {eid}");
+    drop(rd);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 独立复审 2026-11-11 high：payload 无 timestamp 时（ts=接收时刻注入、
+/// 不参与哈希），同一 payload 在**不同接收时刻**的两次 POST = 两次独立
+/// observed 发生，必须各落一行（纯 payload 哈希口径会把第二条误判成重发
+/// 吞掉）。同毫秒重发去重仍由上一测试覆盖（同 now_ms → duplicates）。
+#[test]
+fn ai_hook_events_same_payload_second_occurrence_kept() {
+    let (dir, db) = ext_db("ai-hook-second", EXT_TEST_TOKEN);
+    let body = ai_hook_body(
+        "claude_code",
+        &[json!({"hook_event_name": "Stop", "session_id": "sess-second"})],
+    );
+    let r1 = crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS).unwrap();
+    assert_eq!(r1["inserted"], json!(1));
+    let r2 = crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS + 5_000).unwrap();
+    assert_eq!(r2["inserted"], json!(1), "第二次发生的相同事件不得吞: {r2}");
+    assert_eq!(r2["duplicates"], json!(0));
+    let rd = Connection::open(&db).unwrap();
+    let (n, t1, t2): (i64, String, String) = rd
+        .query_row(
+            "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM events \
+             WHERE event_type='ai_session'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "两次发生各落一行: {n}");
+    assert_ne!(t1, t2, "两条事件时间 = 各自接收时刻: {t1} vs {t2}");
+    drop(rd);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// payload 显式带 `event_id`（去重头）：同一 event_id 重发跨接收时刻稳定
+/// 去重（重试端方案），不同 event_id 各自成事件。
+#[test]
+fn ai_hook_events_explicit_event_id_dedup_header() {
+    let (dir, db) = ext_db("ai-hook-eid", EXT_TEST_TOKEN);
+    let mk = |eid: &str| {
+        ai_hook_body(
+            "claude_code",
+            &[json!({"hook_event_name": "Stop", "session_id": "s", "event_id": eid})],
+        )
+    };
+    let r1 = crate::api_ai_hook_events_post_at(&db, &mk("hook-1"), EXT_NOW_MS).unwrap();
+    assert_eq!(r1["inserted"], json!(1));
+    // 同 event_id 不同时刻重发 → 幂等命中（去重头跨重发稳定）
+    let r2 = crate::api_ai_hook_events_post_at(&db, &mk("hook-1"), EXT_NOW_MS + 9_000).unwrap();
+    assert_eq!(r2["inserted"], json!(0), "同 event_id 重发应去重: {r2}");
+    assert_eq!(r2["duplicates"], json!(1));
+    // 不同 event_id → 新事件
+    let r3 = crate::api_ai_hook_events_post_at(&db, &mk("hook-2"), EXT_NOW_MS + 9_000).unwrap();
+    assert_eq!(r3["inserted"], json!(1));
+    // 非法 event_id（超长）整批拒收
+    let long = "x".repeat(129);
+    assert!(crate::api_ai_hook_events_post_at(&db, &mk(&long), EXT_NOW_MS).is_err());
+    let rd = Connection::open(&db).unwrap();
+    let n: i64 = rd
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type='ai_session'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "去重头口径：2 行（hook-1 去重 + hook-2）: {n}");
+    drop(rd);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// dsh 无 hook 机制：通道如实拒绝（400 风格错误文案说明走文件扫描）。
+#[test]
+fn ai_hook_events_reject_dsh_source() {
+    let (dir, db) = ext_db("ai-hook-dsh", EXT_TEST_TOKEN);
+    let body = ai_hook_body(
+        "dsh",
+        &[json!({"hook_event_name": "Stop", "session_id": "dsh-x"})],
+    );
+    let err = crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS).unwrap_err();
+    assert!(err.contains("dsh 无 hook 机制"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// HTTP 路由级：AI hook 分支受扩展令牌鉴权（无令牌 401，错令牌 401），
+/// 正确令牌 200；zcode 源可写；校验失败整批拒收（写 0 行）。
+#[test]
+fn ai_hook_events_route_auth_and_zcode() {
+    let (dir, db) = ext_db("ai-hook-route", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    let body = ai_hook_body(
+        "zcode",
+        &[
+            json!({"hook_event_name": "SessionStart", "session_id": "zc-sess-1"}),
+            json!({"hook_event_name": "PreToolUse", "session_id": "zc-sess-1", "tool_name": "Bash"}),
+            json!({"hook_event_name": "PostToolUseFailure", "session_id": "zc-sess-1", "tool_name": "Bash"}),
+            json!({"hook_event_name": "Stop", "session_id": "zc-sess-1"}),
+        ],
+    );
+    // 无令牌 → 401
+    let (code, _, out) = route_req_ext(&conn, "POST", "/api/ext/events", &body, &db, None);
+    assert_eq!(code, 401, "{out}");
+    // 错令牌 → 401
+    let (code, _, _) = route_req_ext(&conn, "POST", "/api/ext/events", &body, &db, Some("wrong"));
+    assert_eq!(code, 401);
+    // 正确令牌 → 200，4 行落库（source_id='zcode'）
+    let (code, _, out) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["inserted"], json!(4));
+    // 整批拒收：一条坏事件 → 400 且写 0 行
+    let bad = ai_hook_body(
+        "zcode",
+        &[
+            json!({"hook_event_name": "Stop", "session_id": "zc-ok"}),
+            json!({"hook_event_name": "NotARealEvent", "session_id": "zc-ok"}),
+        ],
+    );
+    let (code, _, out) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &bad,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 400, "{out}");
+    let rd = Connection::open(&db).unwrap();
+    let n: i64 = rd
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type='ai_session' AND source_id='zcode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 4, "坏批不得写半批");
+    drop(rd);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 全链路（hook 事件 → 落库 → ai_run 区间派生）：同一会话 hook observed
+/// 优先于扫描 inferred，不双计；区间窗口 = hook 事件 [最早, 最晚]。
+#[test]
+fn ai_hook_events_feed_ai_run_intervals() {
+    let (dir, db) = ext_db("ai-hook-interval", EXT_TEST_TOKEN);
+    // 先放一条扫描 inferred 会话（模拟 ai_adapter 扫描先行）
+    {
+        let w = Connection::open(&db).unwrap();
+        w.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, event_data, app_name, source_id, quality) \
+             VALUES (?1, 'ai_session', 'ai_run', ?2, 'claude_code', 'ai', 'inferred')",
+            rusqlite::params![
+                "2026-11-02T03:00:00+00:00",
+                json!({
+                    "schema_version": 1, "session_id": "sess-chain", "source": "claude_code",
+                    "start": "2026-11-02T03:00:00+00:00", "end": "2026-11-02T03:05:00+00:00",
+                    "start_quality": "inferred", "end_quality": "inferred"
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    }
+    // hook observed 事件（同会话，3:01-3:02）
+    let body = ai_hook_body(
+        "claude_code",
+        &[
+            json!({"hook_event_name": "PreToolUse", "session_id": "sess-chain", "tool_name": "Edit",
+                   "timestamp": "2026-11-02T03:01:00Z"}),
+            json!({"hook_event_name": "PostToolUse", "session_id": "sess-chain", "tool_name": "Edit",
+                   "duration_ms": 8000, "timestamp": "2026-11-02T03:02:00Z"}),
+        ],
+    );
+    crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS).unwrap();
+    // 全量重建（注入时钟；节流 static 可能挡掉 ingest 内建重建，测试直接重建）
+    let w = Connection::open(&db).unwrap();
+    kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at(&w, EXT_NOW_MS).unwrap();
+    let rows: Vec<(String, String, String, String)> = {
+        let mut stmt = w
+            .prepare(
+                "SELECT app_name, quality, start_ts, end_ts FROM activity_intervals \
+                 WHERE interval_kind='ai_run' ORDER BY start_ts",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+            .unwrap()
+    };
+    assert_eq!(rows.len(), 1, "同会话两路证据不双计");
+    let (app, q, start, end) = &rows[0];
+    assert_eq!(app, "claude_code");
+    assert_eq!(q, "observed", "hook observed 优先于扫描 inferred");
+    assert_eq!(start, "2026-11-02T03:01:00+00:00");
+    assert_eq!(end, "2026-11-02T03:02:00+00:00");
+    drop(w);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// === F06 缺口补齐：人工指定项目（POST /api/intervals/project，migration 0018）===
+
+const PO_BASE_MS: i64 = 1_792_977_600_000; // 2026-11-02T03:00:00Z，固定不读真实时钟
+
+fn po_rfc(off_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(PO_BASE_MS + off_ms)
+        .unwrap()
+        .to_rfc3339()
+}
+
+/// 文件库（POST 写路径走 db_path；内存库不适用）。
+fn po_file_conn(tag: &str) -> (std::path::PathBuf, Connection) {
+    let dir = tmpdir(tag);
+    let db = dir.join("kyn.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(kynoptic_core::db::SCHEMA).unwrap();
+    kynoptic_core::db::run_migrations(&conn).unwrap();
+    (db, conn)
+}
+
+/// 指定项目全链路：校验 → append-only 落库（project_overrides）→ 重建 →
+/// timeline 返回 project_source=manual / project_evidence=observed；二次指定
+/// 同区间 corrected_from=manual（审计：记录被取代的前归属）。_at 注入时钟。
+#[test]
+fn intervals_project_post_assigns_manual_and_rebuilds() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let (db, conn) = po_file_conn("pov-ok");
+    for off in [0i64, 10_000] {
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, event_action, app_name, window_title) \
+             VALUES (?1, 'window', 'switch', 'Code.exe', 'sample-file.rs')",
+            params![po_rfc(off)],
+        )
+        .unwrap();
+    }
+    let now = PO_BASE_MS + 60_000;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+    // 取下钻面板同源的区间时间（尾段断线收口 [0s, now]）
+    let (start_ts, end_ts): (String, String) = conn
+        .query_row(
+            "SELECT start_ts, end_ts FROM activity_intervals \
+             WHERE interval_kind='foreground_dwell' LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    let body = serde_json::json!({
+        "interval_kind": "foreground_dwell",
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "app_name": "Code.exe",
+        "title_hash": conn.query_row(
+            "SELECT title_hash FROM activity_intervals WHERE interval_kind='foreground_dwell' LIMIT 1",
+            [], |r| r.get::<_, Option<String>>(0)).unwrap(),
+        "project": "manual-proj",
+    })
+    .to_string();
+    let (code, _, out) = route_req(&conn, "POST", "/api/intervals/project", &body, &db);
+    assert_eq!(code, 200, "out={out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["project_source"], json!("manual"));
+    assert_eq!(v["project_evidence"], json!("observed"));
+    assert_eq!(v["corrected_from"], json!("unassigned"));
+    assert_eq!(v["rebuilt"], json!(true));
+    // append-only：project_overrides 恰 1 行（审计字段落盘）
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM project_overrides", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // timeline（下钻数据源）返回 manual / observed
+    let tl = crate::api_unified_timeline_at(&conn, 60, now).unwrap();
+    let a = &tl["tracks"].as_array().unwrap()[0];
+    assert_eq!(a["intervals"][0]["project"], json!("manual-proj"));
+    assert_eq!(a["intervals"][0]["project_source"], json!("manual"));
+    assert_eq!(a["intervals"][0]["project_evidence"], json!("observed"));
+
+    // 二次指定（追加覆盖）：corrected_from 如实记录被取代的 manual；
+    // title_hash 必须与区间一致才匹配——重取真实值
+    let th: Option<String> = conn
+        .query_row(
+            "SELECT title_hash FROM activity_intervals WHERE interval_kind='foreground_dwell' LIMIT 1",
+            [], |r| r.get(0)).unwrap();
+    let body2 = serde_json::json!({
+        "interval_kind": "foreground_dwell",
+        "start_ts": start_ts, "end_ts": end_ts,
+        "app_name": "Code.exe", "title_hash": th,
+        "project": "manual-proj-2",
+    })
+    .to_string();
+    let (code2, _, out2) = route_req(&conn, "POST", "/api/intervals/project", &body2, &db);
+    assert_eq!(code2, 200, "out2={out2}");
+    let v2: Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(
+        v2["corrected_from"],
+        json!("manual"),
+        "审计记录被取代的前归属"
+    );
+    let (proj, psrc): (String, String) = conn
+        .query_row(
+            "SELECT project, project_source FROM activity_intervals \
+             WHERE interval_kind='foreground_dwell' LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(proj, "manual-proj-2", "追加覆盖：最晚指定生效");
+    assert_eq!(psrc, "manual");
+    let n2: i64 = conn
+        .query_row("SELECT COUNT(*) FROM project_overrides", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n2, 2, "append-only：只增不删");
+}
+
+/// 校验面：坏 JSON / 未知 kind / 空 project / 缺失目标区间 / 坏时间 → 400，
+/// 且不落任何行（先验后写）。
+#[test]
+fn intervals_project_post_validates_input() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let (db, conn) = po_file_conn("pov-bad");
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, app_name, window_title) \
+         VALUES (?1, 'window', 'switch', 'app.exe', 't')",
+        params![po_rfc(0)],
+    )
+    .unwrap();
+    rebuild_activity_intervals_at(&conn, PO_BASE_MS + 30_000).unwrap();
+    let post = |body: &str| route_req(&conn, "POST", "/api/intervals/project", body, &db).0;
+
+    assert_eq!(post("{oops"), 400, "坏 JSON");
+    assert_eq!(
+        post(
+            r#"{"interval_kind":"away","start_ts":"2026-11-02T03:00:00+00:00","end_ts":"2026-11-02T03:01:00+00:00","app_name":"x","project":"p"}"#
+        ),
+        400,
+        "away 无归属面"
+    );
+    assert_eq!(
+        post(
+            r#"{"interval_kind":"foreground_dwell","start_ts":"2026-11-02T03:00:00+00:00","end_ts":"2026-11-02T03:01:00+00:00","app_name":"app.exe","project":"  "}"#
+        ),
+        400,
+        "空 project"
+    );
+    assert_eq!(
+        post(
+            r#"{"interval_kind":"foreground_dwell","start_ts":"2026-11-02T05:00:00+00:00","end_ts":"2026-11-02T05:01:00+00:00","app_name":"app.exe","project":"p"}"#
+        ),
+        400,
+        "目标区间不存在（窗口不相交）"
+    );
+    assert_eq!(
+        post(
+            r#"{"interval_kind":"foreground_dwell","start_ts":"2026-11-02T03:01:00+00:00","end_ts":"2026-11-02T03:00:00+00:00","app_name":"app.exe","project":"p"}"#
+        ),
+        400,
+        "end_ts <= start_ts"
+    );
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM project_overrides", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "校验失败不得落任何行");
+}
+
+/// 可追溯缺省：无人工指定、无规则 → timeline project_source=unassigned、
+/// project_evidence=null；reports 行 project_source=unassigned（不虚构归属）。
+#[test]
+fn timeline_and_reports_default_to_unassigned_source() {
+    use kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at;
+    let conn = mem_conn();
+    conn.execute(
+        "INSERT INTO events (timestamp, event_type, event_action, app_name, window_title) \
+         VALUES (?1, 'window', 'switch', 'app.exe', 't')",
+        params![po_rfc(0)],
+    )
+    .unwrap();
+    let now = PO_BASE_MS + 60_000;
+    rebuild_activity_intervals_at(&conn, now).unwrap();
+    let tl = crate::api_unified_timeline_at(&conn, 60, now).unwrap();
+    let iv = &tl["tracks"].as_array().unwrap()[0]["intervals"][0];
+    assert_eq!(iv["project_source"], json!("unassigned"));
+    assert_eq!(iv["project_evidence"], Value::Null);
+    let rep = crate::api_reports_at(&conn, 1, now).unwrap();
+    let row = &rep["rows"].as_array().unwrap()[0];
+    assert_eq!(row["project"], json!("(none)"));
+    assert_eq!(row["project_source"], json!("unassigned"));
+}
+
+// === F09 采集器健康（GET /api/health） ===
+
+/// 判定阈值表（纯函数，无时钟）：unknown 优先、超阈值 stale、退避 degraded、
+/// 其余 ok——全部用常量边界值断言，不读真实时钟。
+#[test]
+fn health_classifier_thresholds() {
+    use crate::{classify_monitor_health, HEALTH_MONITOR_STALE_SECS};
+    // 无证据 → unknown（不是零、不是故障）
+    assert_eq!(classify_monitor_health(None, 0), "unknown");
+    // 阈值内 + 无退避 → ok
+    assert_eq!(classify_monitor_health(Some(0), 0), "ok");
+    assert_eq!(
+        classify_monitor_health(Some(HEALTH_MONITOR_STALE_SECS), 0),
+        "ok"
+    );
+    // 超阈值 → stale（即使无退避）
+    assert_eq!(
+        classify_monitor_health(Some(HEALTH_MONITOR_STALE_SECS + 1), 0),
+        "stale"
+    );
+    // 阈值内但连续慢采集中 → degraded
+    assert_eq!(classify_monitor_health(Some(5), 1), "degraded");
+    // stale 优先级高于 degraded：超阈值且退避 → stale
+    assert_eq!(
+        classify_monitor_health(Some(HEALTH_MONITOR_STALE_SECS + 1), 3),
+        "stale"
+    );
+    use crate::{classify_channel_health, HEALTH_AI_CHANNEL_STALE_SECS, HEALTH_EXT_STALE_SECS};
+    assert_eq!(
+        classify_channel_health(None, HEALTH_EXT_STALE_SECS),
+        "unknown"
+    );
+    assert_eq!(
+        classify_channel_health(Some(HEALTH_EXT_STALE_SECS), HEALTH_EXT_STALE_SECS),
+        "ok"
+    );
+    assert_eq!(
+        classify_channel_health(Some(HEALTH_EXT_STALE_SECS + 1), HEALTH_EXT_STALE_SECS),
+        "stale"
+    );
+    assert_eq!(
+        classify_channel_health(
+            Some(HEALTH_AI_CHANNEL_STALE_SECS + 1),
+            HEALTH_AI_CHANNEL_STALE_SECS
+        ),
+        "stale"
+    );
+}
+
+/// /api/health 汇总（注入时钟）：真实 hook 事件落库后 claude_code 通道
+/// 在 24h 阈值内 → ok；把 now 推到 3 天后 → stale；无记录的通道恒 unknown。
+#[test]
+fn api_health_channel_states_with_injected_now() {
+    let (dir, db) = ext_db("health-api", EXT_TEST_TOKEN);
+    let body = ai_hook_body(
+        "claude_code",
+        &[json!({"hook_event_name": "Stop", "session_id": "hc-1"})],
+    );
+    crate::api_ai_hook_events_post_at(&db, &body, EXT_NOW_MS).unwrap();
+    let now = chrono::DateTime::from_timestamp_millis(EXT_NOW_MS).unwrap();
+    // 健康读 events：hook 事件落在 db 文件（ingest 自开写连接），用该库
+    // 连接读，不读与文件无关的 mem_conn。
+    let rconn = Connection::open(&db).unwrap();
+    let h = crate::api_health_at(&rconn, now);
+    assert_eq!(h["endpoint"], json!("health"));
+    // claude_code：10 分钟前有事件 → ok；zcode / 扩展无记录 → unknown
+    let ch = |name: &str| -> Value {
+        h["ai_channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["channel"] == json!(name))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(ch("claude_code hook")["state"], json!("ok"));
+    // hook payload 无 timestamp → 事件时间 = 接收时刻（EXT_NOW_MS 注入），
+    // 与测试 now 相同 → age 0，状态 ok。
+    assert_eq!(ch("claude_code hook")["age_secs"], json!(0));
+    assert_eq!(ch("zcode hook")["state"], json!("unknown"));
+    let ext = |name: &str| -> Value {
+        h["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["channel"] == json!(name))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(ext("browser extension")["state"], json!("unknown"));
+    // 时钟推 3 天：claude_code 超 24h 阈值 → stale，总体 stale
+    let later = now + chrono::Duration::days(3);
+    let h2 = crate::api_health_at(&rconn, later);
+    let ch2 = h2["ai_channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["channel"] == json!("claude_code hook"))
+        .unwrap();
+    assert_eq!(ch2["state"], json!("stale"));
+    assert_eq!(h2["status"], json!("stale"));
+    // 阈值常量随响应透出（前端/CLI 免硬编码）
+    assert_eq!(
+        h["thresholds"]["ai_channel_stale_secs"],
+        json!(crate::HEALTH_AI_CHANNEL_STALE_SECS)
+    );
+    drop(rconn); // Windows：先关连接再清目录
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 路由级：GET /api/health 200 且结构完整（测试进程无采集器 → monitors
+/// 空数组即 unknown 注记；通道条目按清单齐备）；未知查询参数回显。
+#[test]
+fn health_route_arm_200() {
+    let conn = mem_conn();
+    let (code, ctype, out) = route_req(&conn, "GET", "/api/health", "", Path::new("kyn.db"));
+    assert_eq!(code, 200, "{out}");
+    assert_eq!(ctype, "application/json");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], json!("unknown"), "无采集器无事件 → unknown");
+    assert_eq!(v["monitors"], json!([]));
+    assert_eq!(v["ai_channels"].as_array().unwrap().len(), 3);
+    assert_eq!(v["extensions"].as_array().unwrap().len(), 3);
+    let (_, _, out2) = route_req(&conn, "GET", "/api/health?foo=1", "", Path::new("kyn.db"));
+    let v2: Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(v2["ignored_params"], json!(["foo"]));
+}
+
+// === F10 隐私安全（绑定/token/路径注入/整标题脱敏） ===
+
+/// F10-1 断言 serve 只绑 127.0.0.1：serve 起后，同端口通配地址（0.0.0.0）
+/// 必须仍可绑定——若 serve 绑了通配地址，本断言的 bind 会因端口冲突失败。
+/// 另断言 DNS rebinding 防线：非回环 Host 名 403 forbidden_host。
+#[test]
+fn serve_binds_loopback_only() {
+    // 自选空闲端口（先占后放），不依赖 ACTUAL_PORT 全局（避免与并行
+    // serve 测试竞态串台）。
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let (dir, db) = ext_db("bind-loopback", EXT_TEST_TOKEN);
+    let db2 = db.clone();
+    let server = std::thread::spawn(move || {
+        let _ = crate::serve(&db2, port, true);
+    });
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "serve 未在超时内监听 127.0.0.1:{port}");
+    // 通配地址仍空闲 = serve 没有绑 0.0.0.0（只绑了 127.0.0.1）
+    let wildcard = std::net::TcpListener::bind(("0.0.0.0", port));
+    assert!(
+        wildcard.is_ok(),
+        "serve 必须只绑 127.0.0.1；通配地址同端口被占说明绑了 0.0.0.0"
+    );
+    drop(wildcard);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    use std::io::{Read as _, Write as _};
+    let req = format!(
+        "GET /api/status HTTP/1.1\r\nHost: evil.example.com:{port}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.contains("403"), "{resp}");
+    assert!(resp.contains("forbidden_host"), "{resp}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F10-2 token_required 模式下新端点受保护：写 dashboard-token.txt 后
+/// serve，GET /api/health 无令牌 401、错令牌 401、带令牌 200（HTTP 层
+/// /api/* 前缀统一闸门覆盖新端点，无需逐端点白名单）。
+#[test]
+fn health_endpoint_requires_access_token_http() {
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let (dir, db) = ext_db("health-token", EXT_TEST_TOKEN);
+    std::fs::write(dir.join("dashboard-token.txt"), "sekrit-health\n").unwrap();
+    let db2 = db.clone();
+    let server = std::thread::spawn(move || {
+        let _ = crate::serve(&db2, port, true);
+    });
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "serve 未就绪");
+    let send = |token: Option<&str>| -> (u16, String) {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut req =
+            format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+        if let Some(t) = token {
+            req.push_str(&format!("X-Kynoptic-Access-Token: {t}\r\n"));
+        }
+        req.push_str("\r\n");
+        use std::io::{Read as _, Write as _};
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        let code: u16 = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (code, resp)
+    };
+    let (code, resp) = send(None);
+    assert_eq!(code, 401, "{resp}");
+    assert!(resp.contains("unauthorized"), "{resp}");
+    let (code, resp) = send(Some("wrong-token"));
+    assert_eq!(code, 401, "{resp}");
+    let (code, resp) = send(Some("sekrit-health"));
+    assert_eq!(code, 200, "{resp}");
+    assert!(resp.contains("\"endpoint\":\"health\""), "{resp}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F10-3 路径注入防线：file_path 含 `..` 路径段整批拒收（400），不落任何行；
+/// 文件名中恰好含 "a..b"（非路径段）不受影响。
+#[test]
+fn ext_events_reject_dotdot_path_segment() {
+    let (dir, db) = ext_db("ext-dotdot", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    for bad in [
+        "../../etc/passwd",
+        "K:/proj/../../../secret.txt",
+        "a\\..\\b.txt",
+    ] {
+        let body = ext_body(&[("dd-1", "2026-11-02T03:00:00Z", "file_open", bad)]);
+        let (code, _, out) = route_req_ext(
+            &conn,
+            "POST",
+            "/api/ext/events",
+            &body,
+            &db,
+            Some(EXT_TEST_TOKEN),
+        );
+        assert_eq!(code, 400, "path={bad} out={out}");
+        assert!(out.contains(".."), "{out}");
+    }
+    let body = ext_body(&[(
+        "dd-ok",
+        "2026-11-02T03:00:00Z",
+        "file_open",
+        "K:/proj/a..b/x.rs",
+    )]);
+    let (code, _, out) = route_req_ext(
+        &conn,
+        "POST",
+        "/api/ext/events",
+        &body,
+        &db,
+        Some(EXT_TEST_TOKEN),
+    );
+    assert_eq!(code, 200, "{out}");
+    let rd = Connection::open(&db).unwrap();
+    let total: i64 = rd
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type='editor'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 1, "只有正常路径那一条落库");
+    drop(rd);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F10-4 整标题脱敏设置项：POST 落盘 → GET 读回；缺省 false（默认存原文，
+/// 不改变既有行为与既有数据）；dashboard UI 含开关。
+#[test]
+fn redact_titles_full_setting_roundtrip_and_default_off() {
+    let (dir, db) = ext_db("redact-full", EXT_TEST_TOKEN);
+    let conn = mem_conn();
+    let (_, _, out) = route_req(&conn, "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["redact_titles_full"], json!(false), "缺省关");
+    let body = json!({"redact_titles_full": true}).to_string();
+    let (code, _, out) = route_req(&conn, "POST", "/api/settings", &body, &db);
+    assert_eq!(code, 200, "{out}");
+    let (_, _, out) = route_req(&conn, "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["redact_titles_full"], json!(true));
+    assert_eq!(v["redact_titles"], json!(false), "不牵连相邻设置");
+    let (code, _, _) = route_req(
+        &conn,
+        "POST",
+        "/api/settings",
+        r#"{"redact_titles_full": "yes"}"#,
+        &db,
+    );
+    assert_eq!(code, 400, "非布尔值拒收");
+    assert!(crate::DASHBOARD_HTML.contains("set-redact-full"));
+    assert!(crate::DASHBOARD_HTML.contains("redact_titles_full"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// === F11 多设备 timeline 合流（device_endpoints / ?merge=1） ===
+
+/// F11 设置项：POST 接受 device_endpoints 并落盘读回；不出现在 ignored；
+/// 非法 url / 空 name / 非数组拒收 400；UI 含编辑器容器与字段类名。
+#[test]
+fn device_endpoints_setting_roundtrip_and_validation() {
+    let dir = tmpdir("dev-endpoints");
+    let db = dir.join("kyn.db");
+    let conn = mem_conn();
+    // 缺省空（单机模式）
+    let (_, _, out) = route_req(&conn, "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["device_endpoints"], json!([]), "opt-in：默认空");
+    // 合法保存
+    let body = json!({
+        "device_endpoints": [
+            {"name": "workstation-b", "url": "http://127.0.0.1:18422", "token": "sample-token"},
+            {"name": "laptop-c", "url": "http://localhost:8422"}
+        ]
+    })
+    .to_string();
+    let (code, _, out) = route_req(&conn, "POST", "/api/settings", &body, &db);
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("ignored").is_none(),
+        "device_endpoints 不应被列进 ignored"
+    );
+    assert_eq!(v["device_endpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(v["device_endpoints"][0]["name"], json!("workstation-b"));
+    // 落盘读回
+    let (_, _, out) = route_req(&conn, "GET", "/api/settings", "", &db);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["device_endpoints"][0]["url"],
+        json!("http://127.0.0.1:18422")
+    );
+    assert_eq!(v["device_endpoints"][1]["token"], json!(""));
+    // 非法 url（https / 非 http 开头）拒收
+    let (code, _, _) = route_req(
+        &conn,
+        "POST",
+        "/api/settings",
+        r#"{"device_endpoints":[{"name":"x","url":"https://127.0.0.1"}]}"#,
+        &db,
+    );
+    assert_eq!(code, 400, "https url 应拒收");
+    // 空 name 拒收
+    let (code, _, _) = route_req(
+        &conn,
+        "POST",
+        "/api/settings",
+        r#"{"device_endpoints":[{"name":"  ","url":"http://127.0.0.1:1"}]}"#,
+        &db,
+    );
+    assert_eq!(code, 400);
+    // 非数组拒收
+    let (code, _, _) = route_req(
+        &conn,
+        "POST",
+        "/api/settings",
+        r#"{"device_endpoints":"x"}"#,
+        &db,
+    );
+    assert_eq!(code, 400);
+    // UI 编辑器接线
+    assert!(crate::DASHBOARD_HTML.contains("dev-endpoints"));
+    assert!(crate::DASHBOARD_HTML.contains("device_endpoints"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 本地 mock HTTP timeline 服务：回固定 JSON。返回 (线程句柄, base url)。
+fn mock_timeline_server(payload: Value) -> (std::thread::JoinHandle<()>, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = payload.to_string();
+    let h = std::thread::spawn(move || {
+        // 单次请求：路由级 merge 只对每个远端拉一次（filter 透传测试有自己的 mock）
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    (h, format!("http://{}", addr))
+}
+
+/// F11 路由级合流：settings 里配一个在线 mock（返回带 A 轨区间的远端
+/// timeline）+ 一个连不上的端口 → GET /api/timeline?minutes=60&merge=1
+/// 200；本机轨道在前、每区间带 device；远端设备分轨；offline 设备显式
+/// 标注且 error 在场；human_presence_boundary 明示不相加。
+#[test]
+fn timeline_merge_route_merges_remote_and_marks_offline() {
+    let dir = tmpdir("merge-route");
+    let db = dir.join("kyn.db");
+    let conn = mem_conn();
+    // 本机库插一条 window/switch 并重建派生表，让本机 A 轨有真实区间
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let start_ts = chrono::DateTime::from_timestamp_millis(now_ms - 300_000)
+        .unwrap()
+        .to_rfc3339();
+    insert(&conn, &start_ts, "window", "switch", Some("sample-app"));
+    kynoptic_core::db::activity_intervals::rebuild_activity_intervals_at(&conn, now_ms).unwrap();
+    // 远端 mock：合法 timeline payload（远端窗口与请求 minutes 无关，仅验证合流）
+    let remote_payload = json!({
+        "endpoint": "unified_timeline",
+        "window_start_ms": now_ms - 3_600_000i64,
+        "window_end_ms": now_ms,
+        "tracks": [{
+            "id": "A", "label_en": "Foreground windows", "label_zh": "前台窗口",
+            "connected": true,
+            "intervals": [{"start_ms": now_ms - 600_000i64, "end_ms": now_ms - 300_000i64,
+                "duration_ms": 300_000, "evidence_level": "observed"}]
+        }],
+    });
+    let (h, url) = mock_timeline_server(remote_payload);
+    // settings 写入：在线 mock + 必然拒连端口（offline 降级）
+    let settings_body = json!({
+        "device_endpoints": [
+            {"name": "workstation-b", "url": url, "token": ""},
+            {"name": "laptop-c", "url": "http://127.0.0.1:1", "token": ""}
+        ]
+    })
+    .to_string();
+    let (code, _, out) = route_req(&conn, "POST", "/api/settings", &settings_body, &db);
+    assert_eq!(code, 200, "{out}");
+    // 合并请求
+    let (code, _, out) = route_req(&conn, "GET", "/api/timeline?minutes=60&merge=1", "", &db);
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["endpoint"], json!("unified_timeline_merged"));
+    assert_eq!(v["merge"], json!(true));
+    // 设备清单：本机 online + workstation-b online + laptop-c offline
+    let devices = v["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 3);
+    assert_eq!(devices[0]["device"], json!("local"));
+    assert_eq!(devices[1]["name"], json!("workstation-b"));
+    assert_eq!(devices[1]["status"], json!("online"));
+    assert_eq!(devices[2]["name"], json!("laptop-c"));
+    assert_eq!(devices[2]["status"], json!("offline"));
+    assert!(
+        !devices[2]["error"].as_str().unwrap().is_empty(),
+        "offline 必须带错误摘要"
+    );
+    // 轨道：本机 5 轨 + 远端 mock 返回的 1 轨原样并列；offline 无轨道
+    let tracks = v["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 6, "本机 5 轨 + 远端 1 轨，offline 不产轨道");
+    assert_eq!(tracks[0]["device"], json!("local"));
+    assert_eq!(tracks[5]["device"], json!("workstation-b"));
+    // 远端 A 轨区间带 device 标记
+    let remote_a_iv = &tracks[5]["intervals"];
+    assert_eq!(remote_a_iv.as_array().unwrap().len(), 1);
+    assert_eq!(remote_a_iv[0]["device"], json!("workstation-b"));
+    // 本机 A 轨区间也带 device=local
+    let local_a = &tracks[0]["intervals"];
+    if let Some(arr) = local_a.as_array() {
+        if !arr.is_empty() {
+            assert_eq!(arr[0]["device"], json!("local"));
+        }
+    }
+    // human_presence 不相加口径在场
+    assert!(v["human_presence_boundary"]["note_zh"]
+        .as_str()
+        .unwrap()
+        .contains("不相加"));
+    h.join().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F11 无远端配置时 merge=1 仍可用：单设备（仅本机）合流形态，本机数据原样。
+#[test]
+fn timeline_merge_route_with_no_endpoints_is_local_only() {
+    let dir = tmpdir("merge-empty");
+    let db = dir.join("kyn.db");
+    let conn = mem_conn();
+    let (code, _, out) = route_req(&conn, "GET", "/api/timeline?minutes=30&merge=1", "", &db);
+    assert_eq!(code, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["endpoint"], json!("unified_timeline_merged"));
+    let devices = v["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["device"], json!("local"));
+    assert_eq!(devices[0]["status"], json!("online"));
+}
+
+/// F11 纯合流函数：_at 注入（now_ms 显式入参，零真实时钟依赖）——offline
+/// 设备的区间绝不产出、本机轨道保持在前、区间 device 字段全量标注。
+#[test]
+fn merge_unified_timelines_is_pure_and_injects_now() {
+    let now = 1_700_000_000_000i64;
+    let local = json!({
+        "endpoint": "unified_timeline",
+        "window_start_ms": now - 60_000i64,
+        "window_end_ms": now,
+        "tracks": [{
+            "id": "C", "label_zh": "在场 / 离场", "connected": true,
+            "intervals": [{"start_ms": now - 30_000i64, "end_ms": now, "duration_ms": 30_000i64}]
+        }],
+    });
+    let remote = json!({"tracks": [{"id": "A", "connected": true,
+        "intervals": [{"start_ms": now - 10_000i64, "end_ms": now - 5_000i64}]}]});
+    let merged = crate::merge::merge_unified_timelines(
+        local,
+        vec![
+            ("dev-b".into(), Ok(remote)),
+            ("dev-c".into(), Err("timeout".into())),
+        ],
+        1,
+        now,
+    );
+    assert_eq!(merged["minutes"], json!(1));
+    assert_eq!(merged["generated_at_ms"], json!(now), "now_ms 注入直传");
+    let tracks = merged["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 2, "offline 设备不产轨道");
+    assert_eq!(tracks[0]["device"], json!("local"));
+    assert_eq!(tracks[1]["device"], json!("dev-b"));
+    // offline 设备只在 devices 里显式标注
+    assert_eq!(merged["devices"][2]["status"], json!("offline"));
+    assert_eq!(merged["devices"][2]["error"], json!("timeout"));
 }

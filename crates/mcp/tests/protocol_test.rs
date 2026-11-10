@@ -140,8 +140,8 @@ fn full_initialize_list_call_roundtrip() {
         json!("2024-11-05")
     );
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    // 0.4.0 新增 get_topics（F2）：七工具
-    assert_eq!(tools.len(), 7);
+    // Stage 3 新增 get_unified_timeline / get_reports（PRD F07/F08）：九工具
+    assert_eq!(tools.len(), 9);
 
     let status = text_payload(&responses[2]);
     assert_eq!(status["cpu_pct"], json!(12.0));
@@ -153,6 +153,45 @@ fn full_initialize_list_call_roundtrip() {
 
     let anomalies = text_payload(&responses[4]);
     assert!(anomalies["anomalies"].is_array());
+    cleanup(&path);
+}
+
+/// PRD v1.0 Stage 3（F07/F08/F11）：get_unified_timeline / get_reports 经
+/// tools/call 可用；now_ms 显式注入时钟（测试零真实时钟依赖）；响应与
+/// dash 端点同一纯函数产出——endpoint 标识、device_boundary 边界说明一致。
+#[test]
+fn tools_call_unified_timeline_and_reports() {
+    let path = seeded_db();
+    let db_path = path.to_str().unwrap().to_string();
+    // 固定 now：2026-09-01T02:00:00Z = 1786442400000ms（不读真实时钟）
+    let now_ms: i64 = 1_786_442_400_000;
+    let responses = roundtrip(
+        &db_path,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_unified_timeline","arguments":{"minutes":60,"now_ms":now_ms}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_reports","arguments":{"days":7,"now_ms":now_ms}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_unified_timeline","arguments":{"minutes":0,"now_ms":now_ms}}}),
+        ],
+    );
+    let tl = text_payload(&responses[0]);
+    assert_eq!(tl["endpoint"], json!("unified_timeline"));
+    assert_eq!(tl["minutes"], json!(60));
+    assert_eq!(tl["device_boundary"]["scope"], json!("this_database"));
+    assert!(tl["tracks"].is_array());
+
+    let rp = text_payload(&responses[1]);
+    assert_eq!(rp["endpoint"], json!("reports"));
+    assert_eq!(rp["days"], json!(7));
+    assert_eq!(rp["device_boundary"]["scope"], json!("this_database"));
+    assert!(rp["rows"].is_array());
+    assert!(rp["devices"].is_array());
+
+    // minutes=0 硬错误（不静默回落默认，与 days/limit 同政策）
+    let err = text_payload(&responses[2]);
+    assert_eq!(
+        err["error"],
+        json!("minutes must be >= 1（minutes 必须 >= 1，不接受 0 或负数）")
+    );
     cleanup(&path);
 }
 

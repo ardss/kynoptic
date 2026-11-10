@@ -1,12 +1,18 @@
 // Kynoptic browser extension - background service worker (MV3).
 //
 // Event-driven only: reports on tabs.onActivated / tabs.onUpdated.
-// No polling of page content, no content scripts, no webRequest.
+// No polling of page content, no webRequest.
+//
+// F03: the ChatGPT web session collector (content-chatgpt.js, opt-in via the
+// popup) sends start/end signals here; chatgpt-session.js pairs them per tab
+// and hands this worker one .ai_session event, which goes out through the
+// same report() / native messaging path as tab events.
 //
 // Transport: chrome.runtime.sendNativeMessage to the Kynoptic native host.
 // When the host is unreachable (kynoptic not running, host not registered,
 // or transient failure), events are buffered in chrome.storage.local and
 // flushed in order on the next successful send.
+importScripts("chatgpt-session.js");
 
 // TODO: replace with the registered native host name once finalized.
 const NATIVE_HOST_NAME = "kynoptic_browser_host";
@@ -26,10 +32,29 @@ function nowMs() {
   return Date.now();
 }
 
+// Review 2026-11-11 (low): `${ms}-${kind}-${tabId}` alone can collide when
+// the same tab produces two same-kind events within one millisecond (rapid
+// onUpdated url/title churn, adjacent buffered replay entries). Append a
+// per-worker sequence number plus a random worker-instance seed: the
+// sequence disambiguates within one worker lifetime, the seed disambiguates
+// across MV3 service-worker cold starts. Buffered replay resends carry the
+// SAME stored event object, so ids stay stable across resends and the
+// native host dedup still works.
+const EVENT_ID_SEED = Math.random().toString(36).slice(2, 8);
+let eventSeq = 0;
+function nextEventSeq() {
+  eventSeq = (eventSeq + 1) % 0xffff;
+  return eventSeq.toString(36);
+}
+
 function makeEvent(kind, tab, extra) {
   return {
     // event_type matches the kynoptic ingest naming: dot-prefixed sub-kind.
     event_type: ".tab_change",
+    // Client-side idempotency key: the native host dedupes on this
+    // (json_extract(event_data,'$.event_id')) when buffered events are
+    // replayed after a reconnect, so a resend never produces a second row.
+    event_id: `${nowMs()}-${kind}-${tab ? tab.id : "?"}-${EVENT_ID_SEED}${nextEventSeq()}`,
     ts_ms: nowMs(),
     kind: kind, // "activated" | "updated"
     tab_id: tab ? tab.id : null,

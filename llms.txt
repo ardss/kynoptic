@@ -43,11 +43,13 @@
   (numbered migrations), queries, monitor registry
   (`crates/core/src/registry.rs` is the single source of truth for
   what is enabled by default).
-- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary with 21
-  subcommands: `analyze`, `apps`, `autostart`, `collect`, `dashboard`,
-  `db`, `export`, `ghost`, `mcp`, `migrate`, `now`, `presence`, `probe`,
-  `query`, `recompute-actors`, `report`, `skill`, `stats`, `topics`,
-  `update`, `watchdog`. Includes a local-only web dashboard (read-only
+- `crates/cli` - the `kynoptic` / `kynoptic-ctl` binary with 28
+  subcommands: `ai-hooks`, `analyze`, `apps`, `autostart`, `collect`,
+  `dashboard`, `db`, `export`, `ext-event`, `ghost`, `health`, `host-register`,
+  `mcp`, `migrate`, `now`, `presence`, `probe`, `project-overrides`,
+  `query`, `recompute-actors`, `report`, `reports`, `skill`, `stats`,
+  `timeline`, `topics`, `update`, `watchdog`. Includes a local-only web
+  dashboard (read-only
   for activity data; settings are writable via `POST /api/settings`).
   Full command reference: APP.md (kept in sync with the released CLI;
   run `kynoptic --help` for the exact option set of the local binary).

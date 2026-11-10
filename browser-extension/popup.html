@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 280px; padding: 12px; }
+    label { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+    #status { margin-top: 10px; color: #555; line-height: 1.5; }
+    p.note { color: #666; font-size: 12px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <label>
+    <input type="checkbox" id="chatgpt-toggle" />
+    ChatGPT 网页会话采集
+  </label>
+  <div id="status">读取中...</div>
+  <p class="note">
+    默认关闭。开启后仅记录会话开始与结束时间（source=chatgpt_web），
+    不读取对话内容、页面文字或标题。
+  </p>
+</body>
+<script src="popup.js"></script>
+</html>

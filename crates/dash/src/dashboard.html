@@ -284,6 +284,8 @@
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-restop" aria-controls="view-restop" tabindex="-1"><span class="l en">Resources</span><span class="l zh">资源排行</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-diagtl" aria-controls="view-diagtl" tabindex="-1"><span class="l en">Timeline</span><span class="l zh">诊断时间线</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-unifiedtl" aria-controls="view-unifiedtl" tabindex="-1"><span class="l en">Unified timeline</span><span class="l zh">统一时间轴</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-reports" aria-controls="view-reports" tabindex="-1"><span class="l en">Reports</span><span class="l zh">报表</span></button>
+    <button type="button" class="tab" role="tab" aria-selected="false" id="tab-health" aria-controls="view-health" tabindex="-1"><span class="l en">Health</span><span class="l zh">健康</span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-anomalies" aria-controls="view-anomalies" tabindex="-1"><span class="l en">Anomalies</span><span class="l zh">异常</span><span id="anom-badge" class="tab-badge" aria-live="polite"></span></button>
     <button type="button" class="tab" role="tab" aria-selected="false" id="tab-settings" aria-controls="view-settings" tabindex="-1"><span class="l en">Settings</span><span class="l zh">设置</span></button>
   </div>
@@ -527,9 +529,51 @@
       <button type="button" class="save btn-ghost utl-zoom-btn" data-utl-minutes="1440" style="background:var(--surface-btn)"><span class="l en">24 h</span><span class="l zh">24 小时</span></button>
       <span id="utl-window" class="muted" style="font-size:11px"></span>
     </div>
+    <div class="mon-row" id="utl-device-bar" style="display:none;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px">
+      <span class="muted" style="font-size:11px"><span class="l en">device:</span><span class="l zh">设备：</span></span>
+      <div id="utl-device" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+    </div>
+    <div class="mon-row" id="utl-filter" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px">
+      <span class="muted" style="font-size:11px"><span class="l en">filter:</span><span class="l zh">筛选：</span></span>
+      <input id="utl-filter-project" type="text" size="14" style="font-size:12px;padding:2px 6px" aria-label="project filter">
+      <select id="utl-filter-source" style="font-size:12px" aria-label="source filter">
+        <option value="">all / 全部来源</option>
+        <option value="windows">windows</option>
+        <option value="chrome_ext">chrome_ext</option>
+        <option value="vscode_ext">vscode_ext</option>
+        <option value="claude_code">claude_code</option>
+        <option value="zcode">zcode</option>
+        <option value="dsh">dsh</option>
+        <option value="chatgpt_web">chatgpt_web</option>
+      </select>
+      <span class="muted" style="font-size:11px"><span class="l en">evidence:</span><span class="l zh">证据等级：</span></span>
+      <label style="font-size:12px"><input type="checkbox" class="utl-filter-ev" value="observed"> observed</label>
+      <label style="font-size:12px"><input type="checkbox" class="utl-filter-ev" value="inferred"> inferred</label>
+      <label style="font-size:12px"><input type="checkbox" class="utl-filter-ev" value="unknown"> unknown</label>
+      <button type="button" class="btn-ghost" id="utl-filter-apply" style="padding:1px 10px;font-size:12px"><span class="l en">apply</span><span class="l zh">应用</span></button>
+      <button type="button" class="btn-ghost" id="utl-filter-clear" style="padding:1px 10px;font-size:12px"><span class="l en">clear</span><span class="l zh">清除</span></button>
+      <span id="utl-filter-active" class="muted" style="font-size:11px"></span>
+    </div>
     <div id="utl-legend" class="muted" style="font-size:11px;margin:8px 0"></div>
     <div id="utl-tracks"></div>
     <div id="utl-detail" class="muted" style="font-size:12px;margin-top:10px;white-space:normal"></div>
+  </section>
+</div>
+
+<div id="view-reports" role="tabpanel" aria-labelledby="tab-reports" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Statistical report (F08) from the activity_intervals derived table: per local day × kind/source/project durations. estimated (incl. inferred) and unknown segments are listed separately — they are NOT counted into the observed totals. project "(none)" means no attribution evidence (no rule matched), not zero.</span><span class="l zh">统计报表（F08），数据来自 activity_intervals 派生表：按本地日 × 类别/来源/项目汇总时长。estimated（含 inferred）与 unknown 段单列——不计入 observed 合计。项目为 (none) 表示无归属证据（未命中规则），不是零。</span></div>
+  <section>
+    <h2><span class="l en">report — durations by day</span><span class="l zh">报表 — 按天时长汇总</span></h2>
+    <div class="mon-row" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+      <span class="muted" style="font-size:11px"><span class="l en">range:</span><span class="l zh">范围：</span></span>
+      <button type="button" class="save btn-ghost rep-days-btn" data-rep-days="7" style="background:var(--surface-btn)">7</button>
+      <button type="button" class="save btn-ghost rep-days-btn" data-rep-days="14" style="background:var(--surface-btn)">14</button>
+      <button type="button" class="save btn-ghost rep-days-btn" data-rep-days="30" style="background:var(--surface-btn)">30</button>
+      <button type="button" class="save btn-ghost rep-days-btn" data-rep-days="90" style="background:var(--surface-btn)">90</button>
+      <span class="muted" style="font-size:11px"><span class="l en">days (max 90)</span><span class="l zh">天（上限 90）</span></span>
+    </div>
+    <div id="rep-totals" class="muted" style="font-size:12px;margin:8px 0"></div>
+    <div id="rep-table"></div>
   </section>
 </div>
 
@@ -539,6 +583,16 @@
   <h2><span class="l en">anomalies — last 7 days</span><span class="l zh">异常 — 近 7 天</span></h2>
   <ul class="anomalies" id="anomalies"><li class="muted">loading…</li></ul>
 </section>
+</div>
+
+<div id="view-health" role="tabpanel" aria-labelledby="tab-health" style="display:none">
+  <div class="muted" style="font-size:12px;margin-bottom:10px"><span class="l en">Collector health (F09): each polling monitor judged ok / degraded / stale; keyboard and mouse are callback hooks (no polling cycle) and are not listed. AI hook channels and extension connections show last-seen time. unknown = no evidence in this process (e.g. an independent serve process cannot see the tray collector's in-memory stats) — it is not zero and not a fault.</span><span class="l zh">采集器健康（F09）：轮询监视器逐项判定 ok / degraded / stale；键盘与鼠标是回调钩子（无轮询周期），不在本表。AI hook 通道与扩展连接显示最近出数时间。unknown = 本进程无证据（如独立 serve 进程读不到托盘采集器的内存统计）——不是零，也不是故障。</span></div>
+  <section>
+    <h2><span class="l en">overall status</span><span class="l zh">总体状态</span></h2>
+    <div id="health-status" class="muted">loading…</div>
+    <div id="health-monitors" style="margin-top:8px"></div>
+    <div id="health-channels" style="margin-top:12px"></div>
+  </section>
 </div>
 
 <div id="view-settings" role="tabpanel" aria-labelledby="tab-settings" style="display:none">
@@ -640,7 +694,46 @@
     <label for="set-redact"><span class="l en">redact window/tab titles: strip URL query strings (tokens, session ids) from titles before they are stored. applies to new records only; existing data is kept as-is.</span>
     <span class="l zh">窗口/标签页标题脱敏：落库前剥掉标题中网址的查询串（token、session id 等）。仅对新记录生效，已存数据保持原样。</span></label>
   </div>
+  <div class="muted" style="margin:6px 0">
+    <input type="checkbox" id="set-redact-full">
+    <label for="set-redact-full"><span class="l en">full title redaction: store "[redacted]" instead of the original window/tab title. stronger than the option above; recommended when titles may contain document names or message previews. applies to new records only; existing data is never modified or deleted.</span>
+    <span class="l zh">整标题脱敏：窗口/标签页标题一律以 "[redacted]" 落库，不存原文。比上一项更强，适合标题可能包含文档名或消息预览的场景。仅对新记录生效，已存数据不做任何修改或删除。</span></label>
+  </div>
   <div class="muted"><span class="l en">takes effect automatically after save.</span><span class="l zh">保存后自动生效。</span></div>
+</section>
+<section>
+  <h2><span class="l en">settings — project attribution (opt-in)</span><span class="l zh">设置 — 项目归属（可选开启）</span></h2>
+  <div class="muted" style="font-size:12px;margin-bottom:8px">
+    <span class="l en">Project rules (F06): map window title path prefixes or keywords to project names. Rules are matched in order; the first match wins. Attribution is inferred evidence (rule match), applied when activity intervals are rebuilt. Empty list = feature off. Max 100 rules.</span>
+    <span class="l zh">项目归属规则（F06）：把窗口标题的路径前缀或关键词映射到项目名。规则按顺序匹配，第一条命中即生效。归属是 inferred 证据（规则匹配推导），在重建活动区间时打标。空列表 = 功能关闭。上限 100 条。</span>
+  </div>
+  <div id="proj-rules" style="margin-bottom:8px"></div>
+  <button type="button" class="save btn-ghost" id="proj-rule-add" style="background:var(--surface-btn)"><span class="l en">add rule</span><span class="l zh">添加规则</span></button>
+  <div class="muted" style="font-size:11px;margin-top:6px"><span class="l en">path prefix: the window title must start with it (case-insensitive), e.g. K:\myproj. keywords: space-separated substrings, e.g. myproj spec. leave a field empty to skip that match; a rule with both empty cannot be saved. Manual assignment wins over rules: click an interval on the unified timeline, then "assign project" — each assignment is appended with an audit trail (corrected_from / time / source manual, evidence observed) and survives rebuilds.</span>
+  <span class="l zh">路径前缀：窗口标题以其开头即命中（不区分大小写），如 K:\myproj。关键词：空格分隔的子串，如 myproj spec。留空即跳过该匹配；两个字段都为空的规则无法保存。人工指定优先于规则：在统一时间轴点击区间后用「指定项目」——每次指定追加一条审计记录（corrected_from / 时间 / 来源 manual，证据 observed），重建后保留。</span></div>
+</section>
+<section>
+  <h2><span class="l en">multi-device endpoints (opt-in)</span><span class="l zh">多设备远端端点（可选开启）</span></h2>
+  <div class="muted" style="font-size:12px;margin-bottom:8px">
+    <span class="l en">Remote devices (F11): another machine running this app's dashboard. After saving, the unified timeline tab can fetch each device's /api/timeline (5s timeout each, fetched in parallel) and merge tracks per device. A device that cannot be reached is marked offline — local data is never blocked or replaced. If the remote goes through an SSH tunnel, point the URL at the local forwarded port. human_presence is shown per device and never summed across devices. Empty list = single-machine mode.</span>
+    <span class="l zh">远端设备（F11）：另一台运行本产品 dashboard 的机器。保存后统一时间轴页签会并行拉取各设备的 /api/timeline（单端点 5 秒超时）并按设备分轨合并。连不上的设备显式标注 offline——绝不阻塞也不替代本机数据。远端经 SSH 隧道时 URL 填本地转发端口。人在场按设备独立呈现，多设备绝不相加。空列表 = 单机模式。</span>
+  </div>
+  <div id="dev-endpoints" style="margin-bottom:8px"></div>
+  <button type="button" class="save btn-ghost" id="dev-endpoint-add" style="background:var(--surface-btn)"><span class="l en">add device</span><span class="l zh">添加设备</span></button>
+  <div class="muted" style="font-size:11px;margin-top:6px"><span class="l en">name: any label shown in the timeline (e.g. workstation-b). url: http://host:port of the remote dashboard (default port 8422; only http is supported). token: needed only if the remote has dashboard-token.txt enabled.</span>
+  <span class="l zh">名称：时间轴里显示的标签（如 workstation-b）。URL：远端 dashboard 的 http://主机:端口（默认端口 8422；仅支持 http）。令牌：仅当远端开启了 dashboard-token.txt 访问令牌时填写。</span></div>
+</section>
+<section>
+  <h2><span class="l en">editor extension (vscode / cursor)</span><span class="l zh">编辑器扩展（vscode / cursor）</span></h2>
+  <div class="muted" style="font-size:12px;margin-bottom:8px">
+    <span class="l en">The vscode-extension reports real editor events (file focus, language, debug state) to POST /api/ext/events. Paste the token below into the extension's kynoptic.extToken setting. Resetting the token immediately revokes the old one — update the extension setting after resetting.</span>
+    <span class="l zh">vscode-extension 扩展向 POST /api/ext/events 上报真实编辑器事件（文件焦点、语言、调试状态）。把下面的令牌填入扩展的 kynoptic.extToken 设置项。重置令牌后旧令牌立即失效——重置后请同步更新扩展设置。</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <code id="ext-token-value" style="background:var(--surface-btn);padding:4px 8px;border-radius:4px;user-select:all">…</code>
+    <button type="button" class="save btn-ghost" id="ext-token-reset" style="background:var(--surface-btn)"><span class="l en">reset token</span><span class="l zh">重置令牌</span></button>
+  </div>
+  <div id="ext-token-msg" class="muted" style="font-size:12px;margin-top:6px" aria-live="polite"></div>
 </section>
 <section>
   <div class="settings-actions">
@@ -2146,6 +2239,54 @@ async function loadAnomalies() {
   }).join("");
 }
 /* ─── Settings ─── */
+/* F04 编辑器扩展令牌：展示（GET /api/ext/token）与重置（POST /api/ext/token/reset，
+   重置带会话令牌 + CSRF 三防线，与保存设置同级）。 */
+let extTokenFadeTimer = null;
+function extTokenMsg(text, ok) {
+  const el = document.getElementById("ext-token-msg");
+  if (!el) return;
+  if (extTokenFadeTimer) { clearTimeout(extTokenFadeTimer); extTokenFadeTimer = null; }
+  el.textContent = text;
+  el.style.color = ok ? "var(--ok)" : "var(--bad)";
+  el.style.opacity = "1";
+}
+async function loadExtToken() {
+  const r = await fetch("/api/ext/token", { headers: kynHeaders() });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const v = await r.json();
+  const el = document.getElementById("ext-token-value");
+  if (el) el.textContent = v.configured && v.token ? String(v.token) : "[!] " + (document.documentElement.lang === "zh" ? "未配置" : "not configured");
+}
+async function resetExtToken() {
+  try {
+    const r = await fetch("/api/ext/token/reset", {
+      method: "POST",
+      headers: kynHeaders({ "Content-Type": "application/json", "X-Kynoptic": "1", "X-Kynoptic-Token": KYN_CSRF_TOKEN }),
+      body: "{}"
+    });
+    if (r.status === 403) {
+      extTokenMsg(document.documentElement.lang === "zh"
+        ? "会话令牌无效，请刷新页面后重试"
+        : "invalid session token — refresh the page and retry", false);
+      return;
+    }
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      extTokenMsg(apiErrText(e) || ("HTTP " + r.status), false);
+      return;
+    }
+    const v = await r.json();
+    const el = document.getElementById("ext-token-value");
+    if (el) el.textContent = String(v.token);
+    extTokenMsg(document.documentElement.lang === "zh"
+      ? "已重置。旧令牌已失效，请把新令牌更新到扩展设置 kynoptic.extToken"
+      : "reset. the old token is revoked — update kynoptic.extToken in the extension settings", true);
+  } catch (err) {
+    extTokenMsg(String(err && err.message ? err.message : err), false);
+  }
+}
+const extResetBtn = document.getElementById("ext-token-reset");
+if (extResetBtn) extResetBtn.addEventListener("click", resetExtToken);
 let settingsFadeTimer = null;
 function settingsMsg(text, ok) {
   const el = document.getElementById("settings-msg");
@@ -2244,6 +2385,8 @@ async function loadSettings() {
   LAST_SETTINGS = s;
   // 成功才置位（审查：失败后置 true 会让页签静默空白且不再重拉）
   SETTINGS_LOADED = true;
+  loadExtToken().catch(function () {});
+
   const enabled = new Set(s.enabled_monitors);
   const row = m => {
     const n = MON_NAMES[m.id];
@@ -2290,6 +2433,11 @@ async function loadSettings() {
   document.getElementById("set-netetw").checked = !!s.net_etw_enabled;
   // 标题脱敏（隐私 opt-in，默认关）：旧后端缺字段时按默认关回填
   document.getElementById("set-redact").checked = !!s.redact_titles;
+  document.getElementById("set-redact-full").checked = !!s.redact_titles_full;
+  // F06 项目归属规则（旧后端缺字段回退空 = 功能关闭）
+  renderProjRules(s.project_rules || []);
+  // F11 多设备远端端点（旧后端缺字段回退空 = 单机模式）
+  renderDevEndpoints(s.device_endpoints || []);
   settingsMsg("", true);
 }
 /* 诊断信息（发现 ①-4）：首次展开时拉 /api/diagnostics，展示各留档日志的
@@ -2342,6 +2490,59 @@ function restoreDefaults() {
   }
   settingsMsg(t("restoredHint"), true);
 }
+/* ─── 项目归属规则编辑器（F06，opt-in） ─── */
+// 纯渲染 + 增删：每行 name | path_prefix | title_keywords | 删除按钮
+// （CSP 无内联事件：增删走容器事件委托，删除走 data-proj-del）
+function projRuleRow(r) {
+  const inp = (cls, val, ph, w) =>
+    '<input type="text" class="' + cls + '" value="' + esc(val || "") + '" placeholder="' + esc(ph) + '" style="width:' + w + ';background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px">';
+  return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
+    inp("proj-name", r.name, "project name", "140px") +
+    inp("proj-prefix", r.path_prefix, "path prefix (e.g. K:\\myproj)", "240px") +
+    inp("proj-kw", r.title_keywords, "title keywords (space separated)", "240px") +
+    '<button type="button" class="save btn-ghost" data-proj-del style="background:var(--surface-btn);padding:1px 8px">-</button>' +
+    "</div>";
+}
+function renderProjRules(rules) {
+  const el = document.getElementById("proj-rules");
+  if (!el) return;
+  el.innerHTML = (rules || []).map(projRuleRow).join("") ||
+    '<div class="muted" style="font-size:12px"><span class="l en">no rules (feature off)</span><span class="l zh">无规则（功能关闭）</span></div>';
+}
+function collectProjRules() {
+  const rows = [...document.querySelectorAll("#proj-rules > div")].filter(d => d.querySelector(".proj-name"));
+  return rows.map(d => ({
+    name: d.querySelector(".proj-name").value.trim(),
+    path_prefix: d.querySelector(".proj-prefix").value.trim(),
+    title_keywords: d.querySelector(".proj-kw").value.trim()
+  }));
+}
+/* ─── 多设备远端端点编辑器（F11，opt-in） ─── */
+// 纯渲染 + 增删：每行 name | url | token | 删除按钮（CSP 无内联事件）
+function devEndpointRow(e) {
+  const inp = (cls, val, ph, w, extra) =>
+    '<input type="text" class="' + cls + '" value="' + esc(val || "") + '" placeholder="' + esc(ph) + '" ' + (extra || "") + ' style="width:' + w + ';background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px">';
+  return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
+    inp("dev-name", e.name, "device name", "140px") +
+    inp("dev-url", e.url, "http://127.0.0.1:8422", "220px") +
+    inp("dev-token", e.token, "token (optional)", "140px", 'autocomplete="off" spellcheck="false"') +
+    '<button type="button" class="save btn-ghost" data-dev-del style="background:var(--surface-btn);padding:1px 8px">-</button>' +
+    "</div>";
+}
+function renderDevEndpoints(eps) {
+  const el = document.getElementById("dev-endpoints");
+  if (!el) return;
+  el.innerHTML = (eps || []).map(devEndpointRow).join("") ||
+    '<div class="muted" style="font-size:12px"><span class="l en">no devices (single-machine mode)</span><span class="l zh">无设备（单机模式）</span></div>';
+}
+function collectDevEndpoints() {
+  const rows = [...document.querySelectorAll("#dev-endpoints > div")].filter(d => d.querySelector(".dev-name"));
+  return rows.map(d => ({
+    name: d.querySelector(".dev-name").value.trim(),
+    url: d.querySelector(".dev-url").value.trim(),
+    token: d.querySelector(".dev-token").value.trim()
+  }));
+}
 async function saveSettings() {
   const btn = document.getElementById("settings-save");
   btn.disabled = true;
@@ -2379,7 +2580,13 @@ async function saveSettings() {
       low_power: document.getElementById("set-lowpower").checked,
       net_etw_enabled: document.getElementById("set-netetw").checked,
       // 标题脱敏（隐私 opt-in，默认关）：采集侧剥 URL 查询串，仅拦新写入
-      redact_titles: document.getElementById("set-redact").checked
+      redact_titles: document.getElementById("set-redact").checked,
+      // F10 整标题脱敏（隐私 opt-in，默认关）：标题以 [redacted] 落库，仅拦新写入
+      redact_titles_full: document.getElementById("set-redact-full").checked,
+      // F06 项目归属规则（opt-in，默认空列表 = 功能关闭）
+      project_rules: collectProjRules(),
+      // F11 多设备远端端点（opt-in，默认空列表 = 单机模式）
+      device_endpoints: collectDevEndpoints()
     };
     const r = await fetch("/api/settings", {
       method: "POST",
@@ -2500,7 +2707,7 @@ function parseUrlState() {
   const dOk = v => /^\d{4}-\d{2}-\d{2}$/.test(v || "") && v <= TODAY_STR;
   const hm = +q.get("hm") || 0;
   return {
-    view: ["overview", "report", "apps", "input", "insights", "sys", "restop", "diagtl", "unifiedtl", "anomalies", "settings"]
+    view: ["overview", "report", "apps", "input", "insights", "sys", "restop", "diagtl", "unifiedtl", "reports", "anomalies", "health", "settings"]
       .includes(q.get("view")) ? q.get("view") : "overview",
     rd: dOk(q.get("rd")) ? q.get("rd") : "",
     ad: dOk(q.get("ad")) ? q.get("ad") : "",
@@ -2513,7 +2720,7 @@ function showView(name, fromHistory) {
   // 防御：任何 view/tab 元素缺失都不能让异常逃出 showView——否则会落在
   // refreshView 之前，页签能显示但 loader 永不触发、也无控制台报错可查
   //（正是"切换后 loading… 永不解析、数据 API 零请求"这类回归的形态）。
-  for (const v of ["overview", "apps", "report", "insights", "input", "unifiedtl", "anomalies", "settings"]) {
+  for (const v of ["overview", "apps", "report", "insights", "input", "unifiedtl", "reports", "anomalies", "health", "settings"]) {
     const view = document.getElementById("view-" + v);
     if (view) view.style.display = v === name ? "" : "none";
     const tab = document.getElementById("tab-" + v);
@@ -2726,6 +2933,21 @@ function utlBarBg(level) {
   if (level === "inferred") return "repeating-linear-gradient(45deg,#4b7a4b 0 6px,#3a5f3a 6px 12px)";
   return "#3b6ea5"; // observed
 }
+// D 轨按 source 分色（Stage 3：ai_run 三源 + 编辑器前台；observed 基础上
+// 调色相区分来源；unknown/inferred 纹理底优先——证据等级优先于来源装饰）
+const UTL_SOURCE_COLORS = {
+  claude_code: "#8a63b3",
+  zcode: "#3a9e8f",
+  dsh: "#c07a3a",
+  editor: "#5a8a3b"
+};
+function utlBarColor(trackId, iv, ev) {
+  if (ev === "unknown") return utlBarBg("unknown");
+  if (ev === "inferred") return utlBarBg("inferred");
+  if (trackId !== "D") return utlBarBg(ev);
+  const src = iv.source_id === "ai" ? (iv.app_name || "") : "editor";
+  return UTL_SOURCE_COLORS[src] || utlBarBg(ev);
+}
 // 纯渲染：区间 → 绝对定位色块（CSP 无内联 onclick，点击走 #utl-tracks 事件委托）
 function utlIntervalBlock(tr, ti, ii, win, lang) {
   const iv = tr.intervals[ii];
@@ -2735,57 +2957,225 @@ function utlIntervalBlock(tr, ti, ii, win, lang) {
   const w = Math.max(0.3, right - left);
   const label = iv.app_name || (lang === "zh" ? "无应用信息" : "no app info");
   const ev = iv.evidence_level || iv.quality || "unknown";
+  const proj = iv.project ? "  @" + iv.project : "";
+  // F11：区间 tooltip 带设备来源（merge 响应每区间带 device；单机=本机）
+  const dev = iv.device || "local";
   const tip = utlTimeStr(iv.start_ms) + " - " + utlTimeStr(iv.end_ms) + "  " + utlDurStr(iv.duration_ms) +
-    "  " + label + "  [" + ev + "]";
+    "  " + label + proj + "  [" + ev + "]  " + dev;
   return '<div data-utl="' + ti + ":" + ii + '" title="' + esc(tip) + '" style="position:absolute;' +
     'left:' + left + '%;width:' + w + '%;top:2px;bottom:2px;border-radius:2px;' +
-    'background:' + utlBarBg(ev) + ';cursor:pointer;border:1px solid rgba(255,255,255,.12)"></div>';
+    'background:' + utlBarColor(tr.id, iv, ev) + ';cursor:pointer;border:1px solid rgba(255,255,255,.12)"></div>';
+}
+/* ─── F07 筛选条：项目（精确文本）/ 来源（单选）/ 证据等级（多选勾选）。
+   前后端取舍：筛选条件随请求发给后端（/api/timeline?...），由 core 纯函数
+   统一过滤——UI / API / MCP 三端同一口径同值（PRD DoD），前端不做本地二次
+   筛选；响应回显 filters 字段供核对。证据等级词表 observed/inferred/unknown
+   （PRD §2.3），全部不勾 = 不过滤。带筛选时 B 轨 unknown 占位段按后端契约
+   处理：显式勾选 unknown 且未带来源/项目过滤才保留——筛选是用户主动收窄，
+   缺口仍由轨道「未接入」标注如实可见。 ─── */
+let UTL_FILTER_Q = "";
+function utlFilterQuery() {
+  const proj = (document.getElementById("utl-filter-project") || {}).value || "";
+  const src = (document.getElementById("utl-filter-source") || {}).value || "";
+  const evs = Array.from(document.querySelectorAll(".utl-filter-ev:checked")).map(c => c.value);
+  const parts = [];
+  if (proj.trim()) parts.push("project=" + encodeURIComponent(proj.trim()));
+  if (src) parts.push("source=" + src);
+  if (evs.length > 0) parts.push("evidence=" + evs.join(","));
+  return parts.join("&");
+}
+function utlFilterEcho(filters) {
+  const el = document.getElementById("utl-filter-active");
+  if (!el) return;
+  const f = filters || {};
+  const bits = [];
+  if ((f.project || []).length) bits.push("project: " + f.project.join(","));
+  if ((f.source || []).length) bits.push("source: " + f.source.join(","));
+  if ((f.evidence || []).length) bits.push("evidence: " + f.evidence.join(","));
+  el.textContent = bits.length ? "[" + bits.join(" | ") + "]" : "";
 }
 async function loadUnifiedTimeline() {
   const el = document.getElementById("utl-tracks");
   if (!el) return;
   const lang = document.documentElement.lang === "zh" ? "zh" : "en";
   try {
-    const d = await jget("/api/timeline?minutes=" + UTL_MINUTES);
+    // F11 多设备：settings 里有远端端点时走 merge=1（后端并行拉取各远端，
+    // 失败降级 offline 标注，本机数据绝不缺席）；无端点 = 单机原样。
+    let remotes = 0;
+    try {
+      const st = await jget("/api/settings");
+      remotes = (st.device_endpoints || []).length;
+    } catch (_) { /* settings 不可得按单机处理（unknown 不是故障） */ }
+    // F07 筛选：条件拼进 query（后端过滤 + merge 时透传远端）
+    const fq = utlFilterQuery();
+    UTL_FILTER_Q = fq;
+    const d = await jget("/api/timeline?minutes=" + UTL_MINUTES +
+      (remotes > 0 ? "&merge=1" : "") + (fq ? "&" + fq : ""));
     UTL_DATA = d;
     const win = { start: d.window_start_ms, end: d.window_end_ms };
     const winEl = document.getElementById("utl-window");
     if (winEl) winEl.textContent = utlTimeStr(win.start) + " - " + utlTimeStr(win.end) + " (" + utlDurStr(win.end - win.start) + ")";
     const legend = d.legend || {};
     const legendEl = document.getElementById("utl-legend");
-    if (legendEl) legendEl.textContent =
+    utlFilterEcho(d.filters);
+    let legendTxt =
       (lang === "zh" ? "图例：" : "Legend: ") +
       "observed = " + (legend.observed || "") + "；inferred = " + (legend.inferred || "") + "；unknown = " + (legend.unknown || "");
-    let html = "";
-    const tracks = d.tracks || [];
-    for (let ti = 0; ti < tracks.length; ti++) {
-      const tr = tracks[ti];
-      const label = lang === "zh" ? tr.label_zh : tr.label_en;
-      const note = lang === "zh" ? tr.note_zh : tr.note_en;
-      const ivs = tr.intervals || [];
-      let barInner = "";
-      let barNote = "";
-      if (ivs.length === 0) {
-        barNote = tr.connected
-          ? (lang === "zh" ? "窗口内无区间" : "no intervals in window")
-          : (lang === "zh" ? "未接入" : "not connected");
-      } else {
-        for (let ii = 0; ii < ivs.length; ii++) barInner += utlIntervalBlock(tr, ti, ii, win, lang);
-      }
-      html += '<div style="display:flex;align-items:center;gap:8px;margin:6px 0">' +
-        '<div style="flex:0 0 130px;font-size:12px">' + esc(String(label)) +
-        (tr.connected ? "" : ' <span class="badge">未接入</span>') + "</div>" +
-        '<div style="position:relative;flex:1;height:20px;background:var(--bg);border:1px solid var(--border);border-radius:3px;min-width:0">' +
-        barInner +
-        (barNote ? '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;opacity:.7">' + esc(barNote) + "</div>" : "") +
-        "</div>" +
-        '<div class="muted" style="flex:0 0 130px;font-size:11px;opacity:.75">' + esc(String(note || "")) + "</div>" +
-        "</div>";
+    // F11：多设备时追加人在场不相加口径（平实文案，无 emoji）
+    if (d.human_presence_boundary) {
+      legendTxt += " " + (lang === "zh" ? d.human_presence_boundary.note_zh : d.human_presence_boundary.note_en);
     }
-    el.innerHTML = html;
+    if (legendEl) legendEl.textContent = legendTxt;
+    // 设备选择器（仅多设备响应显示）：全部 / 本机 / 各远端
+    const devBar = document.getElementById("utl-device-bar");
+    const devEl = document.getElementById("utl-device");
+    const devices = d.devices || [];
+    if (devBar && devEl) {
+      if (devices.length > 0) {
+        devBar.style.display = "flex";
+        devEl.innerHTML =
+          '<button type="button" class="save btn-ghost utl-dev-btn" data-utl-dev="all" style="background:var(--surface-btn)"><span class="l en">all</span><span class="l zh">全部</span></button>' +
+          devices.map(dev =>
+            '<button type="button" class="save btn-ghost utl-dev-btn" data-utl-dev="' + esc(String(dev.device)) + '" style="background:var(--surface-btn)">' +
+            esc(String(dev.name)) + (dev.status === "offline" ? " [offline]" : "") + "</button>"
+          ).join("");
+        utlSyncDeviceButtons();
+      } else {
+        devBar.style.display = "none";
+        devEl.innerHTML = "";
+      }
+    }
+    utlRenderTracks();
     document.getElementById("utl-detail").textContent = "";
   } catch (e) {
     el.textContent = t("noData");
+  }
+}
+/* F11 设备选择器状态：all / local / 各远端设备名（纯前端过滤缓存数据） */
+let UTL_DEVICE = "all";
+function utlSyncDeviceButtons() {
+  document.querySelectorAll(".utl-dev-btn").forEach(b => {
+    const sel = b.dataset.utlDev === UTL_DEVICE;
+    b.style.fontWeight = sel ? "700" : "400";
+    b.style.textDecoration = sel ? "underline" : "none";
+  });
+}
+// 纯渲染：UTL_DATA.tracks 按设备选择器过滤 + offline 设备显式标注行
+// （多设备响应里每条 track 自带 device / device_status；区间 tooltip 带
+// 设备名。offline 设备不产轨道，以 [!] 行单独呈现——unknown 是缺口不是零）
+function utlRenderTracks() {
+  const el = document.getElementById("utl-tracks");
+  if (!el || !UTL_DATA) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  const d = UTL_DATA;
+  const win = { start: d.window_start_ms, end: d.window_end_ms };
+  const merged = Array.isArray(d.devices);
+  let html = "";
+  const tracks = d.tracks || [];
+  for (let ti = 0; ti < tracks.length; ti++) {
+    const tr = tracks[ti];
+    const dev = tr.device || "local";
+    if (UTL_DEVICE !== "all" && dev !== UTL_DEVICE) continue;
+    const label = lang === "zh" ? tr.label_zh : tr.label_en;
+    const note = lang === "zh" ? tr.note_zh : tr.note_en;
+    const devTag = merged ? '<span class="badge">' + esc(String(dev)) + "</span> " : "";
+    const ivs = tr.intervals || [];
+    let barInner = "";
+    let barNote = "";
+    if (ivs.length === 0) {
+      barNote = tr.connected
+        ? (lang === "zh" ? "窗口内无区间" : "no intervals in window")
+        : (lang === "zh" ? "未接入" : "not connected");
+    } else {
+      for (let ii = 0; ii < ivs.length; ii++) barInner += utlIntervalBlock(tr, ti, ii, win, lang);
+    }
+    html += '<div style="display:flex;align-items:center;gap:8px;margin:6px 0">' +
+      '<div style="flex:0 0 130px;font-size:12px">' + devTag + esc(String(label)) +
+      (tr.connected ? "" : ' <span class="badge"><span class="l en">not connected</span><span class="l zh">未接入</span></span>') + "</div>" +
+      '<div style="position:relative;flex:1;height:20px;background:var(--bg);border:1px solid var(--border);border-radius:3px;min-width:0">' +
+      barInner +
+      (barNote ? '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;opacity:.7">' + esc(barNote) + "</div>" : "") +
+      "</div>" +
+      '<div class="muted" style="flex:0 0 130px;font-size:11px;opacity:.75">' + esc(String(note || "")) + "</div>" +
+      "</div>";
+  }
+  // offline 设备显式标注（[!] 前缀 + 错误摘要；平实文案，绝不静默隐藏）
+  if (merged && (UTL_DEVICE === "all")) {
+    for (const dev of d.devices || []) {
+      if (dev.status !== "offline") continue;
+      html += '<div style="display:flex;align-items:center;gap:8px;margin:6px 0">' +
+        '<div style="flex:0 0 130px;font-size:12px"><span class="badge">' + esc(String(dev.name)) + "</span></div>" +
+        '<div style="flex:1;font-size:12px;color:#e06c6c">[!] ' +
+        (lang === "zh" ? "设备不可达（offline）：该设备时间轴缺失——这是真实缺口，不是零。" : "device unreachable (offline): its timeline is missing — a real gap, not zero.") +
+        ' <span class="muted" style="font-size:11px">' + esc(String(dev.error || "")) + "</span></div>" +
+        "</div>";
+    }
+  }
+  el.innerHTML = html;
+}
+/* ─── F09 采集器健康（/api/health）：监视器 ok/degraded/stale + 通道状态 ─── */
+// 纯函数：state → 行样式与文案（未知值按 unknown 灰显；词表与后端一致）
+function healthStateBadge(state, lang) {
+  const zhMap = { ok: "正常", degraded: "降级", stale: "迟滞", unknown: "无证据" };
+  const enMap = { ok: "ok", degraded: "degraded", stale: "stale", unknown: "unknown" };
+  const label = lang === "zh" ? (zhMap[state] || state) : (enMap[state] || state);
+  const cls = state === "ok" ? "q-confirmed" : state === "unknown" ? "q-unavailable" : "q-incomplete";
+  return '<span class="q-badge ' + cls + '">' + esc(label) + "</span>";
+}
+// 纯函数：通道条目 → 行 HTML（时间只用 last_event_ts，不自行换算本地时钟）
+function healthChannelRow(c, lang) {
+  const last = c.last_event_ts ? esc(String(c.last_event_ts)) : (lang === "zh" ? "无记录" : "no record");
+  const label = esc(String(c.channel));
+  return '<div class="net-row" style="margin:4px 0">' +
+    '<span>' + label + "</span>" +
+    healthStateBadge(c.state, lang) +
+    ' <span class="muted" style="font-size:11px">' + last + "</span></div>";
+}
+async function loadHealth() {
+  const el = document.getElementById("health-status");
+  if (!el) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  try {
+    const d = await jget("/api/health");
+    el.innerHTML = (lang === "zh" ? "总体状态：" : "overall: ") + healthStateBadge(d.status, lang);
+    const mons = d.monitors || [];
+    const monEl = document.getElementById("health-monitors");
+    if (monEl) {
+      if (mons.length === 0) {
+        monEl.innerHTML = '<div class="muted" style="font-size:12px">' +
+          (lang === "zh" ? "监视器：无本进程证据（独立 serve 进程读不到托盘采集器的内存统计；unknown 不是零）。" : "monitors: no evidence in this process (an independent serve process cannot see the tray collector's in-memory stats; unknown is not zero).") + "</div>";
+      } else {
+        let mh = "";
+        for (const m of mons) {
+          mh += '<div class="net-row" style="margin:4px 0"><span>' + esc(String(m.name)) + "</span>" +
+            healthStateBadge(m.state, lang) +
+            ' <span class="muted" style="font-size:11px">' +
+            (m.last_success_age_secs == null ? "-" : String(m.last_success_age_secs) + "s") +
+            " / slow=" + esc(String(m.consecutive_slow)) + "</span></div>";
+        }
+        monEl.innerHTML = "<h3>" + (lang === "zh" ? "轮询监视器" : "polling monitors") + "</h3>" + mh;
+      }
+    }
+    const chEl = document.getElementById("health-channels");
+    if (chEl) {
+      let hs = d.hook_selfheal || {};
+      let ch = "<h3>" + (lang === "zh" ? "钩子自愈" : "hook self-heal") + "</h3>" +
+        '<div class="net-row" style="margin:4px 0"><span>keyboard_hook</span>' +
+        (Number(hs.reinstalls) > 0 || Number(hs.failures) > 0
+          ? '<span class="muted" style="font-size:11px">[' + hs.reinstalls + "] / fail=" + hs.failures + "</span>"
+          : '<span class="muted" style="font-size:11px">0 / fail=0</span>') +
+        (Number(hs.failures) > 0
+          ? ' <span class="muted" style="font-size:11px">[!] ' + (lang === "zh" ? "重挂失败需关注" : "reinstall failures need attention") + "</span>"
+          : "") +
+        "</div>" +
+        "<h3>" + (lang === "zh" ? "AI 通道" : "AI channels") + "</h3>" +
+        (d.ai_channels || []).map(c => healthChannelRow(c, lang)).join("") +
+        "<h3>" + (lang === "zh" ? "扩展连接" : "extensions") + "</h3>" +
+        (d.extensions || []).map(c => healthChannelRow(c, lang)).join("");
+      chEl.innerHTML = ch;
+    }
+  } catch (e) {
+    el.textContent = t("loadFailed") + e.message;
   }
 }
 function utlSyncZoomButtons() {
@@ -2795,7 +3185,9 @@ function utlSyncZoomButtons() {
     b.style.outline = active ? "1px solid var(--border)" : "none";
   });
 }
-// 下钻：区间块点击 → 明细 + 证据等级（事件委托，CSP 无内联 onclick）
+// 下钻：区间块点击 → 明细 + 证据等级 + 项目来源 + 指定项目操作
+//（事件委托入口在 #utl-tracks；按钮在此动态创建，CSP 无内联 onclick）
+const UTL_ASSIGNABLE_KINDS = ["foreground_dwell", "editor_session", "ai_run"];
 function utlShowDetail(key) {
   const el = document.getElementById("utl-detail");
   if (!el || !UTL_DATA || !UTL_DATA.tracks) return;
@@ -2815,7 +3207,169 @@ function utlShowDetail(key) {
     [zh ? "证据等级" : "evidence level", iv.evidence_level || "-"],
     [zh ? "来源" : "source", iv.source_id || "-"],
   ];
+  // F06 可追溯：项目 + 来源三档（manual=人工指定 observed / rule=规则
+  // inferred / unassigned=无归属证据不猜）
+  const srcLabel = { manual: (zh ? "人工指定" : "manual"),
+                     rule: (zh ? "规则匹配" : "rule"),
+                     unassigned: (zh ? "无归属" : "unassigned") };
+  const psrc = iv.project_source || "unassigned";
+  if (iv.project) {
+    const evTxt = iv.project_evidence === "observed"
+      ? (zh ? "证据：observed，人工指定直证" : "evidence: observed, manual assignment")
+      : (zh ? "证据：inferred，规则匹配推导" : "evidence: inferred, rule match");
+    rows.push([zh ? "项目" : "project", iv.project + "（" + (srcLabel[psrc] || psrc) + "，" + evTxt + "）"]);
+  } else {
+    rows.push([zh ? "项目" : "project",
+      (zh ? "（无归属证据，" : "(no attribution evidence, ") + (srcLabel[psrc] || psrc) + "）"]);
+  }
+  if (iv.interval_kind) rows.push([zh ? "区间类别" : "interval kind", iv.interval_kind]);
   el.textContent = rows.map(r => r[0] + ": " + r[1]).join("  |  ");
+  // 指定项目操作（可归属种类才有按钮；away/tab 轨无归属面不出现）
+  if (iv.interval_kind && UTL_ASSIGNABLE_KINDS.includes(iv.interval_kind) && iv.app_name) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-ghost";
+    btn.style.cssText = "padding:1px 10px;font-size:12px;margin-left:8px";
+    btn.textContent = zh ? "指定项目" : "assign project";
+    btn.addEventListener("click", () => utlAssignProject(iv, btn));
+    el.appendChild(btn);
+  }
+}
+// 指定项目：输入项目名 → POST /api/intervals/project → 成功后重取时间轴。
+// 服务端做目标区间核对与审计（corrected_from）；失败把 [!] 错误写在面板上。
+async function utlAssignProject(iv, btn) {
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  const zh = lang === "zh";
+  const name = prompt(zh
+    ? "指定该项目区间的项目名（人工指定优先于规则推断，可重建）："
+    : "project name for this interval (manual assignment overrides rules, rebuildable):");
+  if (name === null) return;
+  const trimmed = (name || "").trim();
+  if (!trimmed) {
+    utlDetailMsg(zh ? "[!] 项目名不能为空" : "[!] project name must not be empty");
+    return;
+  }
+  const note = prompt(zh ? "备注（可选，留空跳过）：" : "note (optional, leave empty to skip):");
+  if (note === null) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/intervals/project", {
+      method: "POST",
+      headers: kynHeaders({ "Content-Type": "application/json", "X-Kynoptic": "1", "X-Kynoptic-Token": KYN_CSRF_TOKEN }),
+      body: JSON.stringify({
+        interval_kind: iv.interval_kind,
+        start_ts: iv.start_ts,
+        end_ts: iv.end_ts,
+        app_name: iv.app_name,
+        title_hash: iv.title_hash || null,
+        project: trimmed,
+        note: (note || "").trim() || null
+      })
+    });
+    const v = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      utlDetailMsg("[!] " + (v.error || ("HTTP " + r.status)));
+      return;
+    }
+    utlDetailMsg(zh
+      ? "已指定：项目 " + v.project + "（来源 manual，证据 observed" +
+        (v.corrected_from && v.corrected_from !== "unassigned" ? "，取代原 " + v.corrected_from : "") +
+        "）；时间轴已重建"
+      : "assigned: project " + v.project + " (source manual, evidence observed" +
+        (v.corrected_from && v.corrected_from !== "unassigned" ? ", replaces " + v.corrected_from : "") +
+        "); timeline rebuilt");
+    await loadUnifiedTimeline();
+  } catch (err) {
+    utlDetailMsg("[!] " + String(err && err.message ? err.message : err));
+  } finally {
+    btn.disabled = false;
+  }
+}
+// 下钻面板追加消息行（不覆盖明细文本；[!] 前缀 = 警示，平实文案无 emoji）
+function utlDetailMsg(text) {
+  const el = document.getElementById("utl-detail");
+  if (!el) return;
+  const span = document.createElement("span");
+  span.className = "muted";
+  span.style.marginLeft = "8px";
+  span.textContent = text;
+  el.appendChild(span);
+}
+/* ─── 统计报表（F08，/api/reports?days=N；按天 × 类别/来源/项目） ─── */
+let REP_DAYS = 7;
+function repDurStr(ms) {
+  if (ms <= 0) return "0";
+  const min = Math.round(ms / 60000);
+  if (min >= 60) return Math.floor(min / 60) + "h" + (min % 60) + "m";
+  if (min >= 1) return min + " min";
+  return Math.round(ms / 1000) + " s";
+}
+const REP_KIND_LABELS = {
+  foreground_dwell: ["Foreground dwell", "前台驻留"],
+  ai_run: ["AI run", "AI 会话"],
+  editor_session: ["Editor session", "编辑器会话"],
+  away: ["Away", "离场"],
+  tab_foreground_dwell: ["Browser tab", "浏览器 Tab"]
+};
+function repSyncDayButtons() {
+  document.querySelectorAll(".rep-days-btn").forEach(b => {
+    const active = +b.dataset.repDays === REP_DAYS;
+    b.style.fontWeight = active ? "700" : "400";
+    b.style.outline = active ? "1px solid var(--border)" : "none";
+  });
+}
+async function loadReports() {
+  const el = document.getElementById("rep-table");
+  if (!el) return;
+  const lang = document.documentElement.lang === "zh" ? "zh" : "en";
+  const zh = lang === "zh";
+  try {
+    repSyncDayButtons();
+    const d = await jget("/api/reports?days=" + REP_DAYS);
+    const rows = d.rows || [];
+    const th = h => "<th style=\"text-align:left;padding:3px 10px\">" + esc(h) + "</th>";
+    const kindLabel = k => {
+      const l = REP_KIND_LABELS[k];
+      return l ? (zh ? l[1] : l[0]) : k;
+    };
+    let html = "";
+    if (!rows.length) {
+      html = '<div class="muted">' + (zh ? "窗口内无区间数据" : "no intervals in window") + "</div>";
+    } else {
+      html = '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:12px;width:100%">' +
+        "<thead><tr>" +
+        th(zh ? "日期" : "date") + th(zh ? "类别" : "kind") + th(zh ? "来源" : "source") +
+        th(zh ? "项目" : "project") +
+        th(zh ? "项目来源" : "project source") +
+        th(zh ? "observed 合计" : "observed total") +
+        th(zh ? "estimated（单列）" : "estimated (separate)") + th(zh ? "unknown（单列）" : "unknown (separate)") +
+        "</tr></thead><tbody>";
+      for (const r of rows) {
+        const gray = !r.observed_ms && !r.estimated_ms && !r.unknown_ms;
+        html += "<tr style=\"border-top:1px solid var(--border)\">" +
+          "<td style=\"padding:3px 10px" + (gray ? ";opacity:.6" : "") + "\">" + esc(r.date) + "</td>" +
+          "<td style=\"padding:3px 10px\">" + esc(kindLabel(r.kind)) + "</td>" +
+          "<td style=\"padding:3px 10px\">" + esc(r.source) + "</td>" +
+          "<td style=\"padding:3px 10px\">" + esc(r.project) + "</td>" +
+          "<td style=\"padding:3px 10px;opacity:.8\">" + esc(r.project_source || "-") + "</td>" +
+          "<td style=\"padding:3px 10px\">" + repDurStr(r.observed_ms || 0) + "</td>" +
+          "<td style=\"padding:3px 10px;opacity:.85\">" + repDurStr(r.estimated_ms || 0) + "</td>" +
+          "<td style=\"padding:3px 10px;opacity:.7\">" + repDurStr(r.unknown_ms || 0) + "</td>" +
+          "</tr>";
+      }
+      html += "</tbody></table></div>";
+    }
+    el.innerHTML = html;
+    const tot = d.totals || {};
+    const totEl = document.getElementById("rep-totals");
+    if (totEl) totEl.textContent =
+      (zh ? "窗口合计（" : "window totals (") + d.days + (zh ? " 天）：observed " : " days): observed ") + repDurStr(tot.observed_ms || 0) +
+      " · estimated " + repDurStr(tot.estimated_ms || 0) +
+      " · unknown " + repDurStr(tot.unknown_ms || 0) +
+      (zh ? "（estimated/unknown 单列，不计入 observed 合计）" : " (estimated/unknown listed separately, not counted into observed)");
+  } catch (e) {
+    el.textContent = t("noData");
+  }
 }
 async function refreshView(name) {
   // 状态行任何视图都刷新（UX 走查 2026-10-12）：此前仅 overview 拉状态行，
@@ -2829,8 +3383,10 @@ async function refreshView(name) {
   else if (name === "restop") await Promise.all([loadStatus(), loadResourceTop()]);
   else if (name === "diagtl") await Promise.all([loadStatus(), loadDiagTimeline()]);
   else if (name === "unifiedtl") await Promise.all([loadStatus(), loadUnifiedTimeline()]);
+  else if (name === "reports") await Promise.all([loadStatus(), loadReports()]);
   else if (name === "input") await Promise.all([loadStatus(), loadInput()]);
   else if (name === "anomalies") await Promise.all([loadStatus(), loadAnomalies()]);
+  else if (name === "health") await Promise.all([loadStatus(), loadHealth()]);
   // settings 分支同样带状态行（审查修复：#39 漏了本分支——深链
   // ?view=settings 时状态行仍滞留 Loading 直到 30 秒轮询）。
   else if (name === "settings") await Promise.all([loadStatus().catch(() => {}), loadSettings()]);
@@ -2955,7 +3511,8 @@ function markDisconnected() {
   on("lang-btn", "click", () => toggleLang());
   [["tab-overview", "overview"], ["tab-report", "report"], ["tab-apps", "apps"],
    ["tab-input", "input"], ["tab-insights", "insights"], ["tab-sys", "sys"],
-   ["tab-restop", "restop"], ["tab-diagtl", "diagtl"], ["tab-unifiedtl", "unifiedtl"], ["tab-anomalies", "anomalies"],
+   ["tab-restop", "restop"], ["tab-diagtl", "diagtl"], ["tab-unifiedtl", "unifiedtl"],
+   ["tab-reports", "reports"], ["tab-anomalies", "anomalies"],
    ["tab-settings", "settings"]].forEach(([id, v]) => on(id, "click", () => showView(v)));
   on("ops-toggle", "click", e => toggleOps(e));
   on("ops-h2", "click", () => toggleOps());
@@ -2985,11 +3542,68 @@ function markDisconnected() {
     const block = e.target.closest("[data-utl]");
     if (block) utlShowDetail(block.dataset.utl);
   });
+  // F07 筛选条：应用/清除（事件委托入口复用容器；CSP 无内联 onclick）
+  on("utl-filter-apply", "click", () => {
+    loadUnifiedTimeline().catch(err => showViewError("unifiedtl", err.message));
+  });
+  on("utl-filter-clear", "click", () => {
+    const proj = document.getElementById("utl-filter-project");
+    const src = document.getElementById("utl-filter-source");
+    if (proj) proj.value = "";
+    if (src) src.value = "";
+    document.querySelectorAll(".utl-filter-ev").forEach(c => { c.checked = false; });
+    loadUnifiedTimeline().catch(err => showViewError("unifiedtl", err.message));
+  });
+  // 证据等级勾选变更即时应用（与「应用」按钮等价；减少一步误操作）
+  document.querySelectorAll(".utl-filter-ev").forEach(c => {
+    c.addEventListener("change", () => {
+      loadUnifiedTimeline().catch(err => showViewError("unifiedtl", err.message));
+    });
+  });
+  // 报表页签：天数范围按钮（事件委托）
+  document.getElementById("view-reports").addEventListener("click", e => {
+    const b = e.target.closest("[data-rep-days]");
+    if (!b) return;
+    REP_DAYS = +b.dataset.repDays;
+    loadReports().catch(err => showViewError("reports", err.message));
+  });
   on("preset-essential", "click", () => applyPreset("essential"));
   on("preset-full", "click", () => applyPreset("full"));
   on("preset-minimal", "click", () => applyPreset("minimal"));
   on("restore-defaults", "click", () => restoreDefaults());
   on("settings-save", "click", () => saveSettings());
+  // F06 项目归属规则：添加一行 / 删除一行（容器事件委托，CSP 无内联事件）
+  on("proj-rule-add", "click", () => {
+    const el = document.getElementById("proj-rules");
+    if (!el) return;
+    const empty = el.querySelector(".muted");
+    if (empty) empty.remove();
+    el.insertAdjacentHTML("beforeend", projRuleRow({ name: "", path_prefix: "", title_keywords: "" }));
+  });
+  on("proj-rules", "click", e => {
+    const del = e.target.closest("[data-proj-del]");
+    if (del) del.parentElement.remove();
+  });
+  // F11 多设备端点：添加一行 / 删除一行
+  on("dev-endpoint-add", "click", () => {
+    const el = document.getElementById("dev-endpoints");
+    if (!el) return;
+    const empty = el.querySelector(".muted");
+    if (empty) empty.remove();
+    el.insertAdjacentHTML("beforeend", devEndpointRow({ name: "", url: "", token: "" }));
+  });
+  on("dev-endpoints", "click", e => {
+    const del = e.target.closest("[data-dev-del]");
+    if (del) del.parentElement.remove();
+  });
+  // F11 统一时间轴设备选择器（本机/各远端/全部；纯前端过滤缓存数据）
+  on("utl-device", "click", e => {
+    const b = e.target.closest("[data-utl-dev]");
+    if (!b) return;
+    UTL_DEVICE = b.dataset.utlDev;
+    utlSyncDeviceButtons();
+    utlRenderTracks();
+  });
 })();
 /* ─── 键盘模式补全（ARIA APG） ─── */
 /* tablist 方向键漫游：ArrowLeft/Right/Home/End 移动焦点并激活页签。
