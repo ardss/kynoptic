@@ -18,10 +18,19 @@
 //! - `/api/summary?date=`            当日 active_minutes / keys / clicks / top_app
 //! - `/api/timeline?hours=`          近 N 小时按本地小时桶的应用分布（top5 + other）
 //! - `/api/timeline?minutes=`        统一时间轴（PRD v1.0 F07）：只读
-//!   activity_intervals 派生表，按轨道 A-E 分组返回区间 + 证据等级
+//!   activity_intervals 派生表，按轨道 A-E 分组返回区间 + 证据等级；
+//!   D 轨 = ai_run + editor_session（Stage 3），区间带 project（F06）
+//! - `/api/timeline?minutes=&merge=1` F11 多设备合流：并行拉取
+//!   settings.device_endpoints 各远端 dashboard 的 /api/timeline（5s 超时，
+//!   失败降级该设备 offline 标注），按设备分轨合并返回（每区间带 device）；
+//!   human_presence 各设备独立呈现不相加（见 merge.rs）
+//! - `/api/reports?days=`            统计报表（F08，默认 7 天上限 90）：
+//!   本地日 × 类别/来源/项目时长汇总（estimated/unknown 单列不并入 observed）
 //! - `/api/anomalies?days=`          与 MCP `get_anomalies` 同一异常检测
 //!   （marathon 桥接阈值读 settings 的 presence_bridge_minutes）
 //! - `/api/status`                   今日日期 + 最新事件时间戳 + db 路径
+//! - `/api/health`                   采集器健康汇总（F09）：监视器
+//!   ok/degraded/stale、AI hook/文件扫描通道最近成功、扩展连接状态
 //! - `/api/sys-overview`             系统总览视图（M4.3）
 //! - `/api/resource-top?minutes=`     资源排行（M4.3）
 //! - `/api/diag-timeline`             诊断时间线（M4.3）
@@ -43,6 +52,18 @@
 //! - `/api/apps_grid?date=`          指定日「小时 × 应用」使用矩阵（Top6 + other）
 //! - `/api/daily_top?days=`          近 N 天每日 Top3 应用（window 事件）
 //! - `/api/settings` (GET/POST)      设置读写（写 settings.json，不触碰 events）
+//! - `/api/ext/events` (POST)        F04 编辑器扩展摄取（PRD v1.0）：扩展令牌
+//!   （data/ext-token.txt，serve 启动缺失即生成）鉴权，401 拒绝；幂等键
+//!   ext_event_id（migration 0017 部分唯一索引）；写 events 表
+//!   （event_type='editor'，source_id='vscode_ext'/'cursor_ext'，quality=
+//!   'observed'）并节流重建 activity_intervals 的 editor_session。本 crate
+//!   唯一的 events 写路径（用户显式启用：扩展持令牌才可写；WAL + busy_timeout
+//!   5s 与 tray 采集器写连接并发安全）。
+//! - `/api/ext/token` (GET)          设置页展示扩展令牌
+//! - `/api/ext/token/reset` (POST)   重置扩展令牌（旧令牌立即失效；页面
+//!   会话令牌 + CSRF 防线把关）
+//! - `/api/intervals/project` (POST) F06 人工指定区间项目（0018
+//!   project_overrides，append-only + 审计 + 重建；下钻面板消费）
 //! - `/api/autostart-status`         autostart 保存读回（settings 值 vs 注册表 Run 键现状）
 //! - `/api/diagnostics`              诊断留档文件清单（存在性/mtime/大小/尾部
 //!   20 行，内容净化、不暴露路径；设置页折叠块消费）
@@ -57,6 +78,7 @@
 //! 修改后需重启 dashboard（托盘菜单重启或重开 `kynoptic-ctl dashboard`）。
 
 pub mod display;
+pub mod merge;
 pub mod settings;
 
 use std::io::{Read, Write};
@@ -533,165 +555,13 @@ fn anomaly_message_en(kind: &str, message: &str, at: Option<&str>) -> String {
     }
 }
 
-/// GET /api/timeline?minutes= — 统一时间轴（PRD v1.0 F07，Stage 1）。只读
-/// activity_intervals 派生表（stage0-audit §5 决策 4：UI/CLI/MCP 三端只读
-/// 派生表保证数值一致；本端点不写、不重建，重建由 collector 侧
-/// rebuild_activity_intervals 负责），按轨道 A-E 分组返回区间：
-/// - A 前台窗口（foreground_dwell）；
-/// - B 浏览器 tab（tab_foreground_dwell）：Stage 2 F02 扩展接入前无数据源，
-///   整段合成一条 unknown 区间并标注「未接入」（不隐藏）；
-/// - C 在场/离场（away 区间）；
-/// - D AI 活动 / E 网络遥测：本阶段无数据源，intervals 留空 + 「未接入」。
-///
-/// 证据等级按 PRD §2.3 词表：quality=observed → observed（原始事件直证）；
-/// estimated → inferred（推导，如与 away 相交）；unknown → unknown（无证据
-/// 缺口，不是零）。区间裁剪到 [now − minutes, now] 窗口，`now_ms` 注入
-/// （_at 变体，测试零真实时钟依赖，先例 api_status_at / api_timeline_at）。
-/// 与既有 `?hours=` 小时桶端点共用 /api/timeline 路由：请求带 `minutes`
-/// 参数即走本端点，两套口径互不掺和（HTTP 层见 route_req）。
-pub fn api_unified_timeline_at(
-    conn: &Connection,
-    minutes: u32,
-    now_ms: i64,
-) -> rusqlite::Result<Value> {
-    let minutes = minutes.clamp(1, 1440);
-    let window_start_ms = now_ms - i64::from(minutes) * 60_000;
-    // activity_intervals 的时间戳统一由 core 侧 to_rfc3339() 写入
-    // （+00:00 后缀、无亚秒），字典序比较与时间序一致，窗口过滤安全。
-    let fmt_ms = |ms: i64| -> String {
-        chrono::DateTime::from_timestamp_millis(ms)
-            .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-            .to_rfc3339()
-    };
-    let parse_ms = |ts: &str| -> i64 {
-        chrono::DateTime::parse_from_rfc3339(ts)
-            .map(|t| t.timestamp_millis())
-            .unwrap_or(0)
-    };
-    // quality → 证据等级（PRD §2.3：observed / inferred / unknown 三级词表）
-    let evidence_level = |quality: &str| -> &'static str {
-        match quality {
-            "observed" | "confirmed" => "observed",
-            "estimated" | "inferred" => "inferred",
-            _ => "unknown",
-        }
-    };
-    let mut stmt = conn.prepare(
-        "SELECT interval_kind, start_ts, end_ts, app_name, title_hash, quality, source_id \
-         FROM activity_intervals \
-         WHERE end_ts >= ?1 AND start_ts <= ?2 \
-         ORDER BY interval_kind, start_ts",
-    )?;
-    let rows = stmt.query_map(params![fmt_ms(window_start_ms), fmt_ms(now_ms)], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, Option<String>>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, Option<String>>(6)?,
-        ))
-    })?;
-    let mut track_a: Vec<Value> = Vec::new();
-    let mut track_b: Vec<Value> = Vec::new();
-    let mut track_c: Vec<Value> = Vec::new();
-    for row in rows {
-        let (kind, start_ts, end_ts, app, title_hash, quality, source_id) = row?;
-        let start = parse_ms(&start_ts).max(window_start_ms);
-        let end = parse_ms(&end_ts).min(now_ms);
-        if end <= start {
-            continue; // 完全在窗口外的裁剪残留（理论不可达，防御）
-        }
-        let iv = json!({
-            "start_ms": start,
-            "end_ms": end,
-            "start_ts": fmt_ms(start),
-            "end_ts": fmt_ms(end),
-            "duration_ms": end - start,
-            "app_name": app,
-            "title_hash": title_hash,
-            "quality": quality,
-            "evidence_level": evidence_level(&quality),
-            "source_id": source_id,
-        });
-        match kind.as_str() {
-            kynoptic_core::db::activity_intervals::KIND_FOREGROUND_DWELL => track_a.push(iv),
-            kynoptic_core::db::activity_intervals::KIND_TAB_FOREGROUND_DWELL => track_b.push(iv),
-            kynoptic_core::db::activity_intervals::KIND_AWAY => track_c.push(iv),
-            _ => {}
-        }
-    }
-    // B 轨无数据源：整段 unknown（真实缺口，不是隐藏，也不标 0）
-    if track_b.is_empty() {
-        track_b.push(json!({
-            "start_ms": window_start_ms,
-            "end_ms": now_ms,
-            "start_ts": fmt_ms(window_start_ms),
-            "end_ts": fmt_ms(now_ms),
-            "duration_ms": now_ms - window_start_ms,
-            "app_name": Value::Null,
-            "title_hash": Value::Null,
-            "quality": "unknown",
-            "evidence_level": "unknown",
-            "source_id": Value::Null,
-        }));
-    }
-    let track = |id: &str,
-                 label_en: &str,
-                 label_zh: &str,
-                 kind: Value,
-                 connected: bool,
-                 note_en: Value,
-                 note_zh: Value,
-                 intervals: Vec<Value>| {
-        json!({
-            "id": id,
-            "label_en": label_en,
-            "label_zh": label_zh,
-            "interval_kind": kind,
-            "connected": connected,
-            "note_en": note_en,
-            "note_zh": note_zh,
-            "intervals": intervals,
-        })
-    };
-    Ok(json!({
-        "endpoint": "unified_timeline",
-        "minutes": minutes,
-        "window_start_ms": window_start_ms,
-        "window_end_ms": now_ms,
-        "window_start": fmt_ms(window_start_ms),
-        "window_end": fmt_ms(now_ms),
-        "legend": {
-            "observed": "原始事件直证 / directly evidenced by raw events",
-            "inferred": "推导（如与离场区间相交）/ inferred (e.g. overlapped away)",
-            "unknown": "无证据缺口，不是零 / real gap, not zero",
-        },
-        "tracks": [
-            track("A", "Foreground windows", "前台窗口",
-                json!(kynoptic_core::db::activity_intervals::KIND_FOREGROUND_DWELL),
-                true, Value::Null, Value::Null, track_a),
-            track("B", "Browser tabs", "浏览器 Tab",
-                json!(kynoptic_core::db::activity_intervals::KIND_TAB_FOREGROUND_DWELL),
-                false,
-                json!("Not connected yet — whole track unknown until Stage 2 extension (F02)"),
-                json!("未接入——Stage 2 浏览器扩展（F02）接入前整段 unknown"),
-                track_b),
-            track("C", "Presence / away", "在场 / 离场",
-                json!(kynoptic_core::db::activity_intervals::KIND_AWAY),
-                true, Value::Null, Value::Null, track_c),
-            track("D", "AI activity", "AI 活动", Value::Null, false,
-                json!("No data source in this stage"),
-                json!("本阶段无数据源，未接入"),
-                Vec::<Value>::new()),
-            track("E", "Network / telemetry", "网络 / 遥测", Value::Null, false,
-                json!("No data source in this stage"),
-                json!("本阶段无数据源，未接入"),
-                Vec::<Value>::new()),
-        ],
-    }))
-}
+// 统一时间轴 / 统计报表（PRD F07/F08）的纯查询函数 Stage 3 下沉到 core
+// （mcp 不能反向依赖 dash——dash 已依赖 mcp，成环；下沉后三端同源，见
+// core::timeline 模块 doc）。本 crate 保留同名 re-export，路由/tests/CLI
+// 的既有调用点不受影响。
+pub use kynoptic_core::timeline::{
+    api_reports_at, api_unified_timeline_at, api_unified_timeline_filtered_at, TimelineFilter,
+};
 
 /// GET /api/anomalies?days= — 与 MCP get_anomalies 同一检测入口（days 须 >= 1，
 /// HTTP 路由层已拒绝 0/负数），但 marathon
@@ -1319,6 +1189,241 @@ fn db_dir_kind(db_path: &Path) -> &'static str {
         (Some(db), Some(exe)) if db == exe => "exe-relative data",
         _ => "user data",
     }
+}
+
+// ═══ F09 采集器健康汇总（PRD v1.0 F09：GET /api/health） ═══════════════════
+//
+// 阈值依据（常量化，注释即依据；判定全部时间参数化，不读真实时钟）：
+// - 轮询监视器 stale = 300s：仓库内最慢常规轮询周期为 60s 级（calendar /
+//   system / windows_update 等；low_power 只会放档到 1s-5s 级），5 倍裕量
+//   覆盖一次卡顿/退避；超过即视为「未按周期出数」。
+// - degraded：consecutive_slow > 0（core collector 已进入退避状态，
+//   collector.rs backoff_wait）。降级但不失联。
+// - AI hook 通道 stale = 86400s（24h）：hook 事件与会话粒度对齐（一次
+//   Claude Code / ZCode 会话数小时不出事件属正常），日级阈值只捕捉
+//   「通道断了一天以上」；文案按证据词表：unknown 不是零、也不是故障。
+// - 扩展连接 stale = 600s（10 分钟）：编辑器扩展默认 5s 一批、浏览器扩展
+//   事件驱动；10 分钟内无事件更可能是「用户没在用」而非断连，因此超过
+//   阈值标 stale（仅表示近 10 分钟无证据），从不判定「已断开」。
+//
+// 判定词表：ok / degraded / stale / unknown（unknown = 本进程无证据，
+// 如独立 serve 进程读不到采集器内存态——不是零，也不臆测故障）。
+
+/// 轮询监视器 stale 阈值（秒）。依据见本节头注释。
+pub const HEALTH_MONITOR_STALE_SECS: u64 = 300;
+
+/// AI hook 通道 stale 阈值（秒，24h）。依据见本节头注释。
+pub const HEALTH_AI_CHANNEL_STALE_SECS: i64 = 86_400;
+
+/// 扩展通道 stale 阈值（秒，10 分钟）。依据见本节头注释。
+pub const HEALTH_EXT_STALE_SECS: i64 = 600;
+
+/// 单监视器健康判定（纯函数，now 已由调用方折进 age_secs）：
+/// - 无证据（None）→ unknown；
+/// - 超过 stale 阈值 → stale；
+/// - 连续慢采集中（退避）→ degraded；
+/// - 其余 → ok。
+pub fn classify_monitor_health(age_secs: Option<u64>, consecutive_slow: u32) -> &'static str {
+    match age_secs {
+        None => "unknown",
+        Some(age) if age > HEALTH_MONITOR_STALE_SECS => "stale",
+        Some(_) if consecutive_slow > 0 => "degraded",
+        Some(_) => "ok",
+    }
+}
+
+/// 事件通道（AI hook / 扩展）健康判定（纯函数）：同 unknown 优先、
+/// 超阈值 stale、否则 ok 的顺序；无 degraded 态（通道只有「出数/不出数」）。
+pub fn classify_channel_health(age_secs: Option<i64>, stale_secs: i64) -> &'static str {
+    match age_secs {
+        None => "unknown",
+        Some(age) if age > stale_secs => "stale",
+        Some(_) => "ok",
+    }
+}
+
+/// 单个事件通道的最近成功时间（observed，直接读 events 表）：
+/// 返回 (last_event_ts, age_secs)。conn 只读；`now` 注入（测试铁律）。
+fn channel_last_event(
+    conn: &Connection,
+    source_ids: &[&str],
+    now: chrono::DateTime<Utc>,
+) -> (Option<String>, Option<i64>) {
+    let placeholders = source_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT MAX(timestamp) FROM events WHERE source_id IN ({placeholders})");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let ts: Option<String> = stmt
+        .query_row(rusqlite::params_from_iter(source_ids.iter()), |r| r.get(0))
+        .ok()
+        .flatten();
+    let age = ts.as_ref().and_then(|t| {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .ok()
+            .map(|d| (now - d.with_timezone(&Utc)).num_seconds())
+    });
+    (ts, age)
+}
+
+/// 事件通道健康条目（serde 直出）。
+fn channel_health_entry(
+    label: &str,
+    kind: &'static str,
+    stale_secs: i64,
+    conn: &Connection,
+    source_ids: &[&str],
+    now: chrono::DateTime<Utc>,
+) -> Value {
+    let (last_ts, age) = channel_last_event(conn, source_ids, now);
+    json!({
+        "channel": label,
+        "kind": kind,
+        "source_ids": source_ids,
+        "last_event_ts": last_ts,
+        "age_secs": age,
+        "stale_threshold_secs": stale_secs,
+        "state": classify_channel_health(age, stale_secs),
+    })
+}
+
+/// GET /api/health — 采集器健康汇总（F09）。三段：
+/// - monitors：轮询监视器逐个 ok/degraded/stale/unknown（来源
+///   core::collector::monitor_stats 进程级内存态；独立 serve 进程无采集器
+///   时为空数组——跨进程盲区与 /api/status 同口径，如实回 unknown 注记，
+///   不冒充健康）。钩子型（keyboard_hook / mouse_hook 回调驱动、无轮询
+///   周期）本就不进统计，见 monitors_note。
+/// - ai_channels：AI hook 通道（claude_code / zcode，POST /api/ext/events
+///   或 ext-event 子命令写入）与文件扫描通道（ai，collector 派生表维护时
+///   写入）最近成功时间。dsh 无 hook 机制，只有文件扫描通道，不单列。
+/// - extensions：chrome_ext（浏览器）/ vscode_ext / cursor_ext（编辑器）
+///   最近事件时间与连接状态。
+///
+/// `now` 注入（_at 变体供测试与 CLI 同源；api_health 直读 Utc::now）。
+pub fn api_health_at(conn: &Connection, now: chrono::DateTime<Utc>) -> Value {
+    let monitors: Vec<Value> = kynoptic_core::collector::monitor_stats()
+        .iter()
+        .map(|m| {
+            json!({
+                "name": m.name,
+                "state": classify_monitor_health(m.last_success_age_secs, m.consecutive_slow),
+                "last_success_age_secs": m.last_success_age_secs,
+                "last_duration_ms": m.last_duration_ms,
+                "consecutive_slow": m.consecutive_slow,
+            })
+        })
+        .collect();
+    // 汇总状态：任一 stale → stale；任一 degraded → degraded；无任何证据
+    // （空监视器表 + 全通道 unknown）→ unknown；其余 ok。
+    let mut worst = "ok";
+    let mut any_evidence = false;
+    for m in &monitors {
+        let s = m["state"].as_str().unwrap_or("unknown");
+        if s == "unknown" {
+            continue;
+        }
+        any_evidence = true;
+        match (worst, s) {
+            (_, "stale") => worst = "stale",
+            ("ok", "degraded") => worst = "degraded",
+            ("unknown", "degraded") => worst = "degraded",
+            _ => {}
+        }
+    }
+    let channels = [
+        (
+            "claude_code hook",
+            "ai_hook",
+            HEALTH_AI_CHANNEL_STALE_SECS,
+            &["claude_code"][..],
+        ),
+        (
+            "zcode hook",
+            "ai_hook",
+            HEALTH_AI_CHANNEL_STALE_SECS,
+            &["zcode"][..],
+        ),
+        (
+            "ai file scan",
+            "ai_adapter",
+            HEALTH_AI_CHANNEL_STALE_SECS,
+            &["ai"][..],
+        ),
+        (
+            "browser extension",
+            "extension",
+            HEALTH_EXT_STALE_SECS,
+            &["chrome_ext"][..],
+        ),
+        (
+            "vscode extension",
+            "extension",
+            HEALTH_EXT_STALE_SECS,
+            &["vscode_ext"][..],
+        ),
+        (
+            "cursor extension",
+            "extension",
+            HEALTH_EXT_STALE_SECS,
+            &["cursor_ext"][..],
+        ),
+    ];
+    let ai_channels: Vec<Value> = channels
+        .iter()
+        .filter(|c| c.1 != "extension")
+        .map(|c| channel_health_entry(c.0, c.1, c.2, conn, c.3, now))
+        .collect();
+    let extensions: Vec<Value> = channels
+        .iter()
+        .filter(|c| c.1 == "extension")
+        .map(|c| channel_health_entry(c.0, c.1, c.2, conn, c.3, now))
+        .collect();
+    for e in ai_channels.iter().chain(extensions.iter()) {
+        let s = e["state"].as_str().unwrap_or("unknown");
+        if s == "unknown" {
+            continue;
+        }
+        any_evidence = true;
+        if s == "stale" {
+            match worst {
+                "stale" => {}
+                _ => worst = "stale",
+            }
+        } else if worst == "unknown" {
+            worst = "ok";
+        }
+    }
+    if !any_evidence && monitors.is_empty() {
+        worst = "unknown";
+    }
+    // AC-17：键盘 hook 摘钩自愈计数随健康端点一并暴露（与 /api/diag 同源）
+    let hook_reinstalls = kynoptic_core::monitors::keyboard_hook::reinstall_count();
+    let hook_reinstall_failures = kynoptic_core::monitors::keyboard_hook::reinstall_failures();
+    json!({
+        "endpoint": "health",
+        "generated_at": now.to_rfc3339(),
+        "status": worst,
+        "hook_selfheal": {
+            "reinstalls": hook_reinstalls,
+            "failures": hook_reinstall_failures,
+            "note": "keyboard_hook 摘钩自愈：被系统摘除后自动重挂的次数；failures>0 表示重挂失败需关注",
+        },
+        "thresholds": {
+            "monitor_stale_secs": HEALTH_MONITOR_STALE_SECS,
+            "ai_channel_stale_secs": HEALTH_AI_CHANNEL_STALE_SECS,
+            "extension_stale_secs": HEALTH_EXT_STALE_SECS,
+        },
+        "monitors": monitors,
+        "monitors_note": "轮询型监视器逐项判定；键盘/鼠标为钩子型（回调驱动，无轮询周期）不进本表；独立 serve 进程读不到采集器内存态时本表为空（unknown，非零）",
+        "ai_channels": ai_channels,
+        "extensions": extensions,
+    })
+}
+
+/// GET /api/health 生产入口（读 Utc::now；测试/CLI 走 api_health_at 注入）。
+pub fn api_health(conn: &Connection) -> Value {
+    api_health_at(conn, Utc::now())
 }
 
 /// GET /api/diagnostics — 诊断文件可见面（发现 ①-4：collector-error /
@@ -2960,7 +3065,7 @@ pub fn api_settings(db_path: &Path) -> Value {
 /// 里回显 null）+ 加一处 `req.get` 接受站点（否则该字段会被列进 ignored）；
 /// tests.rs 有回归测试固化「常量全集均被接受、落盘且不出现在 ignored」。
 /// 响应专用键 `monitors` 不属于本集——请求若误带它，按未知字段列进 ignored。
-const ACCEPTED_SETTING_FIELDS: [&str; 12] = [
+const ACCEPTED_SETTING_FIELDS: [&str; 15] = [
     "enabled_monitors",
     "input_counts_only",
     "vk_frequency_enabled",
@@ -2972,7 +3077,10 @@ const ACCEPTED_SETTING_FIELDS: [&str; 12] = [
     "update_check",
     "low_power",
     "redact_titles",
+    "redact_titles_full",
     "net_etw_enabled",
+    "project_rules",
+    "device_endpoints",
 ];
 
 /// [`ACCEPTED_SETTING_FIELDS`] 各字段在响应侧的取值（响应键 = 常量条目）。
@@ -2989,7 +3097,10 @@ fn setting_field_value(s: &AppSettings, field: &str) -> Value {
         "update_check" => json!(s.update_check),
         "low_power" => json!(s.low_power),
         "redact_titles" => json!(s.redact_titles),
+        "redact_titles_full" => json!(s.redact_titles_full),
         "net_etw_enabled" => json!(s.net_etw_enabled),
+        "project_rules" => json!(s.project_rules),
+        "device_endpoints" => json!(s.device_endpoints),
         // 不可达：settings_payload 只按常量条目迭代；加常量条目后须补上臂。
         _ => Value::Null,
     }
@@ -3081,6 +3192,11 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
     if let Some(v) = req.get("redact_titles") {
         next.redact_titles = v.as_bool().ok_or("redact_titles 应为布尔值")?;
     }
+    // F10 整标题脱敏（隐私 opt-in，默认关）：开启后新写入标题替换为
+    // [redacted]；只拦新写入，不清洗历史数据（append-only 铁律）
+    if let Some(v) = req.get("redact_titles_full") {
+        next.redact_titles_full = v.as_bool().ok_or("redact_titles_full 应为布尔值")?;
+    }
     // ETW 增强模式（0.8.1 A2，默认关）：true 时下次采集启动接线 NetEtw 线程
     if let Some(v) = req.get("net_etw_enabled") {
         next.net_etw_enabled = v.as_bool().ok_or("net_etw_enabled 应为布尔值")?;
@@ -3135,6 +3251,115 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         }
         next.categories = rules;
     }
+    if let Some(v) = req.get("project_rules") {
+        use kynoptic_core::db::activity_intervals::ProjectRule;
+        let arr = v.as_array().ok_or("project_rules 应为数组")?;
+        // fuzz 加固：条数与单字段长度上限（与 categories 同法，拒绝毒值大对象落盘）
+        if arr.len() > settings::MAX_CATEGORIES {
+            return Err(format!(
+                "project_rules 条数不能超过 {}（当前 {}）",
+                settings::MAX_CATEGORIES,
+                arr.len()
+            ));
+        }
+        let mut rules = Vec::with_capacity(arr.len());
+        for r in arr {
+            let name = r
+                .get("name")
+                .and_then(|x| x.as_str())
+                .ok_or("project_rules[].name 缺失")?
+                .to_string();
+            let path_prefix = r
+                .get("path_prefix")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let title_keywords = r
+                .get("title_keywords")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.len() > 256 {
+                return Err("project_rules[].name 长度不能超过 256".into());
+            }
+            for field in ["path_prefix", "title_keywords"] {
+                let val = if field == "path_prefix" {
+                    &path_prefix
+                } else {
+                    &title_keywords
+                };
+                if val.chars().count() > settings::MAX_PATTERN_CHARS {
+                    return Err(format!(
+                        "project_rules[].{field} 长度不能超过 {}",
+                        settings::MAX_PATTERN_CHARS
+                    ));
+                }
+            }
+            if path_prefix.trim().is_empty() && title_keywords.trim().is_empty() {
+                return Err("project_rules[] 的 path_prefix 与 title_keywords 不能同时为空".into());
+            }
+            rules.push(ProjectRule {
+                name,
+                path_prefix,
+                title_keywords,
+            });
+        }
+        next.project_rules = rules;
+    }
+    // F11 多设备远端端点（opt-in，默认空 = 单机模式）：name 必填、url 必须
+    // http:// 开头且主机名合法（防注入请求行）；token 可空（对端无 token 时）。
+    // 条数/长度上限与 categories 同法（拒绝毒值大对象落盘）。
+    if let Some(v) = req.get("device_endpoints") {
+        use settings::DeviceEndpoint;
+        let arr = v.as_array().ok_or("device_endpoints 应为数组")?;
+        if arr.len() > settings::MAX_CATEGORIES {
+            return Err(format!(
+                "device_endpoints 条数不能超过 {}（当前 {}）",
+                settings::MAX_CATEGORIES,
+                arr.len()
+            ));
+        }
+        let mut eps = Vec::with_capacity(arr.len());
+        for e in arr {
+            let name = e
+                .get("name")
+                .and_then(|x| x.as_str())
+                .ok_or("device_endpoints[].name 缺失")?
+                .trim()
+                .to_string();
+            let url = e
+                .get("url")
+                .and_then(|x| x.as_str())
+                .ok_or("device_endpoints[].url 缺失")?
+                .trim()
+                .to_string();
+            let token = e
+                .get("token")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                return Err("device_endpoints[].name 不能为空".into());
+            }
+            if name.len() > 256 {
+                return Err("device_endpoints[].name 长度不能超过 256".into());
+            }
+            // url 形态校验复用拉取侧解析器（同一口径：能解析才能保存）
+            if let Err(pe) = merge::parse_base_url(&url) {
+                return Err(format!("device_endpoints[].url 不合法：{pe}"));
+            }
+            for (val, label) in [(&url, "url"), (&token, "token")] {
+                if val.chars().count() > settings::MAX_PATTERN_CHARS {
+                    return Err(format!(
+                        "device_endpoints[].{label} 长度不能超过 {}",
+                        settings::MAX_PATTERN_CHARS
+                    ));
+                }
+            }
+            eps.push(DeviceEndpoint { name, url, token });
+        }
+        next.device_endpoints = eps;
+    }
     if let Some(v) = req.get("dashboard_port") {
         let port = v.as_u64().ok_or("dashboard_port 应为 1-65535 整数")?;
         // fuzz 加固：0 也是毒值（绑定语义在 serve 层，落库 0 只会让面板打不开）
@@ -3144,6 +3369,11 @@ pub fn api_settings_post(db_path: &Path, body: &str) -> std::result::Result<Valu
         next.dashboard_port = port as u16;
     }
     settings::save(db_path, &next).map_err(|e| format!("写设置失败: {e}"))?;
+    // 独立复审 2026-11-03 接线：project_rules 落盘后同步进程内快照——
+    // collector 的节流重建读此快照，规则保存在下一重建窗口（≤90s+flush）
+    // 生效；tray 内嵌 dashboard 时同进程即时可见，独立 dashboard 进程由
+    // tray 的 settings.json mtime 监视兜底推送。
+    kynoptic_core::db::activity_intervals::set_current_project_rules(next.project_rules.clone());
     if prev != next {
         append_settings_audit(db_path, &settings_audit_summary(&prev, &next));
     }
@@ -3274,13 +3504,25 @@ fn settings_audit_summary(old: &AppSettings, new: &AppSettings) -> String {
             json!([old.categories.len(), new.categories.len()]),
         );
     }
+    if old.project_rules != new.project_rules {
+        d.insert(
+            "project_rules".into(),
+            json!([old.project_rules.len(), new.project_rules.len()]),
+        );
+    }
+    if old.device_endpoints != new.device_endpoints {
+        d.insert(
+            "device_endpoints".into(),
+            json!([old.device_endpoints.len(), new.device_endpoints.len()]),
+        );
+    }
     Value::Object(d).to_string()
 }
 
 // ─── 路由表 ─────────────────────────────────────────────────────────────────
 
 /// 路由：返回 (HTTP status, content-type, body)。
-/// `path` 含 query string；`body` 仅 POST /api/settings 使用；
+/// `path` 含 query string；`body` 仅 POST 使用；
 /// 非 GET/POST → 405；未知路径 → 404；参数坏 → 400。
 pub fn route_req(
     conn: &Connection,
@@ -3288,6 +3530,22 @@ pub fn route_req(
     path: &str,
     body: &str,
     db_path: &Path,
+) -> (u16, &'static str, String) {
+    route_req_ext(conn, method, path, body, db_path, None)
+}
+
+/// 带 F04 扩展令牌的路由变体：`ext_token_presented` 是 HTTP 层从
+/// X-Kynoptic-Ext-Token / Authorization: Bearer 提取的候选令牌，仅供
+/// POST /api/ext/events 鉴权（token_eq 恒时比较，401 失败）；其余端点
+/// 与 [`route_req`] 完全一致。
+#[allow(clippy::too_many_arguments)]
+pub fn route_req_ext(
+    conn: &Connection,
+    method: &str,
+    path: &str,
+    body: &str,
+    db_path: &Path,
+    ext_token_presented: Option<&str>,
 ) -> (u16, &'static str, String) {
     let (route_path, query) = match path.split_once('?') {
         Some((p, q)) => (p, q),
@@ -3397,17 +3655,85 @@ pub fn route_req(
                     Ok(None) => 60, // 不可达：minutes 已确认在场
                     Ok(Some(m)) => m,
                 };
+                // F07 筛选参数（project/source/evidence）：逗号分隔与重复
+                // 参数两种写法都收（?evidence=observed,inferred 等价于
+                // ?evidence=observed&evidence=inferred）；词表越值 400（见
+                // TimelineFilter::validate——静默空表会被误读为「无活动」）。
+                let mut tl_filter = kynoptic_core::timeline::TimelineFilter::default();
+                for key in ["project", "source", "evidence"] {
+                    let mut vals: Vec<String> = Vec::new();
+                    for kv in query.split('&') {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            if k == key {
+                                vals.extend(v.split(',').map(str::to_string).filter(|s| !s.is_empty()));
+                            }
+                        }
+                    }
+                    if vals.is_empty() {
+                        continue;
+                    }
+                    match key {
+                        "project" => tl_filter.project = vals,
+                        "source" => tl_filter.source = vals,
+                        "evidence" => tl_filter.evidence = vals,
+                        _ => unreachable!(),
+                    }
+                }
+                if let Err(e) = tl_filter.validate() {
+                    return (400, "application/json", err_json(&e));
+                }
                 // 纯函数 api_unified_timeline_at（tests.rs 直调）不受缓存影响；
                 // 窗口小（<= 1440 分钟）、只扫派生表，无需 TTL 缓存。
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                match api_unified_timeline_at(conn, minutes_req.min(1440), now_ms) {
+                let minutes = minutes_req.min(1440);
+                // F11 多设备合流（?merge=1）：逐个并行拉取 settings 里远端
+                // dashboard 的 /api/timeline?minutes=N（单端点 5s 超时），
+                // 失败降级该设备 offline 标注，绝不阻塞/绝不替代本机数据。
+                // 远端调用不带 merge，避免级联合流（远端自己的多设备配置
+                // 不在本端点展开）。
+                if first_val("merge") == Some("1") {
+                    let endpoints = settings::load(db_path).device_endpoints;
+                    let local =
+                        match api_unified_timeline_filtered_at(conn, minutes, now_ms, &tl_filter) {
+                            Ok(v) => v,
+                            Err(e) => return (400, "application/json", err_json(&e.to_string())),
+                        };
+                    // 筛选条件透传远端：三端契约一致，远端自己做同样过滤
+                    let filter_q = ["project", "source", "evidence"]
+                        .iter()
+                        .filter_map(|key| {
+                            let vals = match *key {
+                                "project" => &tl_filter.project,
+                                "source" => &tl_filter.source,
+                                _ => &tl_filter.evidence,
+                            };
+                            if vals.is_empty() {
+                                None
+                            } else {
+                                Some(format!("{}={}", key, vals.join(",")))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    let results =
+                        merge::fetch_all_remotes(&endpoints, minutes, &filter_q, std::time::Duration::from_secs(merge::REMOTE_TIMEOUT_SECS));
+                    let mut v = merge::merge_unified_timelines(local, results, minutes, now_ms);
+                    if minutes_req > 1440 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "minutes", minutes_req, 1440);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["minutes", "merge"]));
+                    return (200, "application/json", v.to_string());
+                }
+                match api_unified_timeline_filtered_at(conn, minutes, now_ms, &tl_filter) {
                     Ok(mut v) => {
                         if minutes_req > 1440 {
                             if let Some(obj) = v.as_object_mut() {
                                 cap_note(obj, "minutes", minutes_req, 1440);
                             }
                         }
-                        add_ignored(&mut v, ignored_params(&["minutes"]));
+                        add_ignored(&mut v, ignored_params(&["minutes", "project", "source", "evidence"]));
                         (200, "application/json", v.to_string())
                     }
                     Err(e) => (400, "application/json", err_json(&e.to_string())),
@@ -3545,8 +3871,37 @@ pub fn route_req(
             add_ignored(&mut v, ignored_params(&["days"]));
             (200, "application/json", v.to_string())
         }
+        ("GET", "/api/reports") => {
+            // F08 统计报表：days 默认 7，上限 90（超限钳制 + days_requested/note）
+            let days_req = match qnum("days", 1, 90) {
+                Err(e) => return (400, "application/json", err_json(&e)),
+                Ok(None) => 7,
+                Ok(Some(d)) => d,
+            };
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            match api_reports_at(conn, days_req, now_ms) {
+                Ok(mut v) => {
+                    if days_req > 90 {
+                        if let Some(obj) = v.as_object_mut() {
+                            cap_note(obj, "days", days_req, 90);
+                        }
+                    }
+                    add_ignored(&mut v, ignored_params(&["days"]));
+                    (200, "application/json", v.to_string())
+                }
+                Err(e) => (400, "application/json", err_json(&e.to_string())),
+            }
+        }
         ("GET", "/api/status") => {
             let mut v = api_status(conn, db_path);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
+        // F09 采集器健康汇总（PRD v1.0 F09）：监视器 ok/degraded/stale +
+        // AI hook/文件扫描通道 + 扩展连接状态。只读 events 与进程级内存态，
+        // 与其他 GET 端点同级（token_required 时随 /api/* 统一鉴权）。
+        ("GET", "/api/health") => {
+            let mut v = api_health(conn);
             add_ignored(&mut v, ignored_params(&[]));
             (200, "application/json", v.to_string())
         }
@@ -3571,7 +3926,7 @@ pub fn route_req(
                     cap_note(obj, "minutes", minutes_req, 1440);
                 }
             }
-            add_ignored(&mut v, ignored_params(&["minutes"]));
+            add_ignored(&mut v, ignored_params(&["minutes", "project", "source", "evidence"]));
             (200, "application/json", v.to_string())
         }
         ("GET", "/api/net-derived") => {
@@ -3911,6 +4266,46 @@ pub fn route_req(
                 ),
             }
         }
+        // F04 编辑器扩展摄取：令牌鉴权在 route 层完成（handle_client 提取
+        // 头并传入；route_req 直调路径 presented=None → 恒 401）。
+        ("POST", "/api/ext/events") => {
+            if let Err((code, msg)) = ext_token_ok(db_path, ext_token_presented) {
+                return (code, "application/json", msg);
+            }
+            match api_ext_events_post(db_path, body) {
+                Ok(v) => (200, "application/json", v.to_string()),
+                Err(e) => {
+                    // 库锁/库损坏类（db_error 关键词）映射 503，校验类 400
+                    let code = if err_code(&e) == "db_error" { 503 } else { 400 };
+                    (code, "application/json", err_json(&e))
+                }
+            }
+        }
+        // 扩展令牌展示/重置（设置页消费；走页面会话令牌 + CSRF 防线，
+        // 与 POST /api/settings 同级）
+        ("GET", "/api/ext/token") => {
+            let mut v = api_ext_token_get(db_path);
+            add_ignored(&mut v, ignored_params(&[]));
+            (200, "application/json", v.to_string())
+        }
+        ("POST", "/api/ext/token/reset") => match api_ext_token_reset(db_path) {
+            Ok(v) => (200, "application/json", v.to_string()),
+            Err(e) => (400, "application/json", err_json(&e)),
+        },
+        // F06 缺口补齐：人工指定项目（POST /api/intervals/project）。写路径
+        // 与 POST /api/settings 同级——会话令牌 + CSRF + Origin 防线在 HTTP
+        // 层（handle_client 把关），本层做 payload 校验 + 目标区间核对 +
+        // append-only 落库（project_overrides）+ 派生表重建。
+        ("POST", "/api/intervals/project") => {
+            match api_intervals_project_post(db_path, body) {
+                Ok(v) => (200, "application/json", v.to_string()),
+                Err(e) => {
+                    // 库锁/库损坏类映射 503，校验类 400（与 /api/ext/events 同策略）
+                    let code = if err_code(&e) == "db_error" { 503 } else { 400 };
+                    (code, "application/json", err_json(&e))
+                }
+            }
+        }
         ("POST", "/api/settings") => {
             // 读-改-写整段串行化（审查 P1：并发 POST 会用旧快照覆盖对方字段）
             static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -4103,6 +4498,8 @@ pub fn serve(db_path: &Path, port: u16, readonly: bool) -> Result<()> {
     if access_token.is_some() {
         log::info!("dashboard: 访问令牌已启用（/api/* 需携带 token，见 dashboard-token.txt）");
     }
+    // F04 扩展令牌：缺失则生成（扩展上报 /api/ext/events 的唯一凭证）
+    let _ = ensure_ext_token(db_path);
     // 平台审查（item 8）：启动行日志此前把含账号名的绝对 DB 路径 display() 进
     // 持久日志（每次启动重复累计）。改为只回文件名（数据目录），与项目「日志
     // 只回文件名不回路径」的纪律对齐。
@@ -4206,6 +4603,560 @@ fn loopback_host_ok(host: &str, port: u16) -> bool {
     }
 }
 
+// ─── F04 编辑器扩展摄取（POST /api/ext/events）──────────────────────────────
+//
+// vscode-extension / Cursor 扩展经本机回环 + 扩展令牌上报真实编辑器事件
+// （焦点、打开文件、语言、调试状态）。铁律落点：
+// - 不建第二真相表：事件写进现有 events 表（event_type='editor'，
+//   source_id='vscode_ext'/'cursor_ext'，quality='observed'）；
+// - 幂等：ext_event_id = "{source_id}:{event_id}"（migration 0017 部分唯一
+//   索引），扩展断线重发不产生重复行；
+// - activity_intervals 的 editor_session 区间从这些事件直接派生（rebuild），
+//   证据等级 observed；尾部未闭合按重建时刻收口 unknown。
+//
+// 读写纪律说明：本 crate 对数据面只读的铁律不变（只读连接池照旧）。扩展
+// 摄取是唯一的新写路径，与 POST /api/settings（写 settings.json）同级、
+// 用户显式启用：扩展持令牌才可写。写连接按请求临时打开（WAL + busy_timeout
+// 5s），与 tray 采集器的写连接并发安全；rebuild 节流 10s，避免扩展高频
+// 重发拖垮全量重建。
+
+/// 扩展令牌文件名（data 目录，与 dashboard-token.txt 同模式）。
+const EXT_TOKEN_FILE: &str = "ext-token.txt";
+
+/// 读取扩展令牌：data 目录下 `ext-token.txt` 存在且内容非空。
+pub fn load_ext_token(db_path: &Path) -> Option<String> {
+    let p = db_path.parent()?.join(EXT_TOKEN_FILE);
+    std::fs::read_to_string(p)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 读或生成扩展令牌（serve 启动时调用）：文件缺失/空 → 生成随机令牌落盘。
+/// 生成失败只留日志（None）——此时 /api/ext/events 一律 401，不静默放行。
+pub fn ensure_ext_token(db_path: &Path) -> Option<String> {
+    if let Some(t) = load_ext_token(db_path) {
+        return Some(t);
+    }
+    let dir = db_path.parent()?;
+    let t = gen_session_token();
+    let p = dir.join(EXT_TOKEN_FILE);
+    match std::fs::write(&p, &t) {
+        Ok(_) => {
+            log::info!("dashboard: 扩展令牌已生成（{EXT_TOKEN_FILE}），扩展上报需携带该令牌");
+            Some(t)
+        }
+        Err(e) => {
+            log::warn!("dashboard: 扩展令牌生成失败: {e}");
+            None
+        }
+    }
+}
+
+/// 重置扩展令牌：生成新随机令牌覆盖 ext-token.txt，返回新令牌（设置页展示）。
+/// 旧令牌立即失效——扩展侧需在设置里更新。
+pub fn reset_ext_token(db_path: &Path) -> std::result::Result<String, String> {
+    let dir = db_path
+        .parent()
+        .ok_or_else(|| "无法定位数据目录".to_string())?;
+    let t = gen_session_token();
+    std::fs::write(dir.join(EXT_TOKEN_FILE), &t).map_err(|e| format!("写入扩展令牌失败: {e}"))?;
+    Ok(t)
+}
+
+/// 允许的扩展来源：请求 source → (source_id, events.app_name)。
+const EXT_SOURCES: &[(&str, &str, &str)] = &[
+    ("vscode", "vscode_ext", "vscode"),
+    ("cursor", "cursor_ext", "cursor"),
+];
+
+/// 允许的编辑器事件动作（扩展上报白名单；与 core 派生
+/// derive_ext_editor_intervals 的 EXT_EDITOR_ACTIONS 同一词表）。
+const EXT_ACTIONS: &[&str] = &[
+    "focus_gained",
+    "window_focus",
+    "window_blur",
+    "focus_lost",
+    "file_open",
+    "document_change",
+    "debug_start",
+    "debug_end",
+];
+
+/// 扩展摄取后 editor_session 重建的最小间隔（毫秒）：全量重建成本不变量
+/// 之下，扩展批量上报（默认 5s 一批）最多触发每 10s 一次重建。
+const EXT_REBUILD_MIN_INTERVAL_MS: i64 = 10_000;
+
+/// 上次扩展触发的 rebuild 时刻（epoch 毫秒；0 = 从未）。
+static LAST_EXT_REBUILD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 校验后的单条扩展事件（写入 events 表的映射）。
+struct ParsedExtEvent {
+    ts: String,
+    action: String,
+    ext_event_id: String,
+    app: &'static str,
+    title: Option<String>,
+    data: Option<Value>,
+    source_id: &'static str,
+}
+
+/// GET /api/ext/token — 设置页展示扩展令牌（会话令牌/CSRF 由 HTTP 层把关，
+/// 与 POST /api/settings 同防线；本函数只读文件）。
+pub fn api_ext_token_get(db_path: &Path) -> Value {
+    match load_ext_token(db_path) {
+        Some(t) => json!({"configured": true, "token": t}),
+        None => json!({"configured": false, "token": null}),
+    }
+}
+
+/// POST /api/ext/token/reset — 重置扩展令牌并回新值。
+pub fn api_ext_token_reset(db_path: &Path) -> std::result::Result<Value, String> {
+    let t = reset_ext_token(db_path)?;
+    Ok(json!({"configured": true, "token": t}))
+}
+
+/// 扩展令牌校验（route 层）：presented 来自 HTTP 头；expected 读文件。
+/// 恒时比较（token_eq），不匹配一律 401。
+fn ext_token_ok(db_path: &Path, presented: Option<&str>) -> std::result::Result<(), (u16, String)> {
+    let expected = load_ext_token(db_path);
+    let ok = presented
+        .map(|p| {
+            expected
+                .as_deref()
+                .map(|e| token_eq(p.trim(), e))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err((
+            401,
+            err_json(
+                "扩展令牌缺失或不匹配（请携带 X-Kynoptic-Ext-Token 头或 Authorization: Bearer；不要放 URL query）",
+            ),
+        ))
+    }
+}
+
+/// production 入口：真实时钟。测试一律走 [`api_ext_events_post_at`]。
+pub fn api_ext_events_post(db_path: &Path, body: &str) -> std::result::Result<Value, String> {
+    api_ext_events_post_at(db_path, body, chrono::Utc::now().timestamp_millis())
+}
+
+/// POST /api/ext/events — 扩展事件摄取（`now_ms` 注入，供 rebuild 收口与
+/// 测试；生产路径 [`api_ext_events_post`]）。请求体：
+/// `{"source":"vscode"|"cursor","events":[{event_id,timestamp,action,file_path?,language?,debug?}]}`
+/// 返回 `{received, inserted, duplicates}`；任一条校验失败 → 400 逐条列出
+/// （schema 校验整批拒收，不写半批）。
+pub fn api_ext_events_post_at(
+    db_path: &Path,
+    body: &str,
+    now_ms: i64,
+) -> std::result::Result<Value, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| {
+        format!(
+            "请求体不是合法 JSON（第 {} 行第 {} 列附近）",
+            e.line(),
+            e.column()
+        )
+    })?;
+    let obj = v.as_object().ok_or("请求体应为 JSON 对象")?;
+    let source = obj.get("source").and_then(|s| s.as_str()).ok_or(
+        "缺少 source（编辑器: \"vscode\"/\"cursor\"；AI hook 通道: \"claude_code\"/\"zcode\"）",
+    )?;
+    // F05 AI hook 通道（真实事件）：claude_code / zcode 走 core::ai_hooks
+    // 同一校验与幂等路径（dsh 无 hook 机制，core 会拒并说明走文件扫描）。
+    if kynoptic_core::ai_hooks::AI_HOOK_SOURCES.contains(&source) {
+        return api_ai_hook_events_post_at(db_path, body, now_ms);
+    }
+    let (source_id, app) = EXT_SOURCES
+        .iter()
+        .find(|(s, _, _)| *s == source)
+        .map(|(_, sid, app)| (*sid, *app))
+        .ok_or(format!(
+            "未知 source \"{source}\"（编辑器: vscode / cursor；AI hook 通道: claude_code / zcode）"
+        ))?;
+    let events = obj
+        .get("events")
+        .and_then(|e| e.as_array())
+        .ok_or("缺少 events 数组")?;
+    if events.is_empty() {
+        return Err("events 不能为空".into());
+    }
+    if events.len() > 200 {
+        return Err("events 单批不能超过 200 条".into());
+    }
+    // schema 校验：整批先验后写（不写半批）
+    let mut parsed: Vec<ParsedExtEvent> = Vec::with_capacity(events.len());
+    for (i, ev) in events.iter().enumerate() {
+        fn bad(i: usize, msg: impl Into<String>) -> String {
+            format!("events[{i}]: {}", msg.into())
+        }
+        let ev = ev.as_object().ok_or_else(|| bad(i, "应为对象"))?;
+        let event_id = ev
+            .get("event_id")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| bad(i, "缺少 event_id"))?;
+        if event_id.is_empty() || event_id.len() > 128 {
+            return Err(bad(i, "event_id 应为 1-128 字符"));
+        }
+        if event_id.chars().any(|c| c.is_control()) {
+            return Err(bad(i, "event_id 含控制字符"));
+        }
+        let raw_ts = ev
+            .get("timestamp")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| bad(i, "缺少 timestamp"))?;
+        let ts = chrono::DateTime::parse_from_rfc3339(raw_ts)
+            .map_err(|_| bad(i, "timestamp 应为 RFC3339"))?
+            .with_timezone(&Utc)
+            .to_rfc3339();
+        let action = ev
+            .get("action")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| bad(i, "缺少 action"))?;
+        if !EXT_ACTIONS.contains(&action) {
+            return Err(bad(
+                i,
+                format!(
+                    "未知 action \"{action}\"（允许: {}）",
+                    EXT_ACTIONS.join(", ")
+                ),
+            ));
+        }
+        // file_path：扩展只发路径与元数据（禁读文件内容）；做长度与控制字符
+        // 防线，不解析不展开。F10 注入防线：拒绝含 `..` 路径段的值——该
+        // 字段落 events.window_title 并进区间推导/展示面，`..` 段只可能
+        // 是伪造（真实编辑器路径事件不带相对穿越），整批拒收不留口子。
+        let file_path = match ev.get("file_path") {
+            None => None,
+            Some(Value::String(s)) => {
+                if s.len() > 1024 {
+                    return Err(bad(i, "file_path 超过 1024 字符"));
+                }
+                if s.chars().any(|c| c.is_control()) {
+                    return Err(bad(i, "file_path 含控制字符"));
+                }
+                if s.split(['/', '\\']).any(|seg| seg == "..") {
+                    return Err(bad(i, "file_path 不得包含 .. 路径段"));
+                }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.clone())
+                }
+            }
+            Some(_) => return Err(bad(i, "file_path 应为字符串")),
+        };
+        let language = match ev.get("language") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                if s.len() > 64 {
+                    return Err(bad(i, "language 超过 64 字符"));
+                }
+                Some(s.clone())
+            }
+            Some(_) => return Err(bad(i, "language 应为字符串")),
+        };
+        let debug = ev.get("debug").and_then(|d| d.as_bool());
+        // event_data 只装元数据（语言/调试标志），正文内容扩展侧就禁读了
+        let data = if language.is_some() || debug.is_some() {
+            let mut m = serde_json::Map::new();
+            m.insert("schema_version".into(), json!(1));
+            if let Some(l) = &language {
+                m.insert("language".into(), json!(l));
+            }
+            if let Some(d) = debug {
+                m.insert("debug".into(), json!(d));
+            }
+            Some(Value::Object(m))
+        } else {
+            None
+        };
+        parsed.push(ParsedExtEvent {
+            ts,
+            action: action.to_string(),
+            ext_event_id: format!("{source_id}:{event_id}"),
+            app,
+            title: file_path,
+            data,
+            source_id,
+        });
+    }
+    // 写连接（WAL + busy_timeout 5s，与 tray 采集器写连接并发安全）
+    if !db_path.is_file() {
+        return Err("数据库文件不存在（dashboard 尚未初始化采集）".to_string());
+    }
+    let wconn = Connection::open(db_path).map_err(|e| format!("打开数据库写连接失败: {e}"))?;
+    wconn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("设置 busy_timeout 失败: {e}"))?;
+
+    let mut inserted: u64 = 0;
+    let mut duplicates: u64 = 0;
+    {
+        let mut stmt = wconn
+            .prepare(
+                "INSERT OR IGNORE INTO events \
+                 (timestamp, event_type, event_action, event_data, app_name, window_title, source_id, quality, ext_event_id) \
+                 VALUES (?1, 'editor', ?2, ?3, ?4, ?5, ?6, 'observed', ?7)",
+            )
+            .map_err(|e| format!("预处理扩展事件插入失败: {e}"))?;
+        for ev in &parsed {
+            let data_str = ev.data.as_ref().map(|d| d.to_string());
+            let n = stmt
+                .execute(params![
+                    ev.ts,
+                    ev.action,
+                    data_str,
+                    ev.app,
+                    ev.title,
+                    ev.source_id,
+                    ev.ext_event_id,
+                ])
+                .map_err(|e| format!("扩展事件写入失败: {e}"))?;
+            if n == 1 {
+                inserted += 1;
+            } else {
+                duplicates += 1; // 幂等命中：同 event_id 已落库，忽略
+            }
+        }
+    }
+    // 派生表节流重建：editor_session 从 events 直接派生（observed）。
+    let last = LAST_EXT_REBUILD.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms - last >= EXT_REBUILD_MIN_INTERVAL_MS {
+        LAST_EXT_REBUILD.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        let rules = kynoptic_core::db::activity_intervals::current_project_rules();
+        match kynoptic_core::db::activity_intervals::rebuild_activity_intervals_with_rules_at(
+            &wconn, now_ms, &rules,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                // 事件已落库（append-only），派生表可由下一次重建自愈；
+                // 失败不回滚摄取，只标注。
+                log::warn!("dashboard: 扩展事件落库后重建 activity_intervals 失败: {e}");
+            }
+        }
+    }
+    Ok(json!({
+        "received": parsed.len(),
+        "inserted": inserted,
+        "duplicates": duplicates,
+    }))
+}
+
+/// F05 AI hook 真实事件通道（POST /api/ext/events 的 claude_code/zcode 分支，
+/// `now_ms` 注入）。校验与幂等走 core::ai_hooks 同一路径（CLI ext-event
+/// 亦复用，同校验同幂等）；写 events 表 event_type='ai_session'、
+/// quality='observed'、ext_event_id="{source}:{payload_fnv64}"；随后与编辑器
+/// 分支共用同一节流重建（ai_run 区间从 hook observed 事件派生）。
+pub fn api_ai_hook_events_post_at(
+    db_path: &Path,
+    body: &str,
+    now_ms: i64,
+) -> std::result::Result<Value, String> {
+    // 整批先验后写（core 与 CLI ext-event 同一校验函数）
+    let parsed = kynoptic_core::ai_hooks::parse_hook_payload(body, now_ms)?;
+    if !db_path.is_file() {
+        return Err("数据库文件不存在（dashboard 尚未初始化采集）".to_string());
+    }
+    let wconn = Connection::open(db_path).map_err(|e| format!("打开数据库写连接失败: {e}"))?;
+    wconn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("设置 busy_timeout 失败: {e}"))?;
+    let (inserted, duplicates) = kynoptic_core::ai_hooks::ingest_hook_events(&wconn, &parsed.1)
+        .map_err(|e| format!("AI hook 事件写入失败: {e}"))?;
+    // 节流重建（与编辑器分支同一 static 阈值）
+    let last = LAST_EXT_REBUILD.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms - last >= EXT_REBUILD_MIN_INTERVAL_MS {
+        LAST_EXT_REBUILD.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        let rules = kynoptic_core::db::activity_intervals::current_project_rules();
+        match kynoptic_core::db::activity_intervals::rebuild_activity_intervals_with_rules_at(
+            &wconn, now_ms, &rules,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                // 事件已落库（append-only），派生表可由下一次重建自愈
+                log::warn!("dashboard: AI hook 事件落库后重建 activity_intervals 失败: {e}");
+            }
+        }
+    }
+    Ok(json!({
+        "received": parsed.1.len(),
+        "inserted": inserted,
+        "duplicates": duplicates,
+    }))
+}
+
+// ─── F06 人工指定项目（POST /api/intervals/project，migration 0018）─────────
+
+/// 人工指定可用的区间种类：away 无应用/标题（无归属面）、tab_foreground_dwell
+/// 未接入（无数据源）——两者 400 拒收，不虚构归属面。
+const PROJECT_ASSIGNABLE_KINDS: &[&str] = &[
+    kynoptic_core::db::activity_intervals::KIND_FOREGROUND_DWELL,
+    kynoptic_core::db::activity_intervals::KIND_EDITOR_SESSION,
+    kynoptic_core::db::activity_intervals::KIND_AI_RUN,
+];
+
+/// POST /api/intervals/project — 人工指定区间项目（F06 缺口补齐：人工修正
+/// 与可追溯）。请求体：
+/// `{"interval_kind","start_ts","end_ts","app_name","title_hash"?,"project","note"?}`
+/// 时间取统一时间轴下钻返回的 start_ts/end_ts（UTC RFC3339）。
+///
+/// 行为：payload 校验 → 目标区间核对（activity_intervals 里必须存在
+/// kind+app+title_hash 相同且窗口相交的行，否则 400——防手打错数据）→
+/// append-only 写 project_overrides（corrected_from 记指定前归属，审计）→
+/// 读 settings project_rules → 重建 activity_intervals（人工指定优先于
+/// 规则，`now_ms` 注入时钟，测试零真实时钟依赖）。
+/// 返回 `{ok, id, project, project_source:"manual", project_evidence:"observed",
+/// corrected_from, rebuilt}`。
+pub fn api_intervals_project_post(
+    db_path: &Path,
+    body: &str,
+) -> std::result::Result<Value, String> {
+    api_intervals_project_post_at(db_path, body, chrono::Utc::now().timestamp_millis())
+}
+
+/// 注入时钟版（生产路径 [`api_intervals_project_post`]）。
+pub fn api_intervals_project_post_at(
+    db_path: &Path,
+    body: &str,
+    now_ms: i64,
+) -> std::result::Result<Value, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| {
+        format!(
+            "请求体不是合法 JSON（第 {} 行第 {} 列附近）",
+            e.line(),
+            e.column()
+        )
+    })?;
+    let obj = v.as_object().ok_or("请求体应为 JSON 对象")?;
+    let kind = obj
+        .get("interval_kind")
+        .and_then(|s| s.as_str())
+        .ok_or("缺少 interval_kind")?;
+    if !PROJECT_ASSIGNABLE_KINDS.contains(&kind) {
+        return Err(format!(
+            "interval_kind \"{kind}\" 不支持人工指定（支持：foreground_dwell / editor_session / ai_run；away 无应用归属面，tab 轨未接入）"
+        ));
+    }
+    let project = obj
+        .get("project")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("project 不能为空（清空归属不属于人工指定的语义面）")?;
+    if project.chars().count() > 100 {
+        return Err("project 长度不能超过 100 字符".into());
+    }
+    let app_name = obj
+        .get("app_name")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 app_name（从统一时间轴下钻取值）")?;
+    let title_hash = obj
+        .get("title_hash")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let start_ts = obj
+        .get("start_ts")
+        .and_then(|s| s.as_str())
+        .ok_or("缺少 start_ts")?;
+    let end_ts = obj
+        .get("end_ts")
+        .and_then(|s| s.as_str())
+        .ok_or("缺少 end_ts")?;
+    let start_ms = chrono::DateTime::parse_from_rfc3339(start_ts)
+        .map_err(|_| {
+            format!(
+                "start_ts 不是合法 RFC3339 时间: {}",
+                sanitize_date_echo(start_ts)
+            )
+        })?
+        .timestamp_millis();
+    let end_ms = chrono::DateTime::parse_from_rfc3339(end_ts)
+        .map_err(|_| {
+            format!(
+                "end_ts 不是合法 RFC3339 时间: {}",
+                sanitize_date_echo(end_ts)
+            )
+        })?
+        .timestamp_millis();
+    if end_ms <= start_ms {
+        return Err("end_ts 必须晚于 start_ts".into());
+    }
+    let note = obj
+        .get("note")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(500).collect::<String>());
+
+    if !db_path.is_file() {
+        return Err("数据库文件不存在（dashboard 尚未初始化采集）".to_string());
+    }
+    let wconn = Connection::open(db_path).map_err(|e| format!("打开数据库写连接失败: {e}"))?;
+    wconn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("设置 busy_timeout 失败: {e}"))?;
+
+    // 目标区间核对 + 指定前归属（审计字段 corrected_from，如实记录不猜测）
+    let matched: Option<(Option<String>, Option<String>)> = wconn
+        .query_row(
+            "SELECT project, project_source FROM activity_intervals \
+             WHERE interval_kind = ?1 AND app_name = ?2 AND title_hash IS ?3 \
+               AND end_ts >= ?4 AND start_ts <= ?5 LIMIT 1",
+            params![kind, app_name, title_hash, start_ts, end_ts],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let (_prev_project, prev_source) = matched.ok_or(
+        "未找到匹配区间：请刷新统一时间轴后用下钻面板的最新 start_ts/end_ts 重试（区间可能已被重建合并）",
+    )?;
+    let corrected_from = prev_source
+        .unwrap_or_else(|| kynoptic_core::db::activity_intervals::PROJECT_SOURCE_UNASSIGNED.into());
+
+    let ov = kynoptic_core::db::activity_intervals::ProjectOverride {
+        interval_kind: kind.to_string(),
+        start_ts: start_ts.to_string(),
+        end_ts: end_ts.to_string(),
+        app_name: app_name.to_string(),
+        title_hash: title_hash.map(|s| s.to_string()),
+        project: project.to_string(),
+        corrected_from: corrected_from.clone(),
+    };
+    let id = kynoptic_core::db::activity_intervals::insert_project_override(
+        &wconn,
+        &ov,
+        now_ms,
+        "dashboard",
+        note.as_deref(),
+    )
+    .map_err(|e| format!("人工指定写入失败: {e}"))?;
+
+    // 重建派生表（人工指定立即生效）；规则权威源是 settings.json，读取后
+    // 同步推送进程内快照（与 POST /api/settings 保存后的推送同一语义）。
+    let rules = settings::load(db_path).project_rules;
+    kynoptic_core::db::activity_intervals::set_current_project_rules(rules.clone());
+    let rebuilt = kynoptic_core::db::activity_intervals::rebuild_activity_intervals_with_rules_at(
+        &wconn, now_ms, &rules,
+    )
+    .is_ok();
+    Ok(json!({
+        "ok": true,
+        "id": id,
+        "project": project,
+        "project_source": kynoptic_core::db::activity_intervals::PROJECT_SOURCE_MANUAL,
+        "project_evidence": "observed",
+        "corrected_from": corrected_from,
+        "rebuilt": rebuilt,
+    }))
+}
+
 // ─── 可选访问令牌（Wave31 挂账，opt-in） ────────────────────────────────────
 
 /// 读取可选访问令牌：data 目录下 `dashboard-token.txt` 存在且内容非空即启用。
@@ -4291,9 +5242,39 @@ fn handle_client(
     };
     let head = String::from_utf8_lossy(&raw[..header_end.min(raw.len())]).to_string();
 
+    // 请求行提前解析（F04 扩展摄取分流需要）：method + 裸路径（去 query）。
+    let head_method = head
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let head_route = head
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_string();
+    let is_post = head_method == "POST";
+    // 扩展摄取（POST /api/ext/events）：Bearer 令牌鉴权路径，不是浏览器
+    // 页面请求——CSRF（Origin/X-Kynoptic marker）与会话令牌防线不适用
+    //（令牌本身即凭证），dashboard 访问令牌也不叠加（扩展只认扩展令牌）。
+    let is_ext_ingest = is_post && head_route == "/api/ext/events";
+
     let (mut host, mut origin, mut fetch_site, mut marker, mut token, mut content_length) =
         (String::new(), None, None, false, None, 0usize);
-    let (mut access_hdr, mut auth_hdr): (Option<String>, Option<String>) = (None, None);
+    let (mut access_hdr, mut auth_hdr, mut ext_hdr): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = (None, None, None);
     for l in head.lines().skip(1) {
         let Some((k, v)) = l.split_once(':') else {
             continue;
@@ -4307,6 +5288,7 @@ fn handle_client(
             "x-kynoptic-token" => token = Some(v),
             "x-kynoptic-access-token" => access_hdr = Some(v),
             "authorization" => auth_hdr = Some(v),
+            "x-kynoptic-ext-token" => ext_hdr = Some(v),
             "content-length" => content_length = v.parse().unwrap_or(0),
             _ => {}
         }
@@ -4325,8 +5307,8 @@ fn handle_client(
     // 开启逐键记录）。写请求必须带自定义头 X-Kynoptic: 1：跨站表单/simple
     // request 发不出自定义头；fetch 带它必触发 preflight，本服务不应答 CORS，
     // 攻击请求到不了这里。Origin/Sec-Fetch-Site 双保险。
-    let is_post = head.lines().next().unwrap_or_default().starts_with("POST");
-    if is_post {
+    let is_post_guarded = is_post && !is_ext_ingest;
+    if is_post_guarded {
         // 浏览器对 POST 请求恒发 Origin（同源 fetch 也带），要求必须存在且
         // 回环——不给"Origin 缺失放行"留口子（审查 P2：防线不依赖 marker 单点）。
         let origin_ok = origin
@@ -4363,7 +5345,7 @@ fn handle_client(
             .next()
             .unwrap_or("")
             .starts_with("/api");
-        if is_api {
+        if is_api && !is_ext_ingest {
             let ok = presented_access_token(access_hdr.as_deref(), auth_hdr.as_deref())
                 .map(|p| token_eq(&p, expected))
                 .unwrap_or(false);
@@ -4395,7 +5377,7 @@ fn handle_client(
     // 客户端可控头，只拦浏览器；同机进程还需读到仅本进程注入页面的令牌）。
     // 放在 413 之后，保持"超限 body 必回 413"的既有测试口径。
     // 与访问令牌同口径：token_eq 恒时比较，避免普通 != 的时序侧信道。
-    if is_post && !token.as_deref().map(|t| token_eq(t, csrf)).unwrap_or(false) {
+    if is_post_guarded && !token.as_deref().map(|t| token_eq(t, csrf)).unwrap_or(false) {
         return http_simple(
             &mut stream,
             403,
@@ -4433,7 +5415,16 @@ fn handle_client(
             &tmp_conn
         }
     };
-    let (status, ctype, body) = route_req(conn, &method, &path, &body, db_path);
+    // 扩展摄取路由：候选令牌从头提取后传给 route 层（鉴权在
+    // route_req_ext 的 /api/ext/events arm，恒时比较 + 401）。
+    let (status, ctype, body) = if is_ext_ingest {
+        let presented = ext_hdr
+            .as_deref()
+            .or_else(|| auth_hdr.as_deref().and_then(|h| h.strip_prefix("Bearer ")));
+        route_req_ext(conn, &method, &path, &body, db_path, presented)
+    } else {
+        route_req(conn, &method, &path, &body, db_path)
+    };
     // 首页注入会话令牌（dashboard.html 占位符），前端 POST 回带；
     // 同路径注入 CSP nonce 并走带 nonce 的响应头（script-src 去 unsafe-inline）。
     if method == "GET" && path.split('?').next() == Some("/") {

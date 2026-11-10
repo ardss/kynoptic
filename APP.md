@@ -140,6 +140,13 @@ SQLite，迁移为 `crates/core/src/db/migrations/` 下的编号 SQL 文件（�
 | `recompute-actors [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run]` | 可用 | 重建 actor 证据缓存（仅派生缓存；原始事件不动） |
 | `skill install` | 可用 | 把内置 SKILL.md 同步到 AI 客户端 skill 目录 |
 | `probe [--monitor ID] [--secs N] [--all] [--first-collect-timeout N]` | 可用 | 逐监控器硬件实测探针（0 = 自动推导首次采集等待上限，仍受 420s 上限约束） |
+| `timeline [--minutes N] [--json]` | 可用 | 统一时间轴（轨道 A-E 区间，只读 activity_intervals 派生表；与 dash /api/timeline 同源同数值） |
+| `reports [--days N] [--json]` | 可用 | 统计报表（按天×类别×来源×项目汇总；estimated/unknown 单列不并入 observed 合计；与 /api/reports 同源） |
+| `health` | 可用 | 采集器健康（轮询监视器分级判定 + AI 通道/扩展连接最近出数 + 钩子自愈计数；与 /api/health 同源） |
+| `project-overrides [--json]` | 可用 | 项目归属人工指定查询（F06 可追溯；manual 优先于规则推断） |
+| `host-register --ext-id ID [--manifest-out PATH]` | 可用 | 注册浏览器 Native Messaging host（HKCU 注册表；校验扩展 ID 格式，写清单模板） |
+| `ext-event` | 可用 | 扩展/hook 事件摄取（stdin 读 JSON 直写 events 表，append-only 幂等；供 hooks 与 host 调用） |
+| `ai-hooks render --tool <name>` | 可用 | 输出 AI 工具 hooks 配置片段（真实可用命令行，供安装阶段使用） |
 | `watchdog [--db PATH] [--once]` | 可用 | 看门狗心跳（供计划任务调用，确保托盘存活） |
 | `update [--check]` | 可用 | 自更新（GitHub releases，SHA256 校验 + 五件套 .bak 备份 + 失败回滚）；`--check` 只查不装：stdout 输出 `UPDATE <ver>`（有新版）或 `UP TO DATE (<cur>)`，退出码 0；退出码 1 的三种失败文案见 skill.md「退出码契约」 |
 

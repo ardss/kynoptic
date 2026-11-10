@@ -52,7 +52,21 @@ pub const DB_FILENAME: &str = "kynoptic.db";
 pub const READER_POOL_MAX_WAITS: u32 = 3;
 /// 0014（PRD v1.0 Stage 1）：统一事件结构（events 加列 source_id/device_id/quality）
 /// + activity_intervals 派生区间表。
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+///
+/// 0015（PRD v1.0 Stage 3）：activity_intervals 加 project 列（F06 项目归属）。
+///
+/// 0016（PRD v1.0 Stage 3）：activity_intervals 加 device_id 列（F11 多设备）。
+///
+/// 0017（PRD v1.0 F04 编辑器扩展）：events 加 ext_event_id 幂等摄取键
+/// （部分唯一索引），dash POST /api/ext/events 幂等写入。
+///
+/// 0018（PRD v1.0 F06 缺口补齐）：project_overrides 人工项目指定表
+/// （append-only 派生层）+ activity_intervals 加 project_source 列。
+///
+/// 0019（复审 2026-11-11）：browser-host 事件去重键（$.event_id /
+/// $.event_data.session_id）表达式部分唯一索引——并发重发幂等下沉到
+/// 约束层，摄取改 INSERT OR IGNORE 单步写入。
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 // === 行为分析阈值（analyzer） ===
 /// 至少 N 分钟才算专注段

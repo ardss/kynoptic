@@ -1,6 +1,6 @@
 # Native Messaging Host：实现说明（Stage 1 交付边界）
 
-本目录在 Stage 1 只交付**文档与清单模板**，不交付 Rust host 程序代码。host 的 Rust 实现属于后续阶段的工作。
+本目录交付**文档与清单模板**。Rust host 本体已实现：`crates/browser-host`（二进制 `kynoptic-browser-host`），下述协议要求即其实现契约（单测覆盖）。
 
 ## 文件
 
@@ -10,7 +10,7 @@
 
 ## Rust host 程序（本期不写代码，仅规定接口）
 
-建议以 `crates/` 下新增一个二进制 crate（例如 `kynoptic-browser-host`）实现，要求：
+实现：`crates/browser-host`（lib + bin）。注册入口：`kynoptic host-register --ext <扩展ID>`（生成填写后的清单到 `%APPDATA%\kynoptic\` 并写 HKCU 注册表键），或 `scripts/register-browser-host.ps1 -ExtensionId <ID>`。要求（均已实现）：
 
 ### 协议
 

@@ -282,6 +282,81 @@ impl McpServer {
                 }
                 Ok(v)
             }
+            "get_unified_timeline" => {
+                // PRD v1.0 F07/F11：统一时间轴（只读 activity_intervals 派生表），
+                // 与 dash /api/timeline?minutes= 调同一纯函数（core::timeline），
+                // 三端同源同数值。now_ms 为显式时钟注入（缺省当前时刻）——
+                // 与 _at 系列口径一致，可复现查询。
+                let minutes = match args.get("minutes") {
+                    None | Some(Value::Null) => 60u32,
+                    Some(v) => {
+                        let n = v.as_i64().ok_or_else(|| {
+                            "minutes must be an integer（minutes 必须是整数）".to_string()
+                        })?;
+                        if n < 1 {
+                            return Err(
+                                "minutes must be >= 1（minutes 必须 >= 1，不接受 0 或负数）"
+                                    .to_string(),
+                            );
+                        }
+                        (n as u32).min(1440)
+                    }
+                };
+                let now_ms = parse_now_ms(args)?;
+                // F07 筛选（与 dashboard /api/timeline 同一 TimelineFilter 契约）：
+                // 三个可选 string 数组；evidence 词表越值报错（与 HTTP 400 同口径）
+                let str_list = |key: &str| -> Result<Vec<String>, String> {
+                    match args.get(key) {
+                        None | Some(Value::Null) => Ok(Vec::new()),
+                        Some(Value::Array(a)) => a
+                            .iter()
+                            .map(|v| {
+                                v.as_str().map(str::to_string).ok_or_else(|| {
+                                    format!("{key} must be an array of strings（{key} 必须是字符串数组）")
+                                })
+                            })
+                            .collect(),
+                        Some(_) => Err(format!(
+                            "{key} must be an array of strings（{key} 必须是字符串数组）"
+                        )),
+                    }
+                };
+                let filter = kynoptic_core::timeline::TimelineFilter {
+                    project: str_list("project")?,
+                    source: str_list("source")?,
+                    evidence: str_list("evidence")?,
+                };
+                filter
+                    .validate()
+                    .map_err(|e| format!("invalid evidence filter（evidence 过滤非法）: {e}"))?;
+                kynoptic_core::timeline::api_unified_timeline_filtered_at(
+                    &conn, minutes, now_ms, &filter,
+                )
+                .map_err(|e| {
+                    format!("Unified timeline query failed: {e}（统一时间轴查询失败: {e}）")
+                })
+            }
+            "get_reports" => {
+                // PRD v1.0 F08/F11：统计报表，与 dash /api/reports 同一纯函数；
+                // 响应含 device_boundary（F11：双机 human_presence 不相加）。
+                let days = match args.get("days") {
+                    None | Some(Value::Null) => 7u32,
+                    Some(v) => {
+                        let n = v.as_i64().ok_or_else(|| {
+                            "days must be an integer（days 必须是整数）".to_string()
+                        })?;
+                        if n < 1 {
+                            return Err(
+                                "days must be >= 1（days 必须 >= 1，不接受 0 或负数）".to_string()
+                            );
+                        }
+                        (n as u32).min(90)
+                    }
+                };
+                let now_ms = parse_now_ms(args)?;
+                kynoptic_core::timeline::api_reports_at(&conn, days, now_ms)
+                    .map_err(|e| format!("Reports query failed: {e}（统计报表查询失败: {e}）"))
+            }
             "wait_for" => {
                 let signal = args.get("signal").and_then(|v| v.as_str()).ok_or_else(|| {
                     "Missing required argument: signal（缺少必填参数 signal）".to_string()
@@ -369,6 +444,21 @@ fn parse_wait_timeout(args: &Value) -> Result<(u64, Option<u64>), String> {
                 Ok((n, None))
             }
         }
+    }
+}
+
+/// 解析显式时钟注入 now_ms（get_unified_timeline / get_reports）：缺省 =
+/// 当前 UTC 时刻；存在但非整数 → 硬错误（与 limit/days 同政策）。用途：
+/// 可复现查询与测试零真实时钟依赖（PRD 铁律：测试禁读真实时钟一律 _at 注入）。
+fn parse_now_ms(args: &Value) -> Result<i64, String> {
+    match args.get("now_ms") {
+        None | Some(Value::Null) => Ok(chrono::Utc::now().timestamp_millis()),
+        Some(v) => v.as_i64().ok_or_else(|| {
+            format!(
+                "now_ms must be an integer (UTC epoch millis), got {}（now_ms 必须是 UTC 毫秒整数）",
+                trunc_echo(&v.to_string(), 64)
+            )
+        }),
     }
 }
 
@@ -482,6 +572,33 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "days": { "type": "integer", "minimum": 1, "maximum": 30, "default": 1 },
                     "limit": limit_schema("最多返回条数"),
+                }
+            },
+        }),
+        json!({
+            "name": "get_unified_timeline",
+            "description": "统一时间轴（PRD v1.0 F07）：近 minutes 分钟按 A 前台窗口 / B 浏览器 Tab / C 在场离场 / D AI 与编辑器活动 / E 网络遥测五轨返回区间（只读 activity_intervals 派生表，与 dashboard /api/timeline?minutes= 同源同数值）。区间带 evidence_level（observed/inferred/unknown 三级词表，unknown 是真实缺口不是零）、project（推导标注）与 device_id（F11 设备归属；null=未带设备标识）。响应含 device_boundary：区间按库（单机）返回，双机 human_presence 不相加，跨机合流由后续 MCP/导出完成",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "minutes": { "type": "integer", "minimum": 1, "maximum": 1440, "default": 60, "description": "窗口分钟数；超过 1440 钳到 1440" },
+                    "now_ms": { "type": "integer", "description": "窗口终点（UTC epoch 毫秒）显式注入；缺省=当前时刻。供可复现查询" },
+                    "project": { "type": "array", "items": { "type": "string" }, "description": "F07 筛选：按项目名精确匹配（unassigned 区间不命中）" },
+                    "source": { "type": "array", "items": { "type": "string" }, "description": "F07 筛选：按来源匹配（source_id 或 app_name，如 windows/vscode_ext/claude_code/zcode/dsh）" },
+                    "evidence": { "type": "array", "items": { "type": "string", "enum": ["observed", "inferred", "unknown"] }, "description": "F07 筛选：按证据等级（PRD §2.3 词表）；越表值报错" },
+                }
+            },
+        }),
+        json!({
+            "name": "get_reports",
+            "description": "统计报表（PRD v1.0 F08）：近 days 个本地日 × 类别（foreground_dwell/ai_run/editor_session）× 来源 × 项目 × 设备（F11）的时长汇总，毫秒。与 dashboard /api/reports 同源同数值。口径：observed 合计只含 observed 段；estimated（含 inferred）与 unknown 单列不计入；device_id=(unknown) 表示源事件未带设备标识。响应含 device_boundary：totals 只覆盖本库（单机），双机 human_presence 不相加",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "days": { "type": "integer", "minimum": 1, "maximum": 90, "default": 7, "description": "天数；超过 90 钳到 90" },
+                    "now_ms": { "type": "integer", "description": "窗口终点（UTC epoch 毫秒）显式注入；缺省=当前时刻。供可复现查询" },
                 }
             },
         }),
@@ -837,6 +954,8 @@ mod tests {
                 "get_top_apps",
                 "get_topics",
                 "get_anomalies",
+                "get_unified_timeline",
+                "get_reports",
                 "wait_for"
             ]
         );

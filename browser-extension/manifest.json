@@ -1,16 +1,26 @@
 {
   "manifest_version": 3,
   "name": "Kynoptic Tab Tracker",
-  "version": "0.1.0",
-  "description": "Event-driven tab change reporting for Kynoptic timeline. No page polling; reports on tab activation/update only.",
+  "version": "0.2.0",
+  "description": "Event-driven tab change and opt-in ChatGPT web session reporting for the Kynoptic timeline. No page polling; no page content reads.",
   "permissions": [
     "activeTab",
     "tabs",
-    "idle"
+    "idle",
+    "storage",
+    "scripting",
+    "nativeMessaging"
   ],
   "background": {
     "service_worker": "background.js"
   },
-  "host_permissions": [],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Kynoptic Tab Tracker"
+  },
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
   "minimum_chrome_version": "110"
 }

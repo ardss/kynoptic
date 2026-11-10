@@ -650,6 +650,12 @@ pub struct CollectorSettings {
     /// `start_collection_custom` 内 [`monitors::title_privacy::set_redact_titles`]
     /// 即生效。
     pub redact_titles: bool,
+    /// 整标题脱敏开关（F10 隐私加固，默认 false）：开启后新写入的
+    /// window/tab_change 标题一律替换为 `[redacted]`（比 URL 查询串剥离
+    /// 更强一档）。只拦新写入，不清洗历史数据。接线路径与 redact_titles
+    /// 同款：dash 设置 `redact_titles_full` → tray / CLI 映射 →
+    /// start_collection_custom 内 `monitors::title_privacy::set_redact_full`。
+    pub redact_titles_full: bool,
     /// ETW 内核网络采集开关（0.8.1 A2，默认关）：开启后启动 NetEtw 线程
     /// （KynopticNetMon 会话 → MinuteAggregator → net_process_minute）。
     /// 需管理员权限；AccessDenied 时线程留档 quality=Unavailable 不静默。
@@ -667,6 +673,7 @@ impl Default for CollectorSettings {
             vk_frequency_enabled: true,
             net_etw_enabled: false,
             redact_titles: false,
+            redact_titles_full: false,
             low_power: false,
         }
     }
@@ -717,6 +724,129 @@ fn reject_future_events(batch: &mut Vec<Event>) {
         log::warn!("拒绝 {unparseable_dropped} 条不可解析时间戳事件（非 RFC3339），不入库");
     }
     debug_assert_eq!(dropped, (future_dropped + unparseable_dropped) as usize);
+}
+
+// ─── 派生表节流重建（独立复审 2026-11-03 生产接线）─────────────────────────
+
+/// 两次派生表重建之间的最小间隔。rebuild 是全量口径（先清后建），事件多时
+/// 不便宜；writer flush 周期 ~30s，90s 节流 = 最多 ~3 次 flush 触发一次重建。
+const DERIVED_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(90);
+
+#[derive(Debug)]
+struct DerivedRebuildState {
+    /// 上次（成功或失败）重建尝试时刻——失败同样推进节流，避免坏库时每
+    /// 个 flush 周期都撞一遍重活。
+    last_attempt: std::time::Instant,
+    /// 上次重建时的 events 最大 id；MAX(id) 未变则跳过本轮（无新事实，
+    /// 派生表不随时间漂移——尾部 unknown 收口除外，由下次有新事件的重建补）。
+    watermark: Option<i64>,
+}
+
+static DERIVED_REBUILD: Mutex<Option<DerivedRebuildState>> = Mutex::new(None);
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn collector_device_id() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into())
+}
+
+/// 批落库成功后的派生表维护入口（writer 线程内调用）。门控顺序：
+/// 1. 时间节流（[`DERIVED_REBUILD_MIN_INTERVAL`]）；
+/// 2. `SELECT MAX(id) FROM events` 水位未变 → 直接跳过（不扫 AI、不重建）。
+///
+/// 通过门控后在**同一写连接**内完成：AI 会话扫描摄入（幂等，同 session_id
+/// 不重复写）→ 带 project_rules 快照全量重建 activity_intervals。AI 会话有
+/// 新内容但期间无任何 collector 事件落库的极端情形，会推迟到下一次有事件
+/// 落库的重建窗口——采集运行中事件近乎持续产生，可接受（如实注记）。
+fn maybe_rebuild_derived(db: &Database) {
+    // 节流门控（锁外做重活；持锁窗口只碰状态）
+    {
+        let g = match DERIVED_REBUILD.lock() {
+            Ok(g) => g,
+            Err(_) => return, // 之前持锁 panic：放弃本轮，不毒化 writer
+        };
+        if let Some(s) = g.as_ref() {
+            if s.last_attempt.elapsed() < DERIVED_REBUILD_MIN_INTERVAL {
+                return;
+            }
+        }
+    }
+    let now_ms = now_unix_ms();
+    let device = collector_device_id();
+    let rules = crate::db::activity_intervals::current_project_rules();
+    let roots = crate::ai_adapter::default_ai_roots();
+
+    let outcome = db.with_writer(
+        |conn| -> rusqlite::Result<(usize, i64, bool)> {
+            let mut ai_new = 0usize;
+            if !roots.is_empty() {
+                let sessions = crate::ai_adapter::scan_ai_sessions_at(&roots, now_ms);
+                if !sessions.is_empty() {
+                    ai_new = crate::ai_adapter::ingest_ai_sessions(conn, &sessions, Some(&device))?;
+                }
+            }
+            let wm: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
+            let mut g = match DERIVED_REBUILD.lock() {
+                Ok(g) => g,
+                Err(_) => return Ok((ai_new, wm, false)),
+            };
+            let prev_wm = g.as_ref().and_then(|s| s.watermark);
+            let should = match prev_wm {
+                None => true, // 启动后首轮：无条件建一次
+                Some(p) => wm != p || ai_new > 0,
+            };
+            if !should {
+                // 水位未变且无新 AI 会话：只推进节流时钟，不重算
+                if let Some(s) = g.as_mut() {
+                    s.last_attempt = std::time::Instant::now();
+                }
+                return Ok((ai_new, wm, false));
+            }
+            let _ = crate::db::activity_intervals::rebuild_activity_intervals_with_rules_at(
+                conn, now_ms, &rules,
+            )?;
+            *g = Some(DerivedRebuildState {
+                last_attempt: std::time::Instant::now(),
+                watermark: Some(wm),
+            });
+            Ok((ai_new, wm, true))
+        },
+        || -> rusqlite::Result<(usize, i64, bool)> {
+            // writer 不可用（库降级/锁恢复中）：本轮放弃，节流时钟照推
+            if let Ok(mut g) = DERIVED_REBUILD.lock() {
+                if let Some(s) = g.as_mut() {
+                    s.last_attempt = std::time::Instant::now();
+                }
+            }
+            Ok((0, 0, false))
+        },
+    );
+    match outcome {
+        Ok((ai_new, _wm, rebuilt)) => {
+            if rebuilt {
+                log::info!(
+                    "派生表已重建（AI 新会话 {ai_new} 条，project_rules {} 条）",
+                    rules.len()
+                );
+            }
+        }
+        Err(e) => {
+            // 失败照常记录；下次 flush 过节流窗后重试（全量口径无中间态）
+            log::warn!("派生表重建失败（下次落库后重试）: {e}");
+            if let Ok(mut g) = DERIVED_REBUILD.lock() {
+                *g = Some(DerivedRebuildState {
+                    last_attempt: std::time::Instant::now(),
+                    watermark: None, // 失败不落水位，下轮必重试
+                });
+            }
+        }
+    }
 }
 
 /// 落库一批事件，返回是否成功（整批全失败时为 false）。
@@ -998,6 +1128,12 @@ fn writer_loop_inner(
                 batch.clear();
                 last_flush = now;
                 fail_backoff = Duration::from_millis(500);
+                // 独立复审 2026-11-03 生产接线：批落库成功后触发派生表节流
+                // 重建（activity_intervals + AI 适配器摄入）。此前 rebuild
+                // 无任何生产调用点，/api/timeline、/api/reports 读到的派生
+                // 表恒为空、project_rules 落盘后永不生效。节流 + 事件水位
+                // 门控见 [`maybe_rebuild_derived`]。
+                maybe_rebuild_derived(db);
             } else {
                 thread::sleep(fail_backoff);
                 fail_backoff = (fail_backoff * 2).min(Duration::from_secs(8));
@@ -1712,6 +1848,8 @@ pub fn start_collection_custom(
     // 标题脱敏开关（默认 false）：settings → CollectorSettings → 全局开关，
     // window/browser 采集时按此剥 URL 查询串（monitors::title_privacy）。
     monitors::title_privacy::set_redact_titles(settings.redact_titles);
+    // F10 整标题脱敏（opt-in）：与 URL 模式同点接线。
+    monitors::title_privacy::set_redact_full(settings.redact_titles_full);
     // 剪贴板/通知摘要盐：从库 metadata 加载（首次随机生成并写回），
     // 保证同一明文在不同库得到不同 digest（monitors::clipboard）。
     monitors::clipboard::init_salt_from_db(&db);

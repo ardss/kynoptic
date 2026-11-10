@@ -9,6 +9,278 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- F07 统一时间轴筛选器（PRD v1.0 F07，2026-11-10 差距补齐）：①core 新增
+  `TimelineFilter`（project / source / evidence 三维）与纯函数
+  `api_unified_timeline_filtered_at`——evidence 按 PRD §2.3 词表
+  （observed/inferred/unknown）匹配，source 匹配 `source_id` 或 `app_name`
+  （ai_run 的 app_name=源名 claude_code/zcode/dsh，用户无需知道存储里
+  source_id='ai'），project 精确匹配区间归属；无筛选时与既有
+  `api_unified_timeline_at` 完全同值（同一实现 wrapper）。B 轨整段 unknown
+  占位段仅当过滤为空或 evidence 显式含 unknown 且未带 source/project 过滤
+  时保留——占位段是「无数据源」声明，不是可筛数据；被过滤排除时轨道显示
+  「窗口内无区间」，缺口仍由「未接入」标注如实可见。②dash `GET
+  /api/timeline?minutes=N` 支持 `project=` `source=` `evidence=`（逗号分隔
+  与重复参数两种写法等价）；evidence 越词表值返回 400（静默空表会被误读为
+  「无活动」，违反 unknown 不是零的可追溯原则）；响应回显 `filters` 字段供
+  三端一致性核对。③merge=1 时筛选条件原样透传各远端（三端契约一致）。
+  ④MCP `get_unified_timeline` 新增可选 project/source/evidence 数组参数
+  （与 HTTP 同一 TimelineFilter 契约，evidence 越表报错）。⑤统一时间轴
+  页签筛选条：项目文本框（精确匹配）、来源下拉（windows/chrome_ext/
+  vscode_ext/claude_code/zcode/dsh/chatgpt_web）、证据等级三勾选框
+  （全部不勾=不过滤），应用/清除按钮 + 回显标签；筛选随请求发后端由 core
+  纯函数统一过滤（UI/API/MCP 同口径同值，前端不做本地二次筛选）。
+  ⑥测试：证据等级/来源/项目/组合过滤与默认同值契约、HTTP 筛选契约
+  （400 词表校验、逗号与重复参数等价、ignored_params、filters 回显）、
+  merge 透传 query 进请求行（mock 请求行回显）、dashboard 筛选 UI 挂点。
+
+- F11 多设备 A/B 联合时间轴（PRD v1.0 F11，dash 合流阶段）：①设置项
+  `device_endpoints`（[{name,url,token}]，opt-in 默认空 = 单机模式）——
+  远端设备即另一台机器的本产品 dashboard 地址（经 SSH 隧道时指向本地
+  转发端口），设置页双语编辑器可增删行；POST 校验 name 非空、url 仅
+  http 且主机名可解析（与拉取侧同一解析器，防注入请求行）、字段长度
+  钳制与 categories 同口径。②新合流端点形态 `GET
+  /api/timeline?minutes=N&merge=1`：并行（每端点独立线程）逐个拉取各
+  远端 `/api/timeline?minutes=N`（不带 merge，防级联合流；单端点 5s
+  超时），任一失败降级为该设备 offline 显式标注（status=offline +
+  error 摘要），绝不阻塞也绝不替代本机数据；按设备分轨合并返回，每条
+  track / 区间带 `device` 字段；`human_presence_boundary` 明示 C 轨
+  （人在场）按设备独立呈现、多设备绝不相加（stage0-audit §5 决策 3）。
+  传输零新依赖：std::net 手写 HTTP/1.1 GET（与 serve 同族），远端开启
+  dashboard-token.txt 时以 `X-Kynoptic-Access-Token` 头携带 settings 里
+  配置的 token。③统一时间轴页签 UI：多设备响应自动出现设备选择器
+  （全部/本机/各远端，纯前端过滤缓存数据）；分轨渲染带设备徽标；offline
+  设备以 [!] 行显式标注「时间轴缺失——真实缺口不是零」；区间 tooltip 带
+  设备名。④测试：本地 TcpListener mock（在线返回 timeline JSON /
+  连接拒绝 / 故意慢响应测超时降级）覆盖 fetch 合并/降级/超时、路由级
+  merge=1（在线+offline 混合）、无端点时单机合流形态、纯合流函数
+  now_ms 注入（零真实时钟依赖）、device_endpoints 设置回环与校验拒绝。
+  真机 A/B 联调待双机安装后执行（阻断中）。
+
+- F09 采集器健康汇总（PRD v1.0 F09）：新端点 `GET /api/health`（只读，
+  token_required 时随 /api/* 统一鉴权）。三段判定：轮询监视器逐项
+  ok/degraded/stale/unknown（依据进程级 last_success_age_secs /
+  consecutive_slow，阈值常量化并注明依据——监视器 stale > 300s（覆盖最慢
+  60s 级常规轮询周期 5 倍裕量）、AI 通道 stale > 24h（hook 事件与会话粒度
+  对齐）、扩展 stale > 10min（编辑器默认 5s 一批，超时更可能是没在用而非
+  断连，故只标 stale 不判「已断开」）；unknown = 本进程无证据（如独立
+  serve 进程读不到托盘采集器内存统计），不是零也不是故障。AI hook 通道
+  （claude_code / zcode）与文件扫描通道（ai）最近成功时间直接读 events 表
+  （observed）；扩展连接状态（chrome_ext / vscode_ext / cursor_ext）按
+  source_id 最近事件判定；键盘/鼠标为钩子型（回调驱动无轮询周期）不进
+  监视器表并注记。dashboard 新「健康」页签（/api/health 可视化，双语，
+  未知状态灰显）；CLI 新子命令 `kynoptic health [--json]`（与端点同一
+  api_health_at 纯函数入口，三端同源同数值）。判定全部时间参数化
+  （api_health_at 注入 now），单测覆盖阈值边界 / 通道状态随时间翻转 /
+  路由 200 / 结构完整性。
+
+- F10 隐私安全补强（PRD v1.0 F10）：①绑定断言测试——serve 起后同端口
+  通配地址（0.0.0.0）仍可绑定即证明只绑 127.0.0.1，另钉 DNS rebinding
+  防线（非回环 Host 403 forbidden_host）；②token_required 覆盖新端点
+  测试——dashboard-token.txt 启用后 GET /api/health 无/错令牌 401、正确
+  令牌 200（HTTP 层 /api/* 前缀统一闸门，无需逐端点白名单）；③整标题
+  脱敏 opt-in：新设置项 `redact_titles_full`（默认 false，不改既有行为
+  与既有数据——只拦新写入，历史数据禁删禁改铁律不变），开启后新写入的
+  window/tab_change 标题一律以 `[redacted]` 落库，比 redact_titles 的
+  URL 查询串剥离更强一档；接线路径同款（设置页开关 + POST /api/settings
+  → tray / CLI 映射 CollectorSettings → title_privacy::set_redact_full），
+  设置页隐私区补双语说明；core 单测钉优先级（full 优先于 URL 模式、默认
+  原样）；dash 单测钉设置读写回环 + 默认关 + UI 元素在位；④扩展摄取
+  路径注入防线：POST /api/ext/events 的 file_path 含 `..` 路径段整批
+  400 拒收不落行（真实编辑器路径事件不带相对穿越；文件名内恰好含
+  `a..b` 非路径段不受影响）；AI hook 通道 payload 字段白名单本就不收
+  任何路径字段（session_id / tool_name / duration_ms / waiting / retry），
+  无路径注入面，测试已有覆盖。
+
+- F06 缺口补齐：人工项目指定与归属可追溯（PRD v1.0）。新表
+  `project_overrides`（migration 0018，append-only 派生层）：每次人工指定
+  追加一行、永不改删（修正 = 追加新行），记录 corrected_from（指定前归属
+  来源，审计）/ created_at / created_by / source='manual'，可与 events 一起
+  全量重建 activity_intervals。归属优先级两档：人工指定（project_source=
+  'manual'，归属证据 observed——用户亲口指定是直证）> 规则命中
+  （project_source='rule'，证据 inferred，不变）；全不命中仍为 NULL（查询
+  侧按 unassigned 展示，无证据不猜）。匹配语义：区间 (kind, app_name,
+  title_hash) 相同且窗口相交，多条取最晚指定（id 最大）。activity_intervals
+  加 project_source 列；ai_run 无标题证据、规则无从命中，但人工指定按
+  源名 + 窗口相交仍可归属（不改区间在场 quality——归属证据与在场证据
+  两回事）。dash 新端点 `POST /api/intervals/project`（与 POST /api/settings
+  同级防线：会话令牌 + CSRF + Origin；payload 校验 + 目标区间核对——
+  activity_intervals 里必须存在匹配行否则 400 + append-only 落库 + 读
+  settings 规则重建派生表，人工指定立即生效）；统一时间轴下钻面板显示
+  项目来源并可一键「指定项目」（成功后自动重取时间轴）。可追溯三端同源：
+  `/api/timeline?minutes=` 每区间返回 project_source（rule/manual/
+  unassigned）与 project_evidence（manual=observed / rule=inferred），
+  `/api/reports?days=` 每行返回 project_source；CLI `timeline` / `reports`
+  展示来源列，新增只读子命令 `kynoptic project-overrides [--limit N]
+  [--json]`（人工指定审计清单，只读打开不写库）。设置页 project_rules
+  说明补人工指定优先级与审计语义。测试：core 4 项（人工指定优先于规则
+  且规则命中保持 rule / 追加覆盖最晚生效且旧行保留可重建 / ai_run 人工
+  指定不改区间 quality / editor_session 视图同标）+ dash 3 项（POST 全链路
+  指定→重建→timeline manual/observed→二次指定 corrected_from=manual /
+  校验面五类 400 且零落行 / 缺省 unassigned 三端贯通），时钟一律 _at 注入；
+  CURRENT_SCHEMA_VERSION 17→18。
+
+- F05 AI hook 真实事件通道补齐（PRD v1.0）：文件扫描降级为 inferred 后备，
+  新增 observed 真实通道。core 新模块 `ai_hooks`（dash 与 CLI 共用同一校验
+  与幂等路径）：`POST /api/ext/events` 接受 AI hook 事件（source =
+  `claude_code` / `zcode`，扩展令牌鉴权与编辑器分支一致；dsh 无 hook/插件
+  事件机制——调研 2026-11-03 `.dsh` 目录只有 workflow 产物、无 hooks 配置
+  面——通道如实拒绝并说明走扫描）；单条事件 `hook_event_name`（事件词表
+  映射 session_start/prompt_submit/tool_call/permission_request/tool_result/
+  tool_error/notification/session_stop）+ `session_id`（1-128 字符）+
+  可选 `tool_name` / `duration_ms` / `waiting` / `retry` / `timestamp`
+  （hook payload 无时间戳字段——事件时间取 kynoptic 收到时刻，observed）。
+  校验整批先验后写；幂等键 `ext_event_id="{source}:{payload_fnv64}"`
+  （同一条 hook 事件重试重发 payload 字节相同 → 不重复写，migration 0017
+  部分唯一索引）。写现有 events 表（event_type='ai_session'、
+  source_id=工具源名、quality='observed'，不建第二真相表），落库后与编辑器
+  分支共用同一节流重建。CLI 新增 `kynoptic ext-event --source
+  claude_code|zcode [--session ID]`：stdin 读 JSON 直写 db，与 HTTP 完全
+  同一校验与幂等函数；结果 JSON 打 stderr（hook runner 对 stdout 有输出
+  协议，stdout 保持空）；库不存在不静默新建（写门禁与 db cleanup 同口径）。
+  CLI 新增 `kynoptic ai-hooks render [--target claude_code|zcode|all]`：
+  输出可直接安装的 hooks 配置片段（claude_code：settings.json hooks 键，
+  PreToolUse/PostToolUse/Notification/Stop；zcode：config.json 顶层 hooks
+  键，七个支持事件、`enabled:true`（配置文件 hooks 默认禁用）、不含
+  Notification——官方文档明示不支持；命令指向本机 current_exe 的
+  ext-event；dsh 不渲染并在 notes 说明）。ai_run 区间推导升级
+  （activity_intervals）：hook observed 事件按 (source, session_id) 聚合为
+  [最早,最晚] 事件 ts 区间（observed）；同会话两路证据并存时 observed
+  优先、丢弃扫描 inferred 区间（不双计）；同源同设备重叠区间做并集合并
+  （merged quality 取最弱端；跨设备不缝合）。安装 hooks 到用户真实工具
+  配置属于安装验收阶段动作，本阶段未执行（标阻断）。
+  测试：core ai_hooks 6 项 + activity_intervals 3 项（observed 聚合 /
+  observed 优先不双计 / 并集合并+跨设备不缝合）+ dash 路由 4 项（鉴权/
+  幂等/整批拒收/区间贯通，时钟一律注入）+ CLI 进程级集成测试 3 项（真实
+  hook payload 经 stdin 子进程全链路：落库→幂等→rebuild 区间）。ZCode hook
+  机制依据本机官方 zcode-guide diagnosing-hooks 文档（七事件词表、
+  enabled:true 语义、Notification 不支持）；Claude Code 依据官方 hooks
+  文档口径（payload 字段 session_id/hook_event_name/tool_name）。
+
+- F04 编辑器扩展接入（PRD v1.0）：新增 `vscode-extension/`（TypeScript，
+  VS Code + Cursor 兼容，`@vscode/vsce` 可打包 vsix）。监听
+  onDidChangeActiveTextEditor / onDidChangeTextDocument（每文件 10s 去抖）/
+  onDidChangeWindowState / debug 会话开始结束，产出 file_open /
+  document_change / focus_gained / focus_lost / debug_start / debug_end
+  真实编辑器事件（只发路径与元数据，禁读文件内容），批量（≤200/批）
+  HTTP POST 到本机 dash。新 dash 端点 `POST /api/ext/events`：扩展令牌
+  （data/ext-token.txt，serve 启动缺失即生成）鉴权、401 拒绝、Bearer 或
+  `X-Kynoptic-Ext-Token` 头；schema 校验整批先验后写；幂等键
+  `ext_event_id = "{source_id}:{event_id}"`（migration 0017 events 加列 +
+  部分唯一索引，重发不产生重复行）；写现有 events 表
+  （event_type='editor'、source_id='vscode_ext'/'cursor_ext'、
+  quality='observed'，不建第二真相表），写连接 WAL + busy_timeout 5s 与
+  tray 采集器并发安全（本 crate 唯一的 events 写路径，扩展持令牌才可写）。
+  落库后节流（10s）重建 activity_intervals：core 新增
+  `derive_ext_editor_intervals` 把扩展事件按焦点/文件/调试重放成
+  `editor_session` 直证区间（闭段 observed；尾部未闭合按重建时刻收口
+  unknown；文件路径参与 F06 project_rules 打标）——窗口名分类（dwell 路径）
+  与扩展直证两路证据并存。设置页新增扩展令牌展示/重置区块
+  （`GET /api/ext/token`、`POST /api/ext/token/reset`，重置后旧令牌立即
+  失效）。测试：core 派生 2 项 + dash 端点 5 项（token/幂等/schema/区间/
+  轮换，时钟一律注入）。真机 VS Code 验证未做（无真机环境），标阻断。
+
+- F02 浏览器扩展接入（PRD v1.0 Stage 2）：新增 `crates/browser-host`
+  （kynoptic-browser-host）Native Messaging host 本体——stdin 读 4 字节小端
+  长度前缀 JSON，解析扩展事件（`.tab_change` / `.ai_session`），经 core 现有
+  `Database::with_writer` 写入路径写入 events 表（不建第二真相表；append-only，
+  `.tab_change` 以 `event_data.$.event_id`、`.ai_session` 以
+  `event_data.$.event_data.session_id` 幂等去重，重复投递跳过不删行）；
+  `source_id='chrome_ext'`、quality='observed'、device_id 复用
+  `ai_adapter::ensure_device_id`（metadata 表同源机制）；timestamp 一律取事件
+  自带 `ts_ms`（禁读真实时钟）。解析失败/字段缺失/oversize（>1 MiB）回
+  `{"ok":false,"error":...}` 后安全退出，不 panic。单测 11 项（fixture 脱敏，
+  时钟注入）。kynoptic CLI 新增 `host-register [--ext ID]... [--host-exe]
+  [--manifest PATH]`：生成填写好的 host 清单写入 `%APPDATA%\kynoptic\` 并写
+  HKCU 注册表键（`Software\Google\Chrome\NativeMessagingHosts\kynoptic_browser_host`，
+  无需管理员；扩展 ID 32 位格式校验、占位符拒绝）。
+  scripts/ 新增 `register-browser-host.ps1` 一键注册。扩展侧：manifest 补
+  `nativeMessaging` 权限；background.js 的 `.tab_change` 事件补客户端
+  `event_id` 幂等键（断线缓冲重发不产生重复行），与 host 的消息契约一致。
+- F11 多设备维度（PRD v1.0 Stage 3）：migration 0016 为 activity_intervals
+  派生表加 `device_id` 列（rebuild 从源事件原样抄写——dwell 取首现事件、
+  away 取 idle_start 事件、ai_run 取事件行；NULL = 事件未带设备标识，不虚构
+  本机 UUID）。/api/timeline（统一时间轴）每个区间带 `device_id`，响应带
+  `device_boundary` 边界说明；/api/reports 行按 device_id 分组（无标识的行
+  归入 "(unknown)" 分组标签），响应带 `devices` 列表与 `device_boundary`。
+  本期不建同步服务：每库 = 一台机器，双机 human_presence / 任何时长**不在
+  响应内相加**（跨机求和会把同时在线重复计数），多机合流由后续经 MCP /
+  导出的流程完成。README 与 README.zh-CN 写明该边界。
+- 三端对等暴露（PRD DoD：UI / CLI / MCP 同源同数值）：`api_unified_timeline_at`
+  与 `api_reports_at` 两个只读纯函数从 kynoptic-dash 下沉到
+  kynoptic-core::timeline（mcp 不能反向依赖 dash——dash 已依赖 mcp，成环），
+  dash 保留同名 re-export，既有调用点不受影响。kynoptic CLI 新增
+  `timeline [--minutes N] [--json]` 与 `reports [--days N] [--json]` 只读子
+  命令（调用同一纯函数；--json 输出与 dash 端点响应体完全一致）。MCP 新增
+  `get_unified_timeline`（minutes 1..1440，默认 60）与 `get_reports`（days
+  1..90，默认 7）工具，均带可选 `now_ms` 显式时钟注入（可复现查询；0/负数
+  硬错误，超限钳制）。工具面 7 → 9，schema 拒绝未知参数、协议往返测试更新，
+  新增 get_unified_timeline/get_reports 的 tools/call 集成测试（now_ms 注入，
+  不读真实时钟）。
+- F03 ChatGPT 网页会话（browser-extension，PRD v1.0 Stage 3）：新增
+  `content-chatgpt.js`（仅 chatgpt.com / chat.openai.com，弹窗显式 opt-in
+  后由 `chrome.scripting` 动态注册——不写进 manifest，脚本内再校验一次开
+  关；不读取对话内容/页面文字/标题，只监听 SPA 路由变化、可见性与页面卸载，
+  上报会话开始/结束信号）；`chatgpt-session.js` 在 service worker 内按 tab
+  配对 start/end，产出 `.ai_session` 网页事件（source=chatgpt_web，事件与
+  event_data 双层 schema_version 标注，start/end_quality=observed，
+  prompt_count=null）经既有 native messaging 通道上报；孤儿 start（worker
+  重启 / 扩展关闭）不配对不虚构——时间轴保持 unknown 真实缺口。
+  `popup.html` / `popup.js` 新增开关（默认关；关闭时立即注销并丢弃未配对
+  起点）；manifest 0.2.0：权限补 `storage`（此前断线缓冲用到但漏声明）与
+  `scripting`，host_permissions 仅 chatgpt.com / chat.openai.com；扩展
+  README 更新事件示例与验证步骤。
+
+### Added
+
+- F06 项目归属（PRD v1.0 Stage 3）：settings.json 新增 `project_rules`
+  （opt-in，默认空列表 = 不打标；上限 100 条，路径前缀/标题关键词 → 项目名，
+  匹配顺序即优先级）。migration 0015 为 activity_intervals 派生表加
+  `project` 列；`rebuild_activity_intervals_with_rules_at` 在重建时按规则给
+  foreground_dwell / editor_session 区间打 project（证据 inferred——规则匹配
+  是推导不是直证；未命中与 ai_run 区间恒 NULL：ai_session 事件不带标题/路径，
+  无归属证据不猜）。POST /api/settings 接受 project_rules（校验上限/字段
+  长度/全空规则拒绝），设置页新增规则编辑器（增删行 + 三字段输入）。
+  schema 版本常量 CURRENT_SCHEMA_VERSION 14 → 15。
+- F08 统计报表（PRD v1.0 Stage 3）：新端点 GET /api/reports?days=N（默认 7，
+  上限 90，超限钳制 + days_requested/note 标注；`_at` 注入时钟）。按本地日 ×
+  区间类别（foreground_dwell / ai_run / editor_session）× 来源 × 项目汇总
+  时长，跨本地午界的区间按午界拆分归日。复审口径：estimated（含 inferred）
+  与 unknown 段单列，不计入 observed 合计；project=(none) 表示无归属证据，
+  不是零。dashboard 新增「报表」页签（天数 7/14/30/90 切换 + 三桶分列表格
+  + 窗口合计行）。
+- 统一时间轴 D 轨（Stage 3）改为 ai_run + editor_session 双源区间（此前只有
+  ai_run）：每区间带 interval_kind / project / project_evidence 字段；前端
+  按 source 分色（claude_code / zcode / dsh / 编辑器四色，unknown/inferred
+  纹理底仍优先）；区间全空的窗口该轨标「未接入」（不隐藏不标 0）；下钻
+  明细显示项目名与区间类别。
+
+### Added
+
+- F05 AIActivityAdapter（PRD v1.0 Stage 2，crates/core/src/ai_adapter.rs）：
+  只读扫描三种外部 AI 源（本机真实格式实地调研后固化进模块文档）——
+  Claude Code 会话转写（`~/.claude/projects/*/*.jsonl`，行级 timestamp）、
+  ZCode 会话库（`~/.zcode/cli/db/db.sqlite` 只读打开，session 表 epoch 毫秒）、
+  DSH 工作流产物（`<工作区>/.dsh/workflow-artifacts/dwfrun-*/`，仅 mtime，
+  inferred；近 1 小时内改动按扫描收口标 unknown）。scan_ai_sessions_at(dirs, now)
+  解析 session_id / source / start / end（证据词表 observed/inferred/unknown）/
+  ai_run_elapsed（活跃段并集，不是求和）/ prompt_count；ingest_ai_sessions 写
+  events 表 `event_type='ai_session'`（明细在 event_data JSON 含 schema_version，
+  不建第二真相表），按 session_id 去重 append-only 幂等；device_id 首次生成
+  UUIDv4 存 metadata 表（stage0-audit §5 决策 3）。测试 8 个（7 个脱敏自造
+  fixture 单测 + 1 个 `--ignored` 真实源只读冒烟：本机实测 claude_code=7 /
+  zcode=13281 / dsh=23 全部解析成功，绝不写源文件）；扫描幂等、断口收口、
+  区间推导全部 `_at` 注入时钟；fixture 禁真实标题/路径。
+- activity_intervals 新增两类区间推导（Stage 2，rebuild_activity_intervals_at
+  全量重建口径扩展）：`ai_run`（从 ai_session 事件派生，quality 取区间最弱端
+  证据：observed/inferred/unknown，无时间证据的事件行丢弃不虚构区间）与
+  `editor_session`（F04 编辑器前台驻留分类视图：app_name 命中 code.exe /
+  cursor.exe / windsurf.exe 等编辑器名单，source='windows'，quality 沿用
+  foreground_dwell 口径——闭区间 observed、断线收口尾部 unknown）。F04 边界：
+  本阶段只做前台分类，不做编辑器内部扩展/插件接入。
+- 统一时间轴 D 轨（AI 活动）接入真实数据：/api/timeline 的 track_d 改为
+  只读 activity_intervals 的 ai_run 区间（connected=true，移除「未接入」
+  标注）；E 轨（网络遥测）仍为预留。测试更新走既有 `_at` 注入口径。
+
 - browser-extension/ 骨架（PRD v1.0 F02，Stage 1）：MV3 事件驱动 Chromium 扩展
   （tabs.onActivated/onUpdated，无轮询无 content script，权限 activeTab/tabs/idle），
   tab 事件经 chrome.runtime.sendNativeMessage 以 .tab_change 上报，host 不可达时

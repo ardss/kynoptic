@@ -101,13 +101,29 @@ target\release\kynoptic.exe collect             # foreground collection; tray is
 target\release\kynoptic.exe query --from today
 target\release\kynoptic.exe stats --days 7
 target\release\kynoptic.exe dashboard          # local-only web panel (127.0.0.1)
+target\release\kynoptic.exe timeline --minutes 60   # unified timeline (PRD F07; same data as /api/timeline)
+target\release\kynoptic.exe reports --days 7        # unified reports  (PRD F08; same data as /api/reports)
 ```
+
+### 统一时间轴 / 报表与多设备边界（PRD v1.0 F11）
+
+Unified timeline（`/api/timeline?minutes=N`、`kynoptic timeline`、MCP
+`get_unified_timeline`）与 reports（`/api/reports?days=N`、`kynoptic reports`、
+MCP `get_reports`）是对 `activity_intervals` 只读派生表的同一组纯函数——三端
+同源同数值。每个区间/行带 `device_id`（原样抄写自源事件；`null` / `(unknown)`
+= 事件未带设备标识）。
+
+本期**不建同步服务**：每个库 = 一台机器。双机的 human_presence（以及任何
+时长）**不在响应内相加**——跨机直接求和会把双机同时在线重复计数。多机合流
+由后续经 MCP / 导出的流程完成；两个响应中的 `device_boundary` 字段即此边界
+说明。
 
 ### Use it from your AI assistant (MCP)
 
-Kynoptic ships an MCP server (stdio JSON-RPC) with six tools:
+Kynoptic ships an MCP server (stdio JSON-RPC) with nine tools:
 `get_current_status`, `get_summary`, `get_timeline`, `get_top_apps`,
-`get_anomalies`, `wait_for`. Point your MCP client at it:
+`get_topics`, `get_anomalies`, `wait_for`, `get_unified_timeline`,
+`get_reports`. Point your MCP client at it:
 
 > The MCP server is the `mcp` subcommand of the installed `kynoptic`
 > executable — no separate `kynoptic-mcp.exe` is shipped. If a tool you

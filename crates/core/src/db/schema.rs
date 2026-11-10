@@ -12,6 +12,12 @@
 //!   actor/channel/E_f 标签在查询层计算，见 queries/actor.rs）
 //! - 0014：统一事件结构（events 加列 source_id/device_id/quality，存量回填）
 //!   + activity_intervals 派生区间表（rebuild 见 db/activity_intervals.rs）
+//! - 0015：activity_intervals 加 project 列（F06 项目归属，规则见
+//!   db/activity_intervals.rs ProjectRule）
+//! - 0016：activity_intervals 加 device_id 列（F11 多设备，rebuild 从
+//!   源事件原样抄写）
+//! - 0018：project_overrides 人工项目指定表（append-only 派生层，F06 缺口
+//!   补齐：人工修正与可追溯）+ activity_intervals 加 project_source 列
 //!
 //! PRAGMA 只在 [`apply_pragmas`] 出现一次。
 
@@ -73,6 +79,26 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0014_unified_event_and_intervals",
         include_str!("migrations/0014_unified_event_and_intervals.sql"),
+    ),
+    (
+        "0015_intervals_project",
+        include_str!("migrations/0015_intervals_project.sql"),
+    ),
+    (
+        "0016_intervals_device",
+        include_str!("migrations/0016_intervals_device.sql"),
+    ),
+    (
+        "0017_ext_event_id",
+        include_str!("migrations/0017_ext_event_id.sql"),
+    ),
+    (
+        "0018_project_overrides",
+        include_str!("migrations/0018_project_overrides.sql"),
+    ),
+    (
+        "0019_browser_event_unique_idx",
+        include_str!("migrations/0019_browser_event_unique_idx.sql"),
     ),
 ];
 

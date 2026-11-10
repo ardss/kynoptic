@@ -1,3 +1,5 @@
+pub mod ai_adapter;
+pub mod ai_hooks;
 pub mod analyzer;
 pub mod anomaly;
 pub mod collector;
@@ -23,6 +25,7 @@ pub mod resource_anomaly;
 pub mod singleton;
 pub mod spawn;
 pub mod time;
+pub mod timeline;
 pub mod types;
 
 // crate 统一错误类型——供业务层（analyzer/anomaly/queries 等）与 src-tauri 消费层共用。

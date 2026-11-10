@@ -1,0 +1,12 @@
+-- 0016: activity_intervals 加 device_id 列（PRD v1.0 F11 多设备，Stage 3）
+--
+-- F11：events 已有 device_id 列（0014，机器级 UUID，ai_adapter 写入）。
+-- /api/timeline 与 /api/reports 需要按设备区分区间，因此派生表也要带上
+-- device_id（rebuild 从源事件原样抄写，不做任何归并——双机的 human_presence
+-- 不在本机相加，合流由后续 MCP/导出完成）。
+--
+-- 派生表可全量重建（不进真相链）：加列 + 重建即生效，无数据回填——旧行
+-- 由下次 rebuild 带上 device_id。append-only 铁律不受影响（本表是派生缓存，
+-- 且只加列不删行）。device_id 为 NULL = 源事件未带设备标识（如实缺省，
+-- 不虚构本机值）。
+ALTER TABLE activity_intervals ADD COLUMN device_id TEXT;

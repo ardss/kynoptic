@@ -13,6 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static REDACT_TITLES: AtomicBool = AtomicBool::new(false);
 
+/// 整标题脱敏（F10 隐私加固，默认关，隐私 opt-in）：开启后新写入的
+/// window/tab_change 标题一律替换为 `[redacted]`——比 URL 查询串剥离更
+/// 强一档，适合「窗口标题可能含敏感文档名/消息预览」的用户。只拦新写入，
+/// 不清洗历史数据（铁律：append-only 禁删改既有数据）。
+/// 接线路径与 [`set_redact_titles`] 同款：dash 设置 `redact_titles_full`
+/// → tray / CLI 构造 CollectorSettings → collector 启动接线。
+static REDACT_FULL: AtomicBool = AtomicBool::new(false);
+
 /// 接线点：collector 启动时按设置开关调用。
 pub fn set_redact_titles(on: bool) {
     REDACT_TITLES.store(on, Ordering::Relaxed);
@@ -22,11 +30,24 @@ pub fn redact_titles_enabled() -> bool {
     REDACT_TITLES.load(Ordering::Relaxed)
 }
 
-/// 按当前开关处理标题：未开启时原样返回；开启时把标题中的每个
+/// 整标题脱敏接线点（同上）。
+pub fn set_redact_full(on: bool) {
+    REDACT_FULL.store(on, Ordering::Relaxed);
+}
+
+pub fn redact_full_enabled() -> bool {
+    REDACT_FULL.load(Ordering::Relaxed)
+}
+
+/// 按当前开关处理标题：整标题脱敏开启时恒回 `[redacted]`（优先于 URL
+/// 模式）；否则未开启时原样返回；URL 模式开启时把标题中的每个
 /// `scheme://` URL 截断到查询串之前（保留 scheme://host/路径）。
 /// scheme 按 RFC 3986 形状识别（字母开头 + 字母数字/+.-
 /// 字符），覆盖 http(s)、ws(s) 及自定义应用协议。
 pub fn redact_title(title: &str) -> String {
+    if redact_full_enabled() {
+        return "[redacted]".to_string();
+    }
     if !redact_titles_enabled() {
         return title.to_string();
     }
@@ -102,6 +123,30 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_redact_titles(on);
         f();
+        set_redact_titles(false);
+    }
+
+    /// F10：整标题脱敏（opt-in）恒回 [redacted]，且优先于 URL 模式；
+    /// 关闭后原样（不动既有行为）。
+    #[test]
+    fn full_redact_replaces_entire_title_and_takes_precedence() {
+        let _g = REDACT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 默认关：原文
+        set_redact_full(false);
+        set_redact_titles(false);
+        assert_eq!(redact_title("机密文档.docx - Word"), "机密文档.docx - Word");
+        // 开（URL 模式关）：整标题替换
+        set_redact_full(true);
+        assert_eq!(redact_title("机密文档.docx - Word"), "[redacted]");
+        // 开（URL 模式也开）：整标题优先
+        set_redact_titles(true);
+        assert_eq!(
+            redact_title("登录 - https://example.com/login?token=abc"),
+            "[redacted]"
+        );
+        set_redact_full(false);
         set_redact_titles(false);
     }
 

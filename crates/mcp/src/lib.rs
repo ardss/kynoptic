@@ -1,6 +1,7 @@
 //! kynoptic-mcp —— MCP server（stdio JSON-RPC 2.0）
 //!
-//! 依据《mcp-tool-spec-v1》实现六工具：多语义小工具、列表类工具必带 `limit`
+//! 依据《mcp-tool-spec-v1》实现七工具；PRD v1.0 Stage 3 追加
+//! get_unified_timeline / get_reports（共九工具）：多语义小工具、列表类工具必带 `limit`
 //! （默认 20，上限 100）。协议层见 [`server`]，数据面见 [`state`]。
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,12 @@ pub enum Tool {
     GetAnomalies,
     /// E. wait_for —— 阻塞轮询兜底（MCP Tool 无推送语义）
     WaitFor,
+    /// PRD v1.0 F07（Stage 3）. get_unified_timeline —— 统一时间轴（只读
+    /// activity_intervals 派生表，与 dash /api/timeline?minutes= 同源同数值）
+    GetUnifiedTimeline,
+    /// PRD v1.0 F08（Stage 3）. get_reports —— 统计报表（与 dash /api/reports
+    /// 同源同数值；含 F11 device 维度）
+    GetReports,
 }
 
 impl Tool {
@@ -39,6 +46,8 @@ impl Tool {
             Tool::GetTopics => "get_topics",
             Tool::GetAnomalies => "get_anomalies",
             Tool::WaitFor => "wait_for",
+            Tool::GetUnifiedTimeline => "get_unified_timeline",
+            Tool::GetReports => "get_reports",
         }
     }
 
@@ -51,6 +60,8 @@ impl Tool {
             Tool::GetTopics,
             Tool::GetAnomalies,
             Tool::WaitFor,
+            Tool::GetUnifiedTimeline,
+            Tool::GetReports,
         ]
     }
 }
@@ -95,7 +106,9 @@ mod tests {
                 "get_top_apps",
                 "get_topics",
                 "get_anomalies",
-                "wait_for"
+                "wait_for",
+                "get_unified_timeline",
+                "get_reports"
             ]
         );
     }
