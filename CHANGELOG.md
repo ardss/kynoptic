@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+（暂无）
+
+## [0.9.0] - 2026-11-11
+
+### PRD v1.0 全量实现（跨生态活动感知与统一时间轴）
+
+F01-F12 全功能 + F×AC 追踪矩阵（K:/ardss-council/KY-PRD/ac-matrix.md）；真机端到端 AC 验收在双机安装后执行。
+
+#### Added
+- F05 AI 活动感知：ai_adapter 三源只读扫描（claude_code/zcode/dsh）+ ai_hooks 真实事件通道（CLI ext-event / ai-hooks render），observed/inferred 并集不双计
+- F02 Native Messaging host 本体（kynoptic-browser-host crate）+ HKCU 注册（CLI host-register / scripts/register-browser-host.ps1）；扩展 manifest 0.2.0 补 nativeMessaging/storage/scripting 权限，ChatGPT 网页 content script（opt-in，不读页面内容）
+- F04 VS Code/Cursor 编辑器扩展（vscode-extension，活动编辑器/调试/窗口状态真实事件经 /api/ext/events token 摄取）+ editor_session 区间
+- F06 项目归属：project_rules 规则推断（opt-in）+ project_overrides 人工修正（manual 优先、可追溯）
+- F07 统一时间轴：D 轨接真实 AI/编辑器数据、筛选器（项目/来源/证据等级）、下钻显示项目与证据等级
+- F08 统计报表：GET /api/reports + 报表页签（estimated/unknown 单列不并入 observed）
+- F09 采集健康：GET /api/health（监视器 ok/degraded/stale 分级、轮询型/钩子型分类、钩子自愈计数）+ CLI health
+- F11 多设备：activity_intervals.device_id（0016）、/api/timeline 响应带设备维度与 human_presence 不相加边界说明
+- 三端对等：CLI timeline/reports 子命令、MCP get_unified_timeline/get_reports（与 dash 同源同数值）
+- 迁移 0015-0019（project 列/device_id/ext_event_id 唯一索引/project_overrides）
+
+#### Changed
+- collector 周期性调度 scan/ingest/rebuild（含 project_rules），派生表生产接线（复审缺陷修复）
+- 报表 totals 口径修正：editor_session 不再与 foreground_dwell 双计
+- 事件摄取幂等加固：ext_event_id 哈希含接收序号、INSERT OR IGNORE 原子化、扩展 event_id 加随机后缀
+- CLI 子命令 21→28（llms.txt/APP.md 同步）
+
+（以下为 0.8.1 期间记录的 [Unreleased] 条目，已随 0.9.0 定版收口）
+
 ### Added
 
 - F07 统一时间轴筛选器（PRD v1.0 F07，2026-11-10 差距补齐）：①core 新增
@@ -1570,7 +1598,8 @@ zero data-loss findings left open. Highlights:
   aggregate read caches, 30 s flush interval, per-minute input
   aggregation (opt-in).
 
-[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/ardss/kynoptic/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ardss/kynoptic/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/ardss/kynoptic/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ardss/kynoptic/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ardss/kynoptic/compare/v0.6.0...v0.7.0
