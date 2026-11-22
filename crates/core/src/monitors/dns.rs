@@ -47,32 +47,19 @@ Get-WinEvent -LogName 'Microsoft-Windows-DNS-Client/Operational' -MaxEvents 10 -
         };
 
         let prev_time = self.last_event_time.take();
-        let mut queries = Vec::new();
-        let mut latest_time = prev_time.clone();
-
-        for line in output.trim().lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() >= 4 {
-                let time = parts[0].trim().to_string();
-                // 去重：只发送比上次更新的
-                if let Some(ref pt) = prev_time {
-                    if time <= *pt {
-                        continue;
-                    }
-                }
-                if latest_time.as_ref().is_none_or(|lt| time > *lt) {
-                    latest_time = Some(time.clone());
-                }
-                if queries.len() < 10 {
-                    queries.push(json!({
-                        "domain": parts[1].trim(),
-                        "query_type": parts[2].trim(),
-                        "status": parts[3].trim(),
-                        "time_created": time,
-                    }));
-                }
-            }
-        }
+        let (rows, latest_time) =
+            super::dedup::parse_watermark_lines(&output, 4, prev_time.as_deref(), 10);
+        let queries: Vec<_> = rows
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "domain": p[1],
+                    "query_type": p[2],
+                    "status": p[3],
+                    "time_created": p[0],
+                })
+            })
+            .collect();
 
         self.last_event_time.set(latest_time);
 

@@ -48,31 +48,19 @@ Get-WinEvent -FilterHashtable @{
         };
 
         let prev_time = self.last_event_time.take();
-        let mut events = Vec::new();
-        let mut latest_time = prev_time.clone();
-
-        for line in output.trim().lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() >= 4 {
-                let time = parts[0].trim().to_string();
-                if let Some(ref pt) = prev_time {
-                    if time <= *pt {
-                        continue;
-                    }
-                }
-                if latest_time.as_ref().is_none_or(|lt| time > *lt) {
-                    latest_time = Some(time.clone());
-                }
-                if events.len() < 10 {
-                    events.push(json!({
-                        "event_id": parts[1].trim().parse::<u32>().unwrap_or(0),
-                        "time": time,
-                        "provider": parts[2].trim(),
-                        "message": parts[3].trim(),
-                    }));
-                }
-            }
-        }
+        let (rows, latest_time) =
+            super::dedup::parse_watermark_lines(&output, 4, prev_time.as_deref(), 10);
+        let events: Vec<_> = rows
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "event_id": p[1].parse::<u32>().unwrap_or(0),
+                    "time": p[0],
+                    "provider": p[2],
+                    "message": p[3],
+                })
+            })
+            .collect();
 
         self.last_event_time.set(latest_time);
 
