@@ -97,7 +97,7 @@ pub const DEFAULT_PRESENCE_BRIDGE_MINUTES: u32 = 2;
 /// 某应用事件数 >= 历史均值的 N 倍视为突增
 pub const NEW_APP_SURGE_MULTIPLIER: f64 = 5.0;
 
-// === Insights 告警阈值（src-tauri/commands/system.rs::get_insights） ===
+// === Insights 告警阈值（/api/insights 叙事卡） ===
 /// 磁盘使用率超过此值触发"危险"告警
 pub const DISK_ALERT_USED_PCT: f64 = 90.0;
 /// 磁盘使用率超过此值触发"警告"
@@ -110,7 +110,7 @@ pub const THERMAL_WARN_C: f64 = 70.0;
 /// 来自 DeviceMonitor::interval = 2h；写在此处是因为 insights 算法依赖此值反推日均增长。
 pub const DEVICE_SNAPSHOT_INTERVAL_HOURS: f64 = 2.0;
 
-// === Pet 信号阈值（src-tauri/semantics/engine.rs::SignalEngine::evaluate） ===
+// === Pet 信号阈值（历史电子宠物信号引擎，见 db/schema 迁移兼容） ===
 // 注意:与上面 Insights 告警阈值并列但语义不同 — 这里是宠物情绪反应的触发线,
 // 高于告警线只是"宠物会反应",并非"系统报警"。
 /// CPU 温度（°C）超过此值 → HotEnvironment 信号

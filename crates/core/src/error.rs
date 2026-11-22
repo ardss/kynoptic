@@ -1,6 +1,6 @@
 //! 统一错误类型
 //!
-//! 业务层（analyzer/anomaly/queries/daily_agg 的编排入口）与本 crate 的 src-tauri
+//! 业务层（analyzer/anomaly/queries/daily_agg 的编排入口）与 CLI/托盘/面板
 //! 消费层共用本类型。`#[from] rusqlite::Error` / `serde_json::Error` / `io::Error`
 //! / `csv::Error` 让底层错误自动 `?` 转换，无需 `.map_err(|e| e.to_string())`
 //! 字符串化（Phase 13.2 收尾）。
