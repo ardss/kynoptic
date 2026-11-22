@@ -729,21 +729,26 @@ fn anomaly_message_en(kind: &str, fallback: &str) -> String {
 /// MCP 数据面恒用默认桥接值现算，面板走用户 settings 里可能改过的值，
 /// 两处数字可以不同——响应显式带回本工具实际使用的值，避免客户端误以为
 /// 与面板展示必然一致。
-pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
+///
+/// 检测失败返回 Err（走 server 既有 `{"error": …}` 通道）：此前
+/// `unwrap_or_default` 会把「检测执行失败」伪装成空列表，客户端（AI）
+/// 无从区分「没有异常」与「没查成」。
+pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Result<Value, String> {
     let days = days.clamp(1, 30);
     let limit = clamp_limit(Some(limit));
     let bridge_minutes = kynoptic_core::constants::DEFAULT_PRESENCE_BRIDGE_MINUTES as i64;
     let mut out: Vec<Value> = Vec::new();
     for i in 0..days {
         let date = queries::date_offset_str(-(i as i64));
-        let list = kynoptic_core::anomaly::detect_all(conn, &date).unwrap_or_default();
+        let list = kynoptic_core::anomaly::detect_all(conn, &date)
+            .map_err(|e| format!("anomaly detection failed: {e}（异常检测执行失败）"))?;
         for a in list {
             if out.len() >= limit {
-                return json!({
+                return Ok(json!({
                     "anomalies": out,
                     "truncated": true,
                     "bridge_minutes": bridge_minutes,
-                });
+                }));
             }
             let message_en = anomaly_message_en(&a.kind, &a.message);
             out.push(json!({
@@ -756,11 +761,11 @@ pub fn anomalies(conn: &Connection, days: usize, limit: usize) -> Value {
             }));
         }
     }
-    json!({
+    Ok(json!({
         "anomalies": out,
         "truncated": false,
         "bridge_minutes": bridge_minutes,
-    })
+    }))
 }
 
 // ─── E. wait_for ────────────────────────────────────────────────────────────
@@ -1521,7 +1526,7 @@ mod tests {
     #[test]
     fn anomalies_empty_on_fresh_db() {
         let conn = mem_conn();
-        let v = anomalies(&conn, 1, 20);
+        let v = anomalies(&conn, 1, 20).unwrap();
         assert_eq!(v["truncated"], json!(false));
         assert_eq!(v["anomalies"].as_array().unwrap().len(), 0);
     }
@@ -1543,7 +1548,7 @@ mod tests {
             })
             .unwrap_or_else(|| Utc::now().to_rfc3339());
         insert(&conn, &late, "keyboard", "press", None, None);
-        let v = anomalies(&conn, 1, 20);
+        let v = anomalies(&conn, 1, 20).unwrap();
         let arr = v["anomalies"].as_array().unwrap();
         if arr.is_empty() {
             // 检测器未触发时至少验证映射回退逻辑本身
@@ -1604,7 +1609,7 @@ mod tests {
     #[test]
     fn anomalies_report_bridge_minutes() {
         let conn = mem_conn();
-        let v = anomalies(&conn, 1, 20);
+        let v = anomalies(&conn, 1, 20).unwrap();
         assert_eq!(
             v["bridge_minutes"],
             json!(kynoptic_core::constants::DEFAULT_PRESENCE_BRIDGE_MINUTES as i64)
