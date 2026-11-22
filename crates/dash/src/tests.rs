@@ -3252,24 +3252,9 @@ fn m43_routes_param_contract() {
     assert!(v["window_events"].is_array());
 }
 
-#[test]
-fn m43_dashboard_three_views_present() {
-    // 三视图 id 契约：页签 + 面板容器（HTML 结构，JS 回填）。
-    for id in [
-        "tab-sys",
-        "view-sys",
-        "tab-restop",
-        "view-restop",
-        "tab-diagtl",
-        "view-diagtl",
-        "sys-overview",
-        "restop-rows",
-        "diagtl-rows",
-        "diagtl-dest",
-    ] {
-        assert!(DASHBOARD_HTML.contains(id), "dashboard 须包含 {id}");
-    }
-}
+// 诊断三视图（系统总览/资源排行/诊断时间线）的前端页签在 UI v2 中按设计
+// 移除（对应 /api/sys-overview、/api/resource-top、/api/diag-timeline 端点
+// 保留，行为由各自 API 测试覆盖，不在此重复注册断言）。
 
 // === 统一时间轴（/api/timeline?minutes=，F07，只读 activity_intervals） ===
 
