@@ -126,8 +126,8 @@ mod tests {
     fn fingerprint_reference_vectors() {
         assert_eq!(install_fingerprint("kynoptic"), "A62D7636");
         assert_eq!(
-            install_fingerprint(r"c:\users\13397\appdata\local\programs\kynoptic"),
-            "46516965"
+            install_fingerprint(r"c:\users\dev\appdata\local\programs\kynoptic"),
+            "888A94BD"
         );
         assert_eq!(install_fingerprint("Kynoptic"), "A62D7636");
     }
