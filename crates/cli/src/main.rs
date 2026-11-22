@@ -2227,14 +2227,6 @@ fn acquire_single_instance(name: &str) -> Result<()> {
         Ok(())
     }
     hold(name)?;
-    // 升级过渡桥：同时持有旧名互斥体，旧版 collect/tray（只探旧名）也能
-    // 发现本实例；旧版实例尚在本会话运行时这里会报已存在，同样拒绝启动。
-    // 只对生产新名（Global\ 前缀）生效——测试/注入的任意名字不做桥接。
-    if name.starts_with("Global\\") {
-        if let Some(legacy) = kynoptic_core::singleton::legacy_bridge_mutex_name(name) {
-            hold(legacy)?;
-        }
-    }
     Ok(())
 }
 
@@ -4005,12 +3997,6 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
             .encode_utf16()
             .chain([0])
             .collect();
-        // 升级过渡桥：同时探旧名——watchdog 换新后仍要能为尚未升级的旧版
-        // tray 探活（旧 tray 只持旧名，新 watchdog 只探新名会误判死亡并重复拉起）
-        let legacy_name: Option<Vec<u16>> = kynoptic_core::singleton::legacy_bridge_mutex_name(
-            &kynoptic_core::singleton::singleton_mutex_name(),
-        )
-        .map(|n| n.encode_utf16().chain([0]).collect());
         let exit_flag = exit_flag_path();
         let mut state = load_watchdog_state();
         // 审查 P2：并发 watchdog 互斥锁。拿不到锁 = 已有实例活跃,静默退出
@@ -4027,14 +4013,6 @@ fn cmd_watchdog(args: &[String]) -> Result<()> {
                 if !h.is_null() {
                     windows_sys::Win32::Foundation::CloseHandle(h);
                     true
-                } else if let Some(lname) = &legacy_name {
-                    let hl = OpenMutexW(SYNCHRONIZE, 0, lname.as_ptr());
-                    if !hl.is_null() {
-                        windows_sys::Win32::Foundation::CloseHandle(hl);
-                        true
-                    } else {
-                        false
-                    }
                 } else {
                     false
                 }
