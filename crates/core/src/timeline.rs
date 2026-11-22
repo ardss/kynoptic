@@ -107,9 +107,8 @@ impl TimelineFilter {
                 return false;
             }
         }
-        if !self.project.is_empty() && !project.is_some_and(|p| self.project.iter().any(|f| f == p))
-        {
-            return false;
+        if !self.project.is_empty() {
+            return project.is_some_and(|p| self.project.iter().any(|f| f == p));
         }
         true
     }
