@@ -235,23 +235,6 @@ fn main() {
                 rejected_start_feedback("已有实例在运行(互斥体已存在)");
                 return;
             }
-            // 升级过渡桥：同时持有旧名互斥体——旧版 tray/collect 只持/只探
-            // 旧名，不持旧名则升级窗口里新旧实例互不可见（单实例保护失效）。
-            // 旧版实例尚在本会话运行时此处报已存在，同样退出。
-            if let Some(legacy) = kynoptic_core::singleton::legacy_bridge_mutex_name(
-                &paths::single_instance_mutex_name(),
-            ) {
-                let lname: Vec<u16> = format!("{legacy}\0").encode_utf16().collect();
-                let lh = CreateMutexW(std::ptr::null(), 0, lname.as_ptr());
-                if lh.is_null() {
-                    log::warn!("过渡桥互斥体创建失败(GetLastError={})", GetLastError());
-                } else if GetLastError() == ERROR_ALREADY_EXISTS {
-                    log::warn!("已有旧版实例在运行(过渡桥互斥体已存在)，本实例退出");
-                    eprintln!("kynoptic-tray: 已有实例在运行,退出");
-                    rejected_start_feedback("已有实例在运行(过渡桥互斥体已存在)");
-                    return;
-                }
-            }
         }
     }
 

@@ -7,3 +7,6 @@ dist/
 vscode-extension/node_modules/
 vscode-extension/out/
 *.vsix
+
+# 外部宿主规则文件，不入公开仓库
+AGENTS.md

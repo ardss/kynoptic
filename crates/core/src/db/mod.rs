@@ -278,18 +278,18 @@ pub fn long_path_hint(path: &str) -> Option<String> {
 ///
 /// 优先级：
 /// 1. 环境变量 `KYNOPTIC_DB`（调试/测试覆盖）
-/// 2. exe 同级 `data/kynoptic.db`（打包后标准位置——安装目录/data）
-/// 3. cwd 候选（开发期：src-tauri/data 或 data，保护现有开发数据）
-/// 4. 兜底 exe 同级
+/// 2. exe 同级 `data/kynoptic.db`（安装版标准位置——安装目录/data）
+/// 3. cwd 候选 `data/kynoptic.db`（开发期在仓库根直接跑 exe 时保护现有数据）
+/// 4. 兜底 exe 同级（首次运行时创建在此）
 ///
-/// 此前主应用直接用相对路径 `"data/kynoptic.db"`，依赖 cwd：tauri dev（cwd=src-tauri）
-/// 能工作，但打包后从开始菜单/托盘启动时 cwd 不可控（可能为 System32），数据会丢/分裂。
+/// 不变量：exe 同级优先于 cwd——打包后从开始菜单/托盘启动时 cwd 不可控
+/// （可能为 System32），若依赖相对路径数据会丢/分裂。
 pub fn resolve_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("KYNOPTIC_DB") {
         return PathBuf::from(p);
     }
     let filename = constants::DB_FILENAME;
-    // 2) exe 同级 data/ —— 打包后的标准位置
+    // 2) exe 同级 data/ —— 安装版标准位置
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             let p = exe_dir.join("data").join(filename);
@@ -298,32 +298,11 @@ pub fn resolve_db_path() -> PathBuf {
             }
         }
     }
-    // 3) cwd 候选 —— 开发期保护现有数据（src-tauri/data 或 data）
+    // 3) cwd 候选 —— 开发期保护现有数据
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for cand in [
-        cwd.join("src-tauri/data").join(filename),
-        cwd.join("data").join(filename),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    // 3.5) 从 exe 往上找 src-tauri/data —— 开发期 exe 在 target/debug，
-    //      数据在仓库根 src-tauri/data。从任意 cwd 启动都能定位到。
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let mut dir = exe_dir.to_path_buf();
-            for _ in 0..5 {
-                let cand = dir.join("src-tauri/data").join(filename);
-                if cand.exists() {
-                    return cand;
-                }
-                match dir.parent() {
-                    Some(p) => dir = p.to_path_buf(),
-                    None => break,
-                }
-            }
-        }
+    let cand = cwd.join("data").join(filename);
+    if cand.exists() {
+        return cand;
     }
     // 4) 兜底 exe 同级（首次运行时创建在此）
     if let Ok(exe) = std::env::current_exe() {

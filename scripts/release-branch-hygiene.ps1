@@ -1,6 +1,6 @@
 ﻿# release-branch-hygiene.ps1 — 本地陈旧分支卫生门控（发布窗口执行）
 #
-# 判定铁律（Wave45 缺陷 3 固化）：分支内容是否"已在 main"必须用 tree 字节级
+# 判定铁律：分支内容是否"已在 main"必须用 tree 字节级
 # 对比判定——分支 tip 的 tree 与 main 上某个提交的 tree 完全相同，则其全部
 # 内容字节级已在 main（squash 合入的提交正是以同 tree 落在 main 上），删除
 # 无内容损失（仅丢 squash 前逐提交粒度，正常代价）。
@@ -13,9 +13,19 @@
 # git branch -D（发布窗口前清偿陈旧分支）。
 
 param(
-  [string[]]$Branch = @('chore/site-sync-v0.2.2', 'fix/wave42-deep-review', 'fix/wave43-deep-review'),
+  # 缺省动态枚举所有非 main 的本地分支（调用方可显式传入子集覆盖）。
+  [string[]]$Branch = @(),
   [switch]$Delete
 )
+
+if ($Branch.Count -eq 0) {
+  $Branch = @(& git for-each-ref --format='%(refname:short)' refs/heads/ |
+    Where-Object { $_ -ne 'main' })
+  if ($Branch.Count -eq 0) {
+    Write-Host "== 无非 main 本地分支，无需清理。"
+    exit 0
+  }
+}
 
 $ErrorActionPreference = 'Stop'
 $Root = & git -C $PSScriptRoot rev-parse --show-toplevel
@@ -23,9 +33,13 @@ if ($LASTEXITCODE -ne 0) { Write-Error '定位仓库根失败'; exit 1 }
 Set-Location $Root
 Write-Host "== branch-hygiene: $Root"
 
-# main 上全部提交的 tree 集合（一次 rev-list 取回，本地比对）
-$rawPairs = & git rev-list main --format='%H %T'
-if ($LASTEXITCODE -ne 0) { Write-Error 'git rev-list main 失败'; exit 1 }
+# origin/main 上全部提交的 tree 集合（一次 rev-list 取回，本地比对；
+# 无远端引用时退回本地 main）
+$mainRef = 'origin/main'
+& git rev-parse --verify --quiet 'refs/remotes/origin/main' > $null
+if ($LASTEXITCODE -ne 0) { $mainRef = 'main' }
+$rawPairs = & git rev-list $mainRef --format='%H %T'
+if ($LASTEXITCODE -ne 0) { Write-Error "git rev-list $mainRef 失败"; exit 1 }
 $pairs = @($rawPairs | Where-Object { $_ -match '^[0-9a-f]{40} [0-9a-f]{40}$' })
 $mainByTree = @{}
 foreach ($p in $pairs) {

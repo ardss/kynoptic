@@ -7,11 +7,11 @@
 //! `db::activity_intervals::rebuild_activity_intervals_at` 从事件派生
 //! `interval_kind='ai_run'`。
 //!
-//! ## 三种源的真实格式（2026-11-03 本机只读调研，路径为用户真实目录）
+//! ## 三种源的真实格式（2026-11-03 只读调研；路径为形态示意，非具体机器）
 //!
 //! ### claude_code —— Claude Code 会话转写
 //! - 路径模式：`<root>/projects/<路径转义目录名>/<session-uuid>.jsonl`
-//!   （实测根 `C:/Users/13397/.claude/projects/`，目录名如 `K--ardss-council`）。
+//!   （根为用户主目录下 `.claude/`，目录名如 `C--my-project`）。
 //! - 格式：JSONL，每行一个 JSON 对象。时间证据：行级 `timestamp`
 //!   （RFC3339 带毫秒、Z 后缀）。会话标识：`sessionId` 字段（与文件名一致）。
 //!   用户提示行：`type=="user"` 且 `message.content` 为字符串；回复行
@@ -21,7 +21,7 @@
 //!   一条事件时间戳的活跃段并集。
 //!
 //! ### zcode —— ZCode CLI 会话库
-//! - 路径模式：`<root>/cli/db/db.sqlite`（实测根 `C:/Users/13397/.zcode/`），
+//! - 路径模式：`<root>/cli/db/db.sqlite`（根为用户主目录下 `.zcode/`），
 //!   SQLite 只读打开，绝不写源库。
 //! - 表：`session(id, time_created, time_updated, ...)`，时间列 epoch 毫秒
 //!   整数；`session_input(session_id, kind, ...)` 计提示数（status 任意，
@@ -31,8 +31,8 @@
 //!   全长，这是该源的证据上限，不多猜）。
 //!
 //! ### dsh —— DSH 工作流产物
-//! - 路径模式：`<root>/.dsh/workflow-artifacts/dwfrun-<uuid>/`（实测根
-//!   `K:/OBSIDIAN/AI/`），目录含 summary/report/result 等 md/txt 产物文件。
+//! - 路径模式：`<root>/.dsh/workflow-artifacts/dwfrun-<uuid>/`（root 为
+//!   DSH 工作区根目录），目录含 summary/report/result 等 md/txt 产物文件。
 //! - 格式：产物为普通文本（无行级时间戳）；时间证据只有文件系统 mtime。
 //! - 映射：session_id=目录名；start=最早产物 mtime、end=最晚产物 mtime
 //!   ——mtime 是间接证据，quality=inferred（非 observed 也不算 unknown：
@@ -794,14 +794,19 @@ mod tests {
 
     /// 真实源冒烟（`cargo test -p kynoptic-core ai_adapter -- --ignored`）：
     /// 只读本机真实三源，断言能发现会话且字段合法；绝不写源文件。
+    /// 根目录从当前用户主目录推导（任何机器可用），DSH 根可用
+    /// `KY_TEST_DSH_ROOT` 覆盖（默认 `<主目录>/.dsh` 的工作区根）。
     #[test]
     #[ignore = "依赖本机真实数据（只读），CI 无该环境"]
     fn real_sources_smoke_readonly() {
-        let dirs = vec![
-            PathBuf::from("C:/Users/13397/.claude"),
-            PathBuf::from("C:/Users/13397/.zcode"),
-            PathBuf::from("K:/OBSIDIAN/AI"),
-        ];
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .expect("无法确定用户主目录");
+        let dsh_root = std::env::var_os("KY_TEST_DSH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".dsh"));
+        let dirs = vec![home.join(".claude"), home.join(".zcode"), dsh_root];
         let now = chrono::Utc::now().timestamp_millis();
         let sessions = scan_ai_sessions_at(&dirs, now);
         let by_src = |src: &str| sessions.iter().filter(|s| s.source == src).count();

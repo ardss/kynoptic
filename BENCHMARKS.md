@@ -334,8 +334,7 @@ move 行计入 agg_minute 的 count_value（samples），而增量 `apply_event`
 > 进程的托盘级实测（分支 perf/governance，v0.4.0 代码，四批性能治理改动落地
 > **之前**的构建——PowerShell 路径仍是"每次采集 spawn 一个子进程"的旧行为）。
 > 目的：为 PowerShell 持久宿主、重型预算限流、慢采集退避的重构提供对照基线。
-> 完整方法、隔离证据与原始 CSV 在仓库外测量报告
-> `K:\AIControl\CV-KY-convergence-20261028\work\baseline\RESULTS.md`。
+> 完整方法、隔离证据与原始 CSV 在仓库外测量报告（本地基线档案，不入库）。
 
 ### 方法
 
