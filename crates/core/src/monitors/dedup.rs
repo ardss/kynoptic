@@ -120,3 +120,84 @@ pub(crate) fn save_baseline(key: &str, value: &str) {
         }
     }
 }
+
+// ─── PS 事件行公共解析核（dns/driver/firewall/notification/security/uac） ───
+
+/// PowerShell Get-WinEvent 监控的公共行格式解析 + 时间水位去重。
+///
+/// 各监控的 PS 脚本统一输出 `time|field…|message` 管道分隔行（time 为
+/// RFC3339 UTC，字典序即时间序）。此前六个监控各自复制同一段循环
+/// （splitn → `time <= 水位` 剔除 → 推进 latest → cap），语义细节
+/// （`<=` 边界：同刻重发不算新事件；cap 后的行仍参与水位推进）散落
+/// 六处，修一处漏五处——收敛为单一实现。
+///
+/// - `fields`：行字段数（splitn 上限；字段不足的行静默跳过，与原实现一致）
+/// - `prev`：去重水位（进程内 ∪ 持久基线取较新者，由调用方决定）
+/// - `cap`：返回行的条数上限（仅截断返回值，不影响水位推进）
+///
+/// 返回 `(通过行, 新水位)`；行内字段均已 trim，`rows[i][0]` 为时间列。
+pub(crate) fn parse_watermark_lines(
+    output: &str,
+    fields: usize,
+    prev: Option<&str>,
+    cap: usize,
+) -> (Vec<Vec<String>>, Option<String>) {
+    let mut rows = Vec::new();
+    let mut latest = prev.map(str::to_string);
+    for line in output.trim().lines() {
+        let parts: Vec<&str> = line.splitn(fields, '|').collect();
+        if parts.len() < fields {
+            continue;
+        }
+        let time = parts[0].trim().to_string();
+        // 去重：只保留比水位更新的（同刻 `<=` 剔除——重发不算新事件）
+        if let Some(pt) = prev {
+            if time.as_str() <= pt {
+                continue;
+            }
+        }
+        if latest.as_deref().is_none_or(|lt| time.as_str() > lt) {
+            latest = Some(time);
+        }
+        if rows.len() < cap {
+            rows.push(parts.into_iter().map(|p| p.trim().to_string()).collect());
+        }
+    }
+    (rows, latest)
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::parse_watermark_lines;
+
+    #[test]
+    fn dedups_by_watermark_and_keeps_latest_advance() {
+        let out = "2026-11-22T01:00:00Z|4624|a\n2026-11-22T02:00:00Z|4625|b\n\
+                   2026-11-22T02:00:00Z|4625|b-reread\n2026-11-22T03:00:00Z|4634|c\n";
+        let (rows, latest) = parse_watermark_lines(out, 3, Some("2026-11-22T02:00:00Z"), 10);
+        // 01:00 被水位剔除（<=），02:00 同刻重发剔除，仅 03:00 通过
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][2], "c");
+        assert_eq!(latest.as_deref(), Some("2026-11-22T03:00:00Z"));
+    }
+
+    #[test]
+    fn cap_limits_rows_but_not_watermark() {
+        let out = (1..=5)
+            .map(|i| format!("2026-11-22T0{i}:00:00Z|100|m{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (rows, latest) = parse_watermark_lines(&out, 3, None, 2);
+        assert_eq!(rows.len(), 2);
+        // 水位仍推进到最后一行（被 cap 丢弃的行不算「没发生」）
+        assert_eq!(latest.as_deref(), Some("2026-11-22T05:00:00Z"));
+    }
+
+    #[test]
+    fn short_lines_skipped_and_empty_prev_keeps_all() {
+        let out = "bad-line\n2026-11-22T01:00:00Z|100|m\n";
+        let (rows, latest) = parse_watermark_lines(out, 3, None, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(latest.as_deref(), Some("2026-11-22T01:00:00Z"));
+    }
+}

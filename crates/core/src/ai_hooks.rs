@@ -25,7 +25,7 @@
 //! Windows 安全）；会话标识模板变量 `${CLAUDE_SESSION_ID}` 由 ZCode 展开。
 //!
 //! ### dsh —— 无 hook/插件事件机制，如实不接入
-//! 调研：`K:/OBSIDIAN/AI/.dsh/`（本机真实目录）只有 workflow-artifacts /
+//! 调研：本机 DSH 安装目录（`<root>/.dsh/`）只有 workflow-artifacts /
 //! workflows / workflow-drafts 产物目录，无 hooks.json / hooks 配置面；
 //! DSH 运行生命周期只在其内部 journal 里，未暴露用户可配置的事件钩子。
 //! **该源保留 ai_adapter 文件扫描（inferred）后备**，不虚构 hook 通道。

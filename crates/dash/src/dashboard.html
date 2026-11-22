@@ -2849,9 +2849,10 @@ async function loadSysOverview() {
       value: gpu.data && gpu.data.gpus ? gpu.data.gpus.join(", ") : null,
       note: gpu.quality === "unavailable" ? (lang === "zh" ? "暂无 GPU 快照" : "no GPU snapshot yet") : null }, lang));
     const an = d.anomalies || {};
-    parts.push(sysCard({ label_en: "key anomalies (today)", label_zh: "关键异常（今日）", quality: "confirmed",
-      value: String(an.count || 0),
-      note: (an.top || []).slice(0, 3).map(x => x.kind + "·" + (x.message || "")).join("；") || null }, lang));
+    const anq = an.quality || "confirmed";
+    parts.push(sysCard({ label_en: "key anomalies (today)", label_zh: "关键异常（今日）", quality: anq,
+      value: anq === "unavailable" ? null : String(an.count || 0),
+      note: anq === "unavailable" ? (lang === "zh" ? "异常检测执行失败" : "anomaly detection failed") : ((an.top || []).slice(0, 3).map(x => x.kind + "·" + (x.message || "")).join("；") || null) }, lang));
     const mh = d.monitor_health || {};
     parts.push(sysCard({ label_en: "monitors enabled", label_zh: "启用监控器", quality: "confirmed",
       value: String(mh.enabled_monitors == null ? "–" : mh.enabled_monitors),

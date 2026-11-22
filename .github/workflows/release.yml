@@ -211,8 +211,8 @@ jobs:
         with:
           # P0 delivery-governance (2026-11-01): a tag must NOT publish publicly on its own.
           # Releases land as DRAFT; publishing requires the full acceptance chain
-          # (per-machine install proof -> real QA -> explicit USER GO). Contract:
-          # K:\AIControl\Release-Governance\DELIVERY-CONTRACT.md
+          # (per-machine install proof -> real QA -> explicit USER GO), per the
+          # local delivery-contract archive (not in this repo).
           draft: true
           body_path: dist/RELEASE_NOTES.md
           files: |

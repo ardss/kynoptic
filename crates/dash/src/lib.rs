@@ -567,7 +567,11 @@ pub use kynoptic_core::timeline::{
 /// HTTP 路由层已拒绝 0/负数），但 marathon
 /// 的连续性桥接阈值读 settings 的 `presence_bridge_minutes`（全站连续性口径
 /// 统一源），每条按中文 message 重新参数化 message_en。
-pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
+pub fn api_anomalies(
+    conn: &Connection,
+    days: u32,
+    db_path: &Path,
+) -> std::result::Result<Value, String> {
     let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
     let days = days.clamp(1, 30) as usize;
     let mut out: Vec<Value> = Vec::new();
@@ -608,15 +612,19 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
     };
     // 长跨度性能：逐日循环改为一次整窗调用（core detect_all_days_with_bridge，
     // marathon 的人在场分钟整窗取数一次），逐日结果与旧循环完全一致。
+    // 检测失败返回 Err（路由层 err_json）：此前 unwrap_or_default 会把
+    // 「检测执行失败」伪装成空列表，前端把数据库故障显示成「未检测到异常」。
     let dates: Vec<String> = (0..days)
         .map(|i| queries::date_offset_str(-(i as i64)))
         .collect();
     for (date, list) in kynoptic_core::anomaly::detect_all_days_with_bridge(conn, &dates, bridge)
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())?
     {
         for a in list {
             if out.len() >= 100 {
-                return json!({"anomalies": out, "truncated": true, "baseline_days": baseline_days});
+                return Ok(
+                    json!({"anomalies": out, "truncated": true, "baseline_days": baseline_days}),
+                );
             }
             let at = a.at.clone();
             let message_en = anomaly_message_en(&a.kind, &a.message, at.as_deref());
@@ -632,7 +640,7 @@ pub fn api_anomalies(conn: &Connection, days: u32, db_path: &Path) -> Value {
             }));
         }
     }
-    json!({"anomalies": out, "truncated": false, "baseline_days": baseline_days})
+    Ok(json!({"anomalies": out, "truncated": false, "baseline_days": baseline_days}))
 }
 
 /// GET /api/net-process — 近 N 分钟净指标分钟桶（M2.4）。
@@ -804,24 +812,31 @@ pub fn api_sys_overview_at(conn: &Connection, db_path: &Path, now_ms: i64) -> Va
     } else {
         "confirmed"
     };
-    // 关键异常：今日（与 /api/anomalies 同入口同口径）
+    // 关键异常：今日（与 /api/anomalies 同入口同口径）。检测失败不伪装成
+    // 「0 条异常」：quality=unavailable（与同视图 cpu/gpu/network 卡同模式），
+    // 前端灰显并提示检测失败，而非显示健康的 0。
     let bridge = settings::load(db_path).presence_bridge_minutes.min(15);
     let today = queries::today_local_str();
-    let mut anomaly_count = 0usize;
-    let mut anomaly_top: Vec<Value> = Vec::new();
-    for (_date, list) in kynoptic_core::anomaly::detect_all_days_with_bridge(conn, &[today], bridge)
-        .unwrap_or_default()
-    {
-        for a in list {
-            anomaly_count += 1;
-            if anomaly_top.len() < 5 {
-                anomaly_top.push(json!({
-                    "kind": a.kind, "severity": a.severity,
-                    "message": a.message, "at": a.at,
-                }));
+    let (anomaly_quality, anomaly_count, anomaly_top) =
+        match kynoptic_core::anomaly::detect_all_days_with_bridge(conn, &[today], bridge) {
+            Ok(days_map) => {
+                let mut count = 0usize;
+                let mut top: Vec<Value> = Vec::new();
+                for (_date, list) in days_map {
+                    for a in list {
+                        count += 1;
+                        if top.len() < 5 {
+                            top.push(json!({
+                                "kind": a.kind, "severity": a.severity,
+                                "message": a.message, "at": a.at,
+                            }));
+                        }
+                    }
+                }
+                ("confirmed", count, top)
             }
-        }
-    }
+            Err(_) => ("unavailable", 0, Vec::new()),
+        };
     let s = settings::load(db_path);
     json!({
         "now_ms": now_ms,
@@ -830,7 +845,7 @@ pub fn api_sys_overview_at(conn: &Connection, db_path: &Path, now_ms: i64) -> Va
         "gpu": {"quality": gpu_quality, "data": gpu_data},
         "network": {"minutes": 60, "bytes_in": bin, "bytes_out": bout,
                     "pids": pids.len(), "quality": net_quality},
-        "anomalies": {"count": anomaly_count, "top": anomaly_top},
+        "anomalies": {"quality": anomaly_quality, "count": anomaly_count, "top": anomaly_top},
         "monitor_health": {"watchdog_alert": latest_watchdog_alert(conn),
                            "enabled_monitors": s.enabled_monitors.len()},
     })
@@ -3823,9 +3838,10 @@ pub fn route_req_ext(
             // 60s TTL 缓存（发现 ②）：异常页每次进页全窗重算且前端零反馈
             // （p95/p99 超 500ms）；对照 timeline 同模式补缓存。键 = db +
             // 原始 query（含 days）+ 设置纪元（marathon 桥接阈值读
-            // settings），保存设置后立即失效。api_anomalies 恒返回 Value
-            // （无 Result），缓存块内算完标注即入库；仅常驻 serve 路径
-            // 开启（tests.rs 直调不受影响）。
+            // settings），保存设置后立即失效。api_anomalies 现返回
+            // Result（检测失败→err_json，与 timeline 同口径）；Err 不入库
+            // 不缓存，仅成功结果缓存。仅常驻 serve 路径开启（tests.rs
+            // 直调不受影响）。
             if TIMELINE_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
                 use std::sync::Mutex;
                 use std::time::{Duration, Instant};
@@ -3846,7 +3862,10 @@ pub fn route_req_ext(
                         }
                     }
                 }
-                let mut v = api_anomalies(conn, days, db_path);
+                let mut v = match api_anomalies(conn, days, db_path) {
+                    Ok(v) => v,
+                    Err(e) => return (400, "application/json", err_json(&e)),
+                };
                 if days > 30 {
                     if let Some(obj) = v.as_object_mut() {
                         cap_note(obj, "days", days, 30);
@@ -3859,7 +3878,10 @@ pub fn route_req_ext(
                 }
                 return (200, "application/json", v.to_string());
             }
-            let mut v = api_anomalies(conn, days, db_path);
+            let mut v = match api_anomalies(conn, days, db_path) {
+                Ok(v) => v,
+                Err(e) => return (400, "application/json", err_json(&e)),
+            };
             if days > 30 {
                 if let Some(obj) = v.as_object_mut() {
                     cap_note(obj, "days", days, 30);

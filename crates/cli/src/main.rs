@@ -806,7 +806,9 @@ fn cmd_report(args: &[String]) -> Result<()> {
     let date = resolve_report_date(&date)?;
     let conn = open_db_read(&resolve_db())?;
     let analysis = analyzer::analyze_day(&conn, &date)?;
-    let anomalies = anomaly::detect_all(&conn, &date).unwrap_or_default();
+    // 检测失败必须显式失败（Error 传播）：此前 unwrap_or_default 会把
+    // 「检测执行失败」伪装成「没有异常」写进报告，用户无从区分。
+    let anomalies = anomaly::detect_all(&conn, &date)?;
 
     let mut md = String::new();
     md.push_str(&format!("# Kynoptic · {} 报告\n\n", date));
@@ -1243,7 +1245,8 @@ fn print_analyze_day(conn: &Connection, date: &str) -> Result<()> {
 /// analyze 单日文本（与旧 println! 逐行输出逐字节一致），供并行汇总后打印。
 fn analyze_day_text(conn: &Connection, date: &str) -> Result<String> {
     let analysis = analyzer::analyze_day(conn, date)?;
-    let anomalies = anomaly::detect_all(conn, date).unwrap_or_default();
+    // 同 cmd_report：检测失败显式失败，不落成「无异常」的假空态。
+    let anomalies = anomaly::detect_all(conn, date)?;
     let mut out = String::new();
     use std::fmt::Write as _;
     let w = &mut out;

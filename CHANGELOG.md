@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### PRD v1.0 全量实现（跨生态活动感知与统一时间轴）
 
-F01-F12 全功能 + F×AC 追踪矩阵（K:/ardss-council/KY-PRD/ac-matrix.md）；真机端到端 AC 验收在双机安装后执行。
+F01-F12 全功能 + F×AC 追踪矩阵（内部 PRD 档案，不入库）；真机端到端 AC 验收在双机安装后执行。
 
 #### Added
 - F05 AI 活动感知：ai_adapter 三源只读扫描（claude_code/zcode/dsh）+ ai_hooks 真实事件通道（CLI ext-event / ai-hooks render），observed/inferred 并集不双计

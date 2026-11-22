@@ -56,37 +56,24 @@ $events
         };
 
         let prev_time = self.last_event_time.take();
-        let mut events = Vec::new();
-        let mut latest_time = prev_time.clone();
-
-        for line in output.trim().lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() >= 4 {
-                let time = parts[0].trim().to_string();
-                if let Some(ref pt) = prev_time {
-                    if time <= *pt {
-                        continue;
-                    }
-                }
-                if latest_time.as_ref().is_none_or(|lt| time > *lt) {
-                    latest_time = Some(time.clone());
-                }
-                if events.len() < 10 {
-                    // 隐私对齐（与 notification/clipboard 同粒度，平台审查 item 10）：
-                    // Defender/安全日志原文可能含账号名/进程路径——PII 红线。
-                    // 原文不落库，只存加盐摘要前 8 hex + 字节长度。
-                    let msg = parts[3].trim();
-                    let digest = super::clipboard::salted_digest_hex(msg.as_bytes());
-                    events.push(json!({
-                        "event_id": parts[1].trim().parse::<u32>().unwrap_or(0),
-                        "time": time,
-                        "source": parts[2].trim(),
-                        "digest": &digest[..8],
-                        "len": msg.len(),
-                    }));
-                }
-            }
-        }
+        let (rows, latest_time) =
+            super::dedup::parse_watermark_lines(&output, 4, prev_time.as_deref(), 10);
+        let events: Vec<_> = rows
+            .into_iter()
+            .map(|p| {
+                // 隐私对齐（与 notification/clipboard 同粒度，平台审查 item 10）：
+                // Defender/安全日志原文可能含账号名/进程路径——PII 红线。
+                // 原文不落库，只存加盐摘要前 8 hex + 字节长度。
+                let digest = super::clipboard::salted_digest_hex(p[3].as_bytes());
+                json!({
+                    "event_id": p[1].parse::<u32>().unwrap_or(0),
+                    "time": p[0],
+                    "source": p[2],
+                    "digest": &digest[..8],
+                    "len": p[3].len(),
+                })
+            })
+            .collect();
 
         self.last_event_time.set(latest_time);
 

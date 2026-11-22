@@ -270,7 +270,7 @@ impl McpServer {
                     _ => None,
                 };
                 let (limit, clamped_limit) = parse_limit(args)?;
-                let mut v = state::anomalies(&conn, days, limit);
+                let mut v = state::anomalies(&conn, days, limit)?;
                 // days 与 limit 可能同时超限：分别带 clamped_days / clamped_limit
                 //（clamped_to 兼容保留，语义 = days 的钳制值）
                 if let Some(n) = clamped_days {

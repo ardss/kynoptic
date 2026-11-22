@@ -202,7 +202,7 @@ fn anomalies_shape_matches_core_entry_with_bridge() {
     let conn = mem_conn();
     // settings 文件不存在 → 默认值（bridge=2），不影响 shape
     let db = Path::new("/tmp/kynoptic-test-nonexistent/settings.json");
-    let v = api_anomalies(&conn, 7, db);
+    let v = api_anomalies(&conn, 7, db).unwrap();
     assert!(v["anomalies"].is_array());
     assert_eq!(v["truncated"], json!(false));
 }
@@ -220,7 +220,7 @@ fn anomalies_baseline_days_falls_back_to_events_when_daily_agg_missing() {
     let ts = (chrono::Utc::now() - chrono::Duration::hours(36)).to_rfc3339();
     insert(&conn, &ts, "keyboard", "press", None);
     let db = Path::new("/tmp/kynoptic-test-nonexistent/settings.json");
-    let v = api_anomalies(&conn, 7, db);
+    let v = api_anomalies(&conn, 7, db).unwrap();
     assert_eq!(
         v["baseline_days"],
         json!(1),

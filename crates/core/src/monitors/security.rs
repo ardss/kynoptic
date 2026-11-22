@@ -67,44 +67,31 @@ Get-WinEvent -FilterHashtable @{LogName='Security';Id=$idlist} -MaxEvents 30 -Er
         };
 
         let prev_time = self.last_event_time.take();
-        let mut events = Vec::new();
-        let mut latest_time = prev_time.clone();
-
-        for line in output.trim().lines() {
-            let parts: Vec<&str> = line.splitn(3, '|').collect();
-            if parts.len() >= 3 {
-                let time = parts[0].trim().to_string();
-                if let Some(ref pt) = prev_time {
-                    if time <= *pt {
-                        continue;
-                    }
-                }
-                if latest_time.as_ref().is_none_or(|lt| time > *lt) {
-                    latest_time = Some(time.clone());
-                }
-                let eid: u32 = parts[1].trim().parse().unwrap_or(0);
+        let (rows, latest_time) =
+            super::dedup::parse_watermark_lines(&output, 3, prev_time.as_deref(), 10);
+        let events: Vec<_> = rows
+            .into_iter()
+            .map(|p| {
+                // 隐私对齐（与 notification/clipboard 同粒度，平台审查 item 10）：
+                // 安全日志原文含账号名/来源 IP（4625）、进程路径（4672）——PII
+                // 红线。原文不落库，只存加盐摘要前 8 hex + 字节长度。正文仅在
+                // 子进程 stdout → 本进程内存中转，算完摘要即丢弃。
+                let digest = super::clipboard::salted_digest_hex(p[2].as_bytes());
+                let eid: u32 = p[1].parse().unwrap_or(0);
                 let name = SECURITY_EVENTS
                     .iter()
                     .find(|(id, _)| *id == eid)
                     .map(|(_, n)| *n)
                     .unwrap_or("unknown");
-                if events.len() < 10 {
-                    // 隐私对齐（与 notification/clipboard 同粒度，平台审查 item 10）：
-                    // 安全日志原文含账号名/来源 IP（4625）、进程路径（4672）——PII
-                    // 红线。原文不落库，只存加盐摘要前 8 hex + 字节长度。正文仅在
-                    // 子进程 stdout → 本进程内存中转，算完摘要即丢弃。
-                    let msg = parts[2].trim();
-                    let digest = super::clipboard::salted_digest_hex(msg.as_bytes());
-                    events.push(json!({
-                        "event_id": eid,
-                        "event_name": name,
-                        "time": time,
-                        "digest": &digest[..8],
-                        "len": msg.len(),
-                    }));
-                }
-            }
-        }
+                json!({
+                    "event_id": eid,
+                    "event_name": name,
+                    "time": p[0],
+                    "digest": &digest[..8],
+                    "len": p[2].len(),
+                })
+            })
+            .collect();
 
         self.last_event_time.set(latest_time);
 
